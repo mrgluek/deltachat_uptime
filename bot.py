@@ -1277,6 +1277,28 @@ def on_message_failed(bot, accid, event):
 def on_init(bot, args):
     setup_custom_command_parser(bot, ALLOWED_PREFIXES)
     
+    global dc_bot_instance, dc_accid
+    dc_bot_instance = bot
+    
+    for accid in bot.rpc.get_all_account_ids():
+        dc_accid = accid
+        try:
+            bot.rpc.set_config(accid, "displayname", "Delta Chat Uptime Bot")
+            bot.rpc.set_config(accid, "selfstatus", "Monitors resource availability (HTTP, TCP, Ping) and alerts on outages: https://github.com/mrgluek/deltachat_uptime")
+            
+            # Set bot avatar if icon file exists
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            for icon_name in ["icon.jpg", "icon.png"]:
+                icon_path = os.path.join(base_dir, icon_name)
+                if os.path.exists(icon_path):
+                    bot.rpc.set_config(accid, "selfavatar", icon_path)
+                    bot.logger.info(f"Avatar set from {icon_path}")
+                    break
+            else:
+                bot.logger.warning(f"No icon.jpg or icon.png found in {base_dir}")
+        except Exception as e:
+            bot.logger.warning(f"Could not configure profile: {e}")
+            
     # Start web server thread
     web_thread = threading.Thread(target=start_web_server_thread, daemon=True)
     web_thread.start()

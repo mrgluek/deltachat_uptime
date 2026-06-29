@@ -289,32 +289,26 @@ async def handle_check_result(resource, is_up, error_msg):
         await notify_status_change(resource, old_status, status, error_msg)
 
 async def notify_status_change(resource, old_status, status, error_msg):
+    res_id = resource["id"]
     name = resource["name"] or resource["url"]
     url = resource["url"]
+    type_upper = resource["type"].upper()
     chat_id = resource["dc_chat_id"]
+    
+    uptime_val = await asyncio.to_thread(database.get_resource_uptime_30d, res_id)
+    uptime_str = f"{uptime_val:.2f}%"
     
     if status == "down":
         msg_text = (
-            f"🔴 **Service is DOWN**\n\n"
-            f"🖥️ Name: **{name}**\n"
-            f"🔗 Target: `{url}`\n"
-            f"⚠️ Type: `{resource['type'].upper()}`\n"
-            f"❌ Error: `{error_msg}`\n"
-            f"🕒 Time: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            f"🔴 `ID: {res_id}` **{name}**\n"
+            f"  Target: `{url}` ({type_upper})\n"
+            f"  Uptime 30d: `{uptime_str}` | Status: `DOWN ({error_msg})`"
         )
     else:
-        last_changed = resource["last_changed"]
-        duration_str = "unknown"
-        if last_changed:
-            duration_secs = int(time.time()) - last_changed
-            duration_str = format_duration(duration_secs)
-            
         msg_text = (
-            f"🟢 **Service is UP** (Recovered)\n\n"
-            f"🖥️ Name: **{name}**\n"
-            f"🔗 Target: `{url}`\n"
-            f"🕒 Duration offline: `{duration_str}`\n"
-            f"🕒 Time: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            f"🟢 `ID: {res_id}` **{name}**\n"
+            f"  Target: `{url}` ({type_upper})\n"
+            f"  Uptime 30d: `{uptime_str}` | Status: `UP`"
         )
         
     if dc_bot_instance and dc_accid is not None:

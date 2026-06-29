@@ -1729,6 +1729,36 @@ def url_command(bot, accid, event):
     database.set_config("base_url", url)
     _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=f"✅ Base status URL set to: `{url}`"))
 
+def fetch_html_title(url, timeout=3.0):
+    import urllib.request
+    try:
+        req = urllib.request.Request(
+            url, 
+            headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)'}
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            html_bytes = response.read(65536)
+            charset = 'utf-8'
+            content_type = response.headers.get('Content-Type', '')
+            charset_match = re.search(r'charset=([\w-]+)', content_type, re.IGNORECASE)
+            if charset_match:
+                charset = charset_match.group(1)
+            try:
+                html_text = html_bytes.decode(charset, errors='ignore')
+            except Exception:
+                html_text = html_bytes.decode('utf-8', errors='ignore')
+                
+            match = re.search(r'<title>(.*?)</title>', html_text, re.IGNORECASE | re.DOTALL)
+            if match:
+                title = match.group(1).strip()
+                title = html.unescape(title)
+                title = re.sub(r'\s+', ' ', title)
+                if title:
+                    return title
+    except Exception as e:
+        logger.warning(f"Could not fetch title for {url}: {e}")
+    return None
+
 @dc_cli.on(events.NewMessage(command="/add"))
 def add_command(bot, accid, event):
     msg = event.msg
@@ -1745,13 +1775,22 @@ def add_command(bot, accid, event):
         
     parts = payload.split(None, 1)
     target = parts[0]
-    name = parts[1] if len(parts) > 1 else target
     
     try:
         check_type, url = parse_target(target)
     except ValueError as e:
         _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=f"❌ {e}"))
         return
+        
+    name = parts[1] if len(parts) > 1 else None
+    if not name:
+        if check_type == "http":
+            fetched_title = fetch_html_title(url)
+            name = fetched_title if fetched_title else target
+        else:
+            name = target
+    
+
         
     res_id = database.add_resource(msg.chat_id, url, name, check_type)
     if res_id is None:

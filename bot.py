@@ -432,7 +432,7 @@ def get_dashboard_html(chat_name, resources, overall_uptime) -> str:
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Delta Chat Uptime Monitor - {html.escape(chat_name)}</title>
-    <link rel="icon" type="image/jpeg" href="/icon.jpg" />
+    <link rel="icon" type="image/png" href="/icon.png" />
     <link rel="shortcut icon" href="/favicon.ico" />
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -756,7 +756,7 @@ def get_dashboard_html(chat_name, resources, overall_uptime) -> str:
 <body>
     <header>
         <div class="logo-container">
-            <img class="logo-img" src="/icon.jpg" alt="Logo">
+            <img class="logo-img" src="/icon.png" alt="Logo">
             <span class="logo-title">Delta Chat Uptime</span>
         </div>
     </header>
@@ -842,7 +842,7 @@ async def handle_index(request):
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Delta Chat Uptime Bot</title>
-    <link rel="icon" type="image/jpeg" href="/icon.jpg" />
+    <link rel="icon" type="image/png" href="/icon.png" />
     <link rel="shortcut icon" href="/favicon.ico" />
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -1097,7 +1097,7 @@ async def handle_index(request):
 <body>
     <header>
         <div class="logo-container">
-            <img class="logo-img" src="/icon.jpg" alt="Logo">
+            <img class="logo-img" src="/icon.png" alt="Logo">
             <span class="logo-title">Delta Chat Uptime</span>
         </div>
     </header>
@@ -1224,7 +1224,7 @@ async def handle_robots_txt(request):
 async def handle_icon(request):
     filename = request.path.lstrip('/')
     if filename == 'favicon.ico':
-        filename = 'icon.jpg'
+        filename = 'icon.png'
         
     if os.path.exists(filename):
         headers = {
@@ -1235,7 +1235,7 @@ async def handle_icon(request):
 
 async def _run_web_server():
     app = web.Application()
-    app.router.add_get('/icon.jpg', handle_icon)
+    app.router.add_get('/icon.png', handle_icon)
     app.router.add_get('/favicon.ico', handle_icon)
     app.router.add_get('/robots.txt', handle_robots_txt)
     app.router.add_get('/', handle_index)
@@ -1746,14 +1746,14 @@ def on_init(bot, args):
             
             # Set bot avatar if icon file exists
             base_dir = os.path.dirname(os.path.abspath(__file__))
-            for icon_name in ["icon.jpg", "icon.png"]:
+            for icon_name in ["icon.png", "icon.jpg"]:
                 icon_path = os.path.join(base_dir, icon_name)
                 if os.path.exists(icon_path):
                     bot.rpc.set_config(accid, "selfavatar", icon_path)
                     bot.logger.info(f"Avatar set from {icon_path}")
                     break
             else:
-                bot.logger.warning(f"No icon.jpg or icon.png found in {base_dir}")
+                bot.logger.warning(f"No icon.png or icon.jpg found in {base_dir}")
         except Exception as e:
             bot.logger.warning(f"Could not configure profile: {e}")
             

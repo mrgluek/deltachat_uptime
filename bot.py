@@ -31,6 +31,7 @@ dc_accid = None
 async_event_loop = None
 running_resource_ids = set()
 running_lock = asyncio.Lock()
+index_page_html_cache = None
 
 # Custom command parsing configuration
 ALLOWED_PREFIXES = ["up", "uptime"]
@@ -1196,8 +1197,392 @@ async def handle_index(request):
 </html>"""
     return web.Response(text=html_content, content_type="text/html")
 
+async def handle_index(request):
+    global index_page_html_cache
+    if index_page_html_cache is None:
+        index_page_html_cache = """<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Delta Chat Uptime Bot</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-color: #0b0f19;
+            --card-bg: rgba(20, 26, 42, 0.6);
+            --border-color: rgba(255, 255, 255, 0.08);
+            --text-main: #f3f4f6;
+            --text-muted: #9ca3af;
+            --color-up: #10b981;
+            --color-primary: #3b82f6;
+            --glow-primary: rgba(59, 130, 246, 0.4);
+        }
+        
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+        
+        body {
+            font-family: 'Outfit', sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-main);
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+            background-image: 
+                radial-gradient(circle at 10% 20%, rgba(59, 130, 246, 0.06) 0%, transparent 40%),
+                radial-gradient(circle at 90% 80%, rgba(16, 185, 129, 0.05) 0%, transparent 40%);
+        }
+        
+        header {
+            padding: 2rem 1.5rem;
+            max-width: 900px;
+            width: 100%;
+            margin: 0 auto;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        .logo-container {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+        }
+        
+        .logo-icon {
+            font-size: 1.75rem;
+        }
+        
+        .logo-title {
+            font-size: 1.5rem;
+            font-weight: 700;
+            background: linear-gradient(135deg, #3b82f6, #10b981);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        
+        main {
+            flex-grow: 1;
+            max-width: 900px;
+            width: 100%;
+            margin: 0 auto;
+            padding: 0 1.5rem 3rem;
+            display: flex;
+            flex-direction: column;
+            gap: 2.5rem;
+        }
+        
+        .hero {
+            text-align: center;
+            padding: 2rem 0;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 1rem;
+        }
+        
+        .hero h1 {
+            font-size: 2.5rem;
+            font-weight: 700;
+            line-height: 1.2;
+            background: linear-gradient(135deg, #ffffff, #9ca3af);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        
+        .hero p {
+            font-size: 1.125rem;
+            color: var(--text-muted);
+            max-width: 600px;
+        }
+        
+        .card {
+            background: var(--card-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 1rem;
+            padding: 2rem;
+            backdrop-filter: blur(12px);
+            position: relative;
+            overflow: hidden;
+        }
+        
+        .card::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 3px;
+            background: linear-gradient(90deg, #3b82f6, #10b981);
+        }
+        
+        .card h2 {
+            font-size: 1.5rem;
+            font-weight: 600;
+            margin-bottom: 1.25rem;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+        
+        .features-list {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+            gap: 1.5rem;
+            margin-top: 0.5rem;
+        }
+        
+        .feature-item {
+            display: flex;
+            gap: 0.75rem;
+        }
+        
+        .feature-icon {
+            font-size: 1.25rem;
+            color: var(--color-up);
+        }
+        
+        .feature-text h3 {
+            font-size: 1.05rem;
+            font-weight: 600;
+            margin-bottom: 0.25rem;
+        }
+        
+        .feature-text p {
+            font-size: 0.9rem;
+            color: var(--text-muted);
+            line-height: 1.4;
+        }
+        
+        .steps {
+            display: flex;
+            flex-direction: column;
+            gap: 1rem;
+        }
+        
+        .step-item {
+            display: flex;
+            gap: 1rem;
+            align-items: flex-start;
+        }
+        
+        .step-num {
+            width: 28px;
+            height: 28px;
+            border-radius: 50%;
+            background: rgba(59, 130, 246, 0.1);
+            border: 1px solid rgba(59, 130, 246, 0.3);
+            color: var(--color-primary);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 700;
+            font-size: 0.9rem;
+            flex-shrink: 0;
+        }
+        
+        .step-content h3 {
+            font-size: 1.05rem;
+            font-weight: 600;
+            margin-bottom: 0.25rem;
+        }
+        
+        .step-content p {
+            font-size: 0.9rem;
+            color: var(--text-muted);
+            line-height: 1.4;
+        }
+        
+        .commands-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 0.5rem;
+        }
+        
+        .commands-table th, .commands-table td {
+            text-align: left;
+            padding: 0.75rem 1rem;
+            border-bottom: 1px solid var(--border-color);
+        }
+        
+        .commands-table th {
+            color: var(--text-muted);
+            font-size: 0.85rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            font-weight: 600;
+        }
+        
+        .commands-table td code {
+            background: rgba(255, 255, 255, 0.05);
+            padding: 0.2rem 0.5rem;
+            border-radius: 0.25rem;
+            font-family: monospace;
+            font-size: 0.9rem;
+            color: #3b82f6;
+        }
+        
+        .commands-table td {
+            font-size: 0.95rem;
+        }
+        
+        footer {
+            padding: 2rem 1.5rem;
+            text-align: center;
+            font-size: 0.875rem;
+            color: var(--text-muted);
+            border-top: 1px solid var(--border-color);
+            background: rgba(11, 15, 25, 0.8);
+            margin-top: auto;
+        }
+        
+        footer a {
+            color: #3b82f6;
+            text-decoration: none;
+        }
+        
+        footer a:hover {
+            text-decoration: underline;
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <div class="logo-container">
+            <span class="logo-icon">📊</span>
+            <span class="logo-title">Delta Chat Uptime</span>
+        </div>
+    </header>
+    
+    <main>
+        <div class="hero">
+            <h1>Delta Chat Uptime Monitor</h1>
+            <p>A self-hosted, high-concurrency availability monitoring service that sends downtime alerts directly to Delta Chat and hosts beautiful status dashboards.</p>
+        </div>
+        
+        <div class="card">
+            <h2>✨ Key Features</h2>
+            <div class="features-list">
+                <div class="feature-item">
+                    <span class="feature-icon">🛡️</span>
+                    <div class="feature-text">
+                        <h3>Secure Ownership</h3>
+                        <p>Claim bot administration using cryptographic fingerprints to secure transports and configurations.</p>
+                    </div>
+                </div>
+                <div class="feature-item">
+                    <span class="feature-icon">💬</span>
+                    <div class="feature-text">
+                        <h3>Per-Chat Monitoring</h3>
+                        <p>Monitors are scoped to individual group chats or private chats for privacy and organization.</p>
+                    </div>
+                </div>
+                <div class="feature-item">
+                    <span class="feature-icon">⚙️</span>
+                    <div class="feature-text">
+                        <h3>Multiple Check Modes</h3>
+                        <p>Support HTTP/HTTPS status, TCP ports (like SSH/databases), and non-blocking ICMP Pings.</p>
+                    </div>
+                </div>
+                <div class="feature-item">
+                    <span class="feature-icon">🔄</span>
+                    <div class="feature-text">
+                        <h3>Smart Retry Logic</h3>
+                        <p>Retries 2 times (30s apart) on failures to avoid false alerts. Recovery is marked UP instantly.</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <div class="card">
+            <h2>🚀 Getting Started</h2>
+            <div class="steps">
+                <div class="step-item">
+                    <span class="step-num">1</span>
+                    <div class="step-content">
+                        <h3>Add Uptime Bot in Delta Chat</h3>
+                        <p>Scan the bot's secure join QR code or add the bot's email address to start chatting.</p>
+                    </div>
+                </div>
+                <div class="step-item">
+                    <span class="step-num">2</span>
+                    <div class="step-content">
+                        <h3>Claim Admin Rights</h3>
+                        <p>Send <code>/initadmin</code> in a private chat to link your profile securely via fingerprint authorization.</p>
+                    </div>
+                </div>
+                <div class="step-item">
+                    <span class="step-num">3</span>
+                    <div class="step-content">
+                        <h3>Start Monitoring</h3>
+                        <p>Add your first resource with <code>/add https://yourwebsite.com "My Site"</code>. The bot will start periodic checks immediately!</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <div class="card">
+            <h2>⌨️ Bot Commands</h2>
+            <table class="commands-table">
+                <thead>
+                    <tr>
+                        <th>Command</th>
+                        <th>Description</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><code>/add &lt;target&gt; [name]</code></td>
+                        <td>Add a website (HTTP), socket (IP:port) or host (Ping) to monitor.</td>
+                    </tr>
+                    <tr>
+                        <td><code>/remove &lt;id&gt;</code></td>
+                        <td>Stop monitoring a resource and delete it.</td>
+                    </tr>
+                    <tr>
+                        <td><code>/list</code></td>
+                        <td>List monitored targets and their current state in the current chat.</td>
+                    </tr>
+                    <tr>
+                        <td><code>/status</code></td>
+                        <td>Display average 30-day uptime and link to the secure web dashboard.</td>
+                    </tr>
+                    <tr>
+                        <td><code>/help</code></td>
+                        <td>Show instructions and bot version details.</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+    </main>
+    
+    <footer>
+        <p>Delta Chat Uptime Bot is open-source. Code on <a href="https://github.com/mrgluek/deltachat_uptime" target="_blank">GitHub</a> | <a href="https://git.gluek.info/gluek/deltachat_uptime" target="_blank">Forgejo Mirror</a></p>
+    </footer>
+</body>
+</html>"""
+    headers = {
+        "Cache-Control": "public, max-age=3600"
+    }
+    return web.Response(text=index_page_html_cache, content_type="text/html", headers=headers)
+
+async def handle_robots_txt(request):
+    headers = {
+        "Cache-Control": "public, max-age=86400"
+    }
+    content = "User-agent: *\nDisallow: /\n"
+    return web.Response(text=content, content_type="text/plain", headers=headers)
+
 async def _run_web_server():
     app = web.Application()
+    app.router.add_get('/robots.txt', handle_robots_txt)
     app.router.add_get('/', handle_index)
     app.router.add_get('/{token:[a-zA-Z0-9]{12}}', handle_status_page)
     

@@ -272,21 +272,25 @@ async def run_single_check(resource) -> tuple[bool, str]:
         return False, str(e)
     return False, "Unknown error"
 
-async def check_resource_task(resource, semaphore):
+async def check_group_task(group, semaphore):
+    rep = group[0]
     async with semaphore:
-        is_up, error_msg = await run_single_check(resource)
+        is_up, error_msg = await run_single_check(rep)
         
-        # Retry logic: 2 retries, 30s apart, if failed and previously not down
-        if not is_up and resource["status"] != "down":
+        # Retry logic: retry if check failed and at least one resource in the group was not already DOWN
+        if not is_up and any(r["status"] != "down" for r in group):
             for retry in range(1, 3):
-                logger.info(f"Retry {retry}/2 for resource {resource['id']} ({resource['name'] or resource['url']}) in chat {resource['dc_chat_id']}")
+                for r in group:
+                    if r["status"] != "down":
+                        logger.info(f"Retry {retry}/2 for resource {r['id']} ({r['name'] or r['url']}) in chat {r['dc_chat_id']}")
                 await asyncio.sleep(30)
-                is_up, error_msg = await run_single_check(resource)
+                is_up, error_msg = await run_single_check(rep)
                 if is_up:
                     break
-        
-        logger.info(f"Check result: {resource['name'] or resource['url']} (id: {resource['id']}) in chat {resource['dc_chat_id']} -> {'UP' if is_up else 'DOWN'} ({error_msg})")
-        await handle_check_result(resource, is_up, error_msg)
+                    
+        for r in group:
+            logger.info(f"Check result: {r['name'] or r['url']} (id: {r['id']}) in chat {r['dc_chat_id']} -> {'UP' if is_up else 'DOWN'} ({error_msg})")
+            await handle_check_result(r, is_up, error_msg)
 
 async def handle_check_result(resource, is_up, error_msg):
     status = "up" if is_up else "down"
@@ -339,24 +343,27 @@ async def notify_status_change(resource, old_status, status, error_msg):
         except Exception as e:
             logger.error(f"Failed to send status alert to chat {chat_id}: {e}")
 
-async def run_and_track_check(resource, semaphore):
+async def run_and_track_group(group, semaphore):
     try:
-        await check_resource_task(resource, semaphore)
+        await check_group_task(group, semaphore)
     finally:
         async with running_lock:
-            running_resource_ids.discard(resource["id"])
+            for r in group:
+                running_resource_ids.discard(r["id"])
 
 async def run_checks_parallel(tasks_list):
     await asyncio.gather(*tasks_list, return_exceptions=True)
 
 async def monitoring_scheduler_loop():
+    import collections
     semaphore = asyncio.Semaphore(50)
     while True:
         try:
             resources = await asyncio.to_thread(database.get_all_resources)
             now = int(time.time())
             
-            tasks = []
+            # Group due resources by (type, url)
+            due_groups = collections.defaultdict(list)
             async with running_lock:
                 for r in resources:
                     r_id = r["id"]
@@ -368,10 +375,15 @@ async def monitoring_scheduler_loop():
                     
                     if now - last_checked >= interval:
                         running_resource_ids.add(r_id)
-                        tasks.append(run_and_track_check(r, semaphore))
-                    
+                        target_key = (r["type"], r["url"])
+                        due_groups[target_key].append(r)
+            
+            tasks = []
+            for target_key, group in due_groups.items():
+                tasks.append(run_and_track_group(group, semaphore))
+                
             if tasks:
-                logger.info(f"Triggering {len(tasks)} resource checks...")
+                logger.info(f"Triggering {len(tasks)} target checks (encompassing {sum(len(g) for g in due_groups.values())} resources)...")
                 asyncio.create_task(run_checks_parallel(tasks))
                 
         except Exception as e:

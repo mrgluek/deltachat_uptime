@@ -1274,7 +1274,7 @@ def on_message_failed(bot, accid, event):
         logger.error(f"Failover trigger error: {e}")
 
 @dc_cli.on_init
-def on_init(bot):
+def on_init(bot, args):
     setup_custom_command_parser(bot, ALLOWED_PREFIXES)
     
     # Start web server thread

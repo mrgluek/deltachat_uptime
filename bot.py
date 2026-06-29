@@ -269,11 +269,13 @@ async def check_resource_task(resource, semaphore):
         # Retry logic: 2 retries, 30s apart, if failed and previously not down
         if not is_up and resource["status"] != "down":
             for retry in range(1, 3):
+                logger.info(f"Retry {retry}/2 for resource {resource['id']} ({resource['name'] or resource['url']}) in chat {resource['dc_chat_id']}")
                 await asyncio.sleep(30)
                 is_up, error_msg = await run_single_check(resource)
                 if is_up:
                     break
         
+        logger.info(f"Check result: {resource['name'] or resource['url']} (id: {resource['id']}) in chat {resource['dc_chat_id']} -> {'UP' if is_up else f'DOWN ({error_msg})'}")
         await handle_check_result(resource, is_up, error_msg)
 
 async def handle_check_result(resource, is_up, error_msg):

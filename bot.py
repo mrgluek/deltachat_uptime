@@ -784,7 +784,7 @@ def get_dashboard_html(chat_name, resources, overall_uptime) -> str:
     </main>
     
     <footer>
-        <p>Powered by <a href="https://github.com/mrgluek/deltachat_uptime" target="_blank">Delta Chat Uptime Bot</a></p>
+        <p>Powered by <a href="https://github.com/mrgluek/deltachat_uptime" target="_blank">Delta Chat Uptime Bot</a> (<a href="https://git.gluek.info/gluek/deltachat_uptime" target="_blank">Mirror</a>)</p>
     </footer>
 </body>
 </html>
@@ -874,6 +874,7 @@ def help_command(bot, accid, event):
         f"/remove <id> — Stop monitoring a resource\n"
         f"/list — List all monitors in this chat\n"
         f"/status — Show monthly uptime statistics & web link\n"
+        f"/donate — Support bot development ❤️\n"
         f"/help — Show this help message\n\n"
     )
     
@@ -898,7 +899,23 @@ def help_command(bot, accid, event):
             f"/resilient — Toggle multi-transport resilient send\n\n"
         )
         
+    help_text += (
+        f"**Repository Links:**\n"
+        f"GitHub: https://github.com/mrgluek/deltachat_uptime\n"
+        f"Mirror: https://git.gluek.info/gluek/deltachat_uptime\n"
+    )
     _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=help_text))
+
+@dc_cli.on(events.NewMessage(command="/donate"))
+def donate_command(bot, accid, event):
+    msg = event.msg
+    _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(
+        text="❤️ Support Bot Development\n\n"
+             "If you find this bot useful, you can support its development:\n\n"
+             "☕️ Ko-fi: https://ko-fi.com/gluek (🌍 world cards, paypal)\n"
+             "🚀 Tribute: https://web.tribute.tg/d/IWb (🇷🇺 russian cards, SBP)\n\n"
+             "Thank you! 🙏"
+    ))
 
 @dc_cli.on(events.NewMessage(command="/initadmin"))
 def initadmin_command(bot, accid, event):

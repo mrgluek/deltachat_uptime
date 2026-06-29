@@ -71,9 +71,10 @@ Initialize the bot account with your email and password:
 docker compose run --rm uptime_bot python bot.py init uptimebot@yourdomain.com "your_email_password"
 ```
 
-Configure your admin email address on the server to restrict setup actions:
+Configure your admin email address and optionally your cryptographic fingerprint on the server:
 ```bash
 docker compose run --rm uptime_bot python set_admin.py --email admin@yourdomain.com
+docker compose run --rm uptime_bot python set_admin.py --fingerprint 1234ABCD1234ABCD1234ABCD1234ABCD1234ABCD
 ```
 
 ### 3. Run the Bot

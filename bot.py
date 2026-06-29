@@ -218,18 +218,25 @@ def _is_dc_admin(bot, accid, contact_id):
 
 # Uptime checks execution logic
 async def run_single_check(resource) -> tuple[bool, str]:
+    import http
     rtype = resource["type"]
     url = resource["url"]
     timeout = 10
     
+    start_time = time.time()
     try:
         if rtype == "http":
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout)) as session:
                 async with session.get(url, allow_redirects=True) as resp:
+                    try:
+                        phrase = http.HTTPStatus(resp.status).phrase
+                    except ValueError:
+                        phrase = "Unknown Status"
+                    details = f"{resp.status} - {phrase}"
                     if 200 <= resp.status < 400:
-                        return True, f"HTTP {resp.status}"
+                        return True, details
                     else:
-                        return False, f"HTTP {resp.status}"
+                        return False, details
         elif rtype == "tcp":
             parts = url.rsplit(":", 1)
             host, port = parts[0], int(parts[1])
@@ -242,7 +249,8 @@ async def run_single_check(resource) -> tuple[bool, str]:
                 await writer.wait_closed()
             except Exception:
                 pass
-            return True, "Connected"
+            elapsed_ms = int((time.time() - start_time) * 1000)
+            return True, f"{elapsed_ms} ms"
         elif rtype == "ping":
             host = url.strip()
             if not re.match(r'^[a-zA-Z0-9.-]+$', host):
@@ -254,7 +262,8 @@ async def run_single_check(resource) -> tuple[bool, str]:
             )
             await proc.wait()
             if proc.returncode == 0:
-                return True, "Ping successful"
+                elapsed_ms = int((time.time() - start_time) * 1000)
+                return True, f"{elapsed_ms} ms"
             else:
                 return False, "Ping failed"
     except asyncio.TimeoutError:
@@ -276,7 +285,7 @@ async def check_resource_task(resource, semaphore):
                 if is_up:
                     break
         
-        logger.info(f"Check result: {resource['name'] or resource['url']} (id: {resource['id']}) in chat {resource['dc_chat_id']} -> {'UP' if is_up else f'DOWN ({error_msg})'}")
+        logger.info(f"Check result: {resource['name'] or resource['url']} (id: {resource['id']}) in chat {resource['dc_chat_id']} -> {'UP' if is_up else 'DOWN'} ({error_msg})")
         await handle_check_result(resource, is_up, error_msg)
 
 async def handle_check_result(resource, is_up, error_msg):
@@ -316,7 +325,7 @@ async def notify_status_change(resource, old_status, status, error_msg):
         msg_text = (
             f"🟢 `ID: {res_id}` **{name}**\n"
             f"  Target: `{url}` ({type_upper})\n"
-            f"  Uptime 30d: `{uptime_str}` | Status: `UP`"
+            f"  Uptime 30d: `{uptime_str}` | Status: `UP ({error_msg})`"
         )
         
     if dc_bot_instance and dc_accid is not None:

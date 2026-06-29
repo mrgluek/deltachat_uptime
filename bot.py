@@ -285,7 +285,14 @@ async def handle_check_result(resource, is_up, error_msg):
     failures = 0 if is_up else (resource["consecutive_failures"] + 1)
     await asyncio.to_thread(database.update_resource_status, resource["id"], status, failures)
     
-    if old_status != status and old_status != "unknown":
+    should_notify = False
+    if old_status != status:
+        if old_status != "unknown":
+            should_notify = True
+        elif status == "down":
+            should_notify = True
+            
+    if should_notify:
         await notify_status_change(resource, old_status, status, error_msg)
 
 async def notify_status_change(resource, old_status, status, error_msg):

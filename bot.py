@@ -333,6 +333,9 @@ async def run_and_track_check(resource, semaphore):
         async with running_lock:
             running_resource_ids.discard(resource["id"])
 
+async def run_checks_parallel(tasks_list):
+    await asyncio.gather(*tasks_list, return_exceptions=True)
+
 async def monitoring_scheduler_loop():
     semaphore = asyncio.Semaphore(50)
     while True:
@@ -356,7 +359,7 @@ async def monitoring_scheduler_loop():
                     
             if tasks:
                 logger.info(f"Triggering {len(tasks)} resource checks...")
-                asyncio.create_task(asyncio.gather(*tasks, return_exceptions=True))
+                asyncio.create_task(run_checks_parallel(tasks))
                 
         except Exception as e:
             logger.error(f"Error in monitoring scheduler loop: {e}")

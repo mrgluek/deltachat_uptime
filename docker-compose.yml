@@ -2,6 +2,7 @@ services:
   uptime_bot:
     container_name: deltachat_uptime_bot
     build: .
+    init: true
     restart: unless-stopped
     logging:
       driver: json-file

@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-07-20
+
+### Added
+- **Peer-to-Peer Synchronization (`/sync`):** Added resource synchronization between multiple Uptime Bot instances running in the same group chat. Bots automatically exchange and import missing targets locally.
+- **Sync Rate Limiting:** Implemented a 1-minute rate limit per chat for non-admin users triggering the `/sync` command to prevent spam. Admins bypass the rate limit.
+
 ## [1.0.2] - 2026-07-06
 
 ### Fixed

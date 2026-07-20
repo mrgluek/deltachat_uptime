@@ -22,6 +22,7 @@ logger = logging.getLogger("uptime_bot")
 
 dc_cli = BotCli("uptimebot")
 bot_qr_cache = {}
+last_sync_times = {}
 
 # Global references
 dc_bot_instance = None
@@ -1314,6 +1315,7 @@ def help_command(bot, accid, event):
         f"/remove <id> — Stop monitoring a resource\n"
         f"/list — List all monitors in this chat\n"
         f"/status — Show monthly uptime statistics & web link\n"
+        f"/sync — Synchronize monitors with other bots in the chat\n"
         f"/donate — Support bot development ❤️\n"
         f"/help — Show this help message\n\n"
     )
@@ -1545,6 +1547,58 @@ def status_command(bot, accid, event):
     if not database.get_config("base_url"):
         reply += "\n\n💡 _Admin: Configure base URL via `/url https://domain` to get public links._"
         
+    _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=reply))
+
+@dc_cli.on(events.NewMessage(command="/sync"))
+def sync_command(bot, accid, event):
+    msg = event.msg
+    try:
+        chat = bot.rpc.get_chat(accid, msg.chat_id)
+        is_group = getattr(chat, "chat_type", "Single") != "Single"
+    except Exception:
+        is_group = False
+
+    if not is_group:
+        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(
+            text="ℹ️ Synchronization is only available in group chats containing multiple Uptime Bot instances."
+        ))
+        return
+
+    # Check rate limit (1 minute per chat for non-admins)
+    is_admin = _is_dc_admin(bot, accid, msg.from_id)
+    if not is_admin:
+        now = time.time()
+        last_sync = last_sync_times.get(msg.chat_id, 0.0)
+        if now - last_sync < 60.0:
+            remaining = int(60.0 - (now - last_sync))
+            _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(
+                text=f"⚠️ Command `/sync` is rate-limited. Please wait {remaining}s before trying again."
+            ))
+            return
+        last_sync_times[msg.chat_id] = now
+
+    resources = database.get_resources(msg.chat_id)
+    sync_list = []
+    for r in resources:
+        sync_list.append({
+            "url": r["url"],
+            "name": r["name"],
+            "type": r["type"],
+            "interval": r.get("interval", 60)
+        })
+
+    sync_data = json.dumps(sync_list)
+    reply = (
+        "🔄 **Uptime Bot Synchronization**\n"
+        "Here are the resources monitored by this bot instance:\n\n"
+    )
+    if sync_list:
+        for r in sync_list:
+            reply += f"• `{r['url']}` ({r['name']}) [{r['type'].upper()}]\n"
+    else:
+        reply += "_No resources monitored._\n"
+
+    reply += f"\n[UPTIME_BOT_SYNC_DATA]\n{sync_data}\n[/UPTIME_BOT_SYNC_DATA]"
     _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=reply))
 
 # Admin-Only Account and Transport Command handlers (Standard across bots)
@@ -1839,6 +1893,39 @@ def on_new_message(bot, accid, event):
 
     text = (msg.text or "").strip()
     
+    if msg.from_id == 1:
+        return
+
+    if "[UPTIME_BOT_SYNC_DATA]" in text and "[/UPTIME_BOT_SYNC_DATA]" in text:
+        try:
+            start_idx = text.find("[UPTIME_BOT_SYNC_DATA]") + len("[UPTIME_BOT_SYNC_DATA]")
+            end_idx = text.find("[/UPTIME_BOT_SYNC_DATA]")
+            json_str = text[start_idx:end_idx].strip()
+            sync_list = json.loads(json_str)
+            
+            added_count = 0
+            added_resources = []
+            for item in sync_list:
+                url = item.get("url")
+                name = item.get("name")
+                check_type = item.get("type")
+                interval = item.get("interval", 60)
+                
+                if url and check_type:
+                    res_id = database.add_resource(msg.chat_id, url, name or url, check_type, interval)
+                    if res_id is not None:
+                        added_count += 1
+                        added_resources.append(f"• `{url}` ({name or url}) [{check_type.upper()}]")
+            
+            if added_count > 0:
+                reply = f"📥 **Sync Complete!**\nAdded {added_count} new resource(s) from the other bot:\n" + "\n".join(added_resources)
+                _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=reply))
+            else:
+                _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text="📥 **Sync Complete!**\nNo new resources to add (already up-to-date)."))
+        except Exception as e:
+            logger.error(f"Error parsing sync data: {e}")
+        return
+
     # Auto-greet new users in private chat
     try:
         chat_info = bot.rpc.get_basic_chat_info(accid, msg.chat_id)

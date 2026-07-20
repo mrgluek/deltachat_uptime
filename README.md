@@ -34,6 +34,7 @@ These commands are available to any member of a chat. They support suffixes (e.g
 - `/remove <id>` — Stop monitoring a resource by ID.
 - `/list` — List monitored resources and their status in this chat.
 - `/status` — View monthly uptime statistics and get the link to the chat's secure Web Status Page.
+- `/sync` — Synchronize monitored resources with other bots in the same chat (rate-limited to 1/minute for non-admins).
 - `/help` — View available commands and system information.
 
 ### Admin-Only Commands

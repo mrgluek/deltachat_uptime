@@ -195,5 +195,109 @@ class TestUptimeBot(unittest.TestCase):
         bot.url_command(mock_bot, 1, mock_event)
         self.assertEqual(database.get_config("base_url"), "https://up.gluek.info")
 
+    @patch('bot._is_dc_admin')
+    @patch('bot._dc_send_msg_with_stats')
+    def test_sync_command_and_rate_limit(self, mock_send_with_stats, mock_is_admin):
+        chat_id = 777
+        mock_bot = MagicMock()
+        mock_bot.rpc.get_chat.return_value = MagicMock(chat_type="Group")
+        
+        # Add some initial resources
+        database.add_resource(chat_id, "https://google.com", "Google", "http")
+        database.add_resource(chat_id, "8.8.8.8", "DNS", "ping")
+        
+        # Clear rate-limiting cache for this test
+        bot.last_sync_times.clear()
+        
+        # Scenario 1: First sync trigger by non-admin should work
+        mock_is_admin.return_value = False
+        mock_event = MagicMock()
+        mock_event.msg.chat_id = chat_id
+        mock_event.msg.from_id = 999  # Non-admin
+        
+        bot.sync_command(mock_bot, 1, mock_event)
+        
+        # Verify message sent with sync data
+        self.assertTrue(mock_send_with_stats.called)
+        sent_data = mock_send_with_stats.call_args[0][3]
+        self.assertIn("[UPTIME_BOT_SYNC_DATA]", sent_data.text)
+        self.assertIn("https://google.com", sent_data.text)
+        self.assertIn("8.8.8.8", sent_data.text)
+        
+        # Reset mock
+        mock_send_with_stats.reset_mock()
+        
+        # Scenario 2: Second sync trigger by non-admin immediately should be rate-limited
+        bot.sync_command(mock_bot, 1, mock_event)
+        self.assertTrue(mock_send_with_stats.called)
+        sent_data = mock_send_with_stats.call_args[0][3]
+        self.assertIn("rate-limited", sent_data.text)
+        
+        # Reset mock
+        mock_send_with_stats.reset_mock()
+        
+        # Scenario 3: Admin trigger immediately after should bypass rate limit
+        mock_is_admin.return_value = True
+        admin_event = MagicMock()
+        admin_event.msg.chat_id = chat_id
+        admin_event.msg.from_id = 111  # Admin
+        
+        bot.sync_command(mock_bot, 1, admin_event)
+        self.assertTrue(mock_send_with_stats.called)
+        sent_data = mock_send_with_stats.call_args[0][3]
+        self.assertIn("[UPTIME_BOT_SYNC_DATA]", sent_data.text)
+
+    @patch('bot._dc_send_msg_with_stats')
+    def test_sync_parsing_in_on_new_message(self, mock_send_with_stats):
+        chat_id = 888
+        mock_bot = MagicMock()
+        
+        # Create a mock event representing a sync payload from another bot
+        mock_event = MagicMock()
+        mock_event.msg.chat_id = chat_id
+        mock_event.msg.from_id = 555  # From another bot (not 1)
+        mock_event.msg.is_info = False
+        
+        sync_payload = (
+            "🔄 **Uptime Bot Synchronization**\n"
+            "[UPTIME_BOT_SYNC_DATA]\n"
+            '[{"url": "https://new-resource.org", "name": "New Resource", "type": "http", "interval": 60}]\n'
+            "[/UPTIME_BOT_SYNC_DATA]"
+        )
+        mock_event.msg.text = sync_payload
+        
+        # Trigger on_new_message
+        bot.on_new_message(mock_bot, 1, mock_event)
+        
+        # Verify it was added to database
+        resources = database.get_resources(chat_id)
+        self.assertEqual(len(resources), 1)
+        self.assertEqual(resources[0]["url"], "https://new-resource.org")
+        self.assertEqual(resources[0]["name"], "New Resource")
+        self.assertEqual(resources[0]["type"], "http")
+        
+        # Verify sync complete message was sent
+        self.assertTrue(mock_send_with_stats.called)
+        sent_data = mock_send_with_stats.call_args[0][3]
+        self.assertIn("Sync Complete!", sent_data.text)
+        self.assertIn("new-resource.org", sent_data.text)
+        
+        # Reset database and mock
+        database.delete_resource(chat_id, resources[0]["id"])
+        mock_send_with_stats.reset_mock()
+        
+        # Scenario: Message sent by self (from_id == 1) should be ignored
+        mock_event_self = MagicMock()
+        mock_event_self.msg.chat_id = chat_id
+        mock_event_self.msg.from_id = 1  # Self
+        mock_event_self.msg.is_info = False
+        mock_event_self.msg.text = sync_payload
+        
+        bot.on_new_message(mock_bot, 1, mock_event_self)
+        
+        # Verify nothing was added
+        self.assertEqual(len(database.get_resources(chat_id)), 0)
+        self.assertFalse(mock_send_with_stats.called)
+
 if __name__ == '__main__':
     unittest.main()

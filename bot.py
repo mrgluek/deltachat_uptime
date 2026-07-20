@@ -1941,15 +1941,20 @@ def on_new_message(bot, accid, event):
 
     text = (msg.text or "").strip()
     
+    if "[UPTIME_BOT_SYNC_DATA]" in text:
+        logger.info(f"[SYNC RECEIVE] Found payload. from_id={msg.from_id}, is_info={msg.is_info}")
+    
     if msg.from_id == 1:
         return
 
     if "[UPTIME_BOT_SYNC_DATA]" in text and "[/UPTIME_BOT_SYNC_DATA]" in text:
+        logger.info(f"[SYNC RECEIVE] Processing sync data payload...")
         try:
             start_idx = text.find("[UPTIME_BOT_SYNC_DATA]") + len("[UPTIME_BOT_SYNC_DATA]")
             end_idx = text.find("[/UPTIME_BOT_SYNC_DATA]")
             json_str = text[start_idx:end_idx].strip()
             sync_list = json.loads(json_str)
+            logger.info(f"[SYNC RECEIVE] Parsed json: {sync_list}")
             
             added_count = 0
             added_resources = []

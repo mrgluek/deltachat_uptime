@@ -301,6 +301,44 @@ class TestUptimeBot(unittest.TestCase):
         self.assertEqual(len(database.get_resources(chat_id)), 0)
         self.assertFalse(mock_send_with_stats.called)
 
+    @patch('bot._dc_send_msg_with_stats')
+    def test_sync_validation_security(self, mock_send_with_stats):
+        chat_id = 999
+        mock_bot = MagicMock()
+        
+        # Test 1: Malicious interval (1s) should be forced to 60s
+        # Test 2: Invalid URL should be skipped
+        # Test 3: Mismatched type (google.com http) should be skipped (since google.com is ping, not http)
+        mock_event = MagicMock()
+        mock_event.msg.chat_id = chat_id
+        mock_event.msg.from_id = 555
+        mock_event.msg.is_info = False
+        
+        sync_payload = (
+            "🔄 **Uptime Bot Synchronization**\n"
+            "[UPTIME_BOT_SYNC_DATA]\n"
+            '['
+            '  {"url": "https://valid-target.org", "name": "Valid", "type": "http", "interval": 1},'
+            '  {"url": "invalid-url-here", "name": "Invalid URL", "type": "http", "interval": 60},'
+            '  {"url": "google.com", "name": "Mismatched Type", "type": "http", "interval": 60}'
+            ']\n'
+            "[/UPTIME_BOT_SYNC_DATA]"
+        )
+        mock_event.msg.text = sync_payload
+        
+        bot.on_new_message(mock_bot, 1, mock_event)
+        
+        # Verify only the valid target was added
+        resources = database.get_resources(chat_id)
+        self.assertEqual(len(resources), 1)
+        self.assertEqual(resources[0]["url"], "https://valid-target.org")
+        
+        # Verify interval was forced to 60 (not 1)
+        self.assertEqual(resources[0]["interval"], 60)
+        
+        # Clean up database
+        database.delete_resource(chat_id, resources[0]["id"])
+
     @patch.dict('os.environ', {
         'DISPLAY_NAME': 'Custom Bot Name',
         'STATUS_TEXT': 'Custom status info text',

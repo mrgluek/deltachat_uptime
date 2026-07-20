@@ -1953,19 +1953,42 @@ def on_new_message(bot, accid, event):
             sync_list = json.loads(json_str)
             logger.info(f"[SYNC RECEIVE] Parsed json: {sync_list}")
             
+            if not isinstance(sync_list, list):
+                logger.warning("[SYNC RECEIVE] Payload is not a list. Ignoring.")
+                return
+            
+            # Limit the sync payload to a maximum of 50 items to avoid DB spam
+            sync_list = sync_list[:50]
+            
             added_count = 0
             added_resources = []
             for item in sync_list:
+                if not isinstance(item, dict):
+                    continue
                 url = item.get("url")
                 name = item.get("name")
                 check_type = item.get("type")
-                interval = item.get("interval", 60)
                 
-                if url and check_type:
-                    res_id = database.add_resource(msg.chat_id, url, name or url, check_type, interval)
-                    if res_id is not None:
-                        added_count += 1
-                        added_resources.append(f"• `{url}` ({name or url}) [{check_type.upper()}]")
+                try:
+                    interval = int(item.get("interval", 60))
+                except (TypeError, ValueError):
+                    interval = 60
+                
+                # Security: Force interval to be at least 60 seconds
+                interval = max(60, interval)
+                
+                if url and check_type in ("http", "ping", "tcp"):
+                    # Security: validate URL format and expected type
+                    try:
+                        expected_type, validated_url = parse_target(url)
+                        if expected_type == check_type:
+                            res_id = database.add_resource(msg.chat_id, validated_url, name or validated_url, check_type, interval)
+                            if res_id is not None:
+                                added_count += 1
+                                added_resources.append(f"• `{validated_url}` ({name or validated_url}) [{check_type.upper()}]")
+                    except ValueError:
+                        # Skip invalid URL
+                        continue
             
             if added_count > 0:
                 reply = f"📥 **Sync Complete!**\nAdded {added_count} new resource(s) from the other bot:\n" + "\n".join(added_resources)

@@ -322,5 +322,28 @@ class TestUptimeBot(unittest.TestCase):
         self.assertEqual(config_dict.get("selfstatus"), "Custom status info text")
         self.assertTrue(config_dict.get("selfavatar").endswith("custom_icon.png"))
 
+    def test_is_group_chat(self):
+        # 1. Test dictionary format
+        self.assertFalse(bot.is_group_chat({"type": 1}))
+        self.assertTrue(bot.is_group_chat({"type": 2}))
+        self.assertTrue(bot.is_group_chat({"type": 3}))
+        self.assertFalse(bot.is_group_chat({"chat_type": "Single"}))
+        self.assertTrue(bot.is_group_chat({"chat_type": "Group"}))
+        self.assertFalse(bot.is_group_chat({}))
+
+        # 2. Test object format
+        class MockChat:
+            def __init__(self, c_type=None, chat_type=None):
+                if c_type is not None:
+                    self.type = c_type
+                if chat_type is not None:
+                    self.chat_type = chat_type
+                    
+        self.assertFalse(bot.is_group_chat(MockChat(c_type=1)))
+        self.assertTrue(bot.is_group_chat(MockChat(c_type=2)))
+        self.assertFalse(bot.is_group_chat(MockChat(chat_type="Single")))
+        self.assertTrue(bot.is_group_chat(MockChat(chat_type="Group")))
+        self.assertFalse(bot.is_group_chat(MockChat()))
+
 if __name__ == '__main__':
     unittest.main()

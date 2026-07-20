@@ -89,8 +89,7 @@ def setup_custom_command_parser(bot, allowed_prefixes):
             if event.command in ("/help", "/status", "/list"):
                 try:
                     chat = bot.rpc.get_chat(accid, event.msg.chat_id)
-                    chat_type = chat.get('chat_type', 'Single') if isinstance(chat, dict) else getattr(chat, 'chat_type', 'Single')
-                    is_group = str(chat_type) != "Single"
+                    is_group = is_group_chat(chat)
                 except Exception:
                     is_group = False
                 
@@ -115,6 +114,22 @@ def setup_custom_command_parser(bot, allowed_prefixes):
                         pass
 
     bot._parse_command = custom_parse_command
+
+def is_group_chat(chat) -> bool:
+    if isinstance(chat, dict):
+        t = chat.get("type")
+        if t is not None:
+            return t != 1
+        ct = chat.get("chat_type")
+        if ct is not None:
+            return str(ct) != "Single"
+        return False
+    else:
+        t = getattr(chat, "type", None)
+        if t is not None:
+            return t != 1
+        ct = getattr(chat, "chat_type", "Single")
+        return str(ct) != "Single"
 
 # Helper: format time durations
 def format_duration(seconds: int) -> str:
@@ -1556,8 +1571,7 @@ def sync_command(bot, accid, event):
     msg = event.msg
     try:
         chat = bot.rpc.get_chat(accid, msg.chat_id)
-        chat_type = chat.get('chat_type', 'Single') if isinstance(chat, dict) else getattr(chat, 'chat_type', 'Single')
-        is_group = str(chat_type) != "Single"
+        is_group = is_group_chat(chat)
     except Exception:
         is_group = False
 

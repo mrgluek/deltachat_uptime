@@ -89,8 +89,11 @@ def setup_custom_command_parser(bot, allowed_prefixes):
             
             if event.command in ("/help", "/status", "/list"):
                 try:
-                    chat = bot.rpc.get_chat(accid, event.msg.chat_id)
-                    is_group = is_group_chat(chat)
+                    chat_info = bot.rpc.get_basic_chat_info(accid, event.msg.chat_id)
+                    if isinstance(chat_info, dict):
+                        is_group = chat_info.get("type", 1) != 1
+                    else:
+                        is_group = getattr(chat_info, "type", 1) != 1
                 except Exception:
                     is_group = False
                 
@@ -1571,8 +1574,11 @@ def status_command(bot, accid, event):
 def sync_command(bot, accid, event):
     msg = event.msg
     try:
-        chat = bot.rpc.get_chat(accid, msg.chat_id)
-        is_group = is_group_chat(chat)
+        chat_info = bot.rpc.get_basic_chat_info(accid, msg.chat_id)
+        if isinstance(chat_info, dict):
+            is_group = chat_info.get("type", 1) != 1
+        else:
+            is_group = getattr(chat_info, "type", 1) != 1
     except Exception:
         is_group = False
 

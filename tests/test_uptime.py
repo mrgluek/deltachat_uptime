@@ -200,7 +200,9 @@ class TestUptimeBot(unittest.TestCase):
     def test_sync_command_and_rate_limit(self, mock_send_with_stats, mock_is_admin):
         chat_id = 777
         mock_bot = MagicMock()
-        mock_bot.rpc.get_chat.return_value = MagicMock(chat_type="Group")
+        mock_chat_info = MagicMock()
+        mock_chat_info.chat_type = "Group"
+        mock_bot.rpc.get_basic_chat_info.return_value = mock_chat_info
         
         # Add some initial resources
         database.add_resource(chat_id, "https://google.com", "Google", "http")

@@ -1576,15 +1576,12 @@ def sync_command(bot, accid, event):
     msg = event.msg
     try:
         chat_info = bot.rpc.get_basic_chat_info(accid, msg.chat_id)
-        logger.info(f"[SYNC DEBUG] chat_id={msg.chat_id}, chat_info type={type(chat_info).__name__}, value={chat_info}")
         if isinstance(chat_info, dict):
             chat_type = chat_info.get('chat_type', 'Single')
         else:
             chat_type = getattr(chat_info, 'chat_type', 'Single')
-        logger.info(f"[SYNC DEBUG] chat_type={chat_type}")
         is_group = str(chat_type) in ("Group", "Mailinglist", "OutBroadcast", "InBroadcast")
-    except Exception as e:
-        logger.error(f"[SYNC DEBUG] Exception: {e}")
+    except Exception:
         is_group = False
 
     if not is_group:
@@ -1926,7 +1923,7 @@ def on_start(bot, _args):
         except Exception:
             pass
 
-@dc_cli.on(events.NewMessage)
+@dc_cli.on(events.NewMessage(is_bot=None))
 def on_new_message(bot, accid, event):
     msg = event.msg
     if msg.is_info:

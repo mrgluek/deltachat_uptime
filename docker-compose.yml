@@ -18,6 +18,9 @@ services:
       - PORT=8080
       - DC_DB_DIR=/app/data
       - DB_PATH=/app/data/uptime.db
+      - DISPLAY_NAME
+      - STATUS_TEXT
+      - AVATAR_PATH
     deploy:
       resources:
         limits:

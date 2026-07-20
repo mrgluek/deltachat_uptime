@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - **Peer-to-Peer Synchronization (`/sync`):** Added resource synchronization between multiple Uptime Bot instances running in the same group chat. Bots automatically exchange and import missing targets locally.
 - **Sync Rate Limiting:** Implemented a 1-minute rate limit per chat for non-admin users triggering the `/sync` command to prevent spam. Admins bypass the rate limit.
+- **Profile Customization via Env:** Supported `DISPLAY_NAME`, `STATUS_TEXT`, and `AVATAR_PATH` environment variables on initialization to easily configure bot profile details.
 
 ## [1.0.2] - 2026-07-06
 

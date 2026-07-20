@@ -1816,19 +1816,36 @@ def on_init(bot, args):
     for accid in bot.rpc.get_all_account_ids():
         dc_accid = accid
         try:
-            bot.rpc.set_config(accid, "displayname", "Delta Chat Uptime Bot")
-            bot.rpc.set_config(accid, "selfstatus", "Monitors resource availability (HTTP, TCP, Ping) and alerts on outages: https://github.com/mrgluek/deltachat_uptime")
+            bot_name = os.environ.get("DISPLAY_NAME", "Delta Chat Uptime Bot")
+            bot.rpc.set_config(accid, "displayname", bot_name)
             
-            # Set bot avatar if icon file exists
+            status_text = os.environ.get("STATUS_TEXT", "Monitors resource availability (HTTP, TCP, Ping) and alerts on outages: https://github.com/mrgluek/deltachat_uptime")
+            bot.rpc.set_config(accid, "selfstatus", status_text)
+            
+            # Set bot avatar from custom path if specified, else fallback to defaults
+            avatar_env = os.environ.get("AVATAR_PATH")
+            avatar_paths = []
             base_dir = os.path.dirname(os.path.abspath(__file__))
-            for icon_name in ["icon.png", "icon.jpg"]:
-                icon_path = os.path.join(base_dir, icon_name)
-                if os.path.exists(icon_path):
-                    bot.rpc.set_config(accid, "selfavatar", icon_path)
-                    bot.logger.info(f"Avatar set from {icon_path}")
+            if avatar_env:
+                if os.path.isabs(avatar_env):
+                    avatar_paths.append(avatar_env)
+                else:
+                    avatar_paths.append(os.path.join(base_dir, avatar_env))
+                    avatar_paths.append(os.path.abspath(avatar_env))
+            
+            # Default fallback paths
+            avatar_paths.extend([
+                os.path.join(base_dir, "icon.png"),
+                os.path.join(base_dir, "icon.jpg")
+            ])
+            
+            for path in avatar_paths:
+                if os.path.exists(path):
+                    bot.rpc.set_config(accid, "selfavatar", path)
+                    bot.logger.info(f"Avatar set from {path}")
                     break
             else:
-                bot.logger.warning(f"No icon.png or icon.jpg found in {base_dir}")
+                bot.logger.warning(f"No avatar found in configured or default paths.")
         except Exception as e:
             bot.logger.warning(f"Could not configure profile: {e}")
             

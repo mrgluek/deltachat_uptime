@@ -299,5 +299,28 @@ class TestUptimeBot(unittest.TestCase):
         self.assertEqual(len(database.get_resources(chat_id)), 0)
         self.assertFalse(mock_send_with_stats.called)
 
+    @patch.dict('os.environ', {
+        'DISPLAY_NAME': 'Custom Bot Name',
+        'STATUS_TEXT': 'Custom status info text',
+        'AVATAR_PATH': 'custom_icon.png'
+    })
+    @patch('os.path.exists')
+    def test_profile_customization(self, mock_exists):
+        mock_exists.side_effect = lambda path: 'custom_icon.png' in path or 'icon.png' in path
+        
+        mock_bot = MagicMock()
+        mock_bot.rpc.get_all_account_ids.return_value = [1]
+        
+        # Trigger on_init
+        bot.on_init(mock_bot, [])
+        
+        # Verify set_config calls
+        calls = mock_bot.rpc.set_config.call_args_list
+        config_dict = {call[0][1]: call[0][2] for call in calls}
+        
+        self.assertEqual(config_dict.get("displayname"), "Custom Bot Name")
+        self.assertEqual(config_dict.get("selfstatus"), "Custom status info text")
+        self.assertTrue(config_dict.get("selfavatar").endswith("custom_icon.png"))
+
 if __name__ == '__main__':
     unittest.main()

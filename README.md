@@ -95,6 +95,14 @@ Tell the bot your public status domain so that it generates correct dashboard li
 /url https://up.gluek.info
 ```
 
+## Configuration & Profile Customization
+
+You can customize the bot's name, avatar, and status text by passing environment variables (e.g. in your `.env` file or `docker-compose.yml`):
+
+- `DISPLAY_NAME` — Customize the display name of the bot (default: `Delta Chat Uptime Bot`).
+- `STATUS_TEXT` — Customize the status/about text of the bot.
+- `AVATAR_PATH` — Path to an image file (PNG/JPG) to use as the bot's profile avatar (default: falls back to `icon.png` or `icon.jpg` in the project root).
+
 ---
 
 ## Reverse Proxy with Caddy

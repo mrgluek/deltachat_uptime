@@ -89,7 +89,8 @@ def setup_custom_command_parser(bot, allowed_prefixes):
             if event.command in ("/help", "/status", "/list"):
                 try:
                     chat = bot.rpc.get_chat(accid, event.msg.chat_id)
-                    is_group = getattr(chat, "chat_type", "Single") != "Single"
+                    chat_type = chat.get('chat_type', 'Single') if isinstance(chat, dict) else getattr(chat, 'chat_type', 'Single')
+                    is_group = str(chat_type) != "Single"
                 except Exception:
                     is_group = False
                 
@@ -102,7 +103,8 @@ def setup_custom_command_parser(bot, allowed_prefixes):
                                 bot_count += 1
                                 continue
                             c = bot.rpc.get_contact(accid, contact_id)
-                            if getattr(c, "is_bot", False):
+                            is_bot = c.get('is_bot', False) if isinstance(c, dict) else getattr(c, 'is_bot', False)
+                            if is_bot:
                                 bot_count += 1
                                 if bot_count > 1:
                                     break
@@ -1554,7 +1556,8 @@ def sync_command(bot, accid, event):
     msg = event.msg
     try:
         chat = bot.rpc.get_chat(accid, msg.chat_id)
-        is_group = getattr(chat, "chat_type", "Single") != "Single"
+        chat_type = chat.get('chat_type', 'Single') if isinstance(chat, dict) else getattr(chat, 'chat_type', 'Single')
+        is_group = str(chat_type) != "Single"
     except Exception:
         is_group = False
 

@@ -19,6 +19,7 @@ import database
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
+VERSION = "1.1.0"
 
 dc_cli = BotCli("uptimebot")
 bot_qr_cache = {}
@@ -1322,7 +1323,7 @@ def help_command(bot, accid, event):
     admin_email = database.get_config("admin_dc_email")
     
     help_text = (
-        f"👋 Welcome to Delta Chat Uptime Bot!\n\n"
+        f"👋 Welcome to Delta Chat Uptime Bot {VERSION}!\n\n"
         f"I monitor resource availability (HTTP, TCP, Ping) and alert this chat if they go offline.\n\n"
         f"**Public Commands:**\n"
         f"/add <target> [name] — Monitor a resource. Target formats:\n"
@@ -1826,6 +1827,7 @@ def on_message_failed(bot, accid, event):
 @dc_cli.on_init
 def on_init(bot, args):
     setup_custom_command_parser(bot, ALLOWED_PREFIXES)
+    bot.logger.info(f"Initializing Uptime Bot v{VERSION}...")
     
     global dc_bot_instance, dc_accid
     dc_bot_instance = bot
@@ -1876,6 +1878,7 @@ def on_init(bot, args):
 
 @dc_cli.on_start
 def on_start(bot, _args):
+    bot.logger.info(f"Uptime Bot v{VERSION} is now fully running. Waiting for events...")
     global dc_bot_instance, dc_accid
     dc_bot_instance = bot
     accounts = bot.rpc.get_all_account_ids()

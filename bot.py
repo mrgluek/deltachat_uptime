@@ -91,9 +91,10 @@ def setup_custom_command_parser(bot, allowed_prefixes):
                 try:
                     chat_info = bot.rpc.get_basic_chat_info(accid, event.msg.chat_id)
                     if isinstance(chat_info, dict):
-                        is_group = chat_info.get("type", 1) != 1
+                        chat_type = chat_info.get('chat_type', 'Single')
                     else:
-                        is_group = getattr(chat_info, "type", 1) != 1
+                        chat_type = getattr(chat_info, 'chat_type', 'Single')
+                    is_group = str(chat_type) in ("Group", "Mailinglist", "OutBroadcast", "InBroadcast")
                 except Exception:
                     is_group = False
                 
@@ -1575,11 +1576,15 @@ def sync_command(bot, accid, event):
     msg = event.msg
     try:
         chat_info = bot.rpc.get_basic_chat_info(accid, msg.chat_id)
+        logger.info(f"[SYNC DEBUG] chat_id={msg.chat_id}, chat_info type={type(chat_info).__name__}, value={chat_info}")
         if isinstance(chat_info, dict):
-            is_group = chat_info.get("type", 1) != 1
+            chat_type = chat_info.get('chat_type', 'Single')
         else:
-            is_group = getattr(chat_info, "type", 1) != 1
-    except Exception:
+            chat_type = getattr(chat_info, 'chat_type', 'Single')
+        logger.info(f"[SYNC DEBUG] chat_type={chat_type}")
+        is_group = str(chat_type) in ("Group", "Mailinglist", "OutBroadcast", "InBroadcast")
+    except Exception as e:
+        logger.error(f"[SYNC DEBUG] Exception: {e}")
         is_group = False
 
     if not is_group:
@@ -1972,11 +1977,11 @@ def on_new_message(bot, accid, event):
     # Auto-greet new users in private chat
     try:
         chat_info = bot.rpc.get_basic_chat_info(accid, msg.chat_id)
-        is_private = False
         if isinstance(chat_info, dict):
-            is_private = (chat_info.get("type") == 1)
+            chat_type = chat_info.get('chat_type', 'Single')
         else:
-            is_private = (getattr(chat_info, "type", 1) == 1)
+            chat_type = getattr(chat_info, 'chat_type', 'Single')
+        is_private = str(chat_type) == "Single"
             
         if is_private:
             greeted_key = f"greeted_{msg.from_id}"

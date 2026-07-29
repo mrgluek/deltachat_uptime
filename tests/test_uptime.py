@@ -197,6 +197,40 @@ class TestUptimeBot(unittest.TestCase):
 
     @patch('bot._is_dc_admin')
     @patch('bot._dc_send_msg_with_stats')
+    def test_resilient_command(self, mock_send_with_stats, mock_is_admin):
+        mock_is_admin.return_value = True
+        mock_bot = MagicMock()
+        mock_event = MagicMock()
+        mock_event.msg = MagicMock()
+        mock_event.msg.from_id = 123
+        mock_event.msg.chat_id = 456
+
+        # Case 1: Status query when disabled
+        database.set_config("resilient", "0")
+        database.set_config("resilient_mode", "0")
+        mock_event.payload = ""
+        bot.resilient_command(mock_bot, 1, mock_event)
+        args, kwargs = mock_send_with_stats.call_args
+        self.assertIn("currently DISABLED", args[3].text)
+
+        # Case 2: Turn ON with /resilient on
+        mock_event.payload = "on"
+        bot.resilient_command(mock_bot, 1, mock_event)
+        self.assertEqual(database.get_config("resilient"), "1")
+
+        # Case 3: Status query when enabled
+        mock_event.payload = ""
+        bot.resilient_command(mock_bot, 1, mock_event)
+        args, kwargs = mock_send_with_stats.call_args
+        self.assertIn("currently ENABLED", args[3].text)
+
+        # Case 4: Turn OFF with /resilient off
+        mock_event.payload = "off"
+        bot.resilient_command(mock_bot, 1, mock_event)
+        self.assertEqual(database.get_config("resilient"), "0")
+
+    @patch('bot._is_dc_admin')
+    @patch('bot._dc_send_msg_with_stats')
     def test_sync_command_and_rate_limit(self, mock_send_with_stats, mock_is_admin):
         chat_id = 777
         mock_bot = MagicMock()

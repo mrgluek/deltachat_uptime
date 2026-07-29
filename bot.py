@@ -19,7 +19,7 @@ import database
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 
 dc_cli = BotCli("uptimebot")
 bot_qr_cache = {}
@@ -1783,18 +1783,47 @@ def setprimary_command(bot, accid, event):
 def resilient_command(bot, accid, event):
     msg = event.msg
     if not _is_dc_admin(bot, accid, msg.from_id):
-        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text="❌ This command is only for the administrator."))
+        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text="❌ Only the bot administrator can use /resilient."))
         return
-    resilient = database.get_config("resilient_mode") == "1"
-    new_state = "0" if resilient else "1"
-    database.set_config("resilient_mode", new_state)
-    state_str = "ENABLED" if new_state == "1" else "DISABLED"
-    _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=f"🔄 Resilient sending mode is now {state_str}."))
+
+    arg = event.payload.strip().lower() if event.payload else ""
+
+    try:
+        current = (database.get_config("resilient") == "1") or (database.get_config("resilient_mode") == "1")
+        if not arg:
+            status = "ENABLED" if current else "DISABLED"
+            _dc_send_msg_with_stats(
+                bot, accid, msg.chat_id,
+                MsgData(text=f"ℹ️ Resilient sending mode is currently {status}.\nUse '/resilient on', '/resilient off', or '/resilient' to get status.")
+            )
+            return
+
+        if arg in ("on", "1", "true"):
+            database.set_config("resilient", "1")
+            database.set_config("resilient_mode", "1")
+            _dc_send_msg_with_stats(
+                bot, accid, msg.chat_id,
+                MsgData(text="✅ Resilient sending mode ENABLED. Outgoing failovers will resend via all configured transports.")
+            )
+        elif arg in ("off", "0", "false"):
+            database.set_config("resilient", "0")
+            database.set_config("resilient_mode", "0")
+            _dc_send_msg_with_stats(
+                bot, accid, msg.chat_id,
+                MsgData(text="❌ Resilient sending mode DISABLED.")
+            )
+        else:
+            _dc_send_msg_with_stats(
+                bot, accid, msg.chat_id,
+                MsgData(text="❌ Invalid argument. Use '/resilient on', '/resilient off', or '/resilient' to get status.")
+            )
+    except Exception as e:
+        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=f"❌ Failed to update resilient mode: {e}"))
 
 # Multi-transport resilient sending implementation
 @dc_cli.on(events.RawEvent(events.EventType.MSG_FAILED))
 def on_message_failed(bot, accid, event):
-    if database.get_config("resilient_mode") != "1":
+    if (database.get_config("resilient") != "1") and (database.get_config("resilient_mode") != "1"):
         return
         
     msg_id = event.msg_id

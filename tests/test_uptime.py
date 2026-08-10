@@ -419,5 +419,13 @@ class TestUptimeBot(unittest.TestCase):
         self.assertTrue(bot.is_group_chat(MockChat(chat_type="Group")))
         self.assertFalse(bot.is_group_chat(MockChat()))
 
+    def test_user_agent_header(self):
+        self.assertEqual(
+            bot.USER_AGENT,
+            f"DeltaChat-Uptime-Bot/{bot.VERSION} (https://git.gluek.info/gluek/deltachat_uptime)"
+        )
+        self.assertIn("DeltaChat-Uptime-Bot/", bot.USER_AGENT)
+
 if __name__ == '__main__':
     unittest.main()
+

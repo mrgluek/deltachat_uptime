@@ -12,6 +12,8 @@ Additionally, it automatically generates a secure, beautiful web status dashboar
   - **HTTP/HTTPS:** Checks status code and latency (e.g. `https://example.com`).
   - **TCP Port:** Checks port availability (e.g. `example.com:22`).
   - **Ping (ICMP):** Sends standard ICMP echo requests (e.g. `example.com`).
+- 🤖 **Identified User-Agent:** Sends a custom `User-Agent` header (e.g. `DeltaChat-Uptime-Bot/1.1.2 (https://git.gluek.info/gluek/deltachat_uptime)`) during HTTP checks so server administrators can easily identify monitoring requests in server logs.
+
 - 🔄 **Failure Resiliency & Retry Logic:**
   - Checks resources once a minute.
   - If a resource check fails, the bot does not alert immediately. It retries **2 more times at 30-second intervals**.

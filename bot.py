@@ -19,7 +19,8 @@ import database
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "1.1.1"
+VERSION = "1.1.2"
+USER_AGENT = f"DeltaChat-Uptime-Bot/{VERSION} (https://git.gluek.info/gluek/deltachat_uptime)"
 
 dc_cli = BotCli("uptimebot")
 bot_qr_cache = {}
@@ -249,7 +250,8 @@ async def run_single_check(resource) -> tuple[bool, str]:
     start_time = time.time()
     try:
         if rtype == "http":
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout)) as session:
+            headers = {"User-Agent": USER_AGENT}
+            async with aiohttp.ClientSession(headers=headers, timeout=aiohttp.ClientTimeout(total=timeout)) as session:
                 async with session.get(url, allow_redirects=True) as resp:
                     try:
                         phrase = http.HTTPStatus(resp.status).phrase

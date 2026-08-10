@@ -5,7 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.2] - 2026-08-10
+
+### Added
+- **Identified User-Agent Header:** Configured a custom `User-Agent` HTTP header (`DeltaChat-Uptime-Bot/<version> (https://git.gluek.info/gluek/deltachat_uptime)`) for all HTTP resource checks to allow server operators to identify and whitelist monitoring requests.
+
 ## [1.1.1] - 2026-07-30
+
 
 ### Fixed
 - **Standardized `/resilient` Command:** Refactored `/resilient` to match repository standards. Query status without arguments, or explicitly toggle with `on`/`off`/`1`/`0`/`true`/`false`. Migrated state storage to standard `"resilient"` key.

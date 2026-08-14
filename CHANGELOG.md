@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-08-14
+
+### Added
+- **SSL/TLS Certificate Expiration Monitoring:** Automated SSL certificate expiration tracking for HTTPS resources:
+  - Non-blocking peer certificate inspection cached to execute at most once per hour per HTTPS target.
+  - Multi-stage warning alerts dispatched directly to the Delta Chat chat at **7 days**, **3 days**, and **24 hours (1 day)** prior to expiration, as well as on expiration.
+  - Automatic alert state reset when a renewed certificate is detected.
+  - Expiration remaining time and date displayed in the `/list` command response and on the Web Status Dashboard monitor cards.
+
 ## [1.1.2] - 2026-08-10
 
 ### Added

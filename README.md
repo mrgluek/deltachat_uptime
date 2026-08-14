@@ -12,7 +12,12 @@ Additionally, it automatically generates a secure, beautiful web status dashboar
   - **HTTP/HTTPS:** Checks status code and latency (e.g. `https://example.com`).
   - **TCP Port:** Checks port availability (e.g. `example.com:22`).
   - **Ping (ICMP):** Sends standard ICMP echo requests (e.g. `example.com`).
-- 🤖 **Identified User-Agent:** Sends a custom `User-Agent` header (e.g. `DeltaChat-Uptime-Bot/1.1.2 (https://git.gluek.info/gluek/deltachat_uptime)`) during HTTP checks so server administrators can easily identify monitoring requests in server logs.
+- 🔒 **SSL Certificate Expiration Monitoring:** Automatically tracks SSL/TLS certificate expiration for HTTPS targets:
+  - Periodic checks cached to run at most once per hour.
+  - Staged proactive alerts sent to chat at **7 days**, **3 days**, and **24 hours (1 day)** before expiration, as well as upon expiration.
+  - Automatic alert state reset when certificate is renewed.
+  - Real-time expiration countdown displayed in `/list` and on the Web Status Dashboard.
+- 🤖 **Identified User-Agent:** Sends a custom `User-Agent` header (e.g. `DeltaChat-Uptime-Bot/1.2.0 (https://git.gluek.info/gluek/deltachat_uptime)`) during HTTP checks so server administrators can easily identify monitoring requests in server logs.
 
 - 🔄 **Failure Resiliency & Retry Logic:**
   - Checks resources once a minute.

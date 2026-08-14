@@ -3,12 +3,14 @@ import io
 import logging
 import json
 import os
+import ssl
 import threading
 import time
 import datetime
 import html
 import re
 import socket
+from urllib.parse import urlparse
 import aiohttp
 from aiohttp import web
 from deltachat2 import events, MsgData
@@ -19,7 +21,7 @@ import database
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "1.1.2"
+VERSION = "1.2.0"
 USER_AGENT = f"DeltaChat-Uptime-Bot/{VERSION} (https://git.gluek.info/gluek/deltachat_uptime)"
 
 dc_cli = BotCli("uptimebot")
@@ -241,6 +243,104 @@ def _is_dc_admin(bot, accid, contact_id):
     return False
 
 # Uptime checks execution logic
+async def check_ssl_expiry(url: str, timeout: float = 10.0) -> tuple[int | None, str | None]:
+    """
+    Connects to the HTTPS host, fetches peer certificate and returns:
+    (expiry_timestamp_epoch, None) on success, or (None, error_str) on failure.
+    """
+    try:
+        parsed = urlparse(url)
+        host = parsed.hostname
+        port = parsed.port or 443
+        if not host:
+            return None, "Invalid hostname"
+            
+        ctx = ssl.create_default_context()
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port, ssl=ctx, server_hostname=host),
+            timeout=timeout
+        )
+        ssl_obj = writer.get_extra_info("ssl_object")
+        cert = ssl_obj.getpeercert() if ssl_obj else None
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+        if not cert or "notAfter" not in cert:
+            return None, "No certificate found"
+
+        not_after_str = cert["notAfter"]
+        try:
+            exp_date = datetime.datetime.strptime(not_after_str, "%b %d %H:%M:%S %Y %Z")
+        except ValueError:
+            # Fallback in case of variant date formats
+            import email.utils
+            exp_date = email.utils.parsedate_to_datetime(not_after_str)
+        exp_date = exp_date.replace(tzinfo=datetime.timezone.utc)
+        return int(exp_date.timestamp()), None
+    except ssl.SSLCertVerificationError as e:
+        return None, f"SSL verification error: {getattr(e, 'verify_message', str(e))}"
+    except ssl.SSLError as e:
+        return None, f"SSL error: {e}"
+    except asyncio.TimeoutError:
+        return None, "SSL check timeout"
+    except Exception as e:
+        return None, f"SSL check error: {e}"
+
+async def notify_ssl_alert(resource, days_left: float, exp_date_str: str, alert_stage: int):
+    res_id = resource["id"]
+    name = resource["name"] or resource["url"]
+    url = resource["url"]
+    chat_id = resource["dc_chat_id"]
+
+    if alert_stage == -1:
+        msg_text = (
+            f"🚨 `ID: {res_id}` **{name}**\n"
+            f"  Target: `{url}`\n"
+            f"  🔒 **SSL Certificate Expired!** Expired on `{exp_date_str}`.\n"
+            f"  Please renew the certificate immediately to restore secure access."
+        )
+    elif alert_stage == 1:
+        hours_left = max(1, int(days_left * 24))
+        msg_text = (
+            f"🚨 `ID: {res_id}` **{name}**\n"
+            f"  Target: `{url}`\n"
+            f"  🔒 **SSL Certificate Expiration Warning (24 Hours)**\n"
+            f"  Certificate will expire in ~`{hours_left}h` (on `{exp_date_str}`).\n"
+            f"  Urgent: Please renew your SSL certificate now!"
+        )
+    elif alert_stage == 3:
+        msg_text = (
+            f"⚠️ `ID: {res_id}` **{name}**\n"
+            f"  Target: `{url}`\n"
+            f"  🔒 **SSL Certificate Expiration Warning (3 Days)**\n"
+            f"  Certificate will expire in ~3 days (on `{exp_date_str}`).\n"
+            f"  Please renew your SSL certificate soon."
+        )
+    elif alert_stage == 7:
+        msg_text = (
+            f"⚠️ `ID: {res_id}` **{name}**\n"
+            f"  Target: `{url}`\n"
+            f"  🔒 **SSL Certificate Expiration Warning (7 Days)**\n"
+            f"  Certificate will expire in ~7 days (on `{exp_date_str}`).\n"
+            f"  Please make sure your renewal automation or certificate is up to date."
+        )
+    else:
+        return
+
+    if dc_bot_instance and dc_accid is not None:
+        try:
+            await asyncio.to_thread(
+                dc_bot_instance.rpc.send_msg,
+                dc_accid,
+                chat_id,
+                MsgData(text=msg_text)
+            )
+        except Exception as e:
+            logger.error(f"Failed to send SSL alert to chat {chat_id}: {e}")
+
 async def run_single_check(resource) -> tuple[bool, str]:
     import http
     rtype = resource["type"]
@@ -316,6 +416,44 @@ async def check_group_task(group, semaphore):
         for r in group:
             logger.info(f"Check result: {r['name'] or r['url']} (id: {r['id']}) in chat {r['dc_chat_id']} -> {'UP' if is_up else 'DOWN'} ({error_msg})")
             await handle_check_result(r, is_up, error_msg)
+
+        # Check SSL Certificate Expiry for HTTPS targets (at most once per hour)
+        if rep.get("type") == "http" and rep.get("url", "").startswith("https://"):
+            now = int(time.time())
+            ssl_last_checked = rep.get("ssl_last_checked") or 0
+            if now - ssl_last_checked >= 3600:
+                ssl_exp_ts, ssl_err = await check_ssl_expiry(rep["url"])
+                for r in group:
+                    cur_state = r.get("ssl_alert_state") if r.get("ssl_alert_state") is not None else 0
+                    new_state = cur_state
+                    if ssl_exp_ts is not None:
+                        days_left = (ssl_exp_ts - now) / 86400.0
+                        exp_date_str = datetime.datetime.fromtimestamp(ssl_exp_ts, tz=datetime.timezone.utc).strftime('%Y-%m-%d')
+                        
+                        if days_left > 7:
+                            if cur_state != 0:
+                                new_state = 0
+                        elif days_left <= 0:
+                            if cur_state != -1:
+                                new_state = -1
+                                await notify_ssl_alert(r, days_left, exp_date_str, alert_stage=-1)
+                        elif days_left <= 1:
+                            if cur_state in (0, 7, 3):
+                                new_state = 1
+                                await notify_ssl_alert(r, days_left, exp_date_str, alert_stage=1)
+                        elif days_left <= 3:
+                            if cur_state in (0, 7):
+                                new_state = 3
+                                await notify_ssl_alert(r, days_left, exp_date_str, alert_stage=3)
+                        elif days_left <= 7:
+                            if cur_state == 0:
+                                new_state = 7
+                                await notify_ssl_alert(r, days_left, exp_date_str, alert_stage=7)
+                                
+                        await asyncio.to_thread(database.update_resource_ssl, r["id"], ssl_exp_ts, now, new_state)
+                    else:
+                        logger.warning(f"SSL check for {rep['url']} failed: {ssl_err}")
+                        await asyncio.to_thread(database.update_resource_ssl, r["id"], r.get("ssl_expiry_date"), now, cur_state)
 
 async def handle_check_result(resource, is_up, error_msg):
     status = "up" if is_up else "down"
@@ -445,6 +583,35 @@ def get_dashboard_html(chat_name, resources, overall_uptime) -> str:
             if r["last_checked"]:
                 last_checked_str = datetime.datetime.fromtimestamp(r["last_checked"]).strftime('%Y-%m-%d %H:%M:%S')
                 
+            ssl_stat_html = ""
+            if r.get("url", "").startswith("https://"):
+                exp_ts = r.get("ssl_expiry_date")
+                if exp_ts:
+                    now_ts = int(time.time())
+                    d_left = int((exp_ts - now_ts) / 86400)
+                    if d_left < 0:
+                        ssl_color = "var(--color-down)"
+                        ssl_txt = "Expired"
+                    elif d_left <= 7:
+                        ssl_color = "var(--color-warn)"
+                        ssl_txt = f"{d_left}d left"
+                    else:
+                        ssl_color = "var(--color-up)"
+                        ssl_txt = f"{d_left}d left"
+                    ssl_stat_html = f"""
+                    <div class="m-stat">
+                        <span class="m-val" style="color: {ssl_color}; font-size: 0.875rem;">{ssl_txt}</span>
+                        <span class="m-lbl">SSL Cert</span>
+                    </div>
+                    """
+                else:
+                    ssl_stat_html = """
+                    <div class="m-stat">
+                        <span class="m-val" style="color: var(--text-muted); font-size: 0.875rem;">Pending</span>
+                        <span class="m-lbl">SSL Cert</span>
+                    </div>
+                    """
+                
             monitors_html += f"""
             <div class="monitor-card">
                 <div class="monitor-info">
@@ -460,6 +627,7 @@ def get_dashboard_html(chat_name, resources, overall_uptime) -> str:
                         <span class="m-val" style="color: { 'var(--color-up)' if r["status"] == "up" else 'var(--color-down)' if r["status"] == "down" else 'var(--text-muted)' };">{status_lbl}</span>
                         <span class="m-lbl">Status</span>
                     </div>
+                    {ssl_stat_html}
                     <div class="m-stat">
                         <span class="m-val">{r_uptime:.2f}%</span>
                         <span class="m-lbl">Uptime 30d</span>
@@ -1534,10 +1702,27 @@ def list_command(bot, accid, event):
     for r in resources:
         emoji_status = "🟢" if r["status"] == "up" else ("🔴" if r["status"] == "down" else "⚪")
         uptime = database.get_resource_uptime_30d(r["id"])
+        
+        ssl_info = ""
+        if r.get("url", "").startswith("https://"):
+            exp_ts = r.get("ssl_expiry_date")
+            if exp_ts:
+                now_ts = int(time.time())
+                d_left = int((exp_ts - now_ts) / 86400)
+                exp_date_str = datetime.datetime.fromtimestamp(exp_ts, tz=datetime.timezone.utc).strftime('%Y-%m-%d')
+                if d_left < 0:
+                    ssl_info = f" | SSL: 🚨 Expired (`{exp_date_str}`)"
+                elif d_left <= 7:
+                    ssl_info = f" | SSL: ⚠️ `{d_left}d` left (`{exp_date_str}`)"
+                else:
+                    ssl_info = f" | SSL: 🔒 `{d_left}d` left (`{exp_date_str}`)"
+            else:
+                ssl_info = " | SSL: 🔒 Pending check"
+
         reply += (
             f"{emoji_status} `ID: {r['id']}` **{r['name']}**\n"
             f"  Target: `{r['url']}` ({r['type'].upper()})\n"
-            f"  Uptime 30d: `{uptime:.2f}%` | Status: `{r['status'].upper()}`\n\n"
+            f"  Uptime 30d: `{uptime:.2f}%` | Status: `{r['status'].upper()}`{ssl_info}\n\n"
         )
     _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=reply))
 

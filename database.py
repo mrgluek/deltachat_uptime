@@ -47,9 +47,22 @@ def init_db():
                 last_changed INTEGER,
                 consecutive_failures INTEGER DEFAULT 0,
                 created_at INTEGER DEFAULT (strftime('%s','now')),
+                ssl_expiry_date INTEGER,
+                ssl_last_checked INTEGER,
+                ssl_alert_state INTEGER DEFAULT 0,
                 UNIQUE(dc_chat_id, url)
             )
         ''')
+        
+        # Ensure new SSL columns exist in resources table
+        cursor.execute("PRAGMA table_info(resources)")
+        columns = [row[1] for row in cursor.fetchall()]
+        if "ssl_expiry_date" not in columns:
+            cursor.execute("ALTER TABLE resources ADD COLUMN ssl_expiry_date INTEGER")
+        if "ssl_last_checked" not in columns:
+            cursor.execute("ALTER TABLE resources ADD COLUMN ssl_last_checked INTEGER")
+        if "ssl_alert_state" not in columns:
+            cursor.execute("ALTER TABLE resources ADD COLUMN ssl_alert_state INTEGER DEFAULT 0")
         
         # Downtime events for uptime calculations
         cursor.execute('''
@@ -233,6 +246,30 @@ def update_resource_status(resource_id: int, status: str, consecutive_failures: 
                 WHERE id = ?
             ''', (now, consecutive_failures, resource_id))
             
+        conn.commit()
+        conn.close()
+
+def update_resource_ssl(resource_id: int, ssl_expiry_date: int | None, ssl_last_checked: int, ssl_alert_state: int = 0):
+    with _lock:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute('''
+            UPDATE resources 
+            SET ssl_expiry_date = ?, ssl_last_checked = ?, ssl_alert_state = ? 
+            WHERE id = ?
+        ''', (ssl_expiry_date, ssl_last_checked, ssl_alert_state, resource_id))
+        conn.commit()
+        conn.close()
+
+def update_ssl_alert_state(resource_id: int, ssl_alert_state: int):
+    with _lock:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute('''
+            UPDATE resources 
+            SET ssl_alert_state = ? 
+            WHERE id = ?
+        ''', (ssl_alert_state, resource_id))
         conn.commit()
         conn.close()
 

@@ -657,6 +657,16 @@ class TestUptimeBot(unittest.TestCase):
         self.assertIn("SSL Cert", html_out)
         self.assertIn("45d left", html_out)
 
+    def test_index_page_ssl_info(self):
+        import asyncio
+        bot.index_page_html_cache = None
+        mock_request = MagicMock()
+        response = asyncio.run(bot.handle_index(mock_request))
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.content_type, "text/html")
+        self.assertIn("SSL Certificate Alerts", response.text)
+        self.assertIn("SSL/TLS certificate expiry checks", response.text)
+
 if __name__ == '__main__':
     unittest.main()
 

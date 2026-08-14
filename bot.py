@@ -1343,7 +1343,14 @@ async def handle_index(request):
                     <span class="feature-icon">⚙️</span>
                     <div class="feature-text">
                         <h3>Multiple Check Modes</h3>
-                        <p>Support HTTP/HTTPS status, TCP ports (like SSH/databases), and non-blocking ICMP Pings.</p>
+                        <p>Support HTTP/HTTPS availability, SSL/TLS certificate expiry checks, TCP ports, and non-blocking ICMP Pings.</p>
+                    </div>
+                </div>
+                <div class="feature-item">
+                    <span class="feature-icon">🔒</span>
+                    <div class="feature-text">
+                        <h3>SSL Certificate Alerts</h3>
+                        <p>Tracks HTTPS certificate expiry with hourly checks and proactive notifications at 7d, 3d, and 24h.</p>
                     </div>
                 </div>
                 <div class="feature-item">

@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.0] - 2026-08-19
+
+### Added
+- **Incident-Based Alerting & In-Place Dynamic Updates:**
+  - Consolidated individual monitor down/up alerts into a single unified **Incident** per chat.
+  - When the first monitor fails, an incident is created (`🚨 Incident #X — Ongoing`).
+  - As subsequent monitors fail or partially recover, the existing message is edited in-place (`⚠️ Incident #X — Ongoing (Partial Recovery)`), completely eliminating chat spam.
+  - Upon full recovery of all monitors, the message is edited in-place to `✅ Incident #X — Resolved` with full duration and operational status.
+- **Incident Log Command (`/events` / `/incidents`):**
+  - View the list of recent incidents in the chat, active ongoing outages, and historical resolution times and durations.
+- **Monitor Downtime History Command (`/history [id]`):**
+  - Inspect historical downtime periods for a specific monitor, including exact start/end timestamps, outage duration, and failure cause/error codes (e.g. `502 Bad Gateway`, `Timeout`).
+- **Dashboard Incident Feed:**
+  - Integrated a sleek "Recent Incidents" section into the Web Status Dashboard showing ongoing and resolved incidents.
+
 ## [1.3.0] - 2026-08-19
 
 ### Added

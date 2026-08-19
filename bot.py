@@ -21,7 +21,7 @@ import database
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 USER_AGENT = f"DeltaChat-Uptime-Bot/{VERSION} (https://git.gluek.info/gluek/deltachat_uptime)"
 
 dc_cli = BotCli("uptimebot")
@@ -521,92 +521,191 @@ async def check_group_task(group, semaphore):
                         logger.warning(f"SSL check for {rep['url']} failed: {ssl_err}")
                         await asyncio.to_thread(database.update_resource_ssl, r["id"], r.get("ssl_expiry_date"), now, cur_state)
 
+def format_incident_message(incident_id: int, started_at: int, resources: list[dict], is_resolved: bool = False, resolved_at: int = None) -> str:
+    start_dt = datetime.datetime.fromtimestamp(started_at, tz=datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+    now = int(time.time())
+    
+    total_monitors = len(resources)
+    down_resources = [r for r in resources if r.get("status") == "down"]
+    up_resources = [r for r in resources if r.get("status") == "up"]
+    
+    if is_resolved:
+        resolved_ts = resolved_at or now
+        resolved_dt = datetime.datetime.fromtimestamp(resolved_ts, tz=datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+        duration = max(1, resolved_ts - started_at)
+        duration_str = format_duration(duration)
+        
+        lines = [
+            f"✅ **Incident #{incident_id}** — `Resolved`",
+            f"⏱ **Duration:** `{duration_str}` (`{start_dt}` → `{resolved_dt} UTC`)",
+            f"📊 **All {total_monitors} monitors operational**\n"
+        ]
+        for r in resources:
+            r_name = r.get("name") or r.get("url")
+            r_type = r.get("type", "HTTP").upper()
+            uptime_val = database.get_resource_uptime_30d(r["id"])
+            lines.append(f"• 🟢 `ID: {r['id']}` **{r_name}** ({r_type}) — Uptime 30d: `{uptime_val:.2f}%`")
+        return "\n".join(lines)
+        
+    else:
+        duration = max(1, now - started_at)
+        duration_str = format_duration(duration)
+        down_count = len(down_resources)
+        
+        # Check if partially recovered
+        partially_recovered = any((r.get("last_changed") or 0) >= started_at for r in up_resources) and down_count > 0 and len(up_resources) > 0
+        
+        if partially_recovered:
+            status_tag = "Ongoing (Partial Recovery)"
+            header_icon = "⚠️"
+        else:
+            status_tag = "Ongoing"
+            header_icon = "🚨"
+            
+        lines = [
+            f"{header_icon} **Incident #{incident_id}** — `{status_tag}`",
+            f"⏱ **Started:** `{start_dt} UTC` (active for `{duration_str}`)",
+            f"📊 **Affected:** {down_count} / {total_monitors} monitors down\n",
+            "**Current Status:**"
+        ]
+        
+        for r in down_resources:
+            r_name = r.get("name") or r.get("url")
+            r_type = r.get("type", "HTTP").upper()
+            d_time = max(1, now - (r.get("last_changed") or started_at))
+            d_str = format_duration(d_time)
+            uptime_val = database.get_resource_uptime_30d(r["id"])
+            lines.append(f"• 🔴 `ID: {r['id']}` **{r_name}**\n  Target: `{r['url']}` ({r_type})\n  Status: `DOWN` (down for `{d_str}`) | Uptime 30d: `{uptime_val:.2f}%`")
+            
+        for r in up_resources:
+            if (r.get("last_changed") or 0) >= started_at:
+                r_name = r.get("name") or r.get("url")
+                r_type = r.get("type", "HTTP").upper()
+                rec_dt = datetime.datetime.fromtimestamp(r.get("last_changed"), tz=datetime.timezone.utc).strftime('%H:%M:%S')
+                uptime_val = database.get_resource_uptime_30d(r["id"])
+                lines.append(f"• 🟢 `ID: {r['id']}` **{r_name}**\n  Target: `{r['url']}` ({r_type})\n  Status: `UP` (recovered at `{rec_dt} UTC`) | Uptime 30d: `{uptime_val:.2f}%`")
+
+        return "\n".join(lines)
+
+_incident_sync_locks = {}
+_incident_global_lock = asyncio.Lock()
+
+async def get_chat_incident_lock(dc_chat_id: int) -> asyncio.Lock:
+    async with _incident_global_lock:
+        if dc_chat_id not in _incident_sync_locks:
+            _incident_sync_locks[dc_chat_id] = asyncio.Lock()
+        return _incident_sync_locks[dc_chat_id]
+
+async def sync_chat_incident_state(dc_chat_id: int):
+    chat_lock = await get_chat_incident_lock(dc_chat_id)
+    async with chat_lock:
+        resources = await asyncio.to_thread(database.get_resources, dc_chat_id)
+        if not resources:
+            return
+            
+        down_resources = [r for r in resources if r.get("status") == "down"]
+        active_incident = await asyncio.to_thread(database.get_active_incident, dc_chat_id)
+        now = int(time.time())
+        
+        if down_resources:
+            if not active_incident:
+                inc_id = await asyncio.to_thread(database.create_incident, dc_chat_id, now)
+                active_incident = await asyncio.to_thread(database.get_incident_by_id, dc_chat_id, inc_id)
+                
+            msg_text = format_incident_message(
+                active_incident["id"],
+                active_incident["started_at"],
+                resources,
+                is_resolved=False
+            )
+            
+            if dc_bot_instance and dc_accid is not None:
+                msg_id = active_incident.get("msg_id")
+                if msg_id:
+                    try:
+                        await asyncio.to_thread(
+                            dc_bot_instance.rpc.send_edit_request,
+                            dc_accid,
+                            msg_id,
+                            msg_text
+                        )
+                        logger.info(f"Edited Incident #{active_incident['id']} message {msg_id} in chat {dc_chat_id}")
+                    except Exception as e:
+                        logger.warning(f"Failed to edit Incident message {msg_id} (sending new message): {e}")
+                        try:
+                            new_msg_id = await asyncio.to_thread(
+                                dc_bot_instance.rpc.send_msg,
+                                dc_accid,
+                                dc_chat_id,
+                                MsgData(text=msg_text)
+                            )
+                            if new_msg_id:
+                                await asyncio.to_thread(database.update_incident_msg_id, active_incident["id"], new_msg_id)
+                        except Exception as ex:
+                            logger.error(f"Failed to send incident message to chat {dc_chat_id}: {ex}")
+                else:
+                    try:
+                        new_msg_id = await asyncio.to_thread(
+                            dc_bot_instance.rpc.send_msg,
+                            dc_accid,
+                            dc_chat_id,
+                            MsgData(text=msg_text)
+                        )
+                        if new_msg_id:
+                            await asyncio.to_thread(database.update_incident_msg_id, active_incident["id"], new_msg_id)
+                    except Exception as e:
+                        logger.error(f"Failed to send incident message to chat {dc_chat_id}: {e}")
+                        
+        else:
+            if active_incident:
+                summary_str = f"All {len(resources)} monitors recovered"
+                await asyncio.to_thread(database.resolve_incident, active_incident["id"], now, summary_str)
+                
+                msg_text = format_incident_message(
+                    active_incident["id"],
+                    active_incident["started_at"],
+                    resources,
+                    is_resolved=True,
+                    resolved_at=now
+                )
+                
+                if dc_bot_instance and dc_accid is not None:
+                    msg_id = active_incident.get("msg_id")
+                    if msg_id:
+                        try:
+                            await asyncio.to_thread(
+                                dc_bot_instance.rpc.send_edit_request,
+                                dc_accid,
+                                msg_id,
+                                msg_text
+                            )
+                            logger.info(f"Resolved Incident #{active_incident['id']} by editing message {msg_id} in chat {dc_chat_id}")
+                        except Exception as e:
+                            logger.warning(f"Failed to edit resolved Incident message {msg_id}: {e}")
+                            try:
+                                await asyncio.to_thread(
+                                    dc_bot_instance.rpc.send_msg,
+                                    dc_accid,
+                                    dc_chat_id,
+                                    MsgData(text=msg_text)
+                                )
+                            except Exception as ex:
+                                logger.error(f"Failed to send resolved incident message to chat {dc_chat_id}: {ex}")
+
 async def handle_check_result(resource, is_up, error_msg):
     status = "up" if is_up else "down"
     old_status = resource["status"]
     
     failures = 0 if is_up else (resource["consecutive_failures"] + 1)
-    await asyncio.to_thread(database.update_resource_status, resource["id"], status, failures)
+    await asyncio.to_thread(database.update_resource_status, resource["id"], status, failures, error_msg)
     
-    should_notify = False
+    should_sync = False
     if old_status != status:
-        if old_status != "unknown":
-            should_notify = True
-        elif status == "down":
-            should_notify = True
+        if old_status != "unknown" or status == "down":
+            should_sync = True
             
-    if should_notify:
-        await notify_status_change(resource, old_status, status, error_msg)
-
-async def notify_status_change(resource, old_status, status, error_msg):
-    res_id = resource["id"]
-    name = resource["name"] or resource["url"]
-    url = resource["url"]
-    type_upper = resource["type"].upper()
-    chat_id = resource["dc_chat_id"]
-    last_down_msg_id = resource.get("last_down_msg_id")
-    last_changed = resource.get("last_changed") or 0
-    now = int(time.time())
-    
-    uptime_val = await asyncio.to_thread(database.get_resource_uptime_30d, res_id)
-    uptime_str = f"{uptime_val:.2f}%"
-    
-    if status == "down":
-        msg_text = (
-            f"🔴 `ID: {res_id}` **{name}**\n"
-            f"  Target: `{url}` ({type_upper})\n"
-            f"  Uptime 30d: `{uptime_str}` | Status: `DOWN ({error_msg})`"
-        )
-    else:
-        msg_text = (
-            f"🟢 `ID: {res_id}` **{name}**\n"
-            f"  Target: `{url}` ({type_upper})\n"
-            f"  Uptime 30d: `{uptime_str}` | Status: `UP ({error_msg})`"
-        )
-        
-    if dc_bot_instance and dc_accid is not None:
-        if status == "down":
-            try:
-                sent_msg_id = await asyncio.to_thread(
-                    dc_bot_instance.rpc.send_msg,
-                    dc_accid,
-                    chat_id,
-                    MsgData(text=msg_text)
-                )
-                if sent_msg_id:
-                    await asyncio.to_thread(database.update_resource_down_msg_id, res_id, sent_msg_id)
-            except Exception as e:
-                logger.error(f"Failed to send status alert to chat {chat_id}: {e}")
-        else:
-            edited = False
-            # If recovering from DOWN and downtime was <= 1 hour (3600s), edit the existing DOWN message
-            if old_status == "down" and last_down_msg_id and (now - last_changed <= 3600):
-                try:
-                    await asyncio.to_thread(
-                        dc_bot_instance.rpc.send_edit_request,
-                        dc_accid,
-                        last_down_msg_id,
-                        msg_text
-                    )
-                    logger.info(f"Edited DOWN message {last_down_msg_id} -> UP for resource {res_id} in chat {chat_id}")
-                    edited = True
-                except Exception as e:
-                    logger.warning(f"Failed to edit DOWN message {last_down_msg_id} for resource {res_id} (falling back to new message): {e}")
-                    edited = False
-
-            if not edited:
-                try:
-                    await asyncio.to_thread(
-                        dc_bot_instance.rpc.send_msg,
-                        dc_accid,
-                        chat_id,
-                        MsgData(text=msg_text)
-                    )
-                except Exception as e:
-                    logger.error(f"Failed to send status alert to chat {chat_id}: {e}")
-
-            if last_down_msg_id:
-                await asyncio.to_thread(database.update_resource_down_msg_id, res_id, None)
+    if should_sync:
+        await sync_chat_incident_state(resource["dc_chat_id"])
 
 async def run_and_track_group(group, semaphore):
     try:
@@ -665,7 +764,7 @@ async def monitoring_scheduler_loop():
         await asyncio.sleep(5)
 
 # Web Server handling and dashboard HTML templates
-def get_dashboard_html(chat_name, resources, overall_uptime) -> str:
+def get_dashboard_html(chat_name, resources, overall_uptime, incidents=None) -> str:
     total_monitors = len(resources)
     up_monitors = sum(1 for r in resources if r["status"] == "up")
     down_monitors = sum(1 for r in resources if r["status"] == "down")
@@ -749,6 +848,51 @@ def get_dashboard_html(chat_name, resources, overall_uptime) -> str:
                 </div>
             </div>
             """
+
+    incidents_html = ""
+    if incidents:
+        inc_items = ""
+        for inc in incidents:
+            inc_id = inc["id"]
+            inc_status = inc["status"]
+            started_at = inc["started_at"]
+            resolved_at = inc["resolved_at"]
+            start_str = datetime.datetime.fromtimestamp(started_at, tz=datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+            
+            if inc_status == "ongoing":
+                d_str = format_duration(int(time.time()) - started_at)
+                inc_items += f"""
+                <div class="monitor-card" style="border-left: 4px solid var(--color-down);">
+                    <div class="monitor-info">
+                        <span class="indicator down"></span>
+                        <div class="monitor-meta">
+                            <span class="monitor-name" style="color: var(--color-down);">Incident #{inc_id} — Ongoing</span>
+                            <span class="monitor-url">Started: {start_str} UTC (active for {d_str})</span>
+                        </div>
+                    </div>
+                </div>
+                """
+            else:
+                resolved_str = datetime.datetime.fromtimestamp(resolved_at, tz=datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S') if resolved_at else "Resolved"
+                duration = max(1, (resolved_at or int(time.time())) - started_at)
+                d_str = format_duration(duration)
+                inc_items += f"""
+                <div class="monitor-card" style="border-left: 4px solid var(--color-up);">
+                    <div class="monitor-info">
+                        <span class="indicator up"></span>
+                        <div class="monitor-meta">
+                            <span class="monitor-name">Incident #{inc_id} — Resolved</span>
+                            <span class="monitor-url">{start_str} → {resolved_str} UTC ({d_str})</span>
+                        </div>
+                    </div>
+                </div>
+                """
+        incidents_html = f"""
+        <h3 class="monitors-title" style="margin-top: 2rem;">📋 Recent Incidents</h3>
+        <div class="monitors-grid">
+            {inc_items}
+        </div>
+        """
             
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -760,20 +904,18 @@ def get_dashboard_html(chat_name, resources, overall_uptime) -> str:
     <link rel="shortcut icon" href="/favicon.ico" />
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;700&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
     <style>
         :root {{
-            --bg-color: #0b0f19;
-            --card-bg: rgba(20, 26, 42, 0.6);
-            --border-color: rgba(255, 255, 255, 0.08);
-            --text-main: #f3f4f6;
-            --text-muted: #9ca3af;
+            --bg-primary: #0f172a;
+            --bg-card: #1e293b;
+            --bg-stat: rgba(30, 41, 59, 0.5);
+            --border-color: #334155;
+            --text-primary: #f8fafc;
+            --text-muted: #94a3b8;
             --color-up: #10b981;
             --color-down: #ef4444;
             --color-warn: #f59e0b;
-            --glow-up: rgba(16, 185, 129, 0.4);
-            --glow-down: rgba(239, 68, 68, 0.4);
-            --glow-warn: rgba(245, 158, 11, 0.4);
         }}
         
         * {{
@@ -783,29 +925,27 @@ def get_dashboard_html(chat_name, resources, overall_uptime) -> str:
         }}
         
         body {{
-            font-family: 'Outfit', sans-serif;
-            background-color: var(--bg-color);
-            color: var(--text-main);
+            font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background-color: var(--bg-primary);
+            color: var(--text-primary);
             min-height: 100vh;
             display: flex;
             flex-direction: column;
-            justify-content: space-between;
-            background-image: 
-                radial-gradient(circle at 10% 20%, rgba(16, 185, 129, 0.05) 0%, transparent 40%),
-                radial-gradient(circle at 90% 80%, rgba(59, 130, 246, 0.05) 0%, transparent 40%);
         }}
         
         header {{
-            padding: 2rem 1.5rem;
-            max-width: 1200px;
-            width: 100%;
-            margin: 0 auto;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
+            background: rgba(15, 23, 42, 0.8);
+            backdrop-filter: blur(8px);
+            border-bottom: 1px solid var(--border-color);
+            padding: 1rem 1.5rem;
+            position: sticky;
+            top: 0;
+            z-index: 10;
         }}
         
         .logo-container {{
+            max-width: 1100px;
+            margin: 0 auto;
             display: flex;
             align-items: center;
             gap: 0.75rem;
@@ -814,140 +954,114 @@ def get_dashboard_html(chat_name, resources, overall_uptime) -> str:
         .logo-img {{
             width: 32px;
             height: 32px;
-            border-radius: 6px;
-            object-fit: cover;
+            border-radius: 8px;
         }}
         
         .logo-title {{
-            font-size: 1.5rem;
+            font-size: 1.25rem;
             font-weight: 700;
-            background: linear-gradient(135deg, #3b82f6, #10b981);
+            background: linear-gradient(to right, #38bdf8, #818cf8);
             -webkit-background-clip: text;
             -webkit-text-fill-color: transparent;
         }}
         
         main {{
-            flex-grow: 1;
-            max-width: 1200px;
+            flex: 1;
+            max-width: 1100px;
             width: 100%;
             margin: 0 auto;
-            padding: 0 1.5rem 3rem;
+            padding: 2rem 1.5rem;
         }}
         
         .stats-panel {{
-            background: var(--card-bg);
+            background: var(--bg-card);
             border: 1px solid var(--border-color);
-            border-radius: 1rem;
-            padding: 2rem;
-            backdrop-filter: blur(12px);
+            border-radius: 16px;
+            padding: 1.5rem;
             margin-bottom: 2rem;
-            display: flex;
-            flex-direction: column;
-            gap: 1.5rem;
-            position: relative;
-            overflow: hidden;
-        }}
-        
-        .stats-panel::before {{
-            content: '';
-            position: absolute;
-            top: 0;
-            left: 0;
-            right: 0;
-            height: 3px;
-            background: linear-gradient(90deg, #3b82f6, #10b981);
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
         }}
         
         .stats-header {{
             display: flex;
             justify-content: space-between;
             align-items: center;
+            margin-bottom: 1.5rem;
             flex-wrap: wrap;
             gap: 1rem;
         }}
         
+        .stats-header h2 {{
+            font-size: 1.5rem;
+            font-weight: 700;
+        }}
+        
         .status-badge {{
-            display: flex;
+            display: inline-flex;
             align-items: center;
             gap: 0.5rem;
-            font-size: 1.125rem;
-            font-weight: 600;
             padding: 0.5rem 1rem;
-            border-radius: 2rem;
-            background: rgba(255, 255, 255, 0.04);
-            border: 1px solid var(--border-color);
+            border-radius: 9999px;
+            font-size: 0.875rem;
+            font-weight: 600;
         }}
         
         .status-badge.all-up {{
+            background: rgba(16, 185, 129, 0.1);
             color: var(--color-up);
-            border-color: rgba(16, 185, 129, 0.2);
-            background: rgba(16, 185, 129, 0.05);
+            border: 1px solid rgba(16, 185, 129, 0.2);
         }}
         
         .status-badge.some-down {{
+            background: rgba(239, 68, 68, 0.1);
             color: var(--color-down);
-            border-color: rgba(239, 68, 68, 0.2);
-            background: rgba(239, 68, 68, 0.05);
+            border: 1px solid rgba(239, 68, 68, 0.2);
         }}
         
         .indicator {{
-            width: 10px;
-            height: 10px;
+            width: 8px;
+            height: 8px;
             border-radius: 50%;
             display: inline-block;
         }}
         
         .indicator.up {{
             background-color: var(--color-up);
-            box-shadow: 0 0 12px var(--glow-up);
-            animation: pulse-green 2s infinite;
+            box-shadow: 0 0 8px var(--color-up);
         }}
         
         .indicator.down {{
             background-color: var(--color-down);
-            box-shadow: 0 0 12px var(--glow-down);
-            animation: pulse-red 2s infinite;
+            box-shadow: 0 0 8px var(--color-down);
         }}
         
         .indicator.unknown {{
             background-color: var(--text-muted);
         }}
         
-        @keyframes pulse-green {{
-            0% {{ box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.4); }}
-            70% {{ box-shadow: 0 0 0 8px rgba(16, 185, 129, 0); }}
-            100% {{ box-shadow: 0 0 0 0 rgba(16, 185, 129, 0); }}
-        }}
-        
-        @keyframes pulse-red {{
-            0% {{ box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.4); }}
-            70% {{ box-shadow: 0 0 0 8px rgba(239, 68, 68, 0); }}
-            100% {{ box-shadow: 0 0 0 0 rgba(239, 68, 68, 0); }}
-        }}
-        
         .stats-grid {{
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 1.5rem;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 1rem;
         }}
         
         .stat-card {{
-            background: rgba(255, 255, 255, 0.02);
+            background: var(--bg-stat);
             border: 1px solid var(--border-color);
-            border-radius: 0.75rem;
-            padding: 1.25rem;
+            border-radius: 12px;
+            padding: 1rem;
             display: flex;
             flex-direction: column;
             gap: 0.25rem;
         }}
         
         .stat-val {{
-            font-size: 2rem;
+            font-size: 1.5rem;
             font-weight: 700;
         }}
         
         .stat-lbl {{
-            font-size: 0.875rem;
+            font-size: 0.75rem;
             color: var(--text-muted);
             text-transform: uppercase;
             letter-spacing: 0.05em;
@@ -957,41 +1071,35 @@ def get_dashboard_html(chat_name, resources, overall_uptime) -> str:
             font-size: 1.25rem;
             font-weight: 600;
             margin-bottom: 1rem;
-            display: flex;
-            align-items: center;
-            gap: 0.5rem;
         }}
         
         .monitors-grid {{
-            display: grid;
-            grid-template-columns: 1fr;
-            gap: 1rem;
+            display: flex;
+            flex-direction: column;
+            gap: 0.75rem;
         }}
         
         .monitor-card {{
-            background: var(--card-bg);
+            background: var(--bg-card);
             border: 1px solid var(--border-color);
-            border-radius: 0.75rem;
-            padding: 1.5rem;
-            backdrop-filter: blur(12px);
+            border-radius: 12px;
+            padding: 1.25rem;
             display: flex;
             justify-content: space-between;
             align-items: center;
             flex-wrap: wrap;
             gap: 1rem;
-            transition: transform 0.2s, border-color 0.2s;
+            transition: border-color 0.2s;
         }}
         
         .monitor-card:hover {{
-            transform: translateY(-2px);
-            border-color: rgba(255, 255, 255, 0.15);
+            border-color: #475569;
         }}
         
         .monitor-info {{
             display: flex;
             align-items: center;
             gap: 1rem;
-            min-width: 250px;
         }}
         
         .monitor-meta {{
@@ -1001,8 +1109,8 @@ def get_dashboard_html(chat_name, resources, overall_uptime) -> str:
         }}
         
         .monitor-name {{
-            font-size: 1.125rem;
             font-weight: 600;
+            font-size: 1.05rem;
         }}
         
         .monitor-url {{
@@ -1012,20 +1120,22 @@ def get_dashboard_html(chat_name, resources, overall_uptime) -> str:
         }}
         
         .monitor-type {{
+            display: inline-block;
             font-size: 0.75rem;
-            font-weight: 700;
+            padding: 0.125rem 0.375rem;
+            border-radius: 4px;
             text-transform: uppercase;
-            padding: 0.15rem 0.5rem;
-            border-radius: 0.25rem;
+            font-weight: 600;
+            color: var(--text-muted);
+            border: 1px solid var(--border-color);
             background: rgba(255, 255, 255, 0.05);
             width: max-content;
         }}
         
         .monitor-stats {{
             display: flex;
-            gap: 2rem;
+            gap: 1.5rem;
             align-items: center;
-            flex-wrap: wrap;
         }}
         
         .m-stat {{
@@ -1035,12 +1145,11 @@ def get_dashboard_html(chat_name, resources, overall_uptime) -> str:
         }}
         
         .m-val {{
-            font-size: 1.125rem;
             font-weight: 600;
         }}
         
         .m-lbl {{
-            font-size: 0.75rem;
+            font-size: 0.7rem;
             color: var(--text-muted);
             text-transform: uppercase;
             letter-spacing: 0.05em;
@@ -1052,12 +1161,10 @@ def get_dashboard_html(chat_name, resources, overall_uptime) -> str:
             font-size: 0.875rem;
             color: var(--text-muted);
             border-top: 1px solid var(--border-color);
-            background: rgba(11, 15, 25, 0.8);
-            margin-top: auto;
         }}
         
         footer a {{
-            color: #3b82f6;
+            color: #38bdf8;
             text-decoration: none;
         }}
         
@@ -1067,13 +1174,13 @@ def get_dashboard_html(chat_name, resources, overall_uptime) -> str:
         
         .empty-state {{
             text-align: center;
-            padding: 4rem 2rem;
+            padding: 3rem 1rem;
             color: var(--text-muted);
         }}
         
         .empty-icon {{
-            font-size: 3rem;
-            margin-bottom: 1rem;
+            font-size: 2.5rem;
+            margin-bottom: 0.5rem;
         }}
     </style>
 </head>
@@ -1118,6 +1225,7 @@ def get_dashboard_html(chat_name, resources, overall_uptime) -> str:
         <div class="monitors-grid">
             {monitors_html}
         </div>
+        {incidents_html}
     </main>
     
     <footer>
@@ -1142,6 +1250,7 @@ async def handle_status_page(request):
             pass
             
     resources = await asyncio.to_thread(database.get_resources, chat_id)
+    incidents = await asyncio.to_thread(database.get_recent_incidents, chat_id, 5)
     
     # Calculate average uptime
     overall_uptime = 100.0
@@ -1152,10 +1261,8 @@ async def handle_status_page(request):
             uptimes.append(u)
         overall_uptime = sum(uptimes) / len(uptimes)
         
-    html_content = get_dashboard_html(chat_name, resources, overall_uptime)
+    html_content = get_dashboard_html(chat_name, resources, overall_uptime, incidents)
     return web.Response(text=html_content, content_type="text/html")
-
-
 
 async def handle_index(request):
     global index_page_html_cache
@@ -1624,6 +1731,8 @@ def help_command(bot, accid, event):
         f"/remove <id> — Stop monitoring a resource\n"
         f"/list — List all monitors in this chat\n"
         f"/status — Show monthly uptime statistics & web link\n"
+        f"/events — View incident history and active outages\n"
+        f"/history [id] — View downtime history for monitors\n"
         f"/sync — Synchronize monitors with other bots in the chat\n"
         f"/donate — Support bot development ❤️\n"
         f"/help — Show this help message\n\n"
@@ -1874,6 +1983,119 @@ def status_command(bot, accid, event):
         reply += "\n\n💡 _Admin: Configure base URL via `/url https://domain` to get public links._"
         
     _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=reply))
+
+@dc_cli.on(events.NewMessage(command="/events"))
+@dc_cli.on(events.NewMessage(command="/incidents"))
+def events_command(bot, accid, event):
+    msg = event.msg
+    chat_id = msg.chat_id
+    
+    recent_incs = database.get_recent_incidents(chat_id, limit=10)
+    
+    if not recent_incs:
+        _dc_send_msg_with_stats(bot, accid, chat_id, MsgData(
+            text="✨ **No incidents recorded in this chat!**\nAll monitored resources have been running smoothly."
+        ))
+        return
+        
+    lines = [f"📋 **Incident Log for this Chat ({len(recent_incs)} most recent):**\n"]
+    
+    for inc in recent_incs:
+        inc_id = inc["id"]
+        status = inc["status"]
+        started_at = inc["started_at"]
+        resolved_at = inc["resolved_at"]
+        
+        start_str = datetime.datetime.fromtimestamp(started_at, tz=datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+        
+        if status == "ongoing":
+            duration_str = format_duration(int(time.time()) - started_at)
+            lines.append(
+                f"• 🚨 **Incident #{inc_id}** — `Ongoing`\n"
+                f"  Started: `{start_str} UTC` (active for `{duration_str}`)"
+            )
+        else:
+            resolved_str = datetime.datetime.fromtimestamp(resolved_at, tz=datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S') if resolved_at else "Resolved"
+            duration = max(1, (resolved_at or int(time.time())) - started_at)
+            duration_str = format_duration(duration)
+            lines.append(
+                f"• ✅ **Incident #{inc_id}** — `Resolved`\n"
+                f"  Duration: `{duration_str}` (`{start_str}` → `{resolved_str} UTC`)"
+            )
+            
+    _dc_send_msg_with_stats(bot, accid, chat_id, MsgData(text="\n".join(lines)))
+
+@dc_cli.on(events.NewMessage(command="/history"))
+def history_command(bot, accid, event):
+    msg = event.msg
+    chat_id = msg.chat_id
+    payload = (event.payload or "").strip()
+    
+    if not payload:
+        resources = database.get_resources(chat_id)
+        if not resources:
+            _dc_send_msg_with_stats(bot, accid, chat_id, MsgData(
+                text="ℹ️ No resources monitored in this chat. Add one with `/add <target>`."
+            ))
+            return
+            
+        lines = [
+            "📜 **Monitor Downtime History Guide**\n",
+            "To view the detailed outage log for a specific monitor, use `/history <id>`.\n",
+            "**Monitors in this chat:**"
+        ]
+        for r in resources:
+            name = r["name"] or r["url"]
+            uptime_val = database.get_resource_uptime_30d(r["id"])
+            lines.append(f"• `ID: {r['id']}` **{name}** — 30d Uptime: `{uptime_val:.2f}%`")
+            
+        lines.append("\n💡 Tip: Use `/events` to view the full incident history of this chat.")
+        _dc_send_msg_with_stats(bot, accid, chat_id, MsgData(text="\n".join(lines)))
+        return
+        
+    try:
+        res_id = int(payload)
+    except ValueError:
+        _dc_send_msg_with_stats(bot, accid, chat_id, MsgData(text="❌ Invalid monitor ID. Usage: `/history <id>`"))
+        return
+        
+    resources = database.get_resources(chat_id)
+    target_res = next((r for r in resources if r["id"] == res_id), None)
+    if not target_res:
+        _dc_send_msg_with_stats(bot, accid, chat_id, MsgData(text=f"❌ Monitor ID `{res_id}` not found in this chat."))
+        return
+        
+    events_list = database.get_resource_downtime_events(res_id, limit=10)
+    uptime_val = database.get_resource_uptime_30d(res_id)
+    r_name = target_res["name"] or target_res["url"]
+    r_type = target_res["type"].upper()
+    
+    lines = [
+        f"📜 **Downtime History for ID {res_id} ({r_name})**",
+        f"Target: `{target_res['url']}` ({r_type})",
+        f"Uptime 30d: `{uptime_val:.2f}%`\n"
+    ]
+    
+    if not events_list:
+        lines.append("✨ No downtime events recorded in the last 30 days!")
+    else:
+        lines.append(f"**Recorded Outages ({len(events_list)} most recent):**")
+        for ev in events_list:
+            went_down = ev["went_down_at"]
+            went_up = ev["went_up_at"]
+            error_reason = ev.get("error_msg") or "Outage"
+            
+            down_str = datetime.datetime.fromtimestamp(went_down, tz=datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+            
+            if went_up:
+                up_str = datetime.datetime.fromtimestamp(went_up, tz=datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+                duration_str = format_duration(max(1, went_up - went_down))
+                lines.append(f"• `{down_str}` → `{up_str} UTC` (`{duration_str}`) — `{error_reason}`")
+            else:
+                duration_str = format_duration(max(1, int(time.time()) - went_down))
+                lines.append(f"• 🔴 `{down_str} UTC` → `Ongoing` (`{duration_str}`) — `{error_reason}`")
+                
+    _dc_send_msg_with_stats(bot, accid, chat_id, MsgData(text="\n".join(lines)))
 
 @dc_cli.on(events.NewMessage(command="/sync"))
 def sync_command(bot, accid, event):

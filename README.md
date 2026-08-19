@@ -8,28 +8,29 @@ Additionally, it automatically generates a secure, beautiful web status dashboar
 
 - 🛡️ **Secure Administration:** Claim ownership with `/initadmin` via private chat. Cryptographic fingerprint-based authentication protects administrative actions.
 - 💬 **Per-Chat Isolation:** Each chat (private or group) maintains its own separate list of monitored resources.
-- ⚙️ **Three Check Modes:**
-  - **HTTP/HTTPS:** Checks status code and latency (e.g. `https://example.com`).
-  - **TCP Port:** Checks port availability (e.g. `example.com:22`).
-  - **Ping (ICMP):** Sends standard ICMP echo requests (e.g. `example.com`).
+- 🚨 **Incident-Based Alerting & In-Place Dynamic Updates:**
+  - Instead of flooding the chat with dozens of separate DOWN/UP messages, outages trigger a unified **Incident** per chat.
+  - As multiple monitors fail or recover, the bot edits the **same incident message in-place** with real-time status and duration metrics.
+  - When all services recover, the incident message is updated to **Resolved** with total downtime duration.
+- 📜 **Detailed Outage & Incident History:**
+  - `/events` (or `/incidents`) — View the chat's historical incident log, active outages, and total downtime durations.
+  - `/history [id]` — Inspect recent downtime events for a specific monitor with failure reasons, error codes, and recovery timestamps.
 - 🌐 **Host Outage Protection & Circuit Breaker:**
   - Automatically verifies host internet connectivity via high-speed canary checks (`1.1.1.1`, `8.8.8.8`, `9.9.9.9`, `1.0.0.1`) before declaring any resource DOWN.
   - If the bot host itself loses internet access, false mass-downtime alerts and false downtime logs are suppressed, keeping 30-day uptime metrics accurate.
-- ✍️ **Smart Alert Editing on Rapid Recovery:**
-  - If a resource recovers within **1 hour** of going DOWN, the bot edits the original 🔴 DOWN message into the 🟢 UP notification in-place instead of posting a new message, completely eliminating chat notification noise for flapping services.
 - 🔒 **SSL Certificate Expiration Monitoring:** Automatically tracks SSL/TLS certificate expiration for HTTPS targets:
   - Periodic checks cached to run at most once per hour.
   - Staged proactive alerts sent to chat at **7 days**, **3 days**, and **24 hours (1 day)** before expiration, as well as upon expiration.
   - Automatic alert state reset when certificate is renewed.
   - Real-time expiration countdown displayed in `/list` and on the Web Status Dashboard.
-- 🤖 **Identified User-Agent:** Sends a custom `User-Agent` header (e.g. `DeltaChat-Uptime-Bot/1.3.0 (https://git.gluek.info/gluek/deltachat_uptime)`) during HTTP checks so server administrators can easily identify monitoring requests in server logs.
+- 🤖 **Identified User-Agent:** Sends a custom `User-Agent` header (e.g. `DeltaChat-Uptime-Bot/1.4.0 (https://git.gluek.info/gluek/deltachat_uptime)`) during HTTP checks so server administrators can easily identify monitoring requests in server logs.
 
 - 🔄 **Failure Resiliency & Retry Logic:**
   - Checks resources once a minute.
   - If a resource check fails, the bot does not alert immediately. It retries **2 more times at 30-second intervals**.
   - Alerts are only triggered if all 3 checks fail, avoiding false positives.
   - Once a DOWN resource recovers, it is marked UP on the first successful check.
-- 📊 **Uptime Dashboards:** Generates a secure, 12-character unguessable base62 URL (e.g. `https://up.example.com/k8D2x9mPqL1a`) hosting a modern dark-themed web status dashboard for each chat.
+- 📊 **Uptime Dashboards:** Generates a secure, 12-character unguessable base62 URL (e.g. `https://up.example.com/k8D2x9mPqL1a`) hosting a modern dark-themed web status dashboard with active status, SSL metrics, and recent incident logs for each chat.
 - ✉️ **Multi-Transport Failover:** Supports multiple SMTP servers and automatically falls back to backups if message delivery fails.
 
 ---
@@ -46,6 +47,8 @@ These commands are available to any member of a chat. They support suffixes (e.g
 - `/remove <id>` — Stop monitoring a resource by ID.
 - `/list` — List monitored resources and their status in this chat.
 - `/status` — View monthly uptime statistics and get the link to the chat's secure Web Status Page.
+- `/events` — View recent incidents and active outages for this chat.
+- `/history [id]` — View downtime history and failure reasons for a monitor.
 - `/sync` — Synchronize monitored resources with other bots in the same chat (rate-limited to 1/minute for non-admins).
 - `/help` — View available commands and system information.
 

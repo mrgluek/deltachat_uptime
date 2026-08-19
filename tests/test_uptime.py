@@ -703,109 +703,185 @@ class TestUptimeBot(unittest.TestCase):
         mock_bot.rpc.send_msg.assert_not_called()
         mock_bot.rpc.send_edit_request.assert_not_called()
 
-    def test_rapid_recovery_message_editing_within_hour(self):
+    def test_incident_database_operations(self):
+        chat_id = 9911
+        inc_id = database.create_incident(chat_id)
+        self.assertIsInstance(inc_id, int)
+        
+        active = database.get_active_incident(chat_id)
+        self.assertIsNotNone(active)
+        self.assertEqual(active["id"], inc_id)
+        self.assertEqual(active["status"], "ongoing")
+        self.assertIsNone(active["msg_id"])
+        
+        database.update_incident_msg_id(inc_id, 45678)
+        active = database.get_active_incident(chat_id)
+        self.assertEqual(active["msg_id"], 45678)
+        
+        database.resolve_incident(inc_id, summary="Resolved all")
+        active_after = database.get_active_incident(chat_id)
+        self.assertIsNone(active_after)
+        
+        recent = database.get_recent_incidents(chat_id, limit=5)
+        self.assertEqual(len(recent), 1)
+        self.assertEqual(recent[0]["id"], inc_id)
+        self.assertEqual(recent[0]["status"], "resolved")
+        self.assertEqual(recent[0]["summary"], "Resolved all")
+
+    def test_downtime_events_error_reason_and_history(self):
+        chat_id = 9922
+        r_id = database.add_resource(chat_id, "https://failing.org", "Failing Site", "http")
+        
+        # Trigger DOWN with error reason
+        database.update_resource_status(r_id, "down", 1, error_msg="Timeout after 10s")
+        events = database.get_resource_downtime_events(r_id)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["error_msg"], "Timeout after 10s")
+        self.assertIsNone(events[0]["went_up_at"])
+        
+        # Trigger UP
+        database.update_resource_status(r_id, "up", 0, error_msg="200 - OK")
+        events_after = database.get_resource_downtime_events(r_id)
+        self.assertEqual(len(events_after), 1)
+        self.assertIsNotNone(events_after[0]["went_up_at"])
+
+    def test_incident_lifecycle_and_message_editing(self):
         import asyncio
-        chat_id = 3344
-        r_id = database.add_resource(chat_id, "https://flapping-service.com", "Flapping Service", "http")
-        now = int(time.time())
-        
-        # Setup resource as DOWN 10 minutes ago with an existing DOWN message ID (98765)
-        database.update_resource_status(r_id, "down", 1)
-        database.update_resource_down_msg_id(r_id, 98765)
-        
-        # Manually adjust last_changed to 10 minutes ago
-        conn = database.sqlite3.connect(TEST_DB)
-        cursor = conn.cursor()
-        cursor.execute("UPDATE resources SET last_changed = ? WHERE id = ?", (now - 600, r_id))
-        conn.commit()
-        conn.close()
+        chat_id = 9933
+        r1_id = database.add_resource(chat_id, "https://site-a.org", "Site A", "http")
+        r2_id = database.add_resource(chat_id, "https://site-b.org", "Site B", "http")
         
         mock_bot = MagicMock()
+        mock_bot.rpc.send_msg.return_value = 10001
         bot.dc_bot_instance = mock_bot
         bot.dc_accid = 1
         
-        res = database.get_resources(chat_id)[0]
-        # Notify status change: DOWN -> UP
-        asyncio.run(bot.notify_status_change(res, "down", "up", "200 - OK"))
+        # 1. Site A goes DOWN -> incident created, send_msg called
+        res_a = database.get_resources(chat_id)[0]
+        asyncio.run(bot.handle_check_result(res_a, False, "500 - Server Error"))
         
-        # Verify send_edit_request was called for msg_id 98765
-        mock_bot.rpc.send_edit_request.assert_called_once()
-        call_args = mock_bot.rpc.send_edit_request.call_args[0]
-        self.assertEqual(call_args[0], 1)
-        self.assertEqual(call_args[1], 98765)
-        self.assertIn("UP (200 - OK)", call_args[2])
-        self.assertIn("Flapping Service", call_args[2])
+        mock_bot.rpc.send_msg.assert_called_once()
+        msg_text = mock_bot.rpc.send_msg.call_args[0][2].text
+        self.assertIn("🚨 **Incident #", msg_text)
+        self.assertIn("Site A", msg_text)
+        self.assertIn("DOWN", msg_text)
         
-        # Verify no new message was posted via send_msg
+        active_inc = database.get_active_incident(chat_id)
+        self.assertIsNotNone(active_inc)
+        self.assertEqual(active_inc["msg_id"], 10001)
+        
+        # 2. Site B goes DOWN -> existing incident message edited in-place
+        mock_bot.rpc.send_msg.reset_mock()
+        mock_bot.rpc.send_edit_request.reset_mock()
+        
+        res_b = database.get_resources(chat_id)[1]
+        asyncio.run(bot.handle_check_result(res_b, False, "Connection refused"))
+        
         mock_bot.rpc.send_msg.assert_not_called()
-        
-        # Verify last_down_msg_id is reset in database
-        res_after = database.get_resources(chat_id)[0]
-        self.assertIsNone(res_after["last_down_msg_id"])
-
-    def test_recovery_message_after_hour_sends_new_message(self):
-        import asyncio
-        chat_id = 5566
-        r_id = database.add_resource(chat_id, "https://long-down.org", "Long Down Site", "http")
-        now = int(time.time())
-        
-        # Setup resource as DOWN 2 hours ago (7200s) with an existing DOWN msg_id (11111)
-        database.update_resource_status(r_id, "down", 1)
-        database.update_resource_down_msg_id(r_id, 11111)
-        
-        conn = database.sqlite3.connect(TEST_DB)
-        cursor = conn.cursor()
-        cursor.execute("UPDATE resources SET last_changed = ? WHERE id = ?", (now - 7200, r_id))
-        conn.commit()
-        conn.close()
-        
-        mock_bot = MagicMock()
-        bot.dc_bot_instance = mock_bot
-        bot.dc_accid = 1
-        
-        res = database.get_resources(chat_id)[0]
-        asyncio.run(bot.notify_status_change(res, "down", "up", "200 - OK"))
-        
-        # Verify send_edit_request was NOT called because downtime exceeded 1 hour
-        mock_bot.rpc.send_edit_request.assert_not_called()
-        
-        # Verify send_msg WAS called to post a fresh notification
-        mock_bot.rpc.send_msg.assert_called_once()
-        sent_text = mock_bot.rpc.send_msg.call_args[0][2].text
-        self.assertIn("UP (200 - OK)", sent_text)
-        
-        # Verify last_down_msg_id is reset in database
-        res_after = database.get_resources(chat_id)[0]
-        self.assertIsNone(res_after["last_down_msg_id"])
-
-    def test_recovery_message_edit_failure_fallback(self):
-        import asyncio
-        chat_id = 7788
-        r_id = database.add_resource(chat_id, "https://fallback.org", "Fallback Site", "http")
-        now = int(time.time())
-        
-        database.update_resource_status(r_id, "down", 1)
-        database.update_resource_down_msg_id(r_id, 22222)
-        
-        mock_bot = MagicMock()
-        mock_bot.rpc.send_edit_request.side_effect = Exception("Message not found or already deleted")
-        bot.dc_bot_instance = mock_bot
-        bot.dc_accid = 1
-        
-        res = database.get_resources(chat_id)[0]
-        asyncio.run(bot.notify_status_change(res, "down", "up", "200 - OK"))
-        
-        # Verify send_edit_request was attempted
         mock_bot.rpc.send_edit_request.assert_called_once()
+        edit_args = mock_bot.rpc.send_edit_request.call_args[0]
+        self.assertEqual(edit_args[1], 10001)
+        self.assertIn("Site A", edit_args[2])
+        self.assertIn("Site B", edit_args[2])
+        self.assertIn("2 / 2 monitors down", edit_args[2])
         
-        # Verify fallback to send_msg occurred
-        mock_bot.rpc.send_msg.assert_called_once()
+        # 3. Site A recovers -> message edited in-place showing partial recovery
+        mock_bot.rpc.send_msg.reset_mock()
+        mock_bot.rpc.send_edit_request.reset_mock()
         
-        # Verify last_down_msg_id is reset in database
-        res_after = database.get_resources(chat_id)[0]
-        self.assertIsNone(res_after["last_down_msg_id"])
+        res_a_down = next(r for r in database.get_resources(chat_id) if r["id"] == r1_id)
+        asyncio.run(bot.handle_check_result(res_a_down, True, "200 - OK"))
+        
+        mock_bot.rpc.send_msg.assert_not_called()
+        mock_bot.rpc.send_edit_request.assert_called_once()
+        edit_args = mock_bot.rpc.send_edit_request.call_args[0]
+        self.assertEqual(edit_args[1], 10001)
+        self.assertIn("Ongoing (Partial Recovery)", edit_args[2])
+        self.assertIn("1 / 2 monitors down", edit_args[2])
+        
+        # 4. Site B recovers -> all UP! Incident resolved, message edited to Resolved
+        mock_bot.rpc.send_msg.reset_mock()
+        mock_bot.rpc.send_edit_request.reset_mock()
+        
+        res_b_down = next(r for r in database.get_resources(chat_id) if r["id"] == r2_id)
+        asyncio.run(bot.handle_check_result(res_b_down, True, "200 - OK"))
+        
+        mock_bot.rpc.send_msg.assert_not_called()
+        mock_bot.rpc.send_edit_request.assert_called_once()
+        edit_args = mock_bot.rpc.send_edit_request.call_args[0]
+        self.assertEqual(edit_args[1], 10001)
+        self.assertIn("✅ **Incident #", edit_args[2])
+        self.assertIn("Resolved", edit_args[2])
+        self.assertIn("All 2 monitors operational", edit_args[2])
+        
+        # Incident in DB should now be resolved
+        self.assertIsNone(database.get_active_incident(chat_id))
 
-    def test_dashboard_ssl_html(self):
+    def test_events_command(self):
+        chat_id = 9944
+        mock_bot = MagicMock()
+        mock_event = MagicMock()
+        mock_event.msg.chat_id = chat_id
+        
+        # When no incidents
+        bot.events_command(mock_bot, 1, mock_event)
+        msg_text = mock_bot.rpc.send_msg.call_args[0][2].text
+        self.assertIn("No incidents recorded in this chat", msg_text)
+        
+        # When incidents exist
+        inc1_id = database.create_incident(chat_id, int(time.time()) - 300)
+        database.resolve_incident(inc1_id, int(time.time()), "Resolved")
+        inc2_id = database.create_incident(chat_id, int(time.time()))
+        
+        mock_bot.rpc.send_msg.reset_mock()
+        bot.events_command(mock_bot, 1, mock_event)
+        msg_text = mock_bot.rpc.send_msg.call_args[0][2].text
+        self.assertIn("Incident Log for this Chat", msg_text)
+        self.assertIn(f"Incident #{inc1_id}", msg_text)
+        self.assertIn(f"Incident #{inc2_id}", msg_text)
+        self.assertIn("Ongoing", msg_text)
+        self.assertIn("Resolved", msg_text)
+
+    def test_history_command(self):
+        chat_id = 9955
+        mock_bot = MagicMock()
+        mock_event = MagicMock()
+        mock_event.msg.chat_id = chat_id
+        
+        # 1. No payload -> guide & list of monitors
+        mock_event.payload = ""
+        r_id = database.add_resource(chat_id, "https://history-site.com", "History Site", "http")
+        
+        bot.history_command(mock_bot, 1, mock_event)
+        msg_text = mock_bot.rpc.send_msg.call_args[0][2].text
+        self.assertIn("Monitor Downtime History Guide", msg_text)
+        self.assertIn(f"ID: {r_id}", msg_text)
+        self.assertIn("History Site", msg_text)
+        
+        # 2. Invalid ID payload
+        mock_event.payload = "abc"
+        bot.history_command(mock_bot, 1, mock_event)
+        msg_text = mock_bot.rpc.send_msg.call_args[0][2].text
+        self.assertIn("Invalid monitor ID", msg_text)
+        
+        # 3. Nonexistent ID payload
+        mock_event.payload = "99999"
+        bot.history_command(mock_bot, 1, mock_event)
+        msg_text = mock_bot.rpc.send_msg.call_args[0][2].text
+        self.assertIn("not found in this chat", msg_text)
+        
+        # 4. Valid ID with downtime events
+        database.update_resource_status(r_id, "down", 1, error_msg="HTTP 502 Bad Gateway")
+        database.update_resource_status(r_id, "up", 0, error_msg="200 - OK")
+        
+        mock_event.payload = str(r_id)
+        bot.history_command(mock_bot, 1, mock_event)
+        msg_text = mock_bot.rpc.send_msg.call_args[0][2].text
+        self.assertIn(f"Downtime History for ID {r_id}", msg_text)
+        self.assertIn("Recorded Outages", msg_text)
+        self.assertIn("HTTP 502 Bad Gateway", msg_text)
+
+    def test_dashboard_ssl_and_incidents_html(self):
         now = int(time.time())
         resources = [
             {
@@ -827,9 +903,20 @@ class TestUptimeBot(unittest.TestCase):
                 "ssl_expiry_date": None
             }
         ]
-        html_out = bot.get_dashboard_html("Test Chat", resources, 100.0)
+        incidents = [
+            {
+                "id": 101,
+                "status": "resolved",
+                "started_at": now - 3600,
+                "resolved_at": now - 1800,
+                "summary": "Resolved"
+            }
+        ]
+        html_out = bot.get_dashboard_html("Test Chat", resources, 100.0, incidents)
         self.assertIn("SSL Cert", html_out)
         self.assertIn("45d left", html_out)
+        self.assertIn("Recent Incidents", html_out)
+        self.assertIn("Incident #101 — Resolved", html_out)
 
     def test_index_page_ssl_info(self):
         import asyncio

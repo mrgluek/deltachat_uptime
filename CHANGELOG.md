@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-08-19
+
+### Added
+- **Host Outage Protection & Canary Connectivity Checks:**
+  - Automated outbound internet check across multiple fast DNS canary endpoints (`1.1.1.1:53`, `8.8.8.8:53`, `9.9.9.9:53`, `1.0.0.1:53`) before declaring any monitored resource DOWN.
+  - Suppresses false mass-downtime alerts and avoids corrupting 30-day uptime statistics during host network partitions or server internet outages.
+- **Circuit Breaker for Mass Failures:**
+  - Automatically pauses check execution and alerts when host network loss is detected, resuming smoothly when connectivity is restored.
+- **Smart In-Place Alert Editing on Rapid Recovery:**
+  - When a resource recovers within 1 hour of going DOWN, the bot edits the original 🔴 DOWN message directly in the Delta Chat chat via `send_edit_request` into the 🟢 UP status instead of sending a separate notification, eliminating chat spam from flapping services.
+  - Automatically falls back to posting a new notification message if downtime exceeds 1 hour or if message editing fails.
+
 ## [1.2.0] - 2026-08-14
 
 ### Added

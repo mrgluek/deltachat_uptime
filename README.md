@@ -12,12 +12,17 @@ Additionally, it automatically generates a secure, beautiful web status dashboar
   - **HTTP/HTTPS:** Checks status code and latency (e.g. `https://example.com`).
   - **TCP Port:** Checks port availability (e.g. `example.com:22`).
   - **Ping (ICMP):** Sends standard ICMP echo requests (e.g. `example.com`).
+- 🌐 **Host Outage Protection & Circuit Breaker:**
+  - Automatically verifies host internet connectivity via high-speed canary checks (`1.1.1.1`, `8.8.8.8`, `9.9.9.9`, `1.0.0.1`) before declaring any resource DOWN.
+  - If the bot host itself loses internet access, false mass-downtime alerts and false downtime logs are suppressed, keeping 30-day uptime metrics accurate.
+- ✍️ **Smart Alert Editing on Rapid Recovery:**
+  - If a resource recovers within **1 hour** of going DOWN, the bot edits the original 🔴 DOWN message into the 🟢 UP notification in-place instead of posting a new message, completely eliminating chat notification noise for flapping services.
 - 🔒 **SSL Certificate Expiration Monitoring:** Automatically tracks SSL/TLS certificate expiration for HTTPS targets:
   - Periodic checks cached to run at most once per hour.
   - Staged proactive alerts sent to chat at **7 days**, **3 days**, and **24 hours (1 day)** before expiration, as well as upon expiration.
   - Automatic alert state reset when certificate is renewed.
   - Real-time expiration countdown displayed in `/list` and on the Web Status Dashboard.
-- 🤖 **Identified User-Agent:** Sends a custom `User-Agent` header (e.g. `DeltaChat-Uptime-Bot/1.2.0 (https://git.gluek.info/gluek/deltachat_uptime)`) during HTTP checks so server administrators can easily identify monitoring requests in server logs.
+- 🤖 **Identified User-Agent:** Sends a custom `User-Agent` header (e.g. `DeltaChat-Uptime-Bot/1.3.0 (https://git.gluek.info/gluek/deltachat_uptime)`) during HTTP checks so server administrators can easily identify monitoring requests in server logs.
 
 - 🔄 **Failure Resiliency & Retry Logic:**
   - Checks resources once a minute.

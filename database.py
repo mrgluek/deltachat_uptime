@@ -50,11 +50,12 @@ def init_db():
                 ssl_expiry_date INTEGER,
                 ssl_last_checked INTEGER,
                 ssl_alert_state INTEGER DEFAULT 0,
+                last_down_msg_id INTEGER,
                 UNIQUE(dc_chat_id, url)
             )
         ''')
         
-        # Ensure new SSL columns exist in resources table
+        # Ensure new SSL and tracking columns exist in resources table
         cursor.execute("PRAGMA table_info(resources)")
         columns = [row[1] for row in cursor.fetchall()]
         if "ssl_expiry_date" not in columns:
@@ -63,6 +64,8 @@ def init_db():
             cursor.execute("ALTER TABLE resources ADD COLUMN ssl_last_checked INTEGER")
         if "ssl_alert_state" not in columns:
             cursor.execute("ALTER TABLE resources ADD COLUMN ssl_alert_state INTEGER DEFAULT 0")
+        if "last_down_msg_id" not in columns:
+            cursor.execute("ALTER TABLE resources ADD COLUMN last_down_msg_id INTEGER")
         
         # Downtime events for uptime calculations
         cursor.execute('''
@@ -270,6 +273,18 @@ def update_ssl_alert_state(resource_id: int, ssl_alert_state: int):
             SET ssl_alert_state = ? 
             WHERE id = ?
         ''', (ssl_alert_state, resource_id))
+        conn.commit()
+        conn.close()
+
+def update_resource_down_msg_id(resource_id: int, msg_id: int | None):
+    with _lock:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute('''
+            UPDATE resources 
+            SET last_down_msg_id = ? 
+            WHERE id = ?
+        ''', (msg_id, resource_id))
         conn.commit()
         conn.close()
 

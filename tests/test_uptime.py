@@ -631,6 +631,180 @@ class TestUptimeBot(unittest.TestCase):
         # Plain HTTP should not have SSL tag
         self.assertNotIn("Plain HTTP**\n  Target: `http://plain-http.com` (HTTP)\n  Uptime 30d: `100.00%` | Status: `UNKNOWN` | SSL", text)
 
+    def test_database_down_msg_id(self):
+        chat_id = 9988
+        r_id = database.add_resource(chat_id, "https://msg-track.org", "Track Site", "http")
+        self.assertIsNotNone(r_id)
+        
+        # Initial last_down_msg_id should be None
+        res = database.get_resources(chat_id)
+        self.assertEqual(len(res), 1)
+        self.assertIsNone(res[0]["last_down_msg_id"])
+        
+        # Update last_down_msg_id
+        database.update_resource_down_msg_id(r_id, 45678)
+        res = database.get_resources(chat_id)
+        self.assertEqual(res[0]["last_down_msg_id"], 45678)
+        
+        # Reset to None
+        database.update_resource_down_msg_id(r_id, None)
+        res = database.get_resources(chat_id)
+        self.assertIsNone(res[0]["last_down_msg_id"])
+
+    def test_check_host_internet_connectivity(self):
+        import asyncio
+        bot._canary_last_checked = 0.0
+        bot._host_outage_active = False
+        
+        # Case 1: Online - open_connection succeeds
+        mock_writer = MagicMock()
+        mock_writer.wait_closed = MagicMock()
+        async def mock_open_conn(*args, **kwargs):
+            return MagicMock(), mock_writer
+            
+        with patch('asyncio.open_connection', side_effect=mock_open_conn):
+            is_online = asyncio.run(bot.check_host_internet_connectivity(timeout=1.0, max_age=0.0))
+            self.assertTrue(is_online)
+            self.assertFalse(bot._host_outage_active)
+            
+        # Case 2: Offline - open_connection fails for all canaries
+        bot._canary_last_checked = 0.0
+        async def mock_open_conn_fail(*args, **kwargs):
+            raise OSError("Network unreachable")
+            
+        with patch('asyncio.open_connection', side_effect=mock_open_conn_fail):
+            is_online = asyncio.run(bot.check_host_internet_connectivity(timeout=1.0, max_age=0.0))
+            self.assertFalse(is_online)
+            self.assertTrue(bot._host_outage_active)
+
+    def test_host_outage_suppression(self):
+        import asyncio
+        chat_id = 1122
+        r_id = database.add_resource(chat_id, "https://outage-test.org", "Outage Test", "http")
+        database.update_resource_status(r_id, "up", 0)
+        
+        mock_bot = MagicMock()
+        bot.dc_bot_instance = mock_bot
+        bot.dc_accid = 1
+        
+        # Simulate target check failing AND host internet being down
+        with patch('bot.run_single_check', return_value=(False, "Connection timeout")), \
+             patch('bot.check_host_internet_connectivity', return_value=False), \
+             patch('asyncio.sleep', return_value=None):
+            res_list = database.get_resources(chat_id)
+            semaphore = asyncio.Semaphore(5)
+            asyncio.run(bot.check_group_task(res_list, semaphore))
+            
+        # Resource should NOT transition to DOWN in DB
+        res = database.get_resources(chat_id)[0]
+        self.assertEqual(res["status"], "up")
+        
+        # No alert message should have been sent to chat
+        mock_bot.rpc.send_msg.assert_not_called()
+        mock_bot.rpc.send_edit_request.assert_not_called()
+
+    def test_rapid_recovery_message_editing_within_hour(self):
+        import asyncio
+        chat_id = 3344
+        r_id = database.add_resource(chat_id, "https://flapping-service.com", "Flapping Service", "http")
+        now = int(time.time())
+        
+        # Setup resource as DOWN 10 minutes ago with an existing DOWN message ID (98765)
+        database.update_resource_status(r_id, "down", 1)
+        database.update_resource_down_msg_id(r_id, 98765)
+        
+        # Manually adjust last_changed to 10 minutes ago
+        conn = database.sqlite3.connect(TEST_DB)
+        cursor = conn.cursor()
+        cursor.execute("UPDATE resources SET last_changed = ? WHERE id = ?", (now - 600, r_id))
+        conn.commit()
+        conn.close()
+        
+        mock_bot = MagicMock()
+        bot.dc_bot_instance = mock_bot
+        bot.dc_accid = 1
+        
+        res = database.get_resources(chat_id)[0]
+        # Notify status change: DOWN -> UP
+        asyncio.run(bot.notify_status_change(res, "down", "up", "200 - OK"))
+        
+        # Verify send_edit_request was called for msg_id 98765
+        mock_bot.rpc.send_edit_request.assert_called_once()
+        call_args = mock_bot.rpc.send_edit_request.call_args[0]
+        self.assertEqual(call_args[0], 1)
+        self.assertEqual(call_args[1], 98765)
+        self.assertIn("UP (200 - OK)", call_args[2])
+        self.assertIn("Flapping Service", call_args[2])
+        
+        # Verify no new message was posted via send_msg
+        mock_bot.rpc.send_msg.assert_not_called()
+        
+        # Verify last_down_msg_id is reset in database
+        res_after = database.get_resources(chat_id)[0]
+        self.assertIsNone(res_after["last_down_msg_id"])
+
+    def test_recovery_message_after_hour_sends_new_message(self):
+        import asyncio
+        chat_id = 5566
+        r_id = database.add_resource(chat_id, "https://long-down.org", "Long Down Site", "http")
+        now = int(time.time())
+        
+        # Setup resource as DOWN 2 hours ago (7200s) with an existing DOWN msg_id (11111)
+        database.update_resource_status(r_id, "down", 1)
+        database.update_resource_down_msg_id(r_id, 11111)
+        
+        conn = database.sqlite3.connect(TEST_DB)
+        cursor = conn.cursor()
+        cursor.execute("UPDATE resources SET last_changed = ? WHERE id = ?", (now - 7200, r_id))
+        conn.commit()
+        conn.close()
+        
+        mock_bot = MagicMock()
+        bot.dc_bot_instance = mock_bot
+        bot.dc_accid = 1
+        
+        res = database.get_resources(chat_id)[0]
+        asyncio.run(bot.notify_status_change(res, "down", "up", "200 - OK"))
+        
+        # Verify send_edit_request was NOT called because downtime exceeded 1 hour
+        mock_bot.rpc.send_edit_request.assert_not_called()
+        
+        # Verify send_msg WAS called to post a fresh notification
+        mock_bot.rpc.send_msg.assert_called_once()
+        sent_text = mock_bot.rpc.send_msg.call_args[0][2].text
+        self.assertIn("UP (200 - OK)", sent_text)
+        
+        # Verify last_down_msg_id is reset in database
+        res_after = database.get_resources(chat_id)[0]
+        self.assertIsNone(res_after["last_down_msg_id"])
+
+    def test_recovery_message_edit_failure_fallback(self):
+        import asyncio
+        chat_id = 7788
+        r_id = database.add_resource(chat_id, "https://fallback.org", "Fallback Site", "http")
+        now = int(time.time())
+        
+        database.update_resource_status(r_id, "down", 1)
+        database.update_resource_down_msg_id(r_id, 22222)
+        
+        mock_bot = MagicMock()
+        mock_bot.rpc.send_edit_request.side_effect = Exception("Message not found or already deleted")
+        bot.dc_bot_instance = mock_bot
+        bot.dc_accid = 1
+        
+        res = database.get_resources(chat_id)[0]
+        asyncio.run(bot.notify_status_change(res, "down", "up", "200 - OK"))
+        
+        # Verify send_edit_request was attempted
+        mock_bot.rpc.send_edit_request.assert_called_once()
+        
+        # Verify fallback to send_msg occurred
+        mock_bot.rpc.send_msg.assert_called_once()
+        
+        # Verify last_down_msg_id is reset in database
+        res_after = database.get_resources(chat_id)[0]
+        self.assertIsNone(res_after["last_down_msg_id"])
+
     def test_dashboard_ssl_html(self):
         now = int(time.time())
         resources = [

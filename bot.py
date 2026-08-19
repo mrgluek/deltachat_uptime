@@ -21,7 +21,7 @@ import database
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 USER_AGENT = f"DeltaChat-Uptime-Bot/{VERSION} (https://git.gluek.info/gluek/deltachat_uptime)"
 
 dc_cli = BotCli("uptimebot")
@@ -31,6 +31,63 @@ last_sync_times = {}
 # Global references
 dc_bot_instance = None
 dc_accid = None
+
+# Canary targets for verifying host outbound internet connectivity
+CANARY_TARGETS = [
+    ("1.1.1.1", 53),
+    ("8.8.8.8", 53),
+    ("9.9.9.9", 53),
+    ("1.0.0.1", 53),
+]
+_canary_cache_lock = asyncio.Lock()
+_canary_last_checked = 0.0
+_canary_last_result = True
+_host_outage_active = False
+
+async def _test_single_canary(host: str, port: int, timeout: float) -> bool:
+    try:
+        _, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port),
+            timeout=timeout
+        )
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return False
+
+async def check_host_internet_connectivity(timeout: float = 2.5, max_age: float = 5.0) -> bool:
+    """Verifies that the bot host has outbound internet connectivity via fast canary checks."""
+    global _canary_last_checked, _canary_last_result, _host_outage_active
+    now = time.time()
+    
+    if now - _canary_last_checked < max_age:
+        return _canary_last_result
+        
+    async with _canary_cache_lock:
+        if time.time() - _canary_last_checked < max_age:
+            return _canary_last_result
+            
+        tasks = [_test_single_canary(host, port, timeout) for host, port in CANARY_TARGETS]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        is_online = any(r is True for r in results)
+        
+        _canary_last_checked = time.time()
+        _canary_last_result = is_online
+        
+        if not is_online:
+            if not _host_outage_active:
+                logger.warning("Host network outage detected! Canary checks failed. Suppressing false DOWN alerts.")
+                _host_outage_active = True
+        else:
+            if _host_outage_active:
+                logger.info("Host network connectivity restored.")
+                _host_outage_active = False
+                
+        return is_online
 
 # Async event loop and task tracking for check scheduler
 async_event_loop = None
@@ -412,6 +469,15 @@ async def check_group_task(group, semaphore):
                 is_up, error_msg = await run_single_check(rep)
                 if is_up:
                     break
+
+        # Host Outage Protection: If check failed, verify host internet before marking DOWN
+        if not is_up:
+            has_internet = await check_host_internet_connectivity()
+            if not has_internet:
+                logger.warning(
+                    f"Host internet outage detected! Suppressing DOWN check result for {rep['name'] or rep['url']} in chat {rep['dc_chat_id']}"
+                )
+                return
                     
         for r in group:
             logger.info(f"Check result: {r['name'] or r['url']} (id: {r['id']}) in chat {r['dc_chat_id']} -> {'UP' if is_up else 'DOWN'} ({error_msg})")
@@ -478,6 +544,9 @@ async def notify_status_change(resource, old_status, status, error_msg):
     url = resource["url"]
     type_upper = resource["type"].upper()
     chat_id = resource["dc_chat_id"]
+    last_down_msg_id = resource.get("last_down_msg_id")
+    last_changed = resource.get("last_changed") or 0
+    now = int(time.time())
     
     uptime_val = await asyncio.to_thread(database.get_resource_uptime_30d, res_id)
     uptime_str = f"{uptime_val:.2f}%"
@@ -496,15 +565,48 @@ async def notify_status_change(resource, old_status, status, error_msg):
         )
         
     if dc_bot_instance and dc_accid is not None:
-        try:
-            await asyncio.to_thread(
-                dc_bot_instance.rpc.send_msg,
-                dc_accid,
-                chat_id,
-                MsgData(text=msg_text)
-            )
-        except Exception as e:
-            logger.error(f"Failed to send status alert to chat {chat_id}: {e}")
+        if status == "down":
+            try:
+                sent_msg_id = await asyncio.to_thread(
+                    dc_bot_instance.rpc.send_msg,
+                    dc_accid,
+                    chat_id,
+                    MsgData(text=msg_text)
+                )
+                if sent_msg_id:
+                    await asyncio.to_thread(database.update_resource_down_msg_id, res_id, sent_msg_id)
+            except Exception as e:
+                logger.error(f"Failed to send status alert to chat {chat_id}: {e}")
+        else:
+            edited = False
+            # If recovering from DOWN and downtime was <= 1 hour (3600s), edit the existing DOWN message
+            if old_status == "down" and last_down_msg_id and (now - last_changed <= 3600):
+                try:
+                    await asyncio.to_thread(
+                        dc_bot_instance.rpc.send_edit_request,
+                        dc_accid,
+                        last_down_msg_id,
+                        msg_text
+                    )
+                    logger.info(f"Edited DOWN message {last_down_msg_id} -> UP for resource {res_id} in chat {chat_id}")
+                    edited = True
+                except Exception as e:
+                    logger.warning(f"Failed to edit DOWN message {last_down_msg_id} for resource {res_id} (falling back to new message): {e}")
+                    edited = False
+
+            if not edited:
+                try:
+                    await asyncio.to_thread(
+                        dc_bot_instance.rpc.send_msg,
+                        dc_accid,
+                        chat_id,
+                        MsgData(text=msg_text)
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to send status alert to chat {chat_id}: {e}")
+
+            if last_down_msg_id:
+                await asyncio.to_thread(database.update_resource_down_msg_id, res_id, None)
 
 async def run_and_track_group(group, semaphore):
     try:
@@ -522,6 +624,14 @@ async def monitoring_scheduler_loop():
     semaphore = asyncio.Semaphore(50)
     while True:
         try:
+            # If host network outage was detected, verify connectivity before launching checks
+            if _host_outage_active:
+                is_online = await check_host_internet_connectivity(timeout=2.0, max_age=0.0)
+                if not is_online:
+                    logger.warning("Host network outage is still active. Pausing monitoring checks for 10 seconds...")
+                    await asyncio.sleep(10)
+                    continue
+
             resources = await asyncio.to_thread(database.get_all_resources)
             now = int(time.time())
             

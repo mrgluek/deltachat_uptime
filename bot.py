@@ -21,7 +21,7 @@ import database
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 USER_AGENT = f"DeltaChat-Uptime-Bot/{VERSION} (https://git.gluek.info/gluek/deltachat_uptime)"
 
 dc_cli = BotCli("uptimebot")
@@ -692,9 +692,90 @@ async def sync_chat_incident_state(dc_chat_id: int):
                             except Exception as ex:
                                 logger.error(f"Failed to send resolved incident message to chat {dc_chat_id}: {ex}")
 
+async def check_stale_downtime_notifications(resource, now: int):
+    """Check for continuous prolonged downtime and send 7d notice, 14d warning, or execute 30d auto-cleanup."""
+    res = await asyncio.to_thread(database.get_resource_by_id, resource["id"])
+    if not res or res["status"] != "down":
+        return
+
+    last_changed = res.get("last_changed") or now
+    down_duration = now - last_changed
+    stale_level = res.get("stale_warning_level") or 0
+
+    dc_chat_id = res["dc_chat_id"]
+    res_id = res["id"]
+    res_name = res.get("name") or res.get("url")
+    res_url = res.get("url")
+
+    # 30 Days (2,592,000s): Auto-cleanup and notify chat
+    if down_duration >= 30 * 86400:
+        logger.warning(f"Resource {res_id} ({res_name}) in chat {dc_chat_id} has been down for 30+ days. Auto-removing from monitoring...")
+        await asyncio.to_thread(database.delete_resource, dc_chat_id, res_id)
+        cleanup_text = (
+            f"🗑️ **Auto-Cleanup (30 Days Unreachable)**\n\n"
+            f"Resource **{res_name}** (`ID: {res_id}`) targeting `{res_url}` has had 0% uptime for **30 days** "
+            f"and has been automatically removed from monitoring."
+        )
+        try:
+            if dc_bot_instance and dc_accid:
+                await asyncio.to_thread(
+                    _dc_send_msg_with_stats,
+                    dc_bot_instance,
+                    dc_accid,
+                    dc_chat_id,
+                    MsgData(text=cleanup_text)
+                )
+        except Exception as ex:
+            logger.error(f"Failed to send 30d auto-cleanup message to chat {dc_chat_id}: {ex}")
+        await sync_chat_incident_state(dc_chat_id)
+        return
+
+    # 14 Days (1,209,600s): Warning before 30d auto-removal
+    elif down_duration >= 14 * 86400 and stale_level < 14:
+        await asyncio.to_thread(database.update_stale_warning_level, res_id, 14)
+        warn_text = (
+            f"⚠️ **Downtime Warning (14 Days Unreachable)**\n\n"
+            f"Resource **{res_name}** (`ID: {res_id}`) targeting `{res_url}` has been continuously unreachable for **14 days**.\n\n"
+            f"💡 _Please note: resources that remain at 0% uptime for **30 days** will be automatically removed from monitoring._ "
+            f"You can remove it anytime using `/remove {res_id}`."
+        )
+        try:
+            if dc_bot_instance and dc_accid:
+                await asyncio.to_thread(
+                    _dc_send_msg_with_stats,
+                    dc_bot_instance,
+                    dc_accid,
+                    dc_chat_id,
+                    MsgData(text=warn_text)
+                )
+        except Exception as ex:
+            logger.error(f"Failed to send 14d warning message to chat {dc_chat_id}: {ex}")
+
+    # 7 Days (604,800s): Notice to remove decommissioned services
+    elif down_duration >= 7 * 86400 and stale_level < 7:
+        await asyncio.to_thread(database.update_stale_warning_level, res_id, 7)
+        notice_text = (
+            f"⚠️ **Downtime Notice (7 Days Unreachable)**\n\n"
+            f"Resource **{res_name}** (`ID: {res_id}`) targeting `{res_url}` has been continuously unreachable for **7 days**.\n\n"
+            f"If this service has been permanently retired or decommissioned, consider removing it from monitoring with `/remove {res_id}`."
+        )
+        try:
+            if dc_bot_instance and dc_accid:
+                await asyncio.to_thread(
+                    _dc_send_msg_with_stats,
+                    dc_bot_instance,
+                    dc_accid,
+                    dc_chat_id,
+                    MsgData(text=notice_text)
+                )
+        except Exception as ex:
+            logger.error(f"Failed to send 7d notice message to chat {dc_chat_id}: {ex}")
+
+
 async def handle_check_result(resource, is_up, error_msg):
     status = "up" if is_up else "down"
     old_status = resource["status"]
+    now = int(time.time())
     
     failures = 0 if is_up else (resource["consecutive_failures"] + 1)
     await asyncio.to_thread(database.update_resource_status, resource["id"], status, failures, error_msg)
@@ -706,6 +787,10 @@ async def handle_check_result(resource, is_up, error_msg):
             
     if should_sync:
         await sync_chat_incident_state(resource["dc_chat_id"])
+
+    # If resource is down, evaluate 7d/14d/30d stale downtime reminders and auto-cleanup
+    if not is_up:
+        await check_stale_downtime_notifications(resource, now)
 
 async def run_and_track_group(group, semaphore):
     try:

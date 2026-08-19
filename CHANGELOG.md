@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.0] - 2026-08-19
+
+### Added
+- **Stale Resource Downtime Notices (7 Days & 14 Days):**
+  - Sends a reminder at **7 days** of continuous downtime suggesting removal if the target was decommissioned.
+  - Sends a warning at **14 days** of continuous downtime notifying that monitors with 0% uptime for **30 days** will be automatically purged.
+- **30-Day Continuous Downtime Auto-Cleanup:**
+  - Automatically deletes resources that remain unreachable for **30 consecutive days** (0% uptime) from monitoring and notifies the chat with an auto-cleanup message.
+- **State Tracking & Recovery Reset:**
+  - Persists `stale_warning_level` per resource to prevent duplicate reminder notifications per downtime streak, and automatically resets the level to `0` whenever a resource recovers (`UP`).
+
 ## [1.4.0] - 2026-08-19
 
 ### Added

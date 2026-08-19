@@ -66,6 +66,8 @@ def init_db():
             cursor.execute("ALTER TABLE resources ADD COLUMN ssl_alert_state INTEGER DEFAULT 0")
         if "last_down_msg_id" not in columns:
             cursor.execute("ALTER TABLE resources ADD COLUMN last_down_msg_id INTEGER")
+        if "stale_warning_level" not in columns:
+            cursor.execute("ALTER TABLE resources ADD COLUMN stale_warning_level INTEGER DEFAULT 0")
         
         # Downtime events for uptime calculations
         cursor.execute('''
@@ -217,6 +219,16 @@ def get_resources(dc_chat_id: int) -> list[dict]:
         conn.close()
         return [dict(r) for r in rows]
 
+def get_resource_by_id(resource_id: int) -> dict | None:
+    with _lock:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM resources WHERE id = ?", (resource_id,))
+        row = cursor.fetchone()
+        conn.close()
+        return dict(row) if row else None
+
 def get_all_resources() -> list[dict]:
     with _lock:
         conn = sqlite3.connect(DB_PATH)
@@ -258,12 +270,17 @@ def update_resource_status(resource_id: int, status: str, consecutive_failures: 
                     VALUES (?, ?, NULL, ?)
                 ''', (resource_id, now, error_msg))
             elif status == "up" and old_status == "down":
-                # Close existing downtime event
+                # Close existing downtime event and reset stale warning level
                 cursor.execute('''
                     UPDATE downtime_events 
                     SET went_up_at = ? 
                     WHERE resource_id = ? AND went_up_at IS NULL
                 ''', (now, resource_id))
+                cursor.execute('''
+                    UPDATE resources 
+                    SET stale_warning_level = 0 
+                    WHERE id = ?
+                ''', (resource_id,))
         else:
             # No status change
             cursor.execute('''
@@ -272,6 +289,15 @@ def update_resource_status(resource_id: int, status: str, consecutive_failures: 
                 WHERE id = ?
             ''', (now, consecutive_failures, resource_id))
             
+        conn.commit()
+        conn.close()
+
+def update_stale_warning_level(resource_id: int, level: int):
+    """Update the highest stale downtime warning level sent for this resource (0, 7, 14)."""
+    with _lock:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("UPDATE resources SET stale_warning_level = ? WHERE id = ?", (level, resource_id))
         conn.commit()
         conn.close()
 

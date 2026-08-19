@@ -23,7 +23,11 @@ Additionally, it automatically generates a secure, beautiful web status dashboar
   - Staged proactive alerts sent to chat at **7 days**, **3 days**, and **24 hours (1 day)** before expiration, as well as upon expiration.
   - Automatic alert state reset when certificate is renewed.
   - Real-time expiration countdown displayed in `/list` and on the Web Status Dashboard.
-- 🤖 **Identified User-Agent:** Sends a custom `User-Agent` header (e.g. `DeltaChat-Uptime-Bot/1.4.0 (https://git.gluek.info/gluek/deltachat_uptime)`) during HTTP checks so server administrators can easily identify monitoring requests in server logs.
+- 🧹 **Stale Resource Notices & 30-Day Auto-Cleanup:**
+  - **7-Day Notice:** Sends a notice when a resource is continuously unreachable for 7 days, suggesting removal if decommissioned.
+  - **14-Day Warning:** Sends a warning at 14 days of continuous downtime, advising that 30-day unreachable monitors are automatically removed.
+  - **30-Day Auto-Cleanup:** Automatically deletes resources with continuous 0% uptime for 30 days and notifies the chat of the removal.
+- 🤖 **Identified User-Agent:** Sends a custom `User-Agent` header (e.g. `DeltaChat-Uptime-Bot/1.5.0 (https://git.gluek.info/gluek/deltachat_uptime)`) during HTTP checks so server administrators can easily identify monitoring requests in server logs.
 
 - 🔄 **Failure Resiliency & Retry Logic:**
   - Checks resources once a minute.

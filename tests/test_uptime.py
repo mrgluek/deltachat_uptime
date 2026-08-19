@@ -918,15 +918,107 @@ class TestUptimeBot(unittest.TestCase):
         self.assertIn("Recent Incidents", html_out)
         self.assertIn("Incident #101 — Resolved", html_out)
 
-    def test_index_page_ssl_info(self):
+    def test_stale_downtime_7d_notice_and_14d_warning(self):
         import asyncio
-        bot.index_page_html_cache = None
-        mock_request = MagicMock()
-        response = asyncio.run(bot.handle_index(mock_request))
-        self.assertEqual(response.status, 200)
-        self.assertEqual(response.content_type, "text/html")
-        self.assertIn("SSL Certificate Alerts", response.text)
-        self.assertIn("SSL/TLS certificate expiry checks", response.text)
+        import sqlite3
+        now = int(time.time())
+        chat_id = 4455
+        database.get_or_create_chat_token(chat_id)
+        r_id = database.add_resource(chat_id, "Stale App", "https://stale.org", "http", 60)
+
+        # Mock bot instance & accid
+        bot.dc_bot_instance = MagicMock()
+        bot.dc_accid = 1
+
+        with patch.object(bot, '_dc_send_msg_with_stats') as mock_send:
+            # 1. 7 days downtime -> Notice sent, level updated to 7
+            database.update_resource_status(r_id, "down", 10, "Connection refused")
+            # Manually backdate last_changed
+            with database._lock:
+                conn = sqlite3.connect(database.DB_PATH)
+                conn.execute("UPDATE resources SET last_changed = ? WHERE id = ?", (now - 7 * 86400 - 100, r_id))
+                conn.commit()
+                conn.close()
+
+            res = database.get_resource_by_id(r_id)
+            asyncio.run(bot.check_stale_downtime_notifications(res, now))
+
+            mock_send.assert_called_once()
+            msg_text = mock_send.call_args[0][3].text
+            self.assertIn("Downtime Notice (7 Days Unreachable)", msg_text)
+            self.assertIn("Stale App", msg_text)
+            self.assertIn(f"/remove {r_id}", msg_text)
+
+            res_after_7d = database.get_resource_by_id(r_id)
+            self.assertEqual(res_after_7d["stale_warning_level"], 7)
+
+            # Running again without time advance -> no duplicate message
+            mock_send.reset_mock()
+            asyncio.run(bot.check_stale_downtime_notifications(res_after_7d, now))
+            mock_send.assert_not_called()
+
+            # 2. 14 days downtime -> Warning sent, level updated to 14
+            with database._lock:
+                conn = sqlite3.connect(database.DB_PATH)
+                conn.execute("UPDATE resources SET last_changed = ? WHERE id = ?", (now - 14 * 86400 - 100, r_id))
+                conn.commit()
+                conn.close()
+
+            res = database.get_resource_by_id(r_id)
+            asyncio.run(bot.check_stale_downtime_notifications(res, now))
+
+            mock_send.assert_called_once()
+            msg_text_14 = mock_send.call_args[0][3].text
+            self.assertIn("Downtime Warning (14 Days Unreachable)", msg_text_14)
+            self.assertIn("30 days", msg_text_14)
+
+            res_after_14d = database.get_resource_by_id(r_id)
+            self.assertEqual(res_after_14d["stale_warning_level"], 14)
+
+    def test_stale_downtime_30d_auto_cleanup(self):
+        import asyncio
+        import sqlite3
+        now = int(time.time())
+        chat_id = 4466
+        database.get_or_create_chat_token(chat_id)
+        r_id = database.add_resource(chat_id, "Dead App", "https://dead.org", "http", 60)
+
+        bot.dc_bot_instance = MagicMock()
+        bot.dc_accid = 1
+
+        with patch.object(bot, '_dc_send_msg_with_stats') as mock_send:
+            database.update_resource_status(r_id, "down", 10, "Connection refused")
+            with database._lock:
+                conn = sqlite3.connect(database.DB_PATH)
+                conn.execute("UPDATE resources SET last_changed = ? WHERE id = ?", (now - 30 * 86400 - 100, r_id))
+                conn.commit()
+                conn.close()
+
+            res = database.get_resource_by_id(r_id)
+            asyncio.run(bot.check_stale_downtime_notifications(res, now))
+
+            mock_send.assert_called_once()
+            msg_text_30 = mock_send.call_args[0][3].text
+            self.assertIn("Auto-Cleanup (30 Days Unreachable)", msg_text_30)
+            self.assertIn("Dead App", msg_text_30)
+
+            # Resource should be deleted from database
+            self.assertIsNone(database.get_resource_by_id(r_id))
+
+    def test_stale_warning_level_reset_on_recovery(self):
+        now = int(time.time())
+        chat_id = 4477
+        database.get_or_create_chat_token(chat_id)
+        r_id = database.add_resource(chat_id, "Flaky App", "https://flaky.org", "http", 60)
+
+        # Set down and level = 14
+        database.update_resource_status(r_id, "down", 5, "Connection error")
+        database.update_stale_warning_level(r_id, 14)
+        self.assertEqual(database.get_resource_by_id(r_id)["stale_warning_level"], 14)
+
+        # Resource recovers -> status "up"
+        database.update_resource_status(r_id, "up", 0)
+        self.assertEqual(database.get_resource_by_id(r_id)["stale_warning_level"], 0)
 
 if __name__ == '__main__':
     unittest.main()

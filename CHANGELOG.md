@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.0] - 2026-08-19
+
+### Added
+- **Multi-Transport Resilient Broadcast Sending (`/resilient`):**
+  - Standardized resilient sending mode across all connected mail relays. When enabled via `/resilient on`, outgoing messages are broadcasted via the primary transport and all configured backup relays in background threads (`_setup_resilient_mode`).
+  - Standardized confirmation and status messages for `/resilient` matching the repository-wide bot convention.
+- **Enhanced `/transports` Display & Connectivity Status:**
+  - Live transport status parsing from `get_connectivity_html()` (`🔄 Working`, `🟡 Connecting`, `🔴 Not connected`).
+  - Active sending indicator `✔︎ Used for sending:` displayed for all connected relays when resilient mode is enabled, and for the active primary relay when disabled.
+  - Detailed per-transport `Sent`, `Received`, `Last sent`, and `Last received` timestamp diagnostics.
+- **Intelligent Transport Failover with Exponential Backoff (`on_msg_failed`):**
+  - Standardized reactive failover mechanism when resilient mode is disabled: automatically retries failed messages across alternative transports with backoff (5s, 10s, 20s... up to 300s) and permanent E2E encryption error detection.
+
 ## [1.5.0] - 2026-08-19
 
 ### Added

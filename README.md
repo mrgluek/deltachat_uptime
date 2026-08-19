@@ -35,7 +35,7 @@ Additionally, it automatically generates a secure, beautiful web status dashboar
   - Alerts are only triggered if all 3 checks fail, avoiding false positives.
   - Once a DOWN resource recovers, it is marked UP on the first successful check.
 - 📊 **Uptime Dashboards:** Generates a secure, 12-character unguessable base62 URL (e.g. `https://up.example.com/k8D2x9mPqL1a`) hosting a modern dark-themed web status dashboard with active status, SSL metrics, and recent incident logs for each chat.
-- ✉️ **Multi-Transport Failover:** Supports multiple SMTP servers and automatically falls back to backups if message delivery fails.
+- ✉️ **Multi-Transport & Resilient Sending:** Supports multiple SMTP servers and resilient broadcast sending across all connected relays, with automatic exponential backoff failover if a primary transport encounters errors.
 
 ---
 
@@ -45,15 +45,16 @@ Additionally, it automatically generates a secure, beautiful web status dashboar
 These commands are available to any member of a chat. They support suffixes (e.g. `/add@up`, `/status@uptime`) to route commands correctly if multiple bots exist in the same chat.
 
 - `/add <target> [name]` — Add a monitor. Target formats:
-  - `https://google.com` (HTTP/HTTPS check)
-  - `google.com:443` (TCP port check)
-  - `google.com` (ICMP Ping check)
+  • `https://google.com` (HTTP/HTTPS check)
+  • `google.com:443` (TCP port check)
+  • `google.com` (ICMP Ping check)
 - `/remove <id>` — Stop monitoring a resource by ID.
 - `/list` — List monitored resources and their status in this chat.
 - `/status` — View monthly uptime statistics and get the link to the chat's secure Web Status Page.
 - `/events` — View recent incidents and active outages for this chat.
-- `/history [id]` — View downtime history and failure reasons for a monitor.
+- `/history [id]` — View downtime history for monitors.
 - `/sync` — Synchronize monitored resources with other bots in the same chat (rate-limited to 1/minute for non-admins).
+- `/donate` — Support bot development ❤️
 - `/help` — View available commands and system information.
 
 ### Admin-Only Commands
@@ -67,7 +68,7 @@ These commands are only executable by the configured administrator.
 - `/addtransport` — Add backup mail relays (either chatmail URIs or address/password).
 - `/rmtransport <addr>` — Remove backup mail relay.
 - `/setprimary <addr>` — Switch primary SMTP transport.
-- `/resilient` — Toggle resilient sending (attempts sending on backups if primary fails).
+- `/resilient` — Toggle resilient sending mode (all relays). Outgoing messages are broadcasted across all connected transports.
 
 ---
 

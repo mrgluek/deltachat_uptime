@@ -208,27 +208,87 @@ class TestUptimeBot(unittest.TestCase):
 
         # Case 1: Status query when disabled
         database.set_config("resilient", "0")
-        database.set_config("resilient_mode", "0")
         mock_event.payload = ""
         bot.resilient_command(mock_bot, 1, mock_event)
         args, kwargs = mock_send_with_stats.call_args
-        self.assertIn("currently DISABLED", args[3].text)
+        self.assertIn("currently disabled", args[3].text)
 
         # Case 2: Turn ON with /resilient on
         mock_event.payload = "on"
         bot.resilient_command(mock_bot, 1, mock_event)
         self.assertEqual(database.get_config("resilient"), "1")
+        args, kwargs = mock_send_with_stats.call_args
+        self.assertIn("Resilient sending mode enabled", args[3].text)
 
         # Case 3: Status query when enabled
         mock_event.payload = ""
         bot.resilient_command(mock_bot, 1, mock_event)
         args, kwargs = mock_send_with_stats.call_args
-        self.assertIn("currently ENABLED", args[3].text)
+        self.assertIn("currently enabled", args[3].text)
 
         # Case 4: Turn OFF with /resilient off
         mock_event.payload = "off"
         bot.resilient_command(mock_bot, 1, mock_event)
         self.assertEqual(database.get_config("resilient"), "0")
+        args, kwargs = mock_send_with_stats.call_args
+        self.assertIn("Resilient sending mode disabled", args[3].text)
+
+    @patch('bot._is_dc_admin')
+    @patch('bot._dc_send_msg_with_stats')
+    def test_transports_command_with_resilient_mode(self, mock_send_with_stats, mock_is_admin):
+        mock_is_admin.return_value = True
+        mock_bot = MagicMock()
+        mock_bot.rpc.list_transports.return_value = [
+            {"addr": "uptimebot@chatmail.uk"},
+            {"addr": "uptimebot@chat.gluek.info"}
+        ]
+        mock_bot.rpc.get_config.return_value = "uptimebot@chatmail.uk"
+        mock_bot.rpc.get_connectivity.return_value = 3000
+        mock_bot.rpc.get_connectivity_html.return_value = '<div class="green dot"><b>chatmail.uk:</b> Connected</div><div class="green dot"><b>chat.gluek.info:</b> Connected</div>'
+
+        mock_event = MagicMock()
+        mock_event.msg.from_id = 123
+        mock_event.msg.chat_id = 456
+
+        # Scenario 1: Resilient mode OFF -> only active/primary has "✔︎ Used for sending:"
+        database.set_config("resilient", "0")
+        bot.transports_command(mock_bot, 1, mock_event)
+        text = mock_send_with_stats.call_args[0][3].text
+        self.assertIn("🔌 **Mail Relays (Transports)**", text)
+        self.assertIn("**🔄 Working** ✔︎ Used for sending: `uptimebot@chatmail.uk`", text)
+        self.assertIn("**🔄 Working**: `uptimebot@chat.gluek.info`", text)
+
+        # Scenario 2: Resilient mode ON -> BOTH transports have "✔︎ Used for sending:"
+        database.set_config("resilient", "1")
+        bot.transports_command(mock_bot, 1, mock_event)
+        text_resilient = mock_send_with_stats.call_args[0][3].text
+        self.assertIn("**🔄 Working** ✔︎ Used for sending: `uptimebot@chatmail.uk`", text_resilient)
+        self.assertIn("**🔄 Working** ✔︎ Used for sending: `uptimebot@chat.gluek.info`", text_resilient)
+
+    def test_setup_resilient_mode_sends_to_all_transports(self):
+        mock_bot = MagicMock()
+        mock_bot.rpc.send_msg.return_value = 999
+        mock_bot.rpc.list_transports.return_value = [
+            {"addr": "primary@example.com"},
+            {"addr": "backup@example.com"}
+        ]
+        mock_bot.rpc.get_config.side_effect = lambda accid, key: "primary@example.com" if key in ("configured_addr", "addr") else None
+        mock_bot.rpc.get_message.return_value = {"state": 26}
+
+        bot._setup_resilient_mode(mock_bot)
+
+        # Resilient mode enabled
+        database.set_config("resilient", "1")
+
+        msg_data = deltachat2.MsgData(text="Test message")
+        
+        with patch('time.sleep', return_value=None):
+            res_id = mock_bot.rpc.send_msg(1, 100, msg_data)
+            self.assertEqual(res_id, 999)
+            time.sleep(0.2)
+
+        # Verify resend_messages was called for backup transport
+        mock_bot.rpc.resend_messages.assert_called_with(1, [999])
 
     @patch('bot._is_dc_admin')
     @patch('bot._dc_send_msg_with_stats')

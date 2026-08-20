@@ -522,7 +522,7 @@ async def check_group_task(group, semaphore):
                         logger.warning(f"SSL check for {rep['url']} failed: {ssl_err}")
                         await asyncio.to_thread(database.update_resource_ssl, r["id"], r.get("ssl_expiry_date"), now, cur_state)
 
-def format_incident_message(incident_id: int, started_at: int, resources: list[dict], is_resolved: bool = False, resolved_at: int = None) -> str:
+def format_incident_message(incident_id: int, started_at: int, resources: list[dict], is_resolved: bool = False, resolved_at: int = None, dc_chat_id: int = None) -> str:
     start_dt = datetime.datetime.fromtimestamp(started_at, tz=datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
     now = int(time.time())
     
@@ -536,17 +536,31 @@ def format_incident_message(incident_id: int, started_at: int, resources: list[d
         duration = max(1, resolved_ts - started_at)
         duration_str = format_duration(duration)
         
+        affected_ids = set()
+        if dc_chat_id is not None:
+            try:
+                affected_ids = database.get_incident_affected_resource_ids(dc_chat_id, started_at)
+            except Exception as e:
+                logger.debug(f"Failed to get affected resource ids: {e}")
+
+        recovered_resources = [
+            r for r in resources 
+            if r["id"] in affected_ids
+        ]
+        
         if total_monitors > 0:
             lines = [
                 f"✅ **Incident #{incident_id}** — `Resolved`",
                 f"⏱ **Duration:** `{duration_str}` (`{start_dt}` → `{resolved_dt} UTC`)",
-                f"📊 **All {total_monitors} monitors operational**\n"
+                f"📊 **All {total_monitors} monitors operational**"
             ]
-            for r in resources:
-                r_name = r.get("name") or r.get("url")
-                r_type = r.get("type", "HTTP").upper()
-                uptime_val = database.get_resource_uptime_30d(r["id"])
-                lines.append(f"• 🟢 `ID: {r['id']}` **{r_name}** ({r_type}) — Uptime 30d: `{uptime_val:.2f}%`")
+            if recovered_resources:
+                lines.append("\n**Recovered Monitors:**")
+                for r in recovered_resources:
+                    r_name = r.get("name") or r.get("url")
+                    r_type = r.get("type", "HTTP").upper()
+                    uptime_val = database.get_resource_uptime_30d(r["id"])
+                    lines.append(f"• 🟢 `ID: {r['id']}` **{r_name}** ({r_type}) — Uptime 30d: `{uptime_val:.2f}%`")
         else:
             lines = [
                 f"✅ **Incident #{incident_id}** — `Resolved`",
@@ -690,13 +704,24 @@ async def sync_chat_incident_state(dc_chat_id: int, force_update: bool = False):
                             await asyncio.to_thread(database.update_incident_msg_id, active_incident["id"], new_msg_id)
                             _incident_last_edit_state[inc_id] = (now, status_sig)
                     except Exception as e:
-                        logger.error(f"Failed to send incident message to chat {dc_chat_id}: {ex}")
+                        logger.error(f"Failed to send incident message to chat {dc_chat_id}: {e}")
                         
         else:
             if active_incident:
                 inc_id = active_incident["id"]
                 _incident_last_edit_state.pop(inc_id, None)
-                summary_str = f"All {len(resources)} monitors operational" if resources else "All monitored resources removed or operational"
+                
+                affected_ids = await asyncio.to_thread(database.get_incident_affected_resource_ids, dc_chat_id, active_incident["started_at"])
+                recovered_resources = [
+                    r for r in (resources or [])
+                    if r["id"] in affected_ids
+                ]
+                if recovered_resources:
+                    rec_names = [r.get("name") or r.get("url") for r in recovered_resources]
+                    summary_str = f"Recovered: {', '.join(rec_names)}"
+                else:
+                    summary_str = f"All {len(resources)} monitors operational" if resources else "All monitored resources removed or operational"
+                
                 await asyncio.to_thread(database.resolve_incident, active_incident["id"], now, summary_str)
                 
                 msg_text = format_incident_message(
@@ -704,7 +729,8 @@ async def sync_chat_incident_state(dc_chat_id: int, force_update: bool = False):
                     active_incident["started_at"],
                     resources or [],
                     is_resolved=True,
-                    resolved_at=now
+                    resolved_at=now,
+                    dc_chat_id=dc_chat_id
                 )
                 
                 if dc_bot_instance and dc_accid is not None:

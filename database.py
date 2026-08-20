@@ -446,6 +446,22 @@ def get_resource_downtime_events(resource_id: int, limit: int = 10) -> list[dict
         conn.close()
         return [dict(r) for r in rows]
 
+def get_incident_affected_resource_ids(dc_chat_id: int, started_at: int) -> set[int]:
+    """Return set of resource IDs that experienced downtime in this chat during or overlapping the incident."""
+    with _lock:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT DISTINCT de.resource_id 
+            FROM downtime_events de
+            JOIN resources r ON r.id = de.resource_id
+            WHERE r.dc_chat_id = ? 
+              AND (de.went_down_at >= ? OR de.went_up_at IS NULL OR de.went_up_at >= ?)
+        ''', (dc_chat_id, started_at - 60, started_at))
+        rows = cursor.fetchall()
+        conn.close()
+        return {r[0] for r in rows}
+
 # Uptime calculation functions
 def get_resource_uptime_30d(resource_id: int) -> float:
     """Calculates the uptime percentage of a resource over the last 30 days."""

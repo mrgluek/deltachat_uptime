@@ -8,12 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [1.6.1] - 2026-08-20
 
 ### Added
+- **Concise Resolved Incident Messages:**
+  - Upon incident resolution, the updated message now displays only the specific monitors that were affected and recovered during the incident (`Recovered Monitors:`), eliminating cluttered lists of dozens of unaffected operational services.
 - **Tiered Rate-Limiting for Live Incident Message Edits:**
-  - Implemented progressive time-based throttling for in-place live incident updates when no resource statuses have changed:
+  - Implemented progressive time-based throttling for in-place live incident duration updates:
     - **First minute (< 60s):** updates at most once every **15 seconds**.
     - **1 to 5 minutes (60s – 300s):** updates at most once every **30 seconds**.
     - **5 minutes to 1 hour (300s – 3600s):** updates at most once every **1 minute**.
-    - **Over 1 hour (> 3600s):** updates at most once every **5 minutes**.
+    - **1 to 24 hours (3600s – 86400s):** updates at most once every **5 minutes**.
+    - **Over 24 hours (> 86400s):** updates at most once every **1 hour**.
   - Immediate updates remain active with zero delay whenever an actual monitor state change occurs (e.g. outage, partial recovery, monitor removal, or resolution).
 
 ## [1.6.0] - 2026-08-19

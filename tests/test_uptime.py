@@ -1114,7 +1114,8 @@ class TestUptimeBot(unittest.TestCase):
         )
         edited_text = bot.dc_bot_instance.rpc.send_edit_request.call_args[0][2]
         self.assertIn("Resolved", edited_text)
-        self.assertIn("Good App", edited_text)
+        self.assertIn("All 1 monitors operational", edited_text)
+        self.assertNotIn("Good App", edited_text)
 
     def test_incident_resolves_when_all_monitors_removed(self):
         import asyncio
@@ -1234,6 +1235,42 @@ class TestUptimeBot(unittest.TestCase):
 
         asyncio.run(bot.sync_chat_incident_state(chat_id, force_update=False))
         bot.dc_bot_instance.rpc.send_edit_request.assert_called_once()
+
+    def test_incident_resolved_message_only_shows_affected_monitors(self):
+        import asyncio
+        chat_id = 9991
+        database.get_or_create_chat_token(chat_id)
+        
+        # 3 resources in chat: 1 failing and 2 healthy
+        r1 = database.add_resource(chat_id, "https://affected.org", "Affected Site", "http", 60)
+        r2 = database.add_resource(chat_id, "https://healthy1.org", "Healthy Site 1", "http", 60)
+        r3 = database.add_resource(chat_id, "https://healthy2.org", "Healthy Site 2", "http", 60)
+        
+        database.update_resource_status(r2, "up", 0)
+        database.update_resource_status(r3, "up", 0)
+        
+        # Site 1 goes down -> incident starts
+        database.update_resource_status(r1, "down", 3, "HTTP 500")
+        inc_id = database.create_incident(chat_id, int(time.time()))
+        database.update_incident_msg_id(inc_id, 88801)
+        
+        bot.dc_bot_instance = MagicMock()
+        bot.dc_accid = 1
+        
+        # Site 1 recovers -> all UP, incident resolves
+        database.update_resource_status(r1, "up", 0)
+        
+        asyncio.run(bot.sync_chat_incident_state(chat_id))
+        
+        bot.dc_bot_instance.rpc.send_edit_request.assert_called_once()
+        edited_text = bot.dc_bot_instance.rpc.send_edit_request.call_args[0][2]
+        
+        self.assertIn("All 3 monitors operational", edited_text)
+        self.assertIn("Recovered Monitors:", edited_text)
+        self.assertIn("Affected Site", edited_text)
+        # Healthy sites that never went down MUST NOT be listed in the recovered breakdown
+        self.assertNotIn("Healthy Site 1", edited_text)
+        self.assertNotIn("Healthy Site 2", edited_text)
 
 if __name__ == '__main__':
     unittest.main()

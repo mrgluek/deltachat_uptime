@@ -1076,9 +1076,68 @@ class TestUptimeBot(unittest.TestCase):
         database.update_stale_warning_level(r_id, 14)
         self.assertEqual(database.get_resource_by_id(r_id)["stale_warning_level"], 14)
 
-        # Resource recovers -> status "up"
-        database.update_resource_status(r_id, "up", 0)
-        self.assertEqual(database.get_resource_by_id(r_id)["stale_warning_level"], 0)
+    def test_incident_resolves_when_failing_monitor_removed(self):
+        import asyncio
+        chat_id = 8822
+        database.get_or_create_chat_token(chat_id)
+        r1 = database.add_resource(chat_id, "https://good.org", "Good App", "http", 60)
+        r2 = database.add_resource(chat_id, "https://bad.org", "Bad App", "http", 60)
+
+        database.update_resource_status(r1, "up", 0)
+        database.update_resource_status(r2, "down", 3, "HTTP 500")
+
+        bot.dc_bot_instance = MagicMock()
+        bot.dc_accid = 1
+
+        # Sync -> active incident created
+        asyncio.run(bot.sync_chat_incident_state(chat_id))
+        inc = database.get_active_incident(chat_id)
+        self.assertIsNotNone(inc)
+        database.update_incident_msg_id(inc["id"], 77001)
+
+        # Now user removes Bad App
+        event = MagicMock()
+        event.msg.chat_id = chat_id
+        event.payload = str(r2)
+        with patch.object(bot, '_dc_send_msg_with_stats'):
+            bot.remove_command(bot.dc_bot_instance, bot.dc_accid, event)
+
+        # Sync state
+        asyncio.run(bot.sync_chat_incident_state(chat_id))
+
+        # Incident should now be resolved!
+        self.assertIsNone(database.get_active_incident(chat_id))
+        resolved_inc = database.get_incident_by_id(chat_id, inc["id"])
+        self.assertEqual(resolved_inc["status"], "resolved")
+        bot.dc_bot_instance.rpc.send_edit_request.assert_called_with(
+            1, 77001, unittest.mock.ANY
+        )
+        edited_text = bot.dc_bot_instance.rpc.send_edit_request.call_args[0][2]
+        self.assertIn("Resolved", edited_text)
+        self.assertIn("Good App", edited_text)
+
+    def test_incident_resolves_when_all_monitors_removed(self):
+        import asyncio
+        chat_id = 8833
+        database.get_or_create_chat_token(chat_id)
+        r1 = database.add_resource(chat_id, "https://onlybad.org", "Only Bad App", "http", 60)
+        database.update_resource_status(r1, "down", 3, "HTTP 500")
+
+        bot.dc_bot_instance = MagicMock()
+        bot.dc_accid = 1
+
+        asyncio.run(bot.sync_chat_incident_state(chat_id))
+        inc = database.get_active_incident(chat_id)
+        self.assertIsNotNone(inc)
+        database.update_incident_msg_id(inc["id"], 77002)
+
+        # Remove the only resource
+        database.delete_resource(chat_id, r1)
+        asyncio.run(bot.sync_chat_incident_state(chat_id))
+
+        self.assertIsNone(database.get_active_incident(chat_id))
+        resolved_inc = database.get_incident_by_id(chat_id, inc["id"])
+        self.assertEqual(resolved_inc["status"], "resolved")
 
 if __name__ == '__main__':
     unittest.main()

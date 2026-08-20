@@ -31,6 +31,7 @@ last_sync_times = {}
 # Global references
 dc_bot_instance = None
 dc_accid = None
+async_event_loop = None
 
 # Canary targets for verifying host outbound internet connectivity
 CANARY_TARGETS = [
@@ -535,16 +536,23 @@ def format_incident_message(incident_id: int, started_at: int, resources: list[d
         duration = max(1, resolved_ts - started_at)
         duration_str = format_duration(duration)
         
-        lines = [
-            f"✅ **Incident #{incident_id}** — `Resolved`",
-            f"⏱ **Duration:** `{duration_str}` (`{start_dt}` → `{resolved_dt} UTC`)",
-            f"📊 **All {total_monitors} monitors operational**\n"
-        ]
-        for r in resources:
-            r_name = r.get("name") or r.get("url")
-            r_type = r.get("type", "HTTP").upper()
-            uptime_val = database.get_resource_uptime_30d(r["id"])
-            lines.append(f"• 🟢 `ID: {r['id']}` **{r_name}** ({r_type}) — Uptime 30d: `{uptime_val:.2f}%`")
+        if total_monitors > 0:
+            lines = [
+                f"✅ **Incident #{incident_id}** — `Resolved`",
+                f"⏱ **Duration:** `{duration_str}` (`{start_dt}` → `{resolved_dt} UTC`)",
+                f"📊 **All {total_monitors} monitors operational**\n"
+            ]
+            for r in resources:
+                r_name = r.get("name") or r.get("url")
+                r_type = r.get("type", "HTTP").upper()
+                uptime_val = database.get_resource_uptime_30d(r["id"])
+                lines.append(f"• 🟢 `ID: {r['id']}` **{r_name}** ({r_type}) — Uptime 30d: `{uptime_val:.2f}%`")
+        else:
+            lines = [
+                f"✅ **Incident #{incident_id}** — `Resolved`",
+                f"⏱ **Duration:** `{duration_str}` (`{start_dt}` → `{resolved_dt} UTC`)",
+                f"📊 **All monitored resources removed or operational**"
+            ]
         return "\n".join(lines)
         
     else:
@@ -588,24 +596,22 @@ def format_incident_message(incident_id: int, started_at: int, resources: list[d
         return "\n".join(lines)
 
 _incident_sync_locks = {}
-_incident_global_lock = asyncio.Lock()
+_incident_sync_locks_thread_lock = threading.Lock()
 
-async def get_chat_incident_lock(dc_chat_id: int) -> asyncio.Lock:
-    async with _incident_global_lock:
+def get_chat_incident_lock(dc_chat_id: int) -> asyncio.Lock:
+    with _incident_sync_locks_thread_lock:
         if dc_chat_id not in _incident_sync_locks:
             _incident_sync_locks[dc_chat_id] = asyncio.Lock()
         return _incident_sync_locks[dc_chat_id]
 
 async def sync_chat_incident_state(dc_chat_id: int):
-    chat_lock = await get_chat_incident_lock(dc_chat_id)
+    chat_lock = get_chat_incident_lock(dc_chat_id)
     async with chat_lock:
         resources = await asyncio.to_thread(database.get_resources, dc_chat_id)
-        if not resources:
-            return
-            
-        down_resources = [r for r in resources if r.get("status") == "down"]
         active_incident = await asyncio.to_thread(database.get_active_incident, dc_chat_id)
         now = int(time.time())
+        
+        down_resources = [r for r in resources if r.get("status") == "down"] if resources else []
         
         if down_resources:
             if not active_incident:
@@ -658,13 +664,13 @@ async def sync_chat_incident_state(dc_chat_id: int):
                         
         else:
             if active_incident:
-                summary_str = f"All {len(resources)} monitors recovered"
+                summary_str = f"All {len(resources)} monitors operational" if resources else "All monitored resources removed or operational"
                 await asyncio.to_thread(database.resolve_incident, active_incident["id"], now, summary_str)
                 
                 msg_text = format_incident_message(
                     active_incident["id"],
                     active_incident["started_at"],
-                    resources,
+                    resources or [],
                     is_resolved=True,
                     resolved_at=now
                 )
@@ -691,6 +697,17 @@ async def sync_chat_incident_state(dc_chat_id: int):
                                 )
                             except Exception as ex:
                                 logger.error(f"Failed to send resolved incident message to chat {dc_chat_id}: {ex}")
+
+def trigger_chat_incident_sync(dc_chat_id: int):
+    """Trigger incident state sync from a synchronous handler / thread."""
+    global async_event_loop
+    if async_event_loop and async_event_loop.is_running():
+        asyncio.run_coroutine_threadsafe(sync_chat_incident_state(dc_chat_id), async_event_loop)
+    else:
+        try:
+            asyncio.run(sync_chat_incident_state(dc_chat_id))
+        except Exception as ex:
+            logger.debug(f"Direct sync_chat_incident_state invocation: {ex}")
 
 async def check_stale_downtime_notifications(resource, now: int):
     """Check for continuous prolonged downtime and send 7d notice, 14d warning, or execute 30d auto-cleanup."""
@@ -2000,6 +2017,7 @@ def remove_command(bot, accid, event):
     res_id = int(payload)
     if database.delete_resource(msg.chat_id, res_id):
         _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=f"✅ Removed monitor with ID `{res_id}`."))
+        trigger_chat_incident_sync(msg.chat_id)
     else:
         _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=f"❌ Monitor ID `{res_id}` not found in this chat."))
 

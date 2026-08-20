@@ -1124,6 +1124,7 @@ class TestUptimeBot(unittest.TestCase):
         database.update_resource_status(r1, "down", 3, "HTTP 500")
 
         bot.dc_bot_instance = MagicMock()
+        bot.dc_bot_instance.rpc.send_msg.return_value = 10001
         bot.dc_accid = 1
 
         asyncio.run(bot.sync_chat_incident_state(chat_id))
@@ -1131,13 +1132,52 @@ class TestUptimeBot(unittest.TestCase):
         self.assertIsNotNone(inc)
         database.update_incident_msg_id(inc["id"], 77002)
 
-        # Remove the only resource
+        # Remove the only resource and re-sync
         database.delete_resource(chat_id, r1)
         asyncio.run(bot.sync_chat_incident_state(chat_id))
 
         self.assertIsNone(database.get_active_incident(chat_id))
         resolved_inc = database.get_incident_by_id(chat_id, inc["id"])
         self.assertEqual(resolved_inc["status"], "resolved")
+
+    def test_audit_and_auto_close_stale_active_incidents(self):
+        import asyncio
+        chat_id_1 = 8844
+        chat_id_2 = 8855
+        database.get_or_create_chat_token(chat_id_1)
+        database.get_or_create_chat_token(chat_id_2)
+
+        # Chat 1: Had an old active incident in DB, but its resource is currently UP
+        r1 = database.add_resource(chat_id_1, "https://healed.org", "Healed App", "http", 60)
+        database.update_resource_status(r1, "up", 0)
+        inc1_id = database.create_incident(chat_id_1, int(time.time()) - 3600)
+        database.update_incident_msg_id(inc1_id, 77003)
+
+        # Chat 2: Has an active incident and resource is still DOWN
+        r2 = database.add_resource(chat_id_2, "https://failing.org", "Failing App", "http", 60)
+        database.update_resource_status(r2, "down", 5, "Connection refused")
+        inc2_id = database.create_incident(chat_id_2, int(time.time()) - 1800)
+        database.update_incident_msg_id(inc2_id, 77004)
+
+        active_incidents = database.get_all_active_incidents()
+        self.assertEqual(len(active_incidents), 2)
+
+        bot.dc_bot_instance = MagicMock()
+        bot.dc_accid = 1
+
+        # Simulate periodic scheduler audit
+        for inc in active_incidents:
+            asyncio.run(bot.sync_chat_incident_state(inc["dc_chat_id"]))
+
+        # Chat 1 incident must be automatically self-healed and resolved!
+        self.assertIsNone(database.get_active_incident(chat_id_1))
+        inc1 = database.get_incident_by_id(chat_id_1, inc1_id)
+        self.assertEqual(inc1["status"], "resolved")
+
+        # Chat 2 incident must remain ongoing
+        inc2 = database.get_active_incident(chat_id_2)
+        self.assertIsNotNone(inc2)
+        self.assertEqual(inc2["id"], inc2_id)
 
 if __name__ == '__main__':
     unittest.main()

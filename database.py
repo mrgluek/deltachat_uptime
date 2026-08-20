@@ -367,7 +367,19 @@ def get_active_incident(dc_chat_id: int) -> dict | None:
         conn.close()
         return dict(row) if row else None
 
+def get_all_active_incidents() -> list[dict]:
+    with _lock:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM incidents WHERE status = 'ongoing' ORDER BY id ASC")
+        rows = cursor.fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+
 def update_incident_msg_id(incident_id: int, msg_id: int | None):
+    if msg_id is not None and not isinstance(msg_id, int):
+        return
     with _lock:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()

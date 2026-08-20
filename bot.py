@@ -860,6 +860,11 @@ async def monitoring_scheduler_loop():
                 logger.info(f"Triggering {len(tasks)} target checks (encompassing {sum(len(g) for g in due_groups.values())} resources)...")
                 asyncio.create_task(run_checks_parallel(tasks))
                 
+            # Audit any ongoing incidents across all chats to ensure self-healing
+            active_incidents = await asyncio.to_thread(database.get_all_active_incidents)
+            for inc in active_incidents:
+                asyncio.create_task(sync_chat_incident_state(inc["dc_chat_id"]))
+
         except Exception as e:
             logger.error(f"Error in monitoring scheduler loop: {e}")
             

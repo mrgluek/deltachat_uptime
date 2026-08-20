@@ -613,8 +613,10 @@ def get_incident_update_interval(duration_seconds: int) -> int:
         return 30       # 1 to 5 minutes: update every 30 seconds
     elif duration_seconds < 3600:
         return 60       # 5 minutes to 1 hour: update every 1 minute
+    elif duration_seconds < 86400:
+        return 300      # 1 to 24 hours: update every 5 minutes
     else:
-        return 300      # After 1 hour: update every 5 minutes
+        return 3600     # After 24 hours: update once an hour
 
 async def sync_chat_incident_state(dc_chat_id: int, force_update: bool = False):
     chat_lock = get_chat_incident_lock(dc_chat_id)

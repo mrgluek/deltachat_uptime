@@ -1189,9 +1189,12 @@ class TestUptimeBot(unittest.TestCase):
         # 5 min - 1 hour: 60s
         self.assertEqual(bot.get_incident_update_interval(300), 60)
         self.assertEqual(bot.get_incident_update_interval(3599), 60)
-        # > 1 hour: 300s (5 minutes)
+        # 1 hour - 24 hours: 300s (5 minutes)
         self.assertEqual(bot.get_incident_update_interval(3600), 300)
-        self.assertEqual(bot.get_incident_update_interval(86400), 300)
+        self.assertEqual(bot.get_incident_update_interval(86399), 300)
+        # > 24 hours: 3600s (1 hour)
+        self.assertEqual(bot.get_incident_update_interval(86400), 3600)
+        self.assertEqual(bot.get_incident_update_interval(86400 * 7), 3600)
 
     def test_incident_edit_rate_limiting_and_immediate_state_change(self):
         import asyncio

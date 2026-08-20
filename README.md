@@ -11,6 +11,7 @@ Additionally, it automatically generates a secure, beautiful web status dashboar
 - 🚨 **Incident-Based Alerting & In-Place Dynamic Updates:**
   - Instead of flooding the chat with dozens of separate DOWN/UP messages, outages trigger a unified **Incident** per chat.
   - As multiple monitors fail or recover, the bot edits the **same incident message in-place** with real-time status and duration metrics.
+  - **Tiered Rate-Limiting:** Live duration updates adaptively back off (every 15s in the first minute, 30s during minutes 1–5, 1m up to an hour, and 5m after an hour) while status transitions edit immediately with zero delay.
   - When all services recover, the incident message is updated to **Resolved** with total downtime duration.
 - 📜 **Detailed Outage & Incident History:**
   - `/events` (or `/incidents`) — View the chat's historical incident log, active outages, and total downtime durations.

@@ -21,7 +21,7 @@ import database
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "1.6.0"
+VERSION = "1.6.1"
 USER_AGENT = f"DeltaChat-Uptime-Bot/{VERSION} (https://git.gluek.info/gluek/deltachat_uptime)"
 
 dc_cli = BotCli("uptimebot")
@@ -597,6 +597,7 @@ def format_incident_message(incident_id: int, started_at: int, resources: list[d
 
 _incident_sync_locks = {}
 _incident_sync_locks_thread_lock = threading.Lock()
+_incident_last_edit_state = {}
 
 def get_chat_incident_lock(dc_chat_id: int) -> asyncio.Lock:
     with _incident_sync_locks_thread_lock:
@@ -604,7 +605,18 @@ def get_chat_incident_lock(dc_chat_id: int) -> asyncio.Lock:
             _incident_sync_locks[dc_chat_id] = asyncio.Lock()
         return _incident_sync_locks[dc_chat_id]
 
-async def sync_chat_incident_state(dc_chat_id: int):
+def get_incident_update_interval(duration_seconds: int) -> int:
+    """Return the minimum seconds required between live duration edits based on incident age."""
+    if duration_seconds < 60:
+        return 15       # First minute: update every 15 seconds
+    elif duration_seconds < 300:
+        return 30       # 1 to 5 minutes: update every 30 seconds
+    elif duration_seconds < 3600:
+        return 60       # 5 minutes to 1 hour: update every 1 minute
+    else:
+        return 300      # After 1 hour: update every 5 minutes
+
+async def sync_chat_incident_state(dc_chat_id: int, force_update: bool = False):
     chat_lock = get_chat_incident_lock(dc_chat_id)
     async with chat_lock:
         resources = await asyncio.to_thread(database.get_resources, dc_chat_id)
@@ -617,7 +629,20 @@ async def sync_chat_incident_state(dc_chat_id: int):
             if not active_incident:
                 inc_id = await asyncio.to_thread(database.create_incident, dc_chat_id, now)
                 active_incident = await asyncio.to_thread(database.get_incident_by_id, dc_chat_id, inc_id)
+                force_update = True
                 
+            inc_id = active_incident["id"]
+            started_at = active_incident["started_at"]
+            duration = max(0, now - started_at)
+            
+            status_sig = tuple(sorted((r["id"], r.get("status"), r.get("consecutive_failures")) for r in (resources or [])))
+            last_edit_time, last_sig = _incident_last_edit_state.get(inc_id, (0.0, None))
+            throttle_interval = get_incident_update_interval(duration)
+            
+            should_edit = force_update or (status_sig != last_sig) or ((now - last_edit_time) >= throttle_interval)
+            if not should_edit:
+                return
+
             msg_text = format_incident_message(
                 active_incident["id"],
                 active_incident["started_at"],
@@ -635,6 +660,7 @@ async def sync_chat_incident_state(dc_chat_id: int):
                             msg_id,
                             msg_text
                         )
+                        _incident_last_edit_state[inc_id] = (now, status_sig)
                         logger.info(f"Edited Incident #{active_incident['id']} message {msg_id} in chat {dc_chat_id}")
                     except Exception as e:
                         logger.warning(f"Failed to edit Incident message {msg_id} (sending new message): {e}")
@@ -645,8 +671,9 @@ async def sync_chat_incident_state(dc_chat_id: int):
                                 dc_chat_id,
                                 MsgData(text=msg_text)
                             )
-                            if new_msg_id:
+                            if isinstance(new_msg_id, int):
                                 await asyncio.to_thread(database.update_incident_msg_id, active_incident["id"], new_msg_id)
+                                _incident_last_edit_state[inc_id] = (now, status_sig)
                         except Exception as ex:
                             logger.error(f"Failed to send incident message to chat {dc_chat_id}: {ex}")
                 else:
@@ -657,13 +684,16 @@ async def sync_chat_incident_state(dc_chat_id: int):
                             dc_chat_id,
                             MsgData(text=msg_text)
                         )
-                        if new_msg_id:
+                        if isinstance(new_msg_id, int):
                             await asyncio.to_thread(database.update_incident_msg_id, active_incident["id"], new_msg_id)
+                            _incident_last_edit_state[inc_id] = (now, status_sig)
                     except Exception as e:
-                        logger.error(f"Failed to send incident message to chat {dc_chat_id}: {e}")
+                        logger.error(f"Failed to send incident message to chat {dc_chat_id}: {ex}")
                         
         else:
             if active_incident:
+                inc_id = active_incident["id"]
+                _incident_last_edit_state.pop(inc_id, None)
                 summary_str = f"All {len(resources)} monitors operational" if resources else "All monitored resources removed or operational"
                 await asyncio.to_thread(database.resolve_incident, active_incident["id"], now, summary_str)
                 
@@ -698,14 +728,14 @@ async def sync_chat_incident_state(dc_chat_id: int):
                             except Exception as ex:
                                 logger.error(f"Failed to send resolved incident message to chat {dc_chat_id}: {ex}")
 
-def trigger_chat_incident_sync(dc_chat_id: int):
+def trigger_chat_incident_sync(dc_chat_id: int, force_update: bool = False):
     """Trigger incident state sync from a synchronous handler / thread."""
     global async_event_loop
     if async_event_loop and async_event_loop.is_running():
-        asyncio.run_coroutine_threadsafe(sync_chat_incident_state(dc_chat_id), async_event_loop)
+        asyncio.run_coroutine_threadsafe(sync_chat_incident_state(dc_chat_id, force_update=force_update), async_event_loop)
     else:
         try:
-            asyncio.run(sync_chat_incident_state(dc_chat_id))
+            asyncio.run(sync_chat_incident_state(dc_chat_id, force_update=force_update))
         except Exception as ex:
             logger.debug(f"Direct sync_chat_incident_state invocation: {ex}")
 
@@ -803,7 +833,7 @@ async def handle_check_result(resource, is_up, error_msg):
             should_sync = True
             
     if should_sync:
-        await sync_chat_incident_state(resource["dc_chat_id"])
+        await sync_chat_incident_state(resource["dc_chat_id"], force_update=True)
 
     # If resource is down, evaluate 7d/14d/30d stale downtime reminders and auto-cleanup
     if not is_up:
@@ -2022,7 +2052,7 @@ def remove_command(bot, accid, event):
     res_id = int(payload)
     if database.delete_resource(msg.chat_id, res_id):
         _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=f"✅ Removed monitor with ID `{res_id}`."))
-        trigger_chat_incident_sync(msg.chat_id)
+        trigger_chat_incident_sync(msg.chat_id, force_update=True)
     else:
         _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=f"❌ Monitor ID `{res_id}` not found in this chat."))
 

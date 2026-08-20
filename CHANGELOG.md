@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.1] - 2026-08-20
+
+### Added
+- **Tiered Rate-Limiting for Live Incident Message Edits:**
+  - Implemented progressive time-based throttling for in-place live incident updates when no resource statuses have changed:
+    - **First minute (< 60s):** updates at most once every **15 seconds**.
+    - **1 to 5 minutes (60s – 300s):** updates at most once every **30 seconds**.
+    - **5 minutes to 1 hour (300s – 3600s):** updates at most once every **1 minute**.
+    - **Over 1 hour (> 3600s):** updates at most once every **5 minutes**.
+  - Immediate updates remain active with zero delay whenever an actual monitor state change occurs (e.g. outage, partial recovery, monitor removal, or resolution).
+
 ## [1.6.0] - 2026-08-19
 
 ### Added

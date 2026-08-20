@@ -1179,6 +1179,59 @@ class TestUptimeBot(unittest.TestCase):
         self.assertIsNotNone(inc2)
         self.assertEqual(inc2["id"], inc2_id)
 
+    def test_get_incident_update_interval(self):
+        # 0 - 1 min: 15s
+        self.assertEqual(bot.get_incident_update_interval(0), 15)
+        self.assertEqual(bot.get_incident_update_interval(59), 15)
+        # 1 - 5 min: 30s
+        self.assertEqual(bot.get_incident_update_interval(60), 30)
+        self.assertEqual(bot.get_incident_update_interval(299), 30)
+        # 5 min - 1 hour: 60s
+        self.assertEqual(bot.get_incident_update_interval(300), 60)
+        self.assertEqual(bot.get_incident_update_interval(3599), 60)
+        # > 1 hour: 300s (5 minutes)
+        self.assertEqual(bot.get_incident_update_interval(3600), 300)
+        self.assertEqual(bot.get_incident_update_interval(86400), 300)
+
+    def test_incident_edit_rate_limiting_and_immediate_state_change(self):
+        import asyncio
+        chat_id = 9988
+        database.get_or_create_chat_token(chat_id)
+        r1 = database.add_resource(chat_id, "https://throttled.org", "Throttled App", "http", 60)
+        database.update_resource_status(r1, "down", 3, "HTTP 500")
+
+        bot.dc_bot_instance = MagicMock()
+        bot.dc_bot_instance.rpc.send_msg.return_value = 55001
+        bot.dc_accid = 1
+        bot._incident_last_edit_state.clear()
+
+        # 1. First sync -> sends new message and records last_edit_state
+        asyncio.run(bot.sync_chat_incident_state(chat_id, force_update=False))
+        inc = database.get_active_incident(chat_id)
+        self.assertIsNotNone(inc)
+        database.update_incident_msg_id(inc["id"], 55001)
+        self.assertIn(inc["id"], bot._incident_last_edit_state)
+
+        # 2. Immediate re-sync with NO state change -> throttled, no edit call!
+        bot.dc_bot_instance.rpc.send_edit_request.reset_mock()
+        asyncio.run(bot.sync_chat_incident_state(chat_id, force_update=False))
+        bot.dc_bot_instance.rpc.send_edit_request.assert_not_called()
+
+        # 3. Simulate 20 seconds passing (within first minute, 15s interval passed)
+        last_t, sig = bot._incident_last_edit_state[inc["id"]]
+        bot._incident_last_edit_state[inc["id"]] = (last_t - 20, sig)
+
+        asyncio.run(bot.sync_chat_incident_state(chat_id, force_update=False))
+        bot.dc_bot_instance.rpc.send_edit_request.assert_called_once()
+
+        # 4. Immediate state change (another resource added and failed) -> force_update/sig changed -> immediate edit!
+        bot.dc_bot_instance.rpc.send_edit_request.reset_mock()
+        r2 = database.add_resource(chat_id, "https://second.org", "Second App", "http", 60)
+        database.update_resource_status(r2, "down", 1, "Connection refused")
+
+        asyncio.run(bot.sync_chat_incident_state(chat_id, force_update=False))
+        bot.dc_bot_instance.rpc.send_edit_request.assert_called_once()
+
 if __name__ == '__main__':
     unittest.main()
 

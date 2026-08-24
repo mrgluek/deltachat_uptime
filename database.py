@@ -77,19 +77,24 @@ def init_db():
                 went_down_at INTEGER,
                 went_up_at INTEGER,
                 error_msg TEXT,
-                FOREIGN KEY(resource_id) REFERENCES resources(id) ON DELETE CASCADE
+                incident_id INTEGER,
+                FOREIGN KEY(resource_id) REFERENCES resources(id) ON DELETE CASCADE,
+                FOREIGN KEY(incident_id) REFERENCES incidents(id)
             )
         ''')
         
         # Add index to downtime_events for fast lookups
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_downtime_resource ON downtime_events(resource_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_downtime_went_down ON downtime_events(went_down_at)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_downtime_incident ON downtime_events(incident_id)')
         
-        # Ensure error_msg column exists in downtime_events
+        # Ensure columns exist in downtime_events
         cursor.execute("PRAGMA table_info(downtime_events)")
         columns_dt = [row[1] for row in cursor.fetchall()]
         if "error_msg" not in columns_dt:
             cursor.execute("ALTER TABLE downtime_events ADD COLUMN error_msg TEXT")
+        if "incident_id" not in columns_dt:
+            cursor.execute("ALTER TABLE downtime_events ADD COLUMN incident_id INTEGER")
 
         # Incidents table for tracking grouped chat outages
         cursor.execute('''
@@ -264,11 +269,32 @@ def update_resource_status(resource_id: int, status: str, consecutive_failures: 
             ''', (status, now, now, consecutive_failures, resource_id))
             
             if status == "down":
-                # Opened new downtime event with error message
+                cursor.execute("SELECT dc_chat_id FROM resources WHERE id = ?", (resource_id,))
+                chat_row = cursor.fetchone()
+                inc_id = None
+                if chat_row:
+                    chat_id = chat_row[0]
+                    cursor.execute('''
+                        SELECT i.id, MAX(COALESCE(de.went_down_at, i.started_at)) as last_down_at
+                        FROM incidents i
+                        LEFT JOIN downtime_events de ON de.incident_id = i.id
+                        WHERE i.dc_chat_id = ? AND i.status = 'ongoing'
+                        GROUP BY i.id
+                        HAVING (? - last_down_at) <= 3600 AND (? >= last_down_at)
+                        ORDER BY i.id DESC LIMIT 1
+                    ''', (chat_id, now, now))
+                    inc_row = cursor.fetchone()
+                    if inc_row:
+                        inc_id = inc_row[0]
+                    else:
+                        cursor.execute("INSERT INTO incidents (dc_chat_id, status, started_at) VALUES (?, 'ongoing', ?)", (chat_id, now))
+                        inc_id = cursor.lastrowid
+
+                # Opened new downtime event with error message and incident_id
                 cursor.execute('''
-                    INSERT INTO downtime_events (resource_id, went_down_at, went_up_at, error_msg)
-                    VALUES (?, ?, NULL, ?)
-                ''', (resource_id, now, error_msg))
+                    INSERT INTO downtime_events (resource_id, went_down_at, went_up_at, error_msg, incident_id)
+                    VALUES (?, ?, NULL, ?, ?)
+                ''', (resource_id, now, error_msg, inc_id))
             elif status == "up" and old_status == "down":
                 # Close existing downtime event and reset stale warning level
                 cursor.execute('''
@@ -367,6 +393,41 @@ def get_active_incident(dc_chat_id: int) -> dict | None:
         conn.close()
         return dict(row) if row else None
 
+def get_active_incidents_for_chat(dc_chat_id: int) -> list[dict]:
+    """Returns all currently ongoing incidents for a specific chat."""
+    with _lock:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT * FROM incidents 
+            WHERE dc_chat_id = ? AND status = 'ongoing' 
+            ORDER BY id ASC
+        ''', (dc_chat_id,))
+        rows = cursor.fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+
+def get_active_incident_for_outage(dc_chat_id: int, outage_time: int, max_gap_seconds: int = 3600) -> dict | None:
+    """Finds an active ongoing incident in dc_chat_id whose latest downtime event is within max_gap_seconds of outage_time."""
+    with _lock:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT i.*, 
+                   MAX(COALESCE(de.went_down_at, i.started_at)) as last_down_at
+            FROM incidents i
+            LEFT JOIN downtime_events de ON de.incident_id = i.id
+            WHERE i.dc_chat_id = ? AND i.status = 'ongoing'
+            GROUP BY i.id
+            HAVING (? - last_down_at) <= ? AND (? >= last_down_at)
+            ORDER BY i.id DESC LIMIT 1
+        ''', (dc_chat_id, outage_time, max_gap_seconds, outage_time))
+        row = cursor.fetchone()
+        conn.close()
+        return dict(row) if row else None
+
 def get_all_active_incidents() -> list[dict]:
     with _lock:
         conn = sqlite3.connect(DB_PATH)
@@ -432,6 +493,58 @@ def get_incident_by_id(dc_chat_id: int, incident_id: int) -> dict | None:
         conn.close()
         return dict(row) if row else None
 
+def get_unlinked_open_downtime_events(dc_chat_id: int) -> list[dict]:
+    """Returns open downtime events in this chat that are not yet linked to any incident."""
+    with _lock:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT de.*, r.name, r.url, r.type, r.status as resource_status
+            FROM downtime_events de
+            JOIN resources r ON r.id = de.resource_id
+            WHERE r.dc_chat_id = ? AND de.went_up_at IS NULL AND de.incident_id IS NULL
+            ORDER BY de.went_down_at ASC
+        ''', (dc_chat_id,))
+        rows = cursor.fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+
+def link_downtime_event_to_incident(downtime_event_id: int, incident_id: int):
+    with _lock:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("UPDATE downtime_events SET incident_id = ? WHERE id = ?", (incident_id, downtime_event_id))
+        conn.commit()
+        conn.close()
+
+def get_incident_downtime_events(incident_id: int) -> list[dict]:
+    """Returns all downtime events associated with an incident."""
+    with _lock:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT de.*, r.name, r.url, r.type, r.status as resource_status, r.last_changed, r.consecutive_failures
+            FROM downtime_events de
+            LEFT JOIN resources r ON r.id = de.resource_id
+            WHERE de.incident_id = ?
+            ORDER BY de.went_down_at ASC
+        ''', (incident_id,))
+        rows = cursor.fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+
+def close_resource_downtime_events(resource_id: int, now: int = None):
+    if now is None:
+        now = int(time.time())
+    with _lock:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("UPDATE downtime_events SET went_up_at = ? WHERE resource_id = ? AND went_up_at IS NULL", (now, resource_id))
+        conn.commit()
+        conn.close()
+
 def get_resource_downtime_events(resource_id: int, limit: int = 10) -> list[dict]:
     with _lock:
         conn = sqlite3.connect(DB_PATH)
@@ -446,21 +559,32 @@ def get_resource_downtime_events(resource_id: int, limit: int = 10) -> list[dict
         conn.close()
         return [dict(r) for r in rows]
 
-def get_incident_affected_resource_ids(dc_chat_id: int, started_at: int) -> set[int]:
-    """Return set of resource IDs that experienced downtime in this chat during or overlapping the incident."""
+def get_incident_affected_resource_ids(incident_id: int, fallback_chat_id: int = None, fallback_started_at: int = None) -> set[int]:
+    """Return set of resource IDs that experienced downtime in this incident."""
     with _lock:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         cursor.execute('''
-            SELECT DISTINCT de.resource_id 
-            FROM downtime_events de
-            JOIN resources r ON r.id = de.resource_id
-            WHERE r.dc_chat_id = ? 
-              AND (de.went_down_at >= ? OR de.went_up_at IS NULL OR de.went_up_at >= ?)
-        ''', (dc_chat_id, started_at - 60, started_at))
+            SELECT DISTINCT resource_id FROM downtime_events
+            WHERE incident_id = ? AND resource_id IS NOT NULL
+        ''', (incident_id,))
         rows = cursor.fetchall()
+        res_ids = {r[0] for r in rows if r[0] is not None}
+        
+        # Fallback query if legacy incident before incident_id linking
+        if not res_ids and fallback_chat_id is not None and fallback_started_at is not None:
+            cursor.execute('''
+                SELECT DISTINCT de.resource_id 
+                FROM downtime_events de
+                JOIN resources r ON r.id = de.resource_id
+                WHERE r.dc_chat_id = ? 
+                  AND (de.went_down_at >= ? OR de.went_up_at IS NULL OR de.went_up_at >= ?)
+            ''', (fallback_chat_id, fallback_started_at - 60, fallback_started_at))
+            rows = cursor.fetchall()
+            res_ids = {r[0] for r in rows if r[0] is not None}
+            
         conn.close()
-        return {r[0] for r in rows}
+        return res_ids
 
 # Uptime calculation functions
 def get_resource_uptime_30d(resource_id: int) -> float:

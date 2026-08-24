@@ -1157,7 +1157,8 @@ class TestUptimeBot(unittest.TestCase):
         # Chat 2: Has an active incident and resource is still DOWN
         r2 = database.add_resource(chat_id_2, "https://failing.org", "Failing App", "http", 60)
         database.update_resource_status(r2, "down", 5, "Connection refused")
-        inc2_id = database.create_incident(chat_id_2, int(time.time()) - 1800)
+        inc2 = database.get_active_incident(chat_id_2)
+        inc2_id = inc2["id"]
         database.update_incident_msg_id(inc2_id, 77004)
 
         active_incidents = database.get_all_active_incidents()
@@ -1251,7 +1252,8 @@ class TestUptimeBot(unittest.TestCase):
         
         # Site 1 goes down -> incident starts
         database.update_resource_status(r1, "down", 3, "HTTP 500")
-        inc_id = database.create_incident(chat_id, int(time.time()))
+        inc = database.get_active_incident(chat_id)
+        inc_id = inc["id"]
         database.update_incident_msg_id(inc_id, 88801)
         
         bot.dc_bot_instance = MagicMock()
@@ -1272,6 +1274,78 @@ class TestUptimeBot(unittest.TestCase):
         self.assertNotIn("Healthy Site 1", edited_text)
         self.assertNotIn("Healthy Site 2", edited_text)
 
+    def test_incident_split_after_one_hour_gap(self):
+        import asyncio
+        chat_id = 9992
+        database.get_or_create_chat_token(chat_id)
+
+        r1_id = database.add_resource(chat_id, "https://site-a.org", "Site A", "http")
+        r2_id = database.add_resource(chat_id, "https://site-b.org", "Site B", "http")
+
+        mock_bot = MagicMock()
+        mock_bot.rpc.send_msg.side_effect = [20001, 20002]
+        bot.dc_bot_instance = mock_bot
+        bot.dc_accid = 1
+
+        t0 = 1000000
+
+        # 1. Site A goes DOWN at t0 -> Incident #1 created with msg_id 20001
+        with patch('time.time', return_value=t0):
+            res_a = database.get_resources(chat_id)[0]
+            asyncio.run(bot.handle_check_result(res_a, False, "500 - Server Error"))
+
+        self.assertEqual(mock_bot.rpc.send_msg.call_count, 1)
+        active_incs = database.get_active_incidents_for_chat(chat_id)
+        self.assertEqual(len(active_incs), 1)
+        inc1_id = active_incs[0]["id"]
+        self.assertEqual(active_incs[0]["msg_id"], 20001)
+
+        # 2. Site B goes DOWN at t0 + 4000s (> 1 hour gap) -> Incident #2 created with msg_id 20002!
+        t1 = t0 + 4000
+        with patch('time.time', return_value=t1):
+            res_b = database.get_resources(chat_id)[1]
+            asyncio.run(bot.handle_check_result(res_b, False, "Connection refused"))
+
+        self.assertEqual(mock_bot.rpc.send_msg.call_count, 2)
+        active_incs = database.get_active_incidents_for_chat(chat_id)
+        self.assertEqual(len(active_incs), 2)
+        inc2_id = active_incs[1]["id"]
+        self.assertEqual(active_incs[1]["msg_id"], 20002)
+
+        # 3. Site B recovers at t1 + 300s -> Incident #2 resolves, Incident #1 remains active
+        t2 = t1 + 300
+        mock_bot.rpc.send_edit_request.reset_mock()
+        with patch('time.time', return_value=t2):
+            res_b_down = next(r for r in database.get_resources(chat_id) if r["id"] == r2_id)
+            asyncio.run(bot.handle_check_result(res_b_down, True, "200 - OK"))
+
+        resolved_calls = [c for c in mock_bot.rpc.send_edit_request.call_args_list if c[0][1] == 20002]
+        self.assertEqual(len(resolved_calls), 1)
+        self.assertIn(f"Incident #{inc2_id}", resolved_calls[0][0][2])
+        self.assertIn("Resolved", resolved_calls[0][0][2])
+        self.assertIn("Site B", resolved_calls[0][0][2])
+
+        # Verify only Incident #1 is still active
+        active_incs = database.get_active_incidents_for_chat(chat_id)
+        self.assertEqual(len(active_incs), 1)
+        self.assertEqual(active_incs[0]["id"], inc1_id)
+
+        # 4. Site A recovers at t2 + 500s -> Incident #1 resolves
+        t3 = t2 + 500
+        mock_bot.rpc.send_edit_request.reset_mock()
+        with patch('time.time', return_value=t3):
+            res_a_down = next(r for r in database.get_resources(chat_id) if r["id"] == r1_id)
+            asyncio.run(bot.handle_check_result(res_a_down, True, "200 - OK"))
+
+        resolved_calls = [c for c in mock_bot.rpc.send_edit_request.call_args_list if c[0][1] == 20001]
+        self.assertEqual(len(resolved_calls), 1)
+        self.assertIn(f"Incident #{inc1_id}", resolved_calls[0][0][2])
+        self.assertIn("Resolved", resolved_calls[0][0][2])
+        self.assertIn("Site A", resolved_calls[0][0][2])
+
+        # Both incidents resolved
+        active_incs = database.get_active_incidents_for_chat(chat_id)
+        self.assertEqual(len(active_incs), 0)
+
 if __name__ == '__main__':
     unittest.main()
-

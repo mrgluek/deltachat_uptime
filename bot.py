@@ -21,7 +21,7 @@ import database
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "1.6.1"
+VERSION = "1.7.0"
 USER_AGENT = f"DeltaChat-Uptime-Bot/{VERSION} (https://git.gluek.info/gluek/deltachat_uptime)"
 
 dc_cli = BotCli("uptimebot")
@@ -522,13 +522,13 @@ async def check_group_task(group, semaphore):
                         logger.warning(f"SSL check for {rep['url']} failed: {ssl_err}")
                         await asyncio.to_thread(database.update_resource_ssl, r["id"], r.get("ssl_expiry_date"), now, cur_state)
 
-def format_incident_message(incident_id: int, started_at: int, resources: list[dict], is_resolved: bool = False, resolved_at: int = None, dc_chat_id: int = None) -> str:
+def format_incident_message(incident_id: int, started_at: int, resources: list[dict], is_resolved: bool = False, resolved_at: int = None, dc_chat_id: int = None, total_chat_monitors: int = None) -> str:
     start_dt = datetime.datetime.fromtimestamp(started_at, tz=datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
     now = int(time.time())
     
-    total_monitors = len(resources)
-    down_resources = [r for r in resources if r.get("status") == "down"]
-    up_resources = [r for r in resources if r.get("status") == "up"]
+    total_monitors = total_chat_monitors if total_chat_monitors is not None else len(resources)
+    down_resources = [r for r in resources if r.get("status") == "down" or r.get("resource_status") == "down" or r.get("went_up_at") is None]
+    up_resources = [r for r in resources if (r.get("status") == "up" or r.get("resource_status") == "up") and r.get("went_up_at") is not None]
     
     if is_resolved:
         resolved_ts = resolved_at or now
@@ -536,17 +536,7 @@ def format_incident_message(incident_id: int, started_at: int, resources: list[d
         duration = max(1, resolved_ts - started_at)
         duration_str = format_duration(duration)
         
-        affected_ids = set()
-        if dc_chat_id is not None:
-            try:
-                affected_ids = database.get_incident_affected_resource_ids(dc_chat_id, started_at)
-            except Exception as e:
-                logger.debug(f"Failed to get affected resource ids: {e}")
-
-        recovered_resources = [
-            r for r in resources 
-            if r["id"] in affected_ids
-        ]
+        recovered_resources = [r for r in resources if r.get("name") or r.get("url")]
         
         if total_monitors > 0:
             lines = [
@@ -558,7 +548,7 @@ def format_incident_message(incident_id: int, started_at: int, resources: list[d
                 lines.append("\n**Recovered Monitors:**")
                 for r in recovered_resources:
                     r_name = r.get("name") or r.get("url")
-                    r_type = r.get("type", "HTTP").upper()
+                    r_type = (r.get("type") or "HTTP").upper()
                     uptime_val = database.get_resource_uptime_30d(r["id"])
                     lines.append(f"• 🟢 `ID: {r['id']}` **{r_name}** ({r_type}) — Uptime 30d: `{uptime_val:.2f}%`")
         else:
@@ -575,7 +565,7 @@ def format_incident_message(incident_id: int, started_at: int, resources: list[d
         down_count = len(down_resources)
         
         # Check if partially recovered
-        partially_recovered = any((r.get("last_changed") or 0) >= started_at for r in up_resources) and down_count > 0 and len(up_resources) > 0
+        partially_recovered = len(up_resources) > 0 and down_count > 0
         
         if partially_recovered:
             status_tag = "Ongoing (Partial Recovery)"
@@ -593,19 +583,18 @@ def format_incident_message(incident_id: int, started_at: int, resources: list[d
         
         for r in down_resources:
             r_name = r.get("name") or r.get("url")
-            r_type = r.get("type", "HTTP").upper()
-            d_time = max(1, now - (r.get("last_changed") or started_at))
+            r_type = (r.get("type") or "HTTP").upper()
+            d_time = max(1, now - (r.get("last_changed") or r.get("went_down_at") or started_at))
             d_str = format_duration(d_time)
             uptime_val = database.get_resource_uptime_30d(r["id"])
             lines.append(f"• 🔴 `ID: {r['id']}` **{r_name}**\n  Target: `{r['url']}` ({r_type})\n  Status: `DOWN` (down for `{d_str}`) | Uptime 30d: `{uptime_val:.2f}%`")
             
         for r in up_resources:
-            if (r.get("last_changed") or 0) >= started_at:
-                r_name = r.get("name") or r.get("url")
-                r_type = r.get("type", "HTTP").upper()
-                rec_dt = datetime.datetime.fromtimestamp(r.get("last_changed"), tz=datetime.timezone.utc).strftime('%H:%M:%S')
-                uptime_val = database.get_resource_uptime_30d(r["id"])
-                lines.append(f"• 🟢 `ID: {r['id']}` **{r_name}**\n  Target: `{r['url']}` ({r_type})\n  Status: `UP` (recovered at `{rec_dt} UTC`) | Uptime 30d: `{uptime_val:.2f}%`")
+            r_name = r.get("name") or r.get("url")
+            r_type = (r.get("type") or "HTTP").upper()
+            rec_dt = datetime.datetime.fromtimestamp(r.get("last_changed") or r.get("went_up_at") or now, tz=datetime.timezone.utc).strftime('%H:%M:%S')
+            uptime_val = database.get_resource_uptime_30d(r["id"])
+            lines.append(f"• 🟢 `ID: {r['id']}` **{r_name}**\n  Target: `{r['url']}` ({r_type})\n  Status: `UP` (recovered at `{rec_dt} UTC`) | Uptime 30d: `{uptime_val:.2f}%`")
 
         return "\n".join(lines)
 
@@ -636,105 +625,79 @@ async def sync_chat_incident_state(dc_chat_id: int, force_update: bool = False):
     chat_lock = get_chat_incident_lock(dc_chat_id)
     async with chat_lock:
         resources = await asyncio.to_thread(database.get_resources, dc_chat_id)
-        active_incident = await asyncio.to_thread(database.get_active_incident, dc_chat_id)
+        total_chat_monitors = len(resources) if resources else 0
         now = int(time.time())
+        active_res_map = {r["id"]: r for r in (resources or [])}
         
-        down_resources = [r for r in resources if r.get("status") == "down"] if resources else []
-        
-        if down_resources:
-            if not active_incident:
-                inc_id = await asyncio.to_thread(database.create_incident, dc_chat_id, now)
-                active_incident = await asyncio.to_thread(database.get_incident_by_id, dc_chat_id, inc_id)
+        # Link any unlinked open downtime events to matching incident or create a new incident
+        unlinked_events = await asyncio.to_thread(database.get_unlinked_open_downtime_events, dc_chat_id)
+        for ev in unlinked_events:
+            matching_inc = await asyncio.to_thread(database.get_active_incident_for_outage, dc_chat_id, ev["went_down_at"], 3600)
+            if matching_inc:
+                await asyncio.to_thread(database.link_downtime_event_to_incident, ev["id"], matching_inc["id"])
+            else:
+                new_inc_id = await asyncio.to_thread(database.create_incident, dc_chat_id, ev["went_down_at"])
+                await asyncio.to_thread(database.link_downtime_event_to_incident, ev["id"], new_inc_id)
                 force_update = True
-                
-            inc_id = active_incident["id"]
-            started_at = active_incident["started_at"]
-            duration = max(0, now - started_at)
-            
-            status_sig = tuple(sorted((r["id"], r.get("status"), r.get("consecutive_failures")) for r in (resources or [])))
-            last_edit_time, last_sig = _incident_last_edit_state.get(inc_id, (0.0, None))
-            throttle_interval = get_incident_update_interval(duration)
-            
-            should_edit = force_update or (status_sig != last_sig) or ((now - last_edit_time) >= throttle_interval)
-            if not should_edit:
-                return
 
-            msg_text = format_incident_message(
-                active_incident["id"],
-                active_incident["started_at"],
-                resources,
-                is_resolved=False
-            )
+        active_incidents = await asyncio.to_thread(database.get_active_incidents_for_chat, dc_chat_id)
+        if not active_incidents:
+            return
+
+        for inc in active_incidents:
+            inc_id = inc["id"]
+            events = await asyncio.to_thread(database.get_incident_downtime_events, inc_id)
             
-            if dc_bot_instance and dc_accid is not None:
-                msg_id = active_incident.get("msg_id")
-                if msg_id:
-                    try:
-                        await asyncio.to_thread(
-                            dc_bot_instance.rpc.send_edit_request,
-                            dc_accid,
-                            msg_id,
-                            msg_text
-                        )
-                        _incident_last_edit_state[inc_id] = (now, status_sig)
-                        logger.info(f"Edited Incident #{active_incident['id']} message {msg_id} in chat {dc_chat_id}")
-                    except Exception as e:
-                        logger.warning(f"Failed to edit Incident message {msg_id} (sending new message): {e}")
-                        try:
-                            new_msg_id = await asyncio.to_thread(
-                                dc_bot_instance.rpc.send_msg,
-                                dc_accid,
-                                dc_chat_id,
-                                MsgData(text=msg_text)
-                            )
-                            if isinstance(new_msg_id, int):
-                                await asyncio.to_thread(database.update_incident_msg_id, active_incident["id"], new_msg_id)
-                                _incident_last_edit_state[inc_id] = (now, status_sig)
-                        except Exception as ex:
-                            logger.error(f"Failed to send incident message to chat {dc_chat_id}: {ex}")
-                else:
-                    try:
-                        new_msg_id = await asyncio.to_thread(
-                            dc_bot_instance.rpc.send_msg,
-                            dc_accid,
-                            dc_chat_id,
-                            MsgData(text=msg_text)
-                        )
-                        if isinstance(new_msg_id, int):
-                            await asyncio.to_thread(database.update_incident_msg_id, active_incident["id"], new_msg_id)
-                            _incident_last_edit_state[inc_id] = (now, status_sig)
-                    except Exception as e:
-                        logger.error(f"Failed to send incident message to chat {dc_chat_id}: {e}")
-                        
-        else:
-            if active_incident:
-                inc_id = active_incident["id"]
-                _incident_last_edit_state.pop(inc_id, None)
+            # If any open downtime event belongs to a deleted resource, close it
+            for ev in events:
+                if ev["resource_id"] not in active_res_map and ev.get("went_up_at") is None:
+                    await asyncio.to_thread(database.close_resource_downtime_events, ev["resource_id"], now)
+                    ev["went_up_at"] = now
+
+            open_events = [ev for ev in events if ev.get("went_up_at") is None and ev["resource_id"] in active_res_map]
+            
+            if open_events:
+                # Incident is ongoing
+                started_at = inc["started_at"]
+                duration = max(0, now - started_at)
                 
-                affected_ids = await asyncio.to_thread(database.get_incident_affected_resource_ids, dc_chat_id, active_incident["started_at"])
-                recovered_resources = [
-                    r for r in (resources or [])
-                    if r["id"] in affected_ids
-                ]
-                if recovered_resources:
-                    rec_names = [r.get("name") or r.get("url") for r in recovered_resources]
-                    summary_str = f"Recovered: {', '.join(rec_names)}"
-                else:
-                    summary_str = f"All {len(resources)} monitors operational" if resources else "All monitored resources removed or operational"
+                status_sig = tuple(sorted((ev["resource_id"], ev.get("resource_status"), ev.get("went_up_at")) for ev in events))
+                last_edit_time, last_sig = _incident_last_edit_state.get(inc_id, (0.0, None))
+                throttle_interval = get_incident_update_interval(duration)
                 
-                await asyncio.to_thread(database.resolve_incident, active_incident["id"], now, summary_str)
+                should_edit = (status_sig != last_sig) or ((now - last_edit_time) >= throttle_interval) or (inc.get("msg_id") is None)
+                if not should_edit:
+                    continue
+
+                inc_resources = []
+                seen_res = set()
+                for ev in events:
+                    rid = ev["resource_id"]
+                    if rid in active_res_map and rid not in seen_res:
+                        seen_res.add(rid)
+                        r = active_res_map[rid]
+                        is_currently_down = any(e["resource_id"] == rid and e.get("went_up_at") is None for e in events)
+                        inc_resources.append({
+                            "id": r["id"],
+                            "name": r.get("name"),
+                            "url": r.get("url"),
+                            "type": r.get("type"),
+                            "status": "down" if is_currently_down else "up",
+                            "last_changed": r.get("last_changed") or ev.get("went_up_at") or ev.get("went_down_at"),
+                            "went_down_at": ev.get("went_down_at"),
+                            "went_up_at": ev.get("went_up_at")
+                        })
                 
                 msg_text = format_incident_message(
-                    active_incident["id"],
-                    active_incident["started_at"],
-                    resources or [],
-                    is_resolved=True,
-                    resolved_at=now,
-                    dc_chat_id=dc_chat_id
+                    inc_id,
+                    started_at,
+                    inc_resources,
+                    is_resolved=False,
+                    total_chat_monitors=total_chat_monitors
                 )
                 
                 if dc_bot_instance and dc_accid is not None:
-                    msg_id = active_incident.get("msg_id")
+                    msg_id = inc.get("msg_id")
                     if msg_id:
                         try:
                             await asyncio.to_thread(
@@ -743,7 +706,77 @@ async def sync_chat_incident_state(dc_chat_id: int, force_update: bool = False):
                                 msg_id,
                                 msg_text
                             )
-                            logger.info(f"Resolved Incident #{active_incident['id']} by editing message {msg_id} in chat {dc_chat_id}")
+                            _incident_last_edit_state[inc_id] = (now, status_sig)
+                            logger.info(f"Edited Incident #{inc_id} message {msg_id} in chat {dc_chat_id}")
+                        except Exception as e:
+                            logger.warning(f"Failed to edit Incident message {msg_id} (sending new message): {e}")
+                            try:
+                                new_msg_id = await asyncio.to_thread(
+                                    dc_bot_instance.rpc.send_msg,
+                                    dc_accid,
+                                    dc_chat_id,
+                                    MsgData(text=msg_text)
+                                )
+                                if isinstance(new_msg_id, int):
+                                    await asyncio.to_thread(database.update_incident_msg_id, inc_id, new_msg_id)
+                                    _incident_last_edit_state[inc_id] = (now, status_sig)
+                            except Exception as ex:
+                                logger.error(f"Failed to send incident message to chat {dc_chat_id}: {ex}")
+                    else:
+                        try:
+                            new_msg_id = await asyncio.to_thread(
+                                dc_bot_instance.rpc.send_msg,
+                                dc_accid,
+                                dc_chat_id,
+                                MsgData(text=msg_text)
+                            )
+                            if isinstance(new_msg_id, int):
+                                await asyncio.to_thread(database.update_incident_msg_id, inc_id, new_msg_id)
+                                _incident_last_edit_state[inc_id] = (now, status_sig)
+                        except Exception as e:
+                            logger.error(f"Failed to send incident message to chat {dc_chat_id}: {e}")
+
+            else:
+                # All events for this incident are closed -> Incident is resolved!
+                _incident_last_edit_state.pop(inc_id, None)
+                
+                rec_resources = []
+                seen_res = set()
+                for ev in events:
+                    rid = ev["resource_id"]
+                    if rid in active_res_map and rid not in seen_res:
+                        seen_res.add(rid)
+                        rec_resources.append(active_res_map[rid])
+                
+                if rec_resources:
+                    rec_names = [r.get("name") or r.get("url") for r in rec_resources]
+                    summary_str = f"Recovered: {', '.join(rec_names)}"
+                else:
+                    summary_str = f"All {total_chat_monitors} monitors operational" if total_chat_monitors > 0 else "All monitored resources removed or operational"
+                
+                await asyncio.to_thread(database.resolve_incident, inc_id, now, summary_str)
+                
+                msg_text = format_incident_message(
+                    inc_id,
+                    inc["started_at"],
+                    rec_resources,
+                    is_resolved=True,
+                    resolved_at=now,
+                    total_chat_monitors=total_chat_monitors,
+                    dc_chat_id=dc_chat_id
+                )
+                
+                if dc_bot_instance and dc_accid is not None:
+                    msg_id = inc.get("msg_id")
+                    if msg_id:
+                        try:
+                            await asyncio.to_thread(
+                                dc_bot_instance.rpc.send_edit_request,
+                                dc_accid,
+                                msg_id,
+                                msg_text
+                            )
+                            logger.info(f"Resolved Incident #{inc_id} by editing message {msg_id} in chat {dc_chat_id}")
                         except Exception as e:
                             logger.warning(f"Failed to edit resolved Incident message {msg_id}: {e}")
                             try:

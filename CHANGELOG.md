@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.0] - 2026-08-24
+
+### Added
+- **1-Hour Incident Clustering Window & Independent Incidents:**
+  - Implemented an incident time-window threshold: service outages occurring within **1 hour (3600s)** of previous failure events are clustered together into the active incident and update the existing alert message.
+  - Failures occurring **more than 1 hour** after previous failures now spawn a **new, independent incident** with its own alert message and lifecycle.
+  - Each incident tracks its assigned monitors independently, so when monitors belonging to an incident recover, that incident resolves without affecting other ongoing incidents in the same chat.
+
 ## [1.6.1] - 2026-08-20
 
 ### Added

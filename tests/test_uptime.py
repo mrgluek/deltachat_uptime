@@ -1384,5 +1384,84 @@ class TestUptimeBot(unittest.TestCase):
             if os.path.exists(legacy_db_path):
                 os.remove(legacy_db_path)
 
+    def test_incident_reopened_on_service_flapping_within_one_hour(self):
+        import asyncio
+        chat_id = 9993
+        database.get_or_create_chat_token(chat_id)
+        r_id = database.add_resource(chat_id, "https://flapping-site.org", "Flapping Site", "http")
+
+        mock_bot = MagicMock()
+        mock_bot.rpc.send_msg.return_value = 30001
+        bot.dc_bot_instance = mock_bot
+        bot.dc_accid = 1
+
+        t0 = 1000000
+
+        # 1. Goes DOWN at t0 -> Incident #1 created with send_msg
+        with patch('time.time', return_value=t0):
+            res = database.get_resources(chat_id)[0]
+            asyncio.run(bot.handle_check_result(res, False, "502 - Bad Gateway"))
+
+        mock_bot.rpc.send_msg.assert_called_once()
+        active_incs = database.get_active_incidents_for_chat(chat_id)
+        self.assertEqual(len(active_incs), 1)
+        inc1_id = active_incs[0]["id"]
+        self.assertEqual(active_incs[0]["msg_id"], 30001)
+
+        # 2. Recovers at t0 + 300s -> Incident #1 resolves with send_edit_request
+        t1 = t0 + 300
+        mock_bot.rpc.send_msg.reset_mock()
+        mock_bot.rpc.send_edit_request.reset_mock()
+        with patch('time.time', return_value=t1):
+            res_down = database.get_resources(chat_id)[0]
+            asyncio.run(bot.handle_check_result(res_down, True, "200 - OK"))
+
+        mock_bot.rpc.send_msg.assert_not_called()
+        mock_bot.rpc.send_edit_request.assert_called_once()
+        edit_args = mock_bot.rpc.send_edit_request.call_args[0]
+        self.assertEqual(edit_args[1], 30001)
+        self.assertIn("Resolved", edit_args[2])
+        self.assertEqual(len(database.get_active_incidents_for_chat(chat_id)), 0)
+
+        # 3. Flaps DOWN again at t1 + 300s (T = t0 + 600s, < 1 hour) -> Reopens Incident #1!
+        t2 = t1 + 300
+        mock_bot.rpc.send_msg.reset_mock()
+        mock_bot.rpc.send_edit_request.reset_mock()
+        with patch('time.time', return_value=t2):
+            res_up = database.get_resources(chat_id)[0]
+            asyncio.run(bot.handle_check_result(res_up, False, "Connection timed out"))
+
+        # MUST NOT send a new message
+        mock_bot.rpc.send_msg.assert_not_called()
+        # MUST edit existing message back to Ongoing
+        mock_bot.rpc.send_edit_request.assert_called_once()
+        edit_args = mock_bot.rpc.send_edit_request.call_args[0]
+        self.assertEqual(edit_args[1], 30001)
+        self.assertIn(f"Incident #{inc1_id}", edit_args[2])
+        self.assertIn("Ongoing", edit_args[2])
+        self.assertIn("Flapping Site", edit_args[2])
+
+        # Active incidents in DB should now show Incident #1 active again
+        active_incs = database.get_active_incidents_for_chat(chat_id)
+        self.assertEqual(len(active_incs), 1)
+        self.assertEqual(active_incs[0]["id"], inc1_id)
+        self.assertEqual(active_incs[0]["status"], "ongoing")
+
+        # 4. Finally recovers at t2 + 300s (T = t0 + 900s) -> Resolves again
+        t3 = t2 + 300
+        mock_bot.rpc.send_msg.reset_mock()
+        mock_bot.rpc.send_edit_request.reset_mock()
+        with patch('time.time', return_value=t3):
+            res_down2 = database.get_resources(chat_id)[0]
+            asyncio.run(bot.handle_check_result(res_down2, True, "200 - OK"))
+
+        mock_bot.rpc.send_msg.assert_not_called()
+        mock_bot.rpc.send_edit_request.assert_called_once()
+        edit_args = mock_bot.rpc.send_edit_request.call_args[0]
+        self.assertEqual(edit_args[1], 30001)
+        self.assertIn(f"Incident #{inc1_id}", edit_args[2])
+        self.assertIn("Resolved", edit_args[2])
+        self.assertEqual(len(database.get_active_incidents_for_chat(chat_id)), 0)
+
 if __name__ == '__main__':
     unittest.main()

@@ -21,7 +21,7 @@ import database
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "1.7.0"
+VERSION = "1.7.1"
 USER_AGENT = f"DeltaChat-Uptime-Bot/{VERSION} (https://git.gluek.info/gluek/deltachat_uptime)"
 
 dc_cli = BotCli("uptimebot")
@@ -632,9 +632,12 @@ async def sync_chat_incident_state(dc_chat_id: int, force_update: bool = False):
         # Link any unlinked open downtime events to matching incident or create a new incident
         unlinked_events = await asyncio.to_thread(database.get_unlinked_open_downtime_events, dc_chat_id)
         for ev in unlinked_events:
-            matching_inc = await asyncio.to_thread(database.get_active_incident_for_outage, dc_chat_id, ev["went_down_at"], 3600)
+            matching_inc = await asyncio.to_thread(database.get_active_incident_for_outage, dc_chat_id, ev["went_down_at"], 3600, True)
             if matching_inc:
+                if matching_inc.get("status") == "resolved":
+                    await asyncio.to_thread(database.reopen_incident, matching_inc["id"])
                 await asyncio.to_thread(database.link_downtime_event_to_incident, ev["id"], matching_inc["id"])
+                force_update = True
             else:
                 new_inc_id = await asyncio.to_thread(database.create_incident, dc_chat_id, ev["went_down_at"])
                 await asyncio.to_thread(database.link_downtime_event_to_incident, ev["id"], new_inc_id)
@@ -661,7 +664,7 @@ async def sync_chat_incident_state(dc_chat_id: int, force_update: bool = False):
                 started_at = inc["started_at"]
                 duration = max(0, now - started_at)
                 
-                status_sig = tuple(sorted((ev["resource_id"], ev.get("resource_status"), ev.get("went_up_at")) for ev in events))
+                status_sig = tuple(sorted((ev["resource_id"], ev.get("resource_status") or "", ev.get("went_up_at") or 0) for ev in events))
                 last_edit_time, last_sig = _incident_last_edit_state.get(inc_id, (0.0, None))
                 throttle_interval = get_incident_update_interval(duration)
                 

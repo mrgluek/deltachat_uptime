@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.1] - 2026-08-24
+
+### Added
+- **Reopen Resolved Incidents on Flapping (1-Hour Window):**
+  - If a service recovers but fails again within **1 hour (3600s)** of its previous failure / resolution, the bot reopens the existing incident instead of spamming new incident messages.
+  - The message in the chat is edited in-place from `Resolved` back to `Ongoing`, preserving the overall duration of the flapping window.
+- **Robust Database Migration Order:**
+  - Ensured schema migrations (`ALTER TABLE`) execute prior to index creations (`CREATE INDEX`) to prevent `no such column` startup errors on pre-existing databases.
+
 ## [1.7.0] - 2026-08-24
 
 ### Added

@@ -83,11 +83,6 @@ def init_db():
             )
         ''')
         
-        # Add index to downtime_events for fast lookups
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_downtime_resource ON downtime_events(resource_id)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_downtime_went_down ON downtime_events(went_down_at)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_downtime_incident ON downtime_events(incident_id)')
-        
         # Ensure columns exist in downtime_events
         cursor.execute("PRAGMA table_info(downtime_events)")
         columns_dt = [row[1] for row in cursor.fetchall()]
@@ -95,6 +90,11 @@ def init_db():
             cursor.execute("ALTER TABLE downtime_events ADD COLUMN error_msg TEXT")
         if "incident_id" not in columns_dt:
             cursor.execute("ALTER TABLE downtime_events ADD COLUMN incident_id INTEGER")
+            
+        # Add index to downtime_events for fast lookups
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_downtime_resource ON downtime_events(resource_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_downtime_went_down ON downtime_events(went_down_at)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_downtime_incident ON downtime_events(incident_id)')
 
         # Incidents table for tracking grouped chat outages
         cursor.execute('''

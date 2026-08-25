@@ -1463,5 +1463,124 @@ class TestUptimeBot(unittest.TestCase):
         self.assertIn("Resolved", edit_args[2])
         self.assertEqual(len(database.get_active_incidents_for_chat(chat_id)), 0)
 
+    def test_delete_by_numeric_id(self):
+        chat_id = 9994
+        database.get_or_create_chat_token(chat_id)
+        r_id = database.add_resource(chat_id, "https://delete-id.org", "Delete ID Site", "http")
+
+        mock_bot = MagicMock()
+        mock_event = MagicMock()
+        mock_event.msg.chat_id = chat_id
+        mock_event.msg.quote = None
+        mock_event.payload = str(r_id)
+
+        bot.remove_command(mock_bot, 1, mock_event)
+        mock_bot.rpc.send_msg.assert_called_once()
+        sent_text = mock_bot.rpc.send_msg.call_args[0][2].text
+        self.assertIn("Removed monitor", sent_text)
+        self.assertIn("Delete ID Site", sent_text)
+        self.assertEqual(len(database.get_resources(chat_id)), 0)
+
+    def test_delete_by_url_target(self):
+        chat_id = 9995
+        database.get_or_create_chat_token(chat_id)
+        database.add_resource(chat_id, "https://delete-url.org/api", "Delete URL Site", "http")
+
+        mock_bot = MagicMock()
+        mock_event = MagicMock()
+        mock_event.msg.chat_id = chat_id
+        mock_event.msg.quote = None
+        mock_event.payload = "https://delete-url.org/api"
+
+        bot.remove_command(mock_bot, 1, mock_event)
+        mock_bot.rpc.send_msg.assert_called_once()
+        sent_text = mock_bot.rpc.send_msg.call_args[0][2].text
+        self.assertIn("Removed monitor", sent_text)
+        self.assertIn("Delete URL Site", sent_text)
+        self.assertEqual(len(database.get_resources(chat_id)), 0)
+
+    def test_delete_by_quote_incident_msg_id(self):
+        import asyncio
+        chat_id = 9996
+        database.get_or_create_chat_token(chat_id)
+        r_id = database.add_resource(chat_id, "https://quote-inc.org", "Quote Inc Site", "http")
+
+        # 1. Trigger incident -> msg_id = 40001
+        mock_bot = MagicMock()
+        mock_bot.rpc.send_msg.return_value = 40001
+        bot.dc_bot_instance = mock_bot
+        bot.dc_accid = 1
+
+        res = database.get_resources(chat_id)[0]
+        asyncio.run(bot.handle_check_result(res, False, "503 - Service Unavailable"))
+
+        active_incs = database.get_active_incidents_for_chat(chat_id)
+        self.assertEqual(len(active_incs), 1)
+        self.assertEqual(active_incs[0]["msg_id"], 40001)
+
+        # 2. User sends /delete replying to message 40001
+        mock_bot.rpc.send_msg.reset_mock()
+        mock_event = MagicMock()
+        mock_event.msg.chat_id = chat_id
+        mock_event.msg.quote = {"message_id": 40001, "text": "🚨 Incident #1 — Ongoing\n• https://quote-inc.org"}
+        mock_event.payload = ""
+
+        bot.remove_command(mock_bot, 1, mock_event)
+        mock_bot.rpc.send_msg.assert_called_once()
+        sent_text = mock_bot.rpc.send_msg.call_args[0][2].text
+        self.assertIn("Removed monitor", sent_text)
+        self.assertIn("Quote Inc Site", sent_text)
+        self.assertEqual(len(database.get_resources(chat_id)), 0)
+
+    def test_delete_by_quote_text_url_matching(self):
+        chat_id = 9997
+        database.get_or_create_chat_token(chat_id)
+        database.add_resource(chat_id, "https://quote-text.org", "Quote Text Site", "http")
+
+        mock_bot = MagicMock()
+        mock_event = MagicMock()
+        mock_event.msg.chat_id = chat_id
+        mock_event.msg.quote = {"text": "Notice: https://quote-text.org has been unreachable for 7 days."}
+        mock_event.payload = ""
+
+        bot.remove_command(mock_bot, 1, mock_event)
+        mock_bot.rpc.send_msg.assert_called_once()
+        sent_text = mock_bot.rpc.send_msg.call_args[0][2].text
+        self.assertIn("Removed monitor", sent_text)
+        self.assertIn("Quote Text Site", sent_text)
+        self.assertEqual(len(database.get_resources(chat_id)), 0)
+
+    def test_delete_by_quote_unrelated_message_silently_ignored(self):
+        chat_id = 9998
+        database.get_or_create_chat_token(chat_id)
+        database.add_resource(chat_id, "https://my-own-site.org", "My Site", "http")
+
+        # Quoting a message from another bot in the chat (unrelated URL)
+        mock_bot = MagicMock()
+        mock_event = MagicMock()
+        mock_event.msg.chat_id = chat_id
+        mock_event.msg.quote = {"message_id": 77777, "text": "Alert from Other Bot: https://other-bot-server.org"}
+        mock_event.payload = ""
+
+        bot.remove_command(mock_bot, 1, mock_event)
+        # Must NOT send any message (silent ignore to allow the other bot to respond)
+        mock_bot.rpc.send_msg.assert_not_called()
+        # Must NOT delete this bot's monitor
+        self.assertEqual(len(database.get_resources(chat_id)), 1)
+
+    def test_delete_no_args_no_quote_shows_usage(self):
+        chat_id = 9999
+        mock_bot = MagicMock()
+        mock_event = MagicMock()
+        mock_event.msg.chat_id = chat_id
+        mock_event.msg.quote = None
+        mock_event.payload = ""
+
+        bot.remove_command(mock_bot, 1, mock_event)
+        mock_bot.rpc.send_msg.assert_called_once()
+        sent_text = mock_bot.rpc.send_msg.call_args[0][2].text
+        self.assertIn("Usage:", sent_text)
+        self.assertIn("Reply `/delete`", sent_text)
+
 if __name__ == '__main__':
     unittest.main()

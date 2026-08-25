@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.8.0] - 2026-08-25
+
+### Added
+- **Delete Monitors by Quote / Reply (`/delete`, `/remove`, `/rm`, `/del`):**
+  - Replying `/delete` (without arguments) to an incident notification, downtime reminder, or outage alert message now automatically deletes the affected monitor.
+  - Safely supports multiple bot instances in the same chat: if a quote belongs to another bot or mentions monitors not owned by this instance, the bot silently ignores it without error or accidental deletions.
+- **Delete Monitors by Target URL / Domain:**
+  - Added support for deleting monitors directly by URL or domain name (e.g. `/delete https://example.com` or `/remove example.com`), removing the need to look up internal integer monitor IDs.
+- **Command Aliases:**
+  - Added `/rm` and `/del` aliases alongside `/delete` and `/remove`.
+
 ## [1.7.1] - 2026-08-24
 
 ### Added

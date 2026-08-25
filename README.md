@@ -49,7 +49,7 @@ These commands are available to any member of a chat. They support suffixes (e.g
   • `https://google.com` (HTTP/HTTPS check)
   • `google.com:443` (TCP port check)
   • `google.com` (ICMP Ping check)
-- `/remove <id>` — Stop monitoring a resource by ID.
+- `/remove <id|url>` (or `/delete`, `/rm`, `/del`) — Stop monitoring a resource by ID or target URL. You can also reply `/remove` directly to any incident or outage alert message to remove the affected monitor without knowing its ID.
 - `/list` — List monitored resources and their status in this chat.
 - `/status` — View monthly uptime statistics and get the link to the chat's secure Web Status Page.
 - `/events` — View recent incidents and active outages for this chat.

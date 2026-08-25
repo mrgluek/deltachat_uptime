@@ -21,7 +21,7 @@ import database
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "1.7.1"
+VERSION = "1.8.0"
 USER_AGENT = f"DeltaChat-Uptime-Bot/{VERSION} (https://git.gluek.info/gluek/deltachat_uptime)"
 
 dc_cli = BotCli("uptimebot")
@@ -1823,8 +1823,8 @@ async def handle_index(request):
                         <td>Add a website (HTTP), socket (IP:port) or host (Ping) to monitor.</td>
                     </tr>
                     <tr>
-                        <td><code>/remove &lt;id&gt;</code></td>
-                        <td>Stop monitoring a resource and delete it.</td>
+                        <td><code>/remove &lt;id|url&gt;</code></td>
+                        <td>Stop monitoring a resource (or reply <code>/remove</code> to alert).</td>
                     </tr>
                     <tr>
                         <td><code>/list</code></td>
@@ -1931,7 +1931,7 @@ def help_command(bot, accid, event):
         f"  • `https://example.com` (HTTP/HTTPS)\n"
         f"  • `example.com:22` (TCP Port)\n"
         f"  • `example.com` (ICMP Ping)\n"
-        f"/remove <id> — Stop monitoring a resource\n"
+        f"/remove <id|url> (or reply /remove) — Stop monitoring a resource\n"
         f"/list — List all monitors in this chat\n"
         f"/status — Show monthly uptime statistics & web link\n"
         f"/events — View incident history and active outages\n"
@@ -2104,21 +2104,110 @@ def add_command(bot, accid, event):
              f"🕒 Checking once a minute."
     ))
 
+@dc_cli.on(events.NewMessage(command="/rm"))
+@dc_cli.on(events.NewMessage(command="/del"))
 @dc_cli.on(events.NewMessage(command="/remove"))
 @dc_cli.on(events.NewMessage(command="/delete"))
 def remove_command(bot, accid, event):
     msg = event.msg
-    payload = event.payload.strip()
-    if not payload or not payload.isdigit():
-        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text="Usage: /remove <id>"))
+    payload = (event.payload or "").strip()
+
+    # Case 1: Direct numeric ID (e.g. /delete 1)
+    if payload.isdigit():
+        res_id = int(payload)
+        res = database.get_resource_by_id(res_id)
+        if res and res["dc_chat_id"] == msg.chat_id:
+            res_name = res["name"]
+            res_url = res["url"]
+            database.delete_resource(msg.chat_id, res_id)
+            _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=f"✅ Removed monitor: **{res_name}** (`{res_url}`) (ID: `{res_id}`)."))
+            trigger_chat_incident_sync(msg.chat_id, force_update=True)
+        else:
+            _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=f"❌ Monitor ID `{res_id}` not found in this chat."))
         return
-        
-    res_id = int(payload)
-    if database.delete_resource(msg.chat_id, res_id):
-        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=f"✅ Removed monitor with ID `{res_id}`."))
-        trigger_chat_incident_sync(msg.chat_id, force_update=True)
-    else:
-        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=f"❌ Monitor ID `{res_id}` not found in this chat."))
+
+    # Case 2: Target URL / name passed directly (e.g. /delete https://example.com)
+    if payload:
+        matched_resources = database.get_resources_by_target(msg.chat_id, payload)
+        if not matched_resources:
+            matched_resources = database.get_resources_matching_text(msg.chat_id, payload)
+
+        if matched_resources:
+            deleted_names = []
+            for r in matched_resources:
+                if database.delete_resource(msg.chat_id, r["id"]):
+                    deleted_names.append(f"• **{r['name']}** (`{r['url']}`) (ID: `{r['id']}`)")
+
+            if deleted_names:
+                text = "✅ Removed monitor:\n" + "\n".join(deleted_names) if len(deleted_names) > 1 else f"✅ Removed monitor: **{matched_resources[0]['name']}** (`{matched_resources[0]['url']}`) (ID: `{matched_resources[0]['id']}`)."
+                _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=text))
+                trigger_chat_incident_sync(msg.chat_id, force_update=True)
+                return
+        else:
+            _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=f"❌ No monitored resource matching `{payload}` found in this chat."))
+            return
+
+    # Case 3: No payload -> check if replying / quoting an incident or alert message
+    quote = getattr(msg, "quote", None) or (msg.get("quote") if isinstance(msg, dict) else None)
+    if quote:
+        quote_msg_id = None
+        if isinstance(quote, dict):
+            quote_msg_id = quote.get("message_id") or quote.get("messageId")
+            quote_text = quote.get("text", "")
+        else:
+            quote_msg_id = getattr(quote, "message_id", None) or getattr(quote, "messageId", None)
+            quote_text = getattr(quote, "text", "")
+
+        full_quote_text = quote_text or ""
+        if quote_msg_id and bot and hasattr(bot, "rpc"):
+            try:
+                quoted_msg = bot.rpc.get_message(accid, quote_msg_id)
+                if quoted_msg and hasattr(quoted_msg, "text") and quoted_msg.text:
+                    full_quote_text = f"{full_quote_text}\n{quoted_msg.text}"
+            except Exception as e:
+                logger.debug(f"Could not fetch quoted message {quote_msg_id}: {e}")
+
+        targets_to_delete = []
+
+        # 3a. Check if quote_msg_id corresponds to an incident from this bot in this chat
+        if quote_msg_id:
+            inc = database.get_incident_by_msg_id(msg.chat_id, quote_msg_id)
+            if inc:
+                events = database.get_incident_downtime_events(inc["id"])
+                for ev in events:
+                    r = database.get_resource_by_id(ev["resource_id"])
+                    if r and r["dc_chat_id"] == msg.chat_id and r not in targets_to_delete:
+                        targets_to_delete.append(r)
+
+        # 3b. Match resources by URLs/names in quote text
+        if full_quote_text:
+            text_matched = database.get_resources_matching_text(msg.chat_id, full_quote_text)
+            for r in text_matched:
+                if r not in targets_to_delete:
+                    targets_to_delete.append(r)
+
+        if targets_to_delete:
+            deleted_names = []
+            for r in targets_to_delete:
+                if database.delete_resource(msg.chat_id, r["id"]):
+                    deleted_names.append(f"• **{r['name']}** (`{r['url']}`) (ID: `{r['id']}`)")
+
+            if deleted_names:
+                text = "✅ Removed monitor:\n" + "\n".join(deleted_names) if len(deleted_names) > 1 else f"✅ Removed monitor: **{targets_to_delete[0]['name']}** (`{targets_to_delete[0]['url']}`) (ID: `{targets_to_delete[0]['id']}`)."
+                _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=text))
+                trigger_chat_incident_sync(msg.chat_id, force_update=True)
+            return
+        else:
+            # Quoted message belongs to another bot/message with no matching monitors in this bot.
+            # Silently ignore so the other bot instance can reply cleanly.
+            logger.info(f"Ignoring /delete reply in chat {msg.chat_id}: no matching monitors found for quote {quote_msg_id}")
+            return
+
+    # Case 4: No payload and no quote
+    _dc_send_msg_with_stats(
+        bot, accid, msg.chat_id,
+        MsgData(text="ℹ️ **Usage:**\n• `/delete <id>` — Delete monitor by ID\n• `/delete <url>` — Delete monitor by URL/domain\n• Reply `/delete` directly to an incident or outage alert message.")
+    )
 
 @dc_cli.on(events.NewMessage(command="/list"))
 def list_command(bot, accid, event):

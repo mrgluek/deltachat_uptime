@@ -1,4 +1,5 @@
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -467,6 +468,58 @@ def get_all_active_incidents() -> list[dict]:
         rows = cursor.fetchall()
         conn.close()
         return [dict(r) for r in rows]
+
+def get_incident_by_msg_id(dc_chat_id: int, msg_id: int) -> dict | None:
+    """Finds incident record matching chat and message ID."""
+    with _lock:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT * FROM incidents 
+            WHERE dc_chat_id = ? AND msg_id = ?
+            ORDER BY id DESC LIMIT 1
+        ''', (dc_chat_id, msg_id))
+        row = cursor.fetchone()
+        conn.close()
+        return dict(row) if row else None
+
+def get_resources_matching_text(dc_chat_id: int, text: str) -> list[dict]:
+    """Finds all resources in dc_chat_id whose url or name appears in text."""
+    if not text:
+        return []
+    resources = get_resources(dc_chat_id)
+    matched = []
+    text_lower = text.lower()
+    for r in resources:
+        url = r.get("url", "").strip().lower()
+        name = r.get("name", "").strip().lower()
+        if url:
+            url_no_scheme = re.sub(r'^https?://', '', url).rstrip('/')
+            if url in text_lower or (url_no_scheme and url_no_scheme in text_lower):
+                matched.append(r)
+                continue
+        if name and len(name) >= 3 and name in text_lower:
+            matched.append(r)
+    return matched
+
+def get_resources_by_target(dc_chat_id: int, target: str) -> list[dict]:
+    """Finds resources in dc_chat_id matching a given target string (URL, domain, or name)."""
+    target_clean = target.strip().lower()
+    if not target_clean:
+        return []
+    target_no_scheme = re.sub(r'^https?://', '', target_clean).rstrip('/')
+    resources = get_resources(dc_chat_id)
+    matched = []
+    for r in resources:
+        r_url = r.get("url", "").strip().lower()
+        r_url_no_scheme = re.sub(r'^https?://', '', r_url).rstrip('/')
+        r_name = r.get("name", "").strip().lower()
+        if r_url == target_clean or r_url_no_scheme == target_no_scheme:
+            matched.append(r)
+        elif r_name == target_clean:
+            matched.append(r)
+    return matched
 
 def update_incident_msg_id(incident_id: int, msg_id: int | None):
     if msg_id is not None and not isinstance(msg_id, int):

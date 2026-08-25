@@ -10,6 +10,7 @@ import datetime
 import html
 import re
 import socket
+import shlex
 from urllib.parse import urlparse
 import aiohttp
 from aiohttp import web
@@ -21,7 +22,7 @@ import database
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "1.8.0"
+VERSION = "1.9.0"
 USER_AGENT = f"DeltaChat-Uptime-Bot/{VERSION} (https://git.gluek.info/gluek/deltachat_uptime)"
 
 dc_cli = BotCli("uptimebot")
@@ -399,7 +400,7 @@ async def notify_ssl_alert(resource, days_left: float, exp_date_str: str, alert_
         except Exception as e:
             logger.error(f"Failed to send SSL alert to chat {chat_id}: {e}")
 
-async def run_single_check(resource) -> tuple[bool, str]:
+async def run_single_check(resource) -> tuple[bool, str, int | None]:
     import http
     rtype = resource["type"]
     url = resource["url"]
@@ -411,15 +412,51 @@ async def run_single_check(resource) -> tuple[bool, str]:
             headers = {"User-Agent": USER_AGENT}
             async with aiohttp.ClientSession(headers=headers, timeout=aiohttp.ClientTimeout(total=timeout)) as session:
                 async with session.get(url, allow_redirects=True) as resp:
+                    elapsed_ms = int((time.time() - start_time) * 1000)
                     try:
                         phrase = http.HTTPStatus(resp.status).phrase
                     except ValueError:
                         phrase = "Unknown Status"
                     details = f"{resp.status} - {phrase}"
                     if 200 <= resp.status < 400:
-                        return True, details
+                        # Read body up to 256KB
+                        try:
+                            body_bytes = await resp.content.read(262144)
+                            charset = 'utf-8'
+                            content_type = resp.headers.get('Content-Type', '')
+                            charset_match = re.search(r'charset=([\w-]+)', content_type, re.IGNORECASE)
+                            if charset_match:
+                                charset = charset_match.group(1)
+                            try:
+                                body_text = body_bytes.decode(charset, errors='ignore')
+                            except Exception:
+                                body_text = body_bytes.decode('utf-8', errors='ignore')
+                        except Exception as read_ex:
+                            logger.warning(f"Failed to read body for {url}: {read_ex}")
+                            body_text = ""
+
+                        # 1. Custom Keyword assertion if configured
+                        expected_kw = (resource.get("expected_keyword") or "").strip()
+                        if expected_kw:
+                            if expected_kw.lower() not in body_text.lower():
+                                return False, f"200 OK (Missing keyword: \"{expected_kw}\")", elapsed_ms
+                        else:
+                            # 2. Background Auto-detection of hidden server error pages in 200 OK
+                            body_lower = body_text.lower()
+                            if "error establishing a database connection" in body_lower:
+                                return False, "200 OK (Database connection error detected)", elapsed_ms
+                            if "database connection failed" in body_lower and len(body_text) < 16384:
+                                return False, "200 OK (Database connection failed detected)", elapsed_ms
+                            title_match = re.search(r'<title>(.*?)</title>', body_text, re.IGNORECASE | re.DOTALL)
+                            if title_match:
+                                title_text = title_match.group(1).strip().lower()
+                                for err_pat in ("502 bad gateway", "503 service unavailable", "504 gateway time-out", "database error", "error 521", "error 522", "error 523", "error 524"):
+                                    if err_pat in title_text:
+                                        return False, f"200 OK (Error in title: \"{err_pat.title()}\")", elapsed_ms
+
+                        return True, details, elapsed_ms
                     else:
-                        return False, details
+                        return False, details, elapsed_ms
         elif rtype == "tcp":
             parts = url.rsplit(":", 1)
             host, port = parts[0], int(parts[1])
@@ -433,32 +470,39 @@ async def run_single_check(resource) -> tuple[bool, str]:
             except Exception:
                 pass
             elapsed_ms = int((time.time() - start_time) * 1000)
-            return True, f"{elapsed_ms} ms"
+            return True, f"{elapsed_ms} ms", elapsed_ms
         elif rtype == "ping":
             host = url.strip()
             if not re.match(r'^[a-zA-Z0-9.-]+$', host):
-                return False, "Invalid hostname format"
+                return False, "Invalid hostname format", None
             proc = await asyncio.create_subprocess_exec(
                 "ping", "-c", "1", "-W", "2", host,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL
             )
             await proc.wait()
+            elapsed_ms = int((time.time() - start_time) * 1000)
             if proc.returncode == 0:
-                elapsed_ms = int((time.time() - start_time) * 1000)
-                return True, f"{elapsed_ms} ms"
+                return True, f"{elapsed_ms} ms", elapsed_ms
             else:
-                return False, "Ping failed"
+                return False, "Ping failed", elapsed_ms
     except asyncio.TimeoutError:
-        return False, "Timeout"
+        elapsed_ms = int((time.time() - start_time) * 1000)
+        return False, "Timeout", elapsed_ms
     except Exception as e:
-        return False, str(e)
-    return False, "Unknown error"
+        elapsed_ms = int((time.time() - start_time) * 1000)
+        return False, str(e), elapsed_ms
+    return False, "Unknown error", None
 
 async def check_group_task(group, semaphore):
     rep = group[0]
     async with semaphore:
-        is_up, error_msg = await run_single_check(rep)
+        res = await run_single_check(rep)
+        if len(res) == 3:
+            is_up, error_msg, latency_ms = res
+        else:
+            is_up, error_msg = res
+            latency_ms = None
         
         # Retry logic: retry if check failed and at least one resource in the group was not already DOWN
         if not is_up and any(r["status"] != "down" for r in group):
@@ -467,7 +511,12 @@ async def check_group_task(group, semaphore):
                     if r["status"] != "down":
                         logger.info(f"Retry {retry}/2 for resource {r['id']} ({r['name'] or r['url']}) in chat {r['dc_chat_id']}")
                 await asyncio.sleep(30)
-                is_up, error_msg = await run_single_check(rep)
+                res = await run_single_check(rep)
+                if len(res) == 3:
+                    is_up, error_msg, latency_ms = res
+                else:
+                    is_up, error_msg = res
+                    latency_ms = None
                 if is_up:
                     break
 
@@ -481,6 +530,10 @@ async def check_group_task(group, semaphore):
                 return
                     
         for r in group:
+            if latency_ms is not None:
+                await asyncio.to_thread(database.update_resource_latency, r["id"], latency_ms)
+                r["last_latency_ms"] = latency_ms
+                
             logger.info(f"Check result: {r['name'] or r['url']} (id: {r['id']}) in chat {r['dc_chat_id']} -> {'UP' if is_up else 'DOWN'} ({error_msg})")
             await handle_check_result(r, is_up, error_msg)
 
@@ -884,9 +937,17 @@ async def check_stale_downtime_notifications(resource, now: int):
 
 
 async def handle_check_result(resource, is_up, error_msg):
+    now = int(time.time())
+    m_until = resource.get("maintenance_until") or 0
+    in_maintenance = (now < m_until)
+
+    if in_maintenance:
+        # Resource is in maintenance window. Suppress failure transitions and incident creation.
+        await asyncio.to_thread(database.update_resource_status, resource["id"], resource["status"], 0, error_msg)
+        return
+
     status = "up" if is_up else "down"
     old_status = resource["status"]
-    now = int(time.time())
     
     failures = 0 if is_up else (resource["consecutive_failures"] + 1)
     await asyncio.to_thread(database.update_resource_status, resource["id"], status, failures, error_msg)
@@ -984,20 +1045,61 @@ def get_dashboard_html(chat_name, resources, overall_uptime, incidents=None) -> 
         </div>
         """
     else:
+        now_ts = int(time.time())
         for r in resources:
             r_uptime = database.get_resource_uptime_30d(r["id"])
-            indicator_class = "up" if r["status"] == "up" else ("down" if r["status"] == "down" else "unknown")
-            status_lbl = r["status"].upper()
+            m_until = r.get("maintenance_until") or 0
+            is_maintenance = (now_ts < m_until)
+
+            if is_maintenance:
+                indicator_class = "unknown"
+                status_lbl = "PAUSED"
+                status_color = "var(--color-warn)"
+            elif r["status"] == "up":
+                indicator_class = "up"
+                status_lbl = "UP"
+                status_color = "var(--color-up)"
+            elif r["status"] == "down":
+                indicator_class = "down"
+                status_lbl = "DOWN"
+                status_color = "var(--color-down)"
+            else:
+                indicator_class = "unknown"
+                status_lbl = "UNKNOWN"
+                status_color = "var(--text-muted)"
             
             last_checked_str = "Never"
             if r["last_checked"]:
                 last_checked_str = datetime.datetime.fromtimestamp(r["last_checked"]).strftime('%Y-%m-%d %H:%M:%S')
                 
+            badges_html = f'<span class="monitor-type">{r["type"]}</span>'
+            if r.get("expected_keyword"):
+                badges_html += f' <span class="monitor-type" style="background: rgba(56, 189, 248, 0.1); color: #38bdf8; border-color: rgba(56, 189, 248, 0.25);" title="Expected content keyword">🔍 {html.escape(r["expected_keyword"])}</span>'
+            if is_maintenance:
+                m_left_secs = m_until - now_ts
+                m_left_str = format_duration(m_left_secs)
+                badges_html += f' <span class="monitor-type" style="background: rgba(245, 158, 11, 0.15); color: #f59e0b; border-color: rgba(245, 158, 11, 0.3);">⏸️ Maintenance ({m_left_str} left)</span>'
+
+            latency_stat_html = ""
+            if r.get("last_latency_ms") is not None:
+                lat_ms = r["last_latency_ms"]
+                if lat_ms >= 5000:
+                    lat_color = "var(--color-warn)"
+                elif lat_ms >= 1000:
+                    lat_color = "#38bdf8"
+                else:
+                    lat_color = "var(--color-up)"
+                latency_stat_html = f"""
+                <div class="m-stat">
+                    <span class="m-val" style="color: {lat_color}; font-size: 0.875rem;">{lat_ms} ms</span>
+                    <span class="m-lbl">Latency</span>
+                </div>
+                """
+
             ssl_stat_html = ""
             if r.get("url", "").startswith("https://"):
                 exp_ts = r.get("ssl_expiry_date")
                 if exp_ts:
-                    now_ts = int(time.time())
                     d_left = int((exp_ts - now_ts) / 86400)
                     if d_left < 0:
                         ssl_color = "var(--color-down)"
@@ -1029,14 +1131,15 @@ def get_dashboard_html(chat_name, resources, overall_uptime, incidents=None) -> 
                     <div class="monitor-meta">
                         <span class="monitor-name">{html.escape(r["name"] or r["url"])}</span>
                         <span class="monitor-url">{html.escape(r["url"])}</span>
-                        <span class="monitor-type">{r["type"]}</span>
+                        <div style="display: flex; gap: 0.35rem; flex-wrap: wrap; margin-top: 0.25rem;">{badges_html}</div>
                     </div>
                 </div>
                 <div class="monitor-stats">
                     <div class="m-stat">
-                        <span class="m-val" style="color: { 'var(--color-up)' if r["status"] == "up" else 'var(--color-down)' if r["status"] == "down" else 'var(--text-muted)' };">{status_lbl}</span>
+                        <span class="m-val" style="color: {status_color};">{status_lbl}</span>
                         <span class="m-lbl">Status</span>
                     </div>
+                    {latency_stat_html}
                     {ssl_stat_html}
                     <div class="m-stat">
                         <span class="m-val">{r_uptime:.2f}%</span>
@@ -1927,12 +2030,16 @@ def help_command(bot, accid, event):
         f"👋 Welcome to Delta Chat Uptime Bot {VERSION}!\n\n"
         f"I monitor resource availability (HTTP, TCP, Ping) and alert this chat if they go offline.\n\n"
         f"**Public Commands:**\n"
-        f"/add <target> [name] — Monitor a resource. Target formats:\n"
+        f"/add <target> [name] [\"keyword\"] — Monitor a resource. Target formats:\n"
         f"  • `https://example.com` (HTTP/HTTPS)\n"
+        f"  • `https://api.site.com Health \"status:ok\"` (Keyword assertion)\n"
         f"  • `example.com:22` (TCP Port)\n"
         f"  • `example.com` (ICMP Ping)\n"
         f"/remove <id|url> (or reply /remove) — Stop monitoring a resource\n"
-        f"/list — List all monitors in this chat\n"
+        f"/pause <id|url> [dur] (or reply /pause) — Pause/mute alerts (e.g. `30m`, `2h`)\n"
+        f"/resume <id|url> (or reply /resume) — Resume monitoring after maintenance\n"
+        f"/keyword <id|url> [keyword|none] — Set or remove required keyword assertion\n"
+        f"/list — List all monitors in this chat with uptime, latency & SSL\n"
         f"/status — Show monthly uptime statistics & web link\n"
         f"/events — View incident history and active outages\n"
         f"/history [id] — View downtime history for monitors\n"
@@ -2058,6 +2165,23 @@ def fetch_html_title(url, timeout=3.0):
         logger.warning(f"Could not fetch title for {url}: {e}")
     return None
 
+def parse_duration_string(s: str) -> int | None:
+    if not s:
+        return None
+    s = s.strip().lower()
+    match = re.match(r'^(\d+)\s*(m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days)?$', s)
+    if not match:
+        return None
+    val = int(match.group(1))
+    unit = match.group(2) or "m"
+    if unit.startswith("m"):
+        return val * 60
+    elif unit.startswith("h"):
+        return val * 3600
+    elif unit.startswith("d"):
+        return val * 86400
+    return val * 60
+
 @dc_cli.on(events.NewMessage(command="/add"))
 def add_command(bot, accid, event):
     msg = event.msg
@@ -2065,15 +2189,23 @@ def add_command(bot, accid, event):
     
     if not payload:
         _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(
-            text="Usage: /add <target> [name]\n\nExamples:\n"
+            text="Usage: /add <target> [name] [\"keyword\"]\n\nExamples:\n"
                  "• `/add https://google.com Google` (HTTP)\n"
+                 "• `/add https://api.site.com Health \"status:ok\"` (Keyword assertion)\n"
                  "• `/add google.com:443 Google TCP` (TCP)\n"
                  "• `/add google.com Google Ping` (Ping)"
         ))
         return
         
-    parts = payload.split(None, 1)
-    target = parts[0]
+    try:
+        tokens = shlex.split(payload)
+    except Exception:
+        tokens = payload.split()
+        
+    if not tokens:
+        return
+        
+    target = tokens[0]
     
     try:
         check_type, url = parse_target(target)
@@ -2081,26 +2213,27 @@ def add_command(bot, accid, event):
         _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=f"❌ {e}"))
         return
         
-    name = parts[1] if len(parts) > 1 else None
+    name = tokens[1] if len(tokens) > 1 else None
+    expected_keyword = tokens[2] if len(tokens) > 2 else None
+    
     if not name:
         if check_type == "http":
             fetched_title = fetch_html_title(url)
             name = fetched_title if fetched_title else target
         else:
             name = target
-    
-
         
-    res_id = database.add_resource(msg.chat_id, url, name, check_type)
+    res_id = database.add_resource(msg.chat_id, url, name, check_type, expected_keyword=expected_keyword)
     if res_id is None:
         _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text="❌ This target is already being monitored in this chat."))
         return
         
+    kw_line = f"\n🔍 Expected Keyword: `{expected_keyword}`" if expected_keyword else ""
     _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(
         text=f"✅ Added monitor (ID: `{res_id}`):\n"
              f"🖥️ Name: **{name}**\n"
              f"🔗 Target: `{url}`\n"
-             f"⚙️ Type: `{check_type.upper()}`\n"
+             f"⚙️ Type: `{check_type.upper()}`{kw_line}\n"
              f"🕒 Checking once a minute."
     ))
 
@@ -2198,8 +2331,6 @@ def remove_command(bot, accid, event):
                 trigger_chat_incident_sync(msg.chat_id, force_update=True)
             return
         else:
-            # Quoted message belongs to another bot/message with no matching monitors in this bot.
-            # Silently ignore so the other bot instance can reply cleanly.
             logger.info(f"Ignoring /delete reply in chat {msg.chat_id}: no matching monitors found for quote {quote_msg_id}")
             return
 
@@ -2209,6 +2340,244 @@ def remove_command(bot, accid, event):
         MsgData(text="ℹ️ **Usage:**\n• `/delete <id>` — Delete monitor by ID\n• `/delete <url>` — Delete monitor by URL/domain\n• Reply `/delete` directly to an incident or outage alert message.")
     )
 
+@dc_cli.on(events.NewMessage(command="/pause"))
+@dc_cli.on(events.NewMessage(command="/mute"))
+@dc_cli.on(events.NewMessage(command="/maintenance"))
+def pause_command(bot, accid, event):
+    msg = event.msg
+    payload = (event.payload or "").strip()
+    now = int(time.time())
+    
+    try:
+        tokens = shlex.split(payload) if payload else []
+    except Exception:
+        tokens = payload.split() if payload else []
+
+    target_res = []
+    duration_secs = 3600 # default 1 hour
+    
+    if len(tokens) >= 1:
+        # Check if first token is duration only (e.g. /pause 30m)
+        dur = parse_duration_string(tokens[0])
+        if dur is not None and len(tokens) == 1:
+            duration_secs = dur
+        else:
+            target_ident = tokens[0]
+            if len(tokens) >= 2:
+                parsed_dur = parse_duration_string(tokens[1])
+                if parsed_dur is not None:
+                    duration_secs = parsed_dur
+            
+            if target_ident.isdigit():
+                r = database.get_resource_by_id(int(target_ident))
+                if r and r["dc_chat_id"] == msg.chat_id:
+                    target_res = [r]
+            else:
+                target_res = database.get_resources_by_target(msg.chat_id, target_ident)
+                if not target_res:
+                    target_res = database.get_resources_matching_text(msg.chat_id, target_ident)
+                
+    # If no target specified via args, try quote/reply
+    if not target_res:
+        quote = getattr(msg, "quote", None) or (msg.get("quote") if isinstance(msg, dict) else None)
+        if quote:
+            quote_msg_id = None
+            if isinstance(quote, dict):
+                quote_msg_id = quote.get("message_id") or quote.get("messageId")
+                quote_text = quote.get("text", "")
+            else:
+                quote_msg_id = getattr(quote, "message_id", None) or getattr(quote, "messageId", None)
+                quote_text = getattr(quote, "text", "")
+
+            full_quote_text = quote_text or ""
+            if quote_msg_id and bot and hasattr(bot, "rpc"):
+                try:
+                    qmsg = bot.rpc.get_message(accid, quote_msg_id)
+                    if qmsg and hasattr(qmsg, "text") and qmsg.text:
+                        full_quote_text = f"{full_quote_text}\n{qmsg.text}"
+                except Exception:
+                    pass
+                    
+            if quote_msg_id:
+                inc = database.get_incident_by_msg_id(msg.chat_id, quote_msg_id)
+                if inc:
+                    inc_events = database.get_incident_downtime_events(inc["id"])
+                    for ev in inc_events:
+                        r = database.get_resource_by_id(ev["resource_id"])
+                        if r and r["dc_chat_id"] == msg.chat_id and r not in target_res:
+                            target_res.append(r)
+                            
+            if not target_res and full_quote_text:
+                text_matched = database.get_resources_matching_text(msg.chat_id, full_quote_text)
+                for r in text_matched:
+                    if r not in target_res:
+                        target_res.append(r)
+                    
+            if not target_res:
+                logger.info(f"Pause quote in chat {msg.chat_id} did not match any local resources, ignoring.")
+                return
+
+    if not target_res:
+        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(
+            text="Usage: `/pause <id|url> [duration]` or reply `/pause [duration]` to an alert.\n\n"
+                 "Examples:\n"
+                 "• `/pause 1 30m`\n"
+                 "• `/pause https://example.com 2h`\n"
+                 "• Reply `/pause 1h` directly to an incident alert"
+        ))
+        return
+
+    until_ts = now + duration_secs
+    until_dt_str = datetime.datetime.fromtimestamp(until_ts, tz=datetime.timezone.utc).strftime('%H:%M:%S')
+    dur_str = format_duration(duration_secs)
+    
+    paused_names = []
+    for r in target_res:
+        database.set_resource_maintenance(msg.chat_id, r["id"], until_ts)
+        paused_names.append(f"• `ID: {r['id']}` **{r['name']}** (`{r['url']}`)")
+        
+    _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(
+        text=f"⏸️ **Maintenance Mode Enabled** (active for `{dur_str}`, until `{until_dt_str} UTC`):\n\n" +
+             "\n".join(paused_names) +
+             "\n\n_Outage alerts will be suppressed until maintenance expires, or use `/resume`._"
+    ))
+
+@dc_cli.on(events.NewMessage(command="/resume"))
+@dc_cli.on(events.NewMessage(command="/unpause"))
+def resume_command(bot, accid, event):
+    msg = event.msg
+    payload = (event.payload or "").strip()
+    
+    target_res = []
+    if payload.isdigit():
+        r = database.get_resource_by_id(int(payload))
+        if r and r["dc_chat_id"] == msg.chat_id:
+            target_res = [r]
+    elif payload:
+        target_res = database.get_resources_by_target(msg.chat_id, payload)
+        if not target_res:
+            target_res = database.get_resources_matching_text(msg.chat_id, payload)
+        
+    if not target_res:
+        quote = getattr(msg, "quote", None) or (msg.get("quote") if isinstance(msg, dict) else None)
+        if quote:
+            quote_msg_id = None
+            if isinstance(quote, dict):
+                quote_msg_id = quote.get("message_id") or quote.get("messageId")
+                quote_text = quote.get("text", "")
+            else:
+                quote_msg_id = getattr(quote, "message_id", None) or getattr(quote, "messageId", None)
+                quote_text = getattr(quote, "text", "")
+
+            full_quote_text = quote_text or ""
+            if quote_msg_id and bot and hasattr(bot, "rpc"):
+                try:
+                    qmsg = bot.rpc.get_message(accid, quote_msg_id)
+                    if qmsg and hasattr(qmsg, "text") and qmsg.text:
+                        full_quote_text = f"{full_quote_text}\n{qmsg.text}"
+                except Exception:
+                    pass
+                    
+            if quote_msg_id:
+                inc = database.get_incident_by_msg_id(msg.chat_id, quote_msg_id)
+                if inc:
+                    inc_events = database.get_incident_downtime_events(inc["id"])
+                    for ev in inc_events:
+                        r = database.get_resource_by_id(ev["resource_id"])
+                        if r and r["dc_chat_id"] == msg.chat_id and r not in target_res:
+                            target_res.append(r)
+                            
+            if not target_res and full_quote_text:
+                text_matched = database.get_resources_matching_text(msg.chat_id, full_quote_text)
+                for r in text_matched:
+                    if r not in target_res:
+                        target_res.append(r)
+                    
+            if not target_res:
+                logger.info(f"Resume quote in chat {msg.chat_id} did not match any local resources, ignoring.")
+                return
+
+    if not target_res:
+        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(
+            text="Usage: `/resume <id|url>` or reply `/resume` to an alert."
+        ))
+        return
+
+    resumed_names = []
+    for r in target_res:
+        database.set_resource_maintenance(msg.chat_id, r["id"], 0)
+        resumed_names.append(f"• `ID: {r['id']}` **{r['name']}** (`{r['url']}`)")
+        
+    _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(
+        text="▶️ **Resumed Monitoring:**\n\n" +
+             "\n".join(resumed_names)
+    ))
+
+@dc_cli.on(events.NewMessage(command="/keyword"))
+@dc_cli.on(events.NewMessage(command="/assert"))
+@dc_cli.on(events.NewMessage(command="/kw"))
+def keyword_command(bot, accid, event):
+    msg = event.msg
+    payload = (event.payload or "").strip()
+    
+    try:
+        tokens = shlex.split(payload) if payload else []
+    except Exception:
+        tokens = payload.split() if payload else []
+        
+    if not tokens:
+        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(
+            text="Usage: `/keyword <id|url> <keyword|none>`\n\n"
+                 "Examples:\n"
+                 "• `/keyword 1 \"Welcome to site\"`\n"
+                 "• `/keyword https://api.site.com/health \"status:ok\"`\n"
+                 "• `/keyword 1 none` (to remove keyword assertion)"
+        ))
+        return
+        
+    target_ident = tokens[0]
+    keyword = tokens[1] if len(tokens) > 1 else None
+    
+    target_res = []
+    if target_ident.isdigit():
+        r = database.get_resource_by_id(int(target_ident))
+        if r and r["dc_chat_id"] == msg.chat_id:
+            target_res = [r]
+    else:
+        target_res = database.get_resources_by_target(msg.chat_id, target_ident)
+        if not target_res:
+            target_res = database.get_resources_matching_text(msg.chat_id, target_ident)
+        
+    if not target_res:
+        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(
+            text=f"❌ No monitor found for `{target_ident}` in this chat."
+        ))
+        return
+        
+    target = target_res[0]
+    if keyword is None:
+        current_kw = target.get("expected_keyword")
+        if current_kw:
+            _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(
+                text=f"🔍 Monitor `ID: {target['id']}` (**{target['name']}**) requires keyword:\n`\"{current_kw}\"`"
+            ))
+        else:
+            _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(
+                text=f"ℹ️ Monitor `ID: {target['id']}` (**{target['name']}**) does not have a required keyword configured."
+            ))
+        return
+        
+    if keyword.lower() in ("none", "clear", "remove", "off", "disable", "delete"):
+        database.set_resource_keyword(msg.chat_id, target["id"], None)
+        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(
+            text=f"✅ Cleared expected keyword requirement for **{target['name']}**."
+        ))
+    else:
+        database.set_resource_keyword(msg.chat_id, target["id"], keyword)
+        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(
+            text=f"✅ Set expected keyword for **{target['name']}** (`ID: {target['id']}`):\n`\"{keyword}\"`"
+        ))
+
 @dc_cli.on(events.NewMessage(command="/list"))
 def list_command(bot, accid, event):
     msg = event.msg
@@ -2217,16 +2586,39 @@ def list_command(bot, accid, event):
         _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text="ℹ️ No monitored resources in this chat. Add one with `/add <target>`."))
         return
         
+    now_ts = int(time.time())
     reply = "⚙️ **Monitored Resources:**\n\n"
     for r in resources:
-        emoji_status = "🟢" if r["status"] == "up" else ("🔴" if r["status"] == "down" else "⚪")
+        m_until = r.get("maintenance_until") or 0
+        is_maintenance = (now_ts < m_until)
+
+        if is_maintenance:
+            emoji_status = "⏸️"
+            m_left_secs = m_until - now_ts
+            m_left_str = format_duration(m_left_secs)
+            status_text = f"PAUSED ({m_left_str} left)"
+        elif r["status"] == "up":
+            emoji_status = "🟢"
+            status_text = "UP"
+        elif r["status"] == "down":
+            emoji_status = "🔴"
+            status_text = "DOWN"
+        else:
+            emoji_status = "⚪"
+            status_text = "UNKNOWN"
+            
         uptime = database.get_resource_uptime_30d(r["id"])
         
+        extra_info = ""
+        if r.get("last_latency_ms") is not None:
+            extra_info += f" | ⚡ `{r['last_latency_ms']}ms`"
+        if r.get("expected_keyword"):
+            extra_info += f" | 🔍 \"{r['expected_keyword']}\""
+            
         ssl_info = ""
         if r.get("url", "").startswith("https://"):
             exp_ts = r.get("ssl_expiry_date")
             if exp_ts:
-                now_ts = int(time.time())
                 d_left = int((exp_ts - now_ts) / 86400)
                 exp_date_str = datetime.datetime.fromtimestamp(exp_ts, tz=datetime.timezone.utc).strftime('%Y-%m-%d')
                 if d_left < 0:
@@ -2241,7 +2633,7 @@ def list_command(bot, accid, event):
         reply += (
             f"{emoji_status} `ID: {r['id']}` **{r['name']}**\n"
             f"  Target: `{r['url']}` ({r['type'].upper()})\n"
-            f"  Uptime 30d: `{uptime:.2f}%` | Status: `{r['status'].upper()}`{ssl_info}\n\n"
+            f"  Uptime 30d: `{uptime:.2f}%` | Status: `{status_text}`{extra_info}{ssl_info}\n\n"
         )
     _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=reply))
 

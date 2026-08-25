@@ -13,6 +13,16 @@ Additionally, it automatically generates a secure, beautiful web status dashboar
   - As multiple monitors fail or recover, the bot edits the **same incident message in-place** with real-time status and duration metrics.
   - **Tiered Rate-Limiting:** Live duration updates adaptively back off (every 15s in the first minute, 30s during minutes 1–5, 1m up to an hour, and 5m after an hour) while status transitions edit immediately with zero delay.
   - When all services recover, the incident message is updated to **Resolved** with total downtime duration.
+- 🔍 **Content & Keyword Assertion (Zero-Config + Custom Keywords):**
+  - **Zero-Config Error Detection:** In the background, automatically scans HTTP responses for silent failure signatures wrapped in `200 OK` responses (e.g. database connection errors, 502/503 wrapped in HTML, Cloudflare error screens).
+  - **Custom Keyword Matching:** Assert that response body contains specific text (e.g. `/add https://api.site.com Health "status:ok"` or `/keyword 1 "Welcome"`).
+- ⏸️ **Smart Maintenance Windows & Alert Snoozing:**
+  - Pause monitoring and mute outage alerts during planned maintenance without skewing 30-day uptime metrics: `/pause <id|url> [duration]` (e.g. `/pause 1 30m`, `/pause https://example.com 2h`).
+  - Supports replying `/pause [duration]` directly to incident alerts.
+  - Automatically resumes normal monitoring when the maintenance window expires, or resume early with `/resume`.
+- ⚡ **Universal Latency Measurement & Response Time Tracking:**
+  - Measures probe latency in milliseconds for HTTP/HTTPS, TCP sockets, and ICMP Ping.
+  - Real-time latency badges displayed on the Web Status Dashboard (`⚡ 124ms`) and in `/list`.
 - 📜 **Detailed Outage & Incident History:**
   - `/events` (or `/incidents`) — View the chat's historical incident log, active outages, and total downtime durations.
   - `/history [id]` — Inspect recent downtime events for a specific monitor with failure reasons, error codes, and recovery timestamps.
@@ -28,14 +38,14 @@ Additionally, it automatically generates a secure, beautiful web status dashboar
   - **7-Day Notice:** Sends a notice when a resource is continuously unreachable for 7 days, suggesting removal if decommissioned.
   - **14-Day Warning:** Sends a warning at 14 days of continuous downtime, advising that 30-day unreachable monitors are automatically removed.
   - **30-Day Auto-Cleanup:** Automatically deletes resources with continuous 0% uptime for 30 days and notifies the chat of the removal.
-- 🤖 **Identified User-Agent:** Sends a custom `User-Agent` header (e.g. `DeltaChat-Uptime-Bot/1.5.0 (https://git.gluek.info/gluek/deltachat_uptime)`) during HTTP checks so server administrators can easily identify monitoring requests in server logs.
+- 🤖 **Identified User-Agent:** Sends a custom `User-Agent` header (e.g. `DeltaChat-Uptime-Bot/1.9.0 (https://git.gluek.info/gluek/deltachat_uptime)`) during HTTP checks so server administrators can easily identify monitoring requests in server logs.
 
 - 🔄 **Failure Resiliency & Retry Logic:**
   - Checks resources once a minute.
   - If a resource check fails, the bot does not alert immediately. It retries **2 more times at 30-second intervals**.
   - Alerts are only triggered if all 3 checks fail, avoiding false positives.
   - Once a DOWN resource recovers, it is marked UP on the first successful check.
-- 📊 **Uptime Dashboards:** Generates a secure, 12-character unguessable base62 URL (e.g. `https://up.example.com/k8D2x9mPqL1a`) hosting a modern dark-themed web status dashboard with active status, SSL metrics, and recent incident logs for each chat.
+- 📊 **Uptime Dashboards:** Generates a secure, 12-character unguessable base62 URL (e.g. `https://up.example.com/k8D2x9mPqL1a`) hosting a modern dark-themed web status dashboard with active status, latency metrics, SSL countdowns, and recent incident logs for each chat.
 - ✉️ **Multi-Transport & Resilient Sending:** Supports multiple SMTP servers and resilient broadcast sending across all connected relays, with automatic exponential backoff failover if a primary transport encounters errors.
 
 ---
@@ -45,12 +55,16 @@ Additionally, it automatically generates a secure, beautiful web status dashboar
 ### User Commands (Public per-chat)
 These commands are available to any member of a chat. They support suffixes (e.g. `/add@up`, `/status@uptime`) to route commands correctly if multiple bots exist in the same chat.
 
-- `/add <target> [name]` — Add a monitor. Target formats:
-  • `https://google.com` (HTTP/HTTPS check)
-  • `google.com:443` (TCP port check)
-  • `google.com` (ICMP Ping check)
+- `/add <target> [name] ["keyword"]` — Add a monitor. Target formats:
+  • `https://google.com Google` (HTTP/HTTPS check)
+  • `https://api.site.com Health "status:ok"` (HTTP with keyword assertion)
+  • `google.com:443 Google TCP` (TCP port check)
+  • `google.com Google Ping` (ICMP Ping check)
 - `/remove <id|url>` (or `/delete`, `/rm`, `/del`) — Stop monitoring a resource by ID or target URL. You can also reply `/remove` directly to any incident or outage alert message to remove the affected monitor without knowing its ID.
-- `/list` — List monitored resources and their status in this chat.
+- `/pause <id|url> [dur]` (or `/mute`, `/maintenance`) — Mute outage alerts during maintenance (e.g. `/pause 1 30m`, `/pause https://example.com 2h`, or reply `/pause` to an alert).
+- `/resume <id|url>` (or `/unpause`) — Resume active monitoring after maintenance.
+- `/keyword <id|url> [keyword|none]` — Configure or remove expected keyword assertion.
+- `/list` — List monitored resources, status, latency, and SSL expiration in this chat.
 - `/status` — View monthly uptime statistics and get the link to the chat's secure Web Status Page.
 - `/events` — View recent incidents and active outages for this chat.
 - `/history [id]` — View downtime history for monitors.

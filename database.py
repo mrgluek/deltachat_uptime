@@ -52,11 +52,14 @@ def init_db():
                 ssl_last_checked INTEGER,
                 ssl_alert_state INTEGER DEFAULT 0,
                 last_down_msg_id INTEGER,
+                expected_keyword TEXT,
+                maintenance_until INTEGER DEFAULT 0,
+                last_latency_ms INTEGER,
                 UNIQUE(dc_chat_id, url)
             )
         ''')
         
-        # Ensure new SSL and tracking columns exist in resources table
+        # Ensure new columns exist in resources table
         cursor.execute("PRAGMA table_info(resources)")
         columns = [row[1] for row in cursor.fetchall()]
         if "ssl_expiry_date" not in columns:
@@ -69,6 +72,12 @@ def init_db():
             cursor.execute("ALTER TABLE resources ADD COLUMN last_down_msg_id INTEGER")
         if "stale_warning_level" not in columns:
             cursor.execute("ALTER TABLE resources ADD COLUMN stale_warning_level INTEGER DEFAULT 0")
+        if "expected_keyword" not in columns:
+            cursor.execute("ALTER TABLE resources ADD COLUMN expected_keyword TEXT")
+        if "maintenance_until" not in columns:
+            cursor.execute("ALTER TABLE resources ADD COLUMN maintenance_until INTEGER DEFAULT 0")
+        if "last_latency_ms" not in columns:
+            cursor.execute("ALTER TABLE resources ADD COLUMN last_latency_ms INTEGER")
         
         # Downtime events for uptime calculations
         cursor.execute('''
@@ -188,15 +197,15 @@ def get_chat_id_by_token(token: str) -> int:
         return row[0] if row else None
 
 # Resource functions
-def add_resource(dc_chat_id: int, url: str, name: str, check_type: str, interval: int = 60) -> int:
+def add_resource(dc_chat_id: int, url: str, name: str, check_type: str, interval: int = 60, expected_keyword: str = None) -> int:
     with _lock:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         try:
             cursor.execute('''
-                INSERT INTO resources (dc_chat_id, url, name, type, interval, status, last_changed) 
-                VALUES (?, ?, ?, ?, ?, 'unknown', ?)
-            ''', (dc_chat_id, url, name, check_type, interval, int(time.time())))
+                INSERT INTO resources (dc_chat_id, url, name, type, interval, status, last_changed, expected_keyword) 
+                VALUES (?, ?, ?, ?, ?, 'unknown', ?, ?)
+            ''', (dc_chat_id, url, name, check_type, interval, int(time.time()), expected_keyword))
             resource_id = cursor.lastrowid
             conn.commit()
             return resource_id
@@ -204,6 +213,34 @@ def add_resource(dc_chat_id: int, url: str, name: str, check_type: str, interval
             return None
         finally:
             conn.close()
+
+def set_resource_keyword(dc_chat_id: int, resource_id: int, keyword: str | None) -> bool:
+    with _lock:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("UPDATE resources SET expected_keyword = ? WHERE dc_chat_id = ? AND id = ?", (keyword, dc_chat_id, resource_id))
+        updated = cursor.rowcount > 0
+        conn.commit()
+        conn.close()
+        return updated
+
+def set_resource_maintenance(dc_chat_id: int, resource_id: int, until_ts: int) -> bool:
+    with _lock:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("UPDATE resources SET maintenance_until = ? WHERE dc_chat_id = ? AND id = ?", (until_ts, dc_chat_id, resource_id))
+        updated = cursor.rowcount > 0
+        conn.commit()
+        conn.close()
+        return updated
+
+def update_resource_latency(resource_id: int, latency_ms: int):
+    with _lock:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("UPDATE resources SET last_latency_ms = ? WHERE id = ?", (latency_ms, resource_id))
+        conn.commit()
+        conn.close()
 
 def delete_resource(dc_chat_id: int, resource_id: int) -> bool:
     with _lock:

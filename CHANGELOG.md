@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.9.0] - 2026-08-25
+
+### Added
+- **Keyword & Content Assertion (Zero-Config + Custom Assertions):**
+  - **Zero-Config Error Detection:** In the background, automatically inspects HTTP response bodies for silent failure signatures wrapped in `200 OK` responses (such as database connection errors, 502/503 errors in title/HTML, Cloudflare error screens).
+  - **Custom Keyword Matching:** Supports asserting that response body contains specific text via `/add <url> [name] ["keyword"]` or `/keyword <id|url> [keyword|none]`.
+- **Smart Maintenance Windows & Alert Snoozing (`/pause`, `/resume`, `/mute`):**
+  - Allows muting outage alerts and suppressing incident creation during planned maintenance: `/pause <id|url> [duration]` (supports durations like `30m`, `2h`, `1d`; default `1h`).
+  - Supports replying `/pause [duration]` directly to incident alerts.
+  - Automatically resumes active monitoring upon maintenance expiration, or resume manually with `/resume <id|url>`.
+  - Excludes maintenance windows from skewing 30-day uptime metrics.
+- **Universal Latency Measurement & Dashboard Badges:**
+  - Measures probe latency in milliseconds for HTTP/HTTPS, TCP sockets, and ICMP Ping probes.
+  - Displays live latency metrics on the Web Status Dashboard (`⚡ 124ms`) and in `/list`.
+- **Dashboard & List UI Enhancements:**
+  - Added visual badges for active maintenance state (`⏸️ Maintenance`) and expected keywords (`🔍 keyword`).
+
 ## [1.8.0] - 2026-08-25
 
 ### Added

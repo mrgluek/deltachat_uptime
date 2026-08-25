@@ -3,6 +3,7 @@ import sys
 import unittest
 import time
 import datetime
+import asyncio
 from unittest.mock import MagicMock, patch, ANY
 
 # Setup test environment
@@ -1581,6 +1582,171 @@ class TestUptimeBot(unittest.TestCase):
         sent_text = mock_bot.rpc.send_msg.call_args[0][2].text
         self.assertIn("Usage:", sent_text)
         self.assertIn("Reply `/delete`", sent_text)
+
+    def test_add_with_keyword_and_keyword_command(self):
+        chat_id = 9911
+        mock_bot = MagicMock()
+        mock_event = MagicMock()
+        mock_event.msg.chat_id = chat_id
+        mock_event.payload = 'https://api.mytest.com "API Service" "status:ok"'
+
+        bot.add_command(mock_bot, 1, mock_event)
+        mock_bot.rpc.send_msg.assert_called_once()
+        sent_text = mock_bot.rpc.send_msg.call_args[0][2].text
+        self.assertIn("Added monitor", sent_text)
+        self.assertIn("Expected Keyword: `status:ok`", sent_text)
+
+        resources = database.get_resources(chat_id)
+        self.assertEqual(len(resources), 1)
+        res = resources[0]
+        self.assertEqual(res["expected_keyword"], "status:ok")
+
+        # Update keyword via /keyword command
+        mock_bot.rpc.send_msg.reset_mock()
+        mock_event.payload = f'{res["id"]} "health:green"'
+        bot.keyword_command(mock_bot, 1, mock_event)
+        mock_bot.rpc.send_msg.assert_called_once()
+        self.assertIn("Set expected keyword", mock_bot.rpc.send_msg.call_args[0][2].text)
+        self.assertEqual(database.get_resource_by_id(res["id"])["expected_keyword"], "health:green")
+
+        # Clear keyword via /keyword <id> none
+        mock_bot.rpc.send_msg.reset_mock()
+        mock_event.payload = f'{res["id"]} none'
+        bot.keyword_command(mock_bot, 1, mock_event)
+        mock_bot.rpc.send_msg.assert_called_once()
+        self.assertIn("Cleared expected keyword", mock_bot.rpc.send_msg.call_args[0][2].text)
+        self.assertIsNone(database.get_resource_by_id(res["id"])["expected_keyword"])
+
+    def test_pause_and_resume_commands_and_maintenance_suppression(self):
+        chat_id = 9912
+        res_id = database.add_resource(chat_id, "https://maint-test.org", "Maint Site", "http")
+
+        mock_bot = MagicMock()
+        mock_event = MagicMock()
+        mock_event.msg.chat_id = chat_id
+        mock_event.msg.quote = None
+
+        # 1. /pause 1 30m
+        mock_event.payload = f"{res_id} 30m"
+        bot.pause_command(mock_bot, 1, mock_event)
+        mock_bot.rpc.send_msg.assert_called_once()
+        sent_text = mock_bot.rpc.send_msg.call_args[0][2].text
+        self.assertIn("Maintenance Mode Enabled", sent_text)
+        self.assertIn("Maint Site", sent_text)
+
+        res = database.get_resource_by_id(res_id)
+        now = int(time.time())
+        self.assertGreater(res["maintenance_until"], now + 1700)
+
+        # 2. Check result failure during maintenance should NOT trigger incident
+        asyncio.run(bot.handle_check_result(res, False, "500 - Internal Error"))
+        incidents = database.get_active_incidents_for_chat(chat_id)
+        self.assertEqual(len(incidents), 0)
+
+        # 3. /resume 1
+        mock_bot.rpc.send_msg.reset_mock()
+        mock_event.payload = str(res_id)
+        bot.resume_command(mock_bot, 1, mock_event)
+        mock_bot.rpc.send_msg.assert_called_once()
+        self.assertIn("Resumed Monitoring", mock_bot.rpc.send_msg.call_args[0][2].text)
+        res = database.get_resource_by_id(res_id)
+        self.assertEqual(res["maintenance_until"], 0)
+
+    def test_pause_by_quote_reply(self):
+        chat_id = 9913
+        res_id = database.add_resource(chat_id, "https://pause-quote.org", "Pause Quote Site", "http")
+
+        mock_bot = MagicMock()
+        mock_event = MagicMock()
+        mock_event.msg.chat_id = chat_id
+        mock_event.msg.quote = {"text": "Alert: https://pause-quote.org is down!"}
+        mock_event.payload = "2h"
+
+        bot.pause_command(mock_bot, 1, mock_event)
+        mock_bot.rpc.send_msg.assert_called_once()
+        sent_text = mock_bot.rpc.send_msg.call_args[0][2].text
+        self.assertIn("Maintenance Mode Enabled", sent_text)
+        self.assertIn("Pause Quote Site", sent_text)
+
+        res = database.get_resource_by_id(res_id)
+        now = int(time.time())
+        self.assertGreater(res["maintenance_until"], now + 7100)
+
+    def test_latency_tracking_in_database(self):
+        chat_id = 9914
+        res_id = database.add_resource(chat_id, "https://latency-test.org", "Latency Site", "http")
+
+        database.update_resource_latency(res_id, 145)
+        res = database.get_resource_by_id(res_id)
+        self.assertEqual(res["last_latency_ms"], 145)
+
+        # Verify /list formatting includes latency
+        mock_bot = MagicMock()
+        mock_event = MagicMock()
+        mock_event.msg.chat_id = chat_id
+        bot.list_command(mock_bot, 1, mock_event)
+        mock_bot.rpc.send_msg.assert_called_once()
+        list_text = mock_bot.rpc.send_msg.call_args[0][2].text
+        self.assertIn("⚡ `145ms`", list_text)
+
+    def test_run_single_check_keyword_assertion(self):
+        # 1. Matching keyword -> UP
+        mock_resp = MagicMock()
+        mock_resp.status = 200
+        mock_resp.headers = {"Content-Type": "text/html; charset=utf-8"}
+        mock_resp.content.read = unittest.mock.AsyncMock(return_value=b"<html><body>Welcome to My Site</body></html>")
+
+        class MockSessionContext:
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, exc_type, exc_val, exc_tb):
+                pass
+            def get(self, url, allow_redirects=True):
+                class MockGetContext:
+                    async def __aenter__(self):
+                        return mock_resp
+                    async def __aexit__(self, exc_type, exc_val, exc_tb):
+                        pass
+                return MockGetContext()
+
+        with patch('aiohttp.ClientSession', return_value=MockSessionContext()):
+            res = {"type": "http", "url": "https://test-kw.org", "expected_keyword": "Welcome to My Site"}
+            is_up, details, lat = asyncio.run(bot.run_single_check(res))
+            self.assertTrue(is_up)
+            self.assertIn("200 - OK", details)
+            self.assertIsNotNone(lat)
+
+            # 2. Missing keyword -> DOWN with details
+            res["expected_keyword"] = "NonExistentString"
+            is_up, details, lat = asyncio.run(bot.run_single_check(res))
+            self.assertFalse(is_up)
+            self.assertIn("Missing keyword", details)
+
+    def test_run_single_check_auto_error_detection(self):
+        # Database connection error inside HTTP 200 -> DOWN
+        mock_resp = MagicMock()
+        mock_resp.status = 200
+        mock_resp.headers = {"Content-Type": "text/html; charset=utf-8"}
+        mock_resp.content.read = unittest.mock.AsyncMock(return_value=b"<h1>Error establishing a database connection</h1>")
+
+        class MockSessionContext:
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, exc_type, exc_val, exc_tb):
+                pass
+            def get(self, url, allow_redirects=True):
+                class MockGetContext:
+                    async def __aenter__(self):
+                        return mock_resp
+                    async def __aexit__(self, exc_type, exc_val, exc_tb):
+                        pass
+                return MockGetContext()
+
+        with patch('aiohttp.ClientSession', return_value=MockSessionContext()):
+            res = {"type": "http", "url": "https://test-db-error.org", "expected_keyword": None}
+            is_up, details, lat = asyncio.run(bot.run_single_check(res))
+            self.assertFalse(is_up)
+            self.assertIn("Database connection error detected", details)
 
 if __name__ == '__main__':
     unittest.main()

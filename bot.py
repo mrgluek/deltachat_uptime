@@ -23,7 +23,7 @@ import database
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "2.6.0"
+VERSION = "2.6.1"
 USER_AGENT = f"DeltaChat-Uptime-Bot/{VERSION} (https://git.gluek.info/gluek/deltachat_uptime)"
 
 dc_cli = BotCli("uptimebot")
@@ -181,26 +181,47 @@ async def broadcast_telemetry_to_peers():
         return
         
     resources = await asyncio.to_thread(database.get_all_resources)
-    if not resources:
+    probe_targets = await asyncio.to_thread(database.get_active_probe_targets)
+    if not resources and not probe_targets:
         return
         
     seen_urls = set()
     all_metrics = []
     now = int(time.time())
-    for r in resources:
-        url = r.get("url")
-        if not url or url in seen_urls:
-            continue
-        seen_urls.add(url)
-        all_metrics.append({
-            "url": url,
-            "name": r.get("name") or url,
-            "type": r.get("type") or "http",
-            "expected_keyword": r.get("expected_keyword"),
-            "status": r.get("status", "unknown"),
-            "latency_ms": r.get("last_latency_ms"),
-            "last_checked": r.get("last_checked") or now
-        })
+
+    # 1. Local chat resources
+    if resources:
+        for r in resources:
+            url = r.get("url")
+            if not url or url in seen_urls:
+                continue
+            seen_urls.add(url)
+            all_metrics.append({
+                "url": url,
+                "name": r.get("name") or url,
+                "type": r.get("type") or "http",
+                "expected_keyword": r.get("expected_keyword"),
+                "status": r.get("status", "unknown"),
+                "latency_ms": r.get("last_latency_ms"),
+                "last_checked": r.get("last_checked") or now
+            })
+
+    # 2. Mirrored probe targets measured by this probe node
+    if probe_targets:
+        for pt in probe_targets:
+            url = pt.get("url")
+            if not url or url in seen_urls:
+                continue
+            seen_urls.add(url)
+            all_metrics.append({
+                "url": url,
+                "name": pt.get("name") or url,
+                "type": pt.get("type") or "http",
+                "expected_keyword": pt.get("expected_keyword"),
+                "status": pt.get("last_status") or "unknown",
+                "latency_ms": pt.get("last_latency_ms"),
+                "last_checked": pt.get("last_checked") or now
+            })
         
     if not all_metrics:
         return
@@ -2672,6 +2693,10 @@ def add_command(bot, accid, event):
     if res_id is None:
         _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text="❌ This target is already being monitored in this chat."))
         return
+
+    _scheduler_cache["resources"] = None
+    if async_event_loop and async_event_loop.is_running():
+        asyncio.run_coroutine_threadsafe(broadcast_telemetry_to_peers(), async_event_loop)
         
     kw_line = f"\n🔍 Expected Keyword: `{expected_keyword}`" if expected_keyword else ""
     _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(
@@ -2698,6 +2723,7 @@ def remove_command(bot, accid, event):
             res_name = res["name"]
             res_url = res["url"]
             database.delete_resource(msg.chat_id, res_id)
+            _scheduler_cache["resources"] = None
             _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=f"✅ Removed monitor: **{res_name}** (`{res_url}`) (ID: `{res_id}`)."))
             trigger_chat_incident_sync(msg.chat_id, force_update=True)
         else:
@@ -4469,6 +4495,7 @@ def on_new_message(bot, accid, event):
                 if safe_metrics:
                     database.save_peer_measurements_batch(peer_node, safe_metrics)
                     database.save_probe_targets_batch(safe_metrics, sender_addr or peer_node)
+                    _scheduler_cache["probe_targets"] = None
         except Exception as e:
             logger.error(f"Error handling peer metrics: {e}")
         return

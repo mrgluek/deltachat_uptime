@@ -2244,6 +2244,28 @@ class TestUptimeBot(unittest.TestCase):
         m_after = database.get_peer_measurements_for_url("https://service-unique.org")
         self.assertEqual(len(m_after), 0)
 
+    def test_broadcast_telemetry_includes_probe_targets(self):
+        # Setup peer
+        database.add_or_update_peer("remote_de@gluek.info", "DE-Node", 555)
+
+        # 0 local resources in chats, only mirrored probe targets
+        database.save_probe_targets_batch([
+            {"url": "https://deltachat.wiki/en", "name": "DeltaChat Wiki", "type": "http"}
+        ], "remote_de@gluek.info")
+        database.update_probe_target_result("https://deltachat.wiki/en", "up", 42, None)
+
+        bot.dc_bot_instance = MagicMock()
+        bot.dc_accid = 1
+
+        with patch.object(bot, '_dc_send_msg_with_stats') as mock_send:
+            asyncio.run(bot.broadcast_telemetry_to_peers())
+            mock_send.assert_called_once()
+            args, _ = mock_send.call_args
+            payload_text = args[3].text
+            self.assertIn("[UPTIME_PEER_METRICS]", payload_text)
+            self.assertIn("https://deltachat.wiki/en", payload_text)
+            self.assertIn('"latency_ms": 42', payload_text)
+
 if __name__ == '__main__':
     unittest.main()
 

@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.6.1] - 2026-08-27
+
+### Fixed
+- **Bi-Directional Probe Telemetry Broadcast:** Fixed an issue where probe nodes with 0 local chat resources did not include scanned `probe_targets` in outgoing telemetry broadcasts back to primary nodes. Now all measured mirrored targets are broadcast back automatically.
+- **Immediate Telemetry Sync on Resource Addition:** Adding a monitor via `/add` immediately invalidates the scheduler cache and triggers background telemetry broadcast to all connected peers.
+- **Automatic Probe Target Cache Invalidation:** Incoming telemetry packets immediately invalidate the local `probe_targets` cache so new endpoints are scheduled on the very next scheduler tick without waiting for cache TTL.
+
 ## [2.6.0] - 2026-08-27
 
 ### Security & Hardening

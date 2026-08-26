@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.0] - 2026-08-27
+
+### Added
+- **Automatic Remote Probe Mirroring & Telemetry Sync:**
+  - Active monitoring targets added on one bot (in any private chat or group) are automatically mirrored to all peered remote probes in the background.
+  - Remote probe bots continuously scan mirrored targets from their location and report real-time latencies back every 2 minutes.
+  - **Deduplication by URL:** Scheduled checks group identical targets by URL so each unique endpoint is scanned strictly once per cycle with zero redundant network load.
+  - **Universal Multi-Node Dashboards:** Web status pages now display live multi-region latencies (`[📍 DE: 18ms] [🛰️ RU: 45ms]`) across all monitored targets automatically.
+  - **Instance-Isolated Dynamic Suffix Routing:** Command suffixes (`@up`, `@de`, `@ruptime`, `@ru`) dynamically match against each bot's own email local-part and configured node name, preventing cross-bot command collisions.
+
 ## [2.1.0] - 2026-08-27
 
 ### Added

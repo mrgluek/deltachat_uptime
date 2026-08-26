@@ -23,7 +23,7 @@ import database
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 USER_AGENT = f"DeltaChat-Uptime-Bot/{VERSION} (https://git.gluek.info/gluek/deltachat_uptime)"
 
 dc_cli = BotCli("uptimebot")
@@ -178,6 +178,9 @@ async def broadcast_telemetry_to_peers():
         seen_urls.add(url)
         metrics.append({
             "url": url,
+            "name": r.get("name") or url,
+            "type": r.get("type") or "http",
+            "expected_keyword": r.get("expected_keyword"),
             "status": r.get("status", "unknown"),
             "latency_ms": r.get("last_latency_ms"),
             "last_checked": r.get("last_checked") or now
@@ -186,10 +189,12 @@ async def broadcast_telemetry_to_peers():
     if not metrics:
         return
         
+    self_addr = _get_self_addr(dc_bot_instance, dc_accid)
     payload = {
         "node_name": database.get_local_node_name(),
+        "sender_email": self_addr,
         "timestamp": now,
-        "metrics": metrics[:50]
+        "metrics": metrics[:100]
     }
     msg_text = f"[UPTIME_PEER_METRICS]\n{json.dumps(payload)}\n[/UPTIME_PEER_METRICS]"
     
@@ -642,6 +647,19 @@ async def run_single_check(resource) -> tuple[bool, str, int | None]:
 async def check_group_task(group, semaphore):
     rep = group[0]
     async with semaphore:
+        if rep.get("is_probe_only"):
+            res = await run_single_check(rep)
+            if len(res) == 3:
+                is_up, error_msg, latency_ms = res
+            else:
+                is_up, error_msg = res
+                latency_ms = None
+            status_str = "up" if is_up else "down"
+            local_node = database.get_local_node_name()
+            await asyncio.to_thread(database.update_probe_target_result, rep["url"], status_str, latency_ms, error_msg)
+            await asyncio.to_thread(database.save_peer_measurement, rep["url"], local_node, status_str, latency_ms, error_msg)
+            return
+
         res = await run_single_check(rep)
         if len(res) == 3:
             is_up, error_msg, latency_ms = res
@@ -698,6 +716,11 @@ async def check_group_task(group, semaphore):
                 
             logger.info(f"Check result: {r['name'] or r['url']} (id: {r['id']}) in chat {r['dc_chat_id']} -> {'UP' if is_up else 'DOWN'} ({error_msg})")
             await handle_check_result(r, is_up, error_msg)
+
+        # Save local node measurement for dashboard and telemetry sync
+        local_node = database.get_local_node_name()
+        status_str = "up" if is_up else "down"
+        await asyncio.to_thread(database.save_peer_measurement, rep["url"], local_node, status_str, latency_ms, error_msg)
 
         # Check SSL Certificate Expiry for HTTPS targets (at most once per hour)
         if rep.get("type") == "http" and rep.get("url", "").startswith("https://"):
@@ -1151,10 +1174,12 @@ async def monitoring_scheduler_loop():
                     continue
 
             resources = await asyncio.to_thread(database.get_all_resources)
+            probe_targets = await asyncio.to_thread(database.get_active_probe_targets)
             now = int(time.time())
             
             # Group due resources by (type, url)
             due_groups = collections.defaultdict(list)
+            seen_urls = set()
             async with running_lock:
                 for r in resources:
                     r_id = r["id"]
@@ -1168,6 +1193,32 @@ async def monitoring_scheduler_loop():
                         running_resource_ids.add(r_id)
                         target_key = (r["type"], r["url"])
                         due_groups[target_key].append(r)
+                        seen_urls.add(r["url"])
+                    else:
+                        seen_urls.add(r["url"])
+
+                # Add probe-only targets mirrored from peers if not already checked by local chats
+                for pt in probe_targets:
+                    pt_url = pt.get("url")
+                    if not pt_url or pt_url in seen_urls:
+                        continue
+                    pt_key = f"probe_{pt_url}"
+                    if pt_key in running_resource_ids:
+                        continue
+                    last_checked = pt.get("last_checked") or 0
+                    if now - last_checked >= 60:
+                        running_resource_ids.add(pt_key)
+                        probe_rep = {
+                            "id": pt_key,
+                            "dc_chat_id": 0,
+                            "url": pt_url,
+                            "name": pt.get("name") or pt_url,
+                            "type": pt.get("type") or "http",
+                            "expected_keyword": pt.get("expected_keyword"),
+                            "status": pt.get("last_status") or "unknown",
+                            "is_probe_only": True
+                        }
+                        due_groups[(probe_rep["type"], pt_url)].append(probe_rep)
             
             tasks = []
             for target_key, group in due_groups.items():
@@ -1250,13 +1301,14 @@ def get_dashboard_html(chat_name, resources, overall_uptime, incidents=None) -> 
 
             probe_badges_html = ""
             peer_measurements = database.get_peer_measurements_for_url(r["url"])
-            if peer_measurements:
-                local_node = database.get_local_node_name()
+            local_node = database.get_local_node_name()
+            remote_measurements = [pm for pm in peer_measurements if pm.get("node_name") != local_node]
+            if remote_measurements:
                 local_lat = f"{r['last_latency_ms']}ms" if r.get("last_latency_ms") is not None else ("UP" if r["status"] == "up" else "DOWN")
                 local_badge_color = "var(--color-up)" if r["status"] == "up" else ("var(--color-down)" if r["status"] == "down" else "var(--text-muted)")
                 probe_badges_html = f'<div style="display: flex; gap: 0.35rem; flex-wrap: wrap; margin-top: 0.35rem; font-size: 0.75rem;">'
                 probe_badges_html += f'<span style="background: rgba(255, 255, 255, 0.05); padding: 2px 6px; border-radius: 4px; border: 1px solid rgba(255, 255, 255, 0.1);">📍 <b>{html.escape(local_node)}</b>: <span style="color: {local_badge_color};">{local_lat}</span></span>'
-                for pm in peer_measurements:
+                for pm in remote_measurements:
                     pm_status = pm.get("status")
                     pm_lat = f"{pm['latency_ms']}ms" if pm.get("latency_ms") is not None else (pm_status.upper() if pm_status else "UNKNOWN")
                     pm_color = "var(--color-up)" if pm_status == "up" else ("var(--color-down)" if pm_status == "down" else "var(--text-muted)")
@@ -4079,16 +4131,21 @@ def on_new_message(bot, accid, event):
             metrics_data = json.loads(text[start_idx:end_idx].strip())
             peer_node = metrics_data.get("node_name") or "Remote-Node"
             metrics_list = metrics_data.get("metrics", [])
-            try:
-                contact = bot.rpc.get_contact(accid, msg.from_id)
-                sender_addr = getattr(contact, 'address', '') or (contact.get('address') if isinstance(contact, dict) else '')
-                if sender_addr:
-                    database.update_peer_last_seen(sender_addr)
-            except Exception:
-                pass
+            sender_addr = metrics_data.get("sender_email")
+            if not sender_addr:
+                try:
+                    contact = bot.rpc.get_contact(accid, msg.from_id)
+                    sender_addr = getattr(contact, 'address', '') or (contact.get('address') if isinstance(contact, dict) else '')
+                except Exception:
+                    pass
+            if sender_addr:
+                database.update_peer_last_seen(sender_addr)
 
             if metrics_list:
+                # 1. Save measurements reported from peer to show on web dashboard
                 database.save_peer_measurements_batch(peer_node, metrics_list)
+                # 2. Mirror targets to local probe queue so this node monitors them too!
+                database.save_probe_targets_batch(metrics_list, sender_addr or peer_node)
         except Exception as e:
             logger.error(f"Error handling peer metrics: {e}")
         return

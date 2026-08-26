@@ -158,6 +158,22 @@ def init_db():
             )
         ''')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_peer_measurements_url ON peer_measurements(url)')
+
+        # Remote probe targets mirrored from peer bots
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS probe_targets (
+                url TEXT PRIMARY KEY,
+                name TEXT,
+                type TEXT DEFAULT 'http',
+                expected_keyword TEXT,
+                source_peer TEXT,
+                last_seen INTEGER,
+                last_checked INTEGER,
+                last_status TEXT,
+                last_latency_ms INTEGER,
+                last_error TEXT
+            )
+        ''')
         
         conn.commit()
         conn.close()
@@ -980,6 +996,59 @@ def get_all_peer_measurements() -> list[dict]:
         conn.close()
         return [dict(r) for r in rows]
 
+# Remote probe targets functions
+def save_probe_targets_batch(targets: list[dict], source_peer: str = None):
+    if not targets:
+        return
+    with _lock:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        now = int(time.time())
+        for item in targets:
+            url = item.get("url")
+            if not url:
+                continue
+            name = item.get("name") or url
+            chk_type = item.get("type", "http")
+            kw = item.get("expected_keyword")
+            cursor.execute('''
+                INSERT INTO probe_targets (url, name, type, expected_keyword, source_peer, last_seen)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(url) DO UPDATE SET
+                    name = excluded.name,
+                    type = excluded.type,
+                    expected_keyword = excluded.expected_keyword,
+                    source_peer = COALESCE(excluded.source_peer, probe_targets.source_peer),
+                    last_seen = excluded.last_seen
+            ''', (url, name, chk_type, kw, source_peer, now))
+        conn.commit()
+        conn.close()
+
+def get_active_probe_targets(max_age_seconds: int = 86400) -> list[dict]:
+    with _lock:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        min_seen = int(time.time()) - max_age_seconds
+        cursor.execute("SELECT * FROM probe_targets WHERE last_seen >= ? ORDER BY url ASC", (min_seen,))
+        rows = cursor.fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+
+def update_probe_target_result(url: str, status: str, latency_ms: int = None, error_msg: str = None):
+    with _lock:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        now = int(time.time())
+        cursor.execute('''
+            UPDATE probe_targets
+            SET last_checked = ?, last_status = ?, last_latency_ms = ?, last_error = ?
+            WHERE url = ?
+        ''', (now, status, latency_ms, error_msg, url))
+        conn.commit()
+        conn.close()
+
 # Initialize DB on module import
 init_db()
+
 

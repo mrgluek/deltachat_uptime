@@ -2058,6 +2058,42 @@ class TestUptimeBot(unittest.TestCase):
         mock_bot_ru._parse_command(1, event_ru_ok)
         self.assertTrue(orig_parse_ru.called)
 
+    def test_probe_targets_database_and_mirroring(self):
+        targets = [
+            {"url": "https://mirrored1.org", "name": "Mirrored 1", "type": "http", "expected_keyword": "hello"},
+            {"url": "https://mirrored2.org", "name": "Mirrored 2", "type": "http"}
+        ]
+        database.save_probe_targets_batch(targets, "probe@example.com")
+        active = database.get_active_probe_targets()
+        self.assertEqual(len(active), 2)
+        urls = [a["url"] for a in active]
+        self.assertIn("https://mirrored1.org", urls)
+        self.assertIn("https://mirrored2.org", urls)
+
+        # Update probe target result
+        database.update_probe_target_result("https://mirrored1.org", "up", 35, None)
+        active_after = database.get_active_probe_targets()
+        m1 = next(a for a in active_after if a["url"] == "https://mirrored1.org")
+        self.assertEqual(m1["last_status"], "up")
+        self.assertEqual(m1["last_latency_ms"], 35)
+
+    def test_check_group_task_probe_only(self):
+        database.set_local_node_name("RU-Moscow")
+        group = [{
+            "id": "probe_https://probeonly.org",
+            "dc_chat_id": 0,
+            "url": "https://probeonly.org",
+            "name": "Probe Only Target",
+            "type": "http",
+            "is_probe_only": True
+        }]
+        sem = asyncio.Semaphore(1)
+        with patch('bot.run_single_check', unittest.mock.AsyncMock(return_value=(True, "200 OK", 45))):
+            asyncio.run(bot.check_group_task(group, sem))
+        
+        meas = database.get_peer_measurements_for_url("https://probeonly.org")
+        self.assertTrue(any(m["node_name"] == "RU-Moscow" and m["latency_ms"] == 45 for m in meas))
+
 if __name__ == '__main__':
     unittest.main()
 

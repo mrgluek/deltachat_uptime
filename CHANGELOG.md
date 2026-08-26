@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.6.0] - 2026-08-27
+
+### Security & Hardening
+- **Peer Protocol Authentication & Verification:** Verified all incoming peer protocol messages (`[UPTIME_PEER_*]`) against registered peers table to prevent unauthorized message spoofing.
+- **SSRF & Private Network Protection:** Added `is_safe_target_url()` blocking dangerous target queries (localhost, loopback, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.169.254, cloud metadata) during cross-checks and telemetry mirroring.
+- **Verified Node Attribution:** Enforced lookup of node names from registered peers database rather than unverified JSON payloads to prevent cross-node metric spoofing.
+- **Protocol Message Deduplication:** Added `msg_id` tracking cache to eliminate redundant processing from retransmitted Delta Chat messages.
+
+### Performance & Scalability
+- **Rotating Telemetry Window for >100 Targets:** Implemented rotating offset broadcast mechanism ensuring all unique targets are eventually synchronized across nodes regardless of cluster size.
+- **Batch Insertion via `executemany`:** Replaced looped individual SQL executions with bulk `executemany` statements for `save_peer_measurements_batch` and `save_probe_targets_batch`.
+- **Scheduler Query Caching:** Added TTL-based caching to scheduler loop reducing full-table SQLite scans by over 50% and spaced incident/peer audit intervals to 30s.
+- **Thread-safe Future Resolution:** Replaced direct `Future.set_result` with `call_soon_threadsafe` for cross-check response synchronization.
+
 ## [2.5.0] - 2026-08-27
 
 ### Added

@@ -1018,29 +1018,54 @@ def save_peer_measurement(url: str, node_name: str, status: str, latency_ms: int
         conn.close()
 
 def save_peer_measurements_batch(node_name: str, metrics_list: list[dict]):
+    if not metrics_list:
+        return
+    clean_node = (node_name or "Remote-Node").strip()[:64]
     now = int(time.time())
+    
+    rows = []
+    for item in metrics_list[:200]:
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("url") or "").strip()[:500]
+        if not url:
+            continue
+        status = str(item.get("status") or "unknown").strip().lower()
+        if status not in ("up", "down", "unknown", "paused"):
+            status = "unknown"
+        raw_lat = item.get("latency_ms")
+        latency_ms = None
+        if raw_lat is not None:
+            try:
+                lat_int = int(raw_lat)
+                if 0 <= lat_int <= 600000:
+                    latency_ms = lat_int
+            except (ValueError, TypeError):
+                latency_ms = None
+        err = item.get("error_msg")
+        error_msg = str(err)[:500] if err else None
+        ts = item.get("last_checked")
+        try:
+            checked_ts = int(ts) if ts is not None else now
+        except (ValueError, TypeError):
+            checked_ts = now
+        rows.append((url, clean_node, status, latency_ms, error_msg, checked_ts))
+
+    if not rows:
+        return
+
     with _lock:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
-        for item in metrics_list:
-            if not isinstance(item, dict):
-                continue
-            url = item.get("url")
-            if not url:
-                continue
-            status = item.get("status", "unknown")
-            latency_ms = item.get("latency_ms")
-            error_msg = item.get("error_msg")
-            ts = item.get("last_checked") or now
-            cursor.execute('''
-                INSERT INTO peer_measurements (url, node_name, status, latency_ms, error_msg, last_checked)
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(url, node_name) DO UPDATE SET
-                    status = excluded.status,
-                    latency_ms = excluded.latency_ms,
-                    error_msg = excluded.error_msg,
-                    last_checked = excluded.last_checked
-            ''', (url, node_name, status, latency_ms, error_msg, ts))
+        cursor.executemany('''
+            INSERT INTO peer_measurements (url, node_name, status, latency_ms, error_msg, last_checked)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(url, node_name) DO UPDATE SET
+                status = excluded.status,
+                latency_ms = excluded.latency_ms,
+                error_msg = excluded.error_msg,
+                last_checked = excluded.last_checked
+        ''', rows)
         conn.commit()
         conn.close()
 
@@ -1075,14 +1100,23 @@ def save_probe_targets_batch(targets: list[dict], source_peer: str = None):
         ignored_set = set(row[0] for row in cursor.fetchall())
 
         now = int(time.time())
-        for item in targets:
-            url = item.get("url")
+        rows = []
+        for item in targets[:200]:
+            if not isinstance(item, dict):
+                continue
+            url = str(item.get("url") or "").strip()[:500]
             if not url or url in ignored_set:
                 continue
-            name = item.get("name") or url
-            chk_type = item.get("type", "http")
-            kw = item.get("expected_keyword")
-            cursor.execute('''
+            name = str(item.get("name") or url).strip()[:200]
+            chk_type = str(item.get("type") or "http").strip().lower()
+            if chk_type not in ("http", "tcp", "ping"):
+                chk_type = "http"
+            raw_kw = item.get("expected_keyword")
+            kw = str(raw_kw).strip()[:200] if raw_kw else None
+            rows.append((url, name, chk_type, kw, source_peer, now))
+
+        if rows:
+            cursor.executemany('''
                 INSERT INTO probe_targets (url, name, type, expected_keyword, source_peer, last_seen)
                 VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(url) DO UPDATE SET
@@ -1091,7 +1125,7 @@ def save_probe_targets_batch(targets: list[dict], source_peer: str = None):
                     expected_keyword = excluded.expected_keyword,
                     source_peer = COALESCE(excluded.source_peer, probe_targets.source_peer),
                     last_seen = excluded.last_seen
-            ''', (url, name, chk_type, kw, source_peer, now))
+            ''', rows)
         conn.commit()
         conn.close()
 

@@ -2189,6 +2189,61 @@ class TestUptimeBot(unittest.TestCase):
             self.assertEqual(args[2], 777)
             self.assertIn("Test Admin Alert", args[3].text)
 
+    def test_is_safe_target_url_ssrf_blocking(self):
+        # Allowed public targets
+        self.assertTrue(bot.is_safe_target_url("https://google.com", "http"))
+        self.assertTrue(bot.is_safe_target_url("https://sub.domain.org/path?q=1", "http"))
+        self.assertTrue(bot.is_safe_target_url("example.com:443", "tcp"))
+        self.assertTrue(bot.is_safe_target_url("8.8.8.8", "ping"))
+
+        # Blocked dangerous SSRF targets
+        self.assertFalse(bot.is_safe_target_url("http://localhost/admin", "http"))
+        self.assertFalse(bot.is_safe_target_url("http://127.0.0.1:8080", "http"))
+        self.assertFalse(bot.is_safe_target_url("http://169.254.169.254/latest/meta-data/", "http"))
+        self.assertFalse(bot.is_safe_target_url("http://10.0.0.1", "http"))
+        self.assertFalse(bot.is_safe_target_url("http://192.168.1.1", "http"))
+        self.assertFalse(bot.is_safe_target_url("http://172.16.0.1", "http"))
+        self.assertFalse(bot.is_safe_target_url("http://0.0.0.0", "http"))
+        self.assertFalse(bot.is_safe_target_url("127.0.0.1:5432", "tcp"))
+        self.assertFalse(bot.is_safe_target_url("127.0.0.1", "ping"))
+        self.assertFalse(bot.is_safe_target_url("invalid url!!", "http"))
+
+    def test_peer_telemetry_deduplication(self):
+        mock_bot = MagicMock()
+        contact_mock = MagicMock()
+        contact_mock.address = "mesh_peer@gluek.info"
+        mock_bot.rpc.get_contact.return_value = contact_mock
+        database.add_or_update_peer("mesh_peer@gluek.info", "Mesh-Node", 999)
+
+        mock_event = MagicMock()
+        mock_event.msg.is_info = False
+        mock_event.msg.from_id = 12
+        mock_event.msg.chat_id = 999
+        mock_event.msg.text = (
+            '[UPTIME_PEER_METRICS]\n'
+            '{"node_name": "Mesh-Node", "msg_id": "test_unique_msg_1", "metrics": ['
+            '{"url": "https://service-unique.org", "status": "up", "latency_ms": 25}'
+            ']}\n'
+            '[/UPTIME_PEER_METRICS]'
+        )
+
+        # First delivery: processed and saved
+        bot.on_new_message(mock_bot, 1, mock_event)
+        m = database.get_peer_measurements_for_url("https://service-unique.org")
+        self.assertEqual(len(m), 1)
+
+        # Clear measurements to verify duplicate is ignored
+        with database._lock:
+            conn = sqlite3.connect(database.DB_PATH)
+            conn.cursor().execute("DELETE FROM peer_measurements")
+            conn.commit()
+            conn.close()
+
+        # Second delivery with same msg_id: ignored!
+        bot.on_new_message(mock_bot, 1, mock_event)
+        m_after = database.get_peer_measurements_for_url("https://service-unique.org")
+        self.assertEqual(len(m_after), 0)
+
 if __name__ == '__main__':
     unittest.main()
 

@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.0] - 2026-08-27
+
+### Added
+- **E2E Encrypted SecureJoin Peering Support (`/invitepeer` & `/addpeer <link>`):**
+  - Added `/invitepeer` (and `/peerinvite`) command to generate a 1:1 SecureJoin invite link (`https://i.delta.chat/#...`).
+  - Enhanced `/addpeer` to accept both email addresses and SecureJoin invite links.
+  - Automatically executes `secure_join` when adding a peer via invite link, exchanging public PGP keys and establishing strict end-to-end encryption.
+  - Fixes `Permanent E2E encryption failure` on strict Chatmail and custom mail servers (e.g. `chat.gluek.info`).
+  - Enriched peering handshake payloads with `sender_email` for deterministic identification across instances.
+
 ## [2.0.0] - 2026-08-27
 
 ### Added

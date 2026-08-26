@@ -23,7 +23,7 @@ import database
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 USER_AGENT = f"DeltaChat-Uptime-Bot/{VERSION} (https://git.gluek.info/gluek/deltachat_uptime)"
 
 dc_cli = BotCli("uptimebot")
@@ -2217,8 +2217,9 @@ def help_command(bot, accid, event):
             f"**Admin Commands:**\n"
             f"/url [base_url] — Set/view base status URL (e.g. `https://up.gluek.info`)\n"
             f"/nodename [name] — Set/view local probe node name (e.g. `Frankfurt-DE`)\n"
+            f"/invitepeer — Generate SecureJoin E2EE invite link for pairing with other bots\n"
             f"/peers (or /probes) — List distributed peer bots and their status\n"
-            f"/addpeer <email> [node_name] — Add remote peer bot for cross-checking\n"
+            f"/addpeer <email|link> [node_name] — Add remote peer bot (via email or SecureJoin invite)\n"
             f"/rmpeer <email> — Remove remote peer bot\n"
             f"/accounts — List configured bot accounts\n"
             f"/rmaccount <id> — Delete a bot account\n"
@@ -3240,6 +3241,15 @@ def resilient_command(bot, accid, event):
     except Exception as e:
         _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=f"❌ Failed to update resilient mode: {e}"))
 
+def _get_self_addr(bot, accid) -> str:
+    try:
+        addr = bot.rpc.get_config(accid, "configured_addr") or bot.rpc.get_config(accid, "addr")
+        if isinstance(addr, str):
+            return addr
+        return ""
+    except Exception:
+        return ""
+
 # Peer administration commands
 @dc_cli.on(events.NewMessage(command="/nodename"))
 def nodename_command(bot, accid, event):
@@ -3294,6 +3304,30 @@ def peers_command(bot, accid, event):
         reply += "Commands:\n• `/addpeer <email> [node_name]`\n• `/rmpeer <email>`\n• `/nodename <name>`"
     _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=reply.strip()))
 
+@dc_cli.on(events.NewMessage(command="/invitepeer"))
+@dc_cli.on(events.NewMessage(command="/peerinvite"))
+def invitepeer_command(bot, accid, event):
+    msg = event.msg
+    if not _is_dc_admin(bot, accid, msg.from_id):
+        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text="❌ This command is only for the administrator."))
+        return
+    try:
+        qr_link = bot.rpc.get_chat_securejoin_qr_code(accid, None)
+        node_name = database.get_local_node_name()
+        addr = bot.rpc.get_config(accid, "configured_addr") or bot.rpc.get_config(accid, "addr")
+        
+        reply = (
+            f"🔗 **Peering Invite Link (E2E Encrypted SecureJoin)**\n\n"
+            f"Local Node: **{node_name}** (`{addr}`)\n\n"
+            f"To link this bot to another Delta Chat Uptime bot:\n"
+            f"1. Copy this command:\n"
+            f"`/addpeer {qr_link} {node_name}`\n\n"
+            f"2. Send it to your other bot (in private chat)."
+        )
+        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=reply))
+    except Exception as e:
+        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=f"❌ Failed to generate invite link: {e}"))
+
 @dc_cli.on(events.NewMessage(command="/addpeer"))
 def addpeer_command(bot, accid, event):
     msg = event.msg
@@ -3303,15 +3337,70 @@ def addpeer_command(bot, accid, event):
     payload = (event.payload or "").strip()
     if not payload:
         _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(
-            text="Usage: `/addpeer <email> [node_name]`\nExample: `/addpeer ruptimebot@chat.gluek.info RU`"
+            text="Usage:\n"
+                 "• Via SecureJoin Invite Link (Recommended for Chatmail/Strict E2EE):\n"
+                 "  `/addpeer https://i.delta.chat/#... [node_name]`\n"
+                 "• Via Email Address:\n"
+                 "  `/addpeer user@example.com [node_name]`\n\n"
+                 "💡 Tip: Use `/invitepeer` on your other bot to generate a SecureJoin invite link."
         ))
         return
     parts = payload.split(maxsplit=1)
-    email = parts[0].strip().lower()
+    target = parts[0].strip()
     node_name = parts[1].strip() if len(parts) > 1 else "Remote-Node"
     
+    if "i.delta.chat" in target or target.startswith("OPENPGP4FPR:") or target.startswith("DCACCOUNT:"):
+        try:
+            # SecureJoin flow for strict E2EE
+            qr_info = bot.rpc.check_qr(accid, target)
+            chat_id = bot.rpc.secure_join(accid, target)
+            
+            peer_email = ""
+            if isinstance(qr_info, dict):
+                peer_email = qr_info.get("address") or qr_info.get("text") or ""
+                if not peer_email and qr_info.get("contact_id"):
+                    try:
+                        c = bot.rpc.get_contact(accid, qr_info["contact_id"])
+                        peer_email = getattr(c, 'address', '') or (c.get('address') if isinstance(c, dict) else '')
+                    except Exception:
+                        pass
+                        
+            if not peer_email and chat_id:
+                try:
+                    contacts = bot.rpc.get_chat_contacts(accid, chat_id)
+                    for cid in contacts:
+                        if cid != 1:
+                            c = bot.rpc.get_contact(accid, cid)
+                            peer_email = getattr(c, 'address', '') or (c.get('address') if isinstance(c, dict) else '')
+                            break
+                except Exception:
+                    pass
+                    
+            if not peer_email:
+                peer_email = f"peer_{chat_id}@securejoin"
+                
+            database.add_or_update_peer(peer_email, node_name, chat_id)
+            
+            self_addr = _get_self_addr(bot, accid)
+            hello_payload = {
+                "node_name": database.get_local_node_name(),
+                "sender_email": self_addr,
+                "version": VERSION
+            }
+            hello_text = f"[UPTIME_PEER_HELLO]\n{json.dumps(hello_payload)}\n[/UPTIME_PEER_HELLO]"
+            _dc_send_msg_with_stats(bot, accid, chat_id, MsgData(text=hello_text))
+            
+            _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(
+                text=f"✅ SecureJoin E2EE established with **{node_name}** (`{peer_email}`).\nChat ID: `{chat_id}`."
+            ))
+        except Exception as e:
+            _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=f"❌ Failed to process SecureJoin invite: {e}"))
+        return
+        
+    # Email address flow
+    email = target.lower()
     if "@" not in email or "." not in email:
-        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text="❌ Invalid email address."))
+        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text="❌ Invalid email address or invite link."))
         return
         
     try:
@@ -3319,16 +3408,18 @@ def addpeer_command(bot, accid, event):
         chat_id = bot.rpc.create_chat_by_contact_id(accid, contact_id)
         database.add_or_update_peer(email, node_name, chat_id)
         
-        # Send initial handshake message into private chat
+        self_addr = _get_self_addr(bot, accid)
         hello_payload = {
             "node_name": database.get_local_node_name(),
+            "sender_email": self_addr,
             "version": VERSION
         }
         hello_text = f"[UPTIME_PEER_HELLO]\n{json.dumps(hello_payload)}\n[/UPTIME_PEER_HELLO]"
         _dc_send_msg_with_stats(bot, accid, chat_id, MsgData(text=hello_text))
         
         _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(
-            text=f"✅ Peer `{email}` (**{node_name}**) added.\nSent peering handshake via private chat (Chat ID: `{chat_id}`)."
+            text=f"✅ Peer `{email}` (**{node_name}**) added.\nSent peering handshake via private chat (Chat ID: `{chat_id}`).\n\n"
+                 f"💡 _Note: If your provider requires strict E2EE (e.g. chatmail), generate an invite on the other bot with `/invitepeer` and add it via `/addpeer <link>`._"
         ))
     except Exception as e:
         _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=f"❌ Failed to add peer: {e}"))
@@ -3820,16 +3911,20 @@ def on_new_message(bot, accid, event):
             end_idx = text.find("[/UPTIME_PEER_HELLO]")
             hello_data = json.loads(text[start_idx:end_idx].strip())
             peer_node = hello_data.get("node_name") or "Remote-Node"
-            try:
-                contact = bot.rpc.get_contact(accid, msg.from_id)
-                sender_addr = getattr(contact, 'address', '') or (contact.get('address') if isinstance(contact, dict) else '')
-                if sender_addr:
-                    database.add_or_update_peer(sender_addr, peer_node, msg.chat_id, int(time.time()))
-            except Exception:
-                pass
+            sender_addr = hello_data.get("sender_email")
+            if not sender_addr:
+                try:
+                    contact = bot.rpc.get_contact(accid, msg.from_id)
+                    sender_addr = getattr(contact, 'address', '') or (contact.get('address') if isinstance(contact, dict) else '')
+                except Exception:
+                    pass
+            if sender_addr:
+                database.add_or_update_peer(sender_addr, peer_node, msg.chat_id, int(time.time()))
 
+            self_addr = _get_self_addr(bot, accid)
             ack_payload = {
                 "node_name": database.get_local_node_name(),
+                "sender_email": self_addr,
                 "version": VERSION
             }
             ack_msg = f"[UPTIME_PEER_HELLO_ACK]\n{json.dumps(ack_payload)}\n[/UPTIME_PEER_HELLO_ACK]"
@@ -3845,13 +3940,15 @@ def on_new_message(bot, accid, event):
             end_idx = text.find("[/UPTIME_PEER_HELLO_ACK]")
             ack_data = json.loads(text[start_idx:end_idx].strip())
             peer_node = ack_data.get("node_name") or "Remote-Node"
-            try:
-                contact = bot.rpc.get_contact(accid, msg.from_id)
-                sender_addr = getattr(contact, 'address', '') or (contact.get('address') if isinstance(contact, dict) else '')
-                if sender_addr:
-                    database.add_or_update_peer(sender_addr, peer_node, msg.chat_id, int(time.time()))
-            except Exception:
-                pass
+            sender_addr = ack_data.get("sender_email")
+            if not sender_addr:
+                try:
+                    contact = bot.rpc.get_contact(accid, msg.from_id)
+                    sender_addr = getattr(contact, 'address', '') or (contact.get('address') if isinstance(contact, dict) else '')
+                except Exception:
+                    pass
+            if sender_addr:
+                database.add_or_update_peer(sender_addr, peer_node, msg.chat_id, int(time.time()))
         except Exception as e:
             logger.error(f"Error handling peer hello ack: {e}")
         return

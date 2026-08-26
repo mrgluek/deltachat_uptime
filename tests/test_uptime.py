@@ -1873,7 +1873,23 @@ class TestUptimeBot(unittest.TestCase):
         self.assertIn("RU-Moscow", args[2].text)
         self.assertIn("ruptime@gluek.info", args[2].text)
 
-        # 5. Remove peer
+        # 5. Invitepeer command
+        mock_bot.rpc.get_chat_securejoin_qr_code.return_value = "https://i.delta.chat/#testinvite123"
+        bot.invitepeer_command(mock_bot, 1, mock_event)
+        args, kwargs = mock_bot.rpc.send_msg.call_args
+        self.assertIn("https://i.delta.chat/#testinvite123", args[2].text)
+
+        # 6. Add peer via SecureJoin invite link
+        mock_bot.rpc.check_qr.return_value = {"address": "securebot@chatmail.uk", "contact_id": 55}
+        mock_bot.rpc.secure_join.return_value = 888
+        mock_event.payload = "https://i.delta.chat/#testinvite123 London-Node"
+        bot.addpeer_command(mock_bot, 1, mock_event)
+        peer_sj = database.get_peer("securebot@chatmail.uk")
+        self.assertIsNotNone(peer_sj)
+        self.assertEqual(peer_sj["node_name"], "London-Node")
+        self.assertEqual(peer_sj["chat_id"], 888)
+
+        # 7. Remove peer
         mock_event.payload = "ruptime@gluek.info"
         bot.rmpeer_command(mock_bot, 1, mock_event)
         self.assertIsNone(database.get_peer("ruptime@gluek.info"))

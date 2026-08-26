@@ -83,8 +83,9 @@ These commands are only executable by the configured administrator.
 - `/url` — View current base external status URL.
 - `/url <url>` — Update the base external status URL (e.g., `/url https://up.gluek.info`) to generate correct status links.
 - `/nodename [name]` — View or set the local probe node identifier (e.g. `/nodename Frankfurt-DE`).
+- `/invitepeer` — Generate a SecureJoin E2E encrypted invite link (`https://i.delta.chat/#...`) for pairing with other bots.
 - `/peers` (or `/probes`) — List distributed monitoring peers, node names, and last seen activity.
-- `/addpeer <email> [node_name]` — Link another Delta Chat Uptime bot as a remote probe (e.g. `/addpeer ruptimebot@chat.gluek.info RU`).
+- `/addpeer <email|link> [node_name]` — Link another Delta Chat Uptime bot as a remote probe using its email address or SecureJoin invite link (e.g. `/addpeer https://i.delta.chat/#... RU` or `/addpeer ruptimebot@chat.gluek.info RU`).
 - `/rmpeer <email>` — Remove a remote peer probe.
 - `/accounts` — List active bot accounts.
 - `/rmaccount <id>` — Delete a bot account.

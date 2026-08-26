@@ -132,6 +132,32 @@ def init_db():
                 last_received_at INTEGER
             )
         ''')
+
+        # Distributed peers (multi-node bots via 1:1 Delta Chat DMs)
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS peers (
+                email TEXT PRIMARY KEY,
+                node_name TEXT,
+                chat_id INTEGER,
+                last_seen INTEGER,
+                created_at INTEGER DEFAULT (strftime('%s','now'))
+            )
+        ''')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_peers_chat ON peers(chat_id)')
+
+        # Telemetry metrics reported from remote peer probes
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS peer_measurements (
+                url TEXT,
+                node_name TEXT,
+                status TEXT, -- 'up', 'down', 'unknown'
+                latency_ms INTEGER,
+                error_msg TEXT,
+                last_checked INTEGER,
+                PRIMARY KEY (url, node_name)
+            )
+        ''')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_peer_measurements_url ON peer_measurements(url)')
         
         conn.commit()
         conn.close()
@@ -798,5 +824,162 @@ def get_all_transport_stats() -> list[dict]:
         conn.close()
         return [dict(r) for r in rows]
 
+# Peer management functions
+def get_local_node_name() -> str:
+    name = get_config("node_name")
+    if name:
+        return name
+    return os.getenv("NODE_NAME", "Node-1")
+
+def set_local_node_name(name: str):
+    set_config("node_name", name.strip())
+
+def add_or_update_peer(email: str, node_name: str = None, chat_id: int = None, last_seen: int = None):
+    email = email.lower().strip()
+    with _lock:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("SELECT node_name, chat_id, last_seen FROM peers WHERE email = ?", (email,))
+        row = cursor.fetchone()
+        
+        now = int(time.time())
+        if row:
+            curr_node, curr_chat, curr_seen = row
+            new_node = node_name if node_name is not None else curr_node
+            new_chat = chat_id if chat_id is not None else curr_chat
+            new_seen = last_seen if last_seen is not None else (curr_seen or now)
+            cursor.execute(
+                "UPDATE peers SET node_name = ?, chat_id = ?, last_seen = ? WHERE email = ?",
+                (new_node, new_chat, new_seen, email)
+            )
+        else:
+            n_name = node_name or "Remote-Node"
+            c_id = chat_id
+            s_time = last_seen or now
+            cursor.execute(
+                "INSERT INTO peers (email, node_name, chat_id, last_seen) VALUES (?, ?, ?, ?)",
+                (email, n_name, c_id, s_time)
+            )
+        conn.commit()
+        conn.close()
+
+def remove_peer(email: str) -> bool:
+    email = email.lower().strip()
+    with _lock:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM peers WHERE email = ?", (email,))
+        changed = cursor.rowcount > 0
+        conn.commit()
+        conn.close()
+        return changed
+
+def get_peer(email: str) -> dict | None:
+    email = email.lower().strip()
+    with _lock:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM peers WHERE email = ?", (email,))
+        row = cursor.fetchone()
+        conn.close()
+        return dict(row) if row else None
+
+def get_peer_by_chat_id(chat_id: int) -> dict | None:
+    with _lock:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM peers WHERE chat_id = ?", (chat_id,))
+        row = cursor.fetchone()
+        conn.close()
+        return dict(row) if row else None
+
+def get_all_peers() -> list[dict]:
+    with _lock:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM peers ORDER BY node_name ASC")
+        rows = cursor.fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+
+def update_peer_last_seen(email: str, timestamp: int = None):
+    email = email.lower().strip()
+    now = timestamp if timestamp is not None else int(time.time())
+    with _lock:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("UPDATE peers SET last_seen = ? WHERE email = ?", (now, email))
+        conn.commit()
+        conn.close()
+
+# Peer measurements (remote probe telemetry)
+def save_peer_measurement(url: str, node_name: str, status: str, latency_ms: int | None = None, error_msg: str = None, last_checked: int = None):
+    now = last_checked if last_checked is not None else int(time.time())
+    with _lock:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO peer_measurements (url, node_name, status, latency_ms, error_msg, last_checked)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(url, node_name) DO UPDATE SET
+                status = excluded.status,
+                latency_ms = excluded.latency_ms,
+                error_msg = excluded.error_msg,
+                last_checked = excluded.last_checked
+        ''', (url, node_name, status, latency_ms, error_msg, now))
+        conn.commit()
+        conn.close()
+
+def save_peer_measurements_batch(node_name: str, metrics_list: list[dict]):
+    now = int(time.time())
+    with _lock:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        for item in metrics_list:
+            if not isinstance(item, dict):
+                continue
+            url = item.get("url")
+            if not url:
+                continue
+            status = item.get("status", "unknown")
+            latency_ms = item.get("latency_ms")
+            error_msg = item.get("error_msg")
+            ts = item.get("last_checked") or now
+            cursor.execute('''
+                INSERT INTO peer_measurements (url, node_name, status, latency_ms, error_msg, last_checked)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(url, node_name) DO UPDATE SET
+                    status = excluded.status,
+                    latency_ms = excluded.latency_ms,
+                    error_msg = excluded.error_msg,
+                    last_checked = excluded.last_checked
+            ''', (url, node_name, status, latency_ms, error_msg, ts))
+        conn.commit()
+        conn.close()
+
+def get_peer_measurements_for_url(url: str) -> list[dict]:
+    with _lock:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM peer_measurements WHERE url = ? ORDER BY node_name ASC", (url,))
+        rows = cursor.fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+
+def get_all_peer_measurements() -> list[dict]:
+    with _lock:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM peer_measurements ORDER BY url, node_name ASC")
+        rows = cursor.fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+
 # Initialize DB on module import
 init_db()
+

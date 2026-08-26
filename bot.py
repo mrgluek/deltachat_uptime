@@ -11,6 +11,7 @@ import html
 import re
 import socket
 import shlex
+import secrets
 from urllib.parse import urlparse
 import aiohttp
 from aiohttp import web
@@ -22,7 +23,7 @@ import database
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "1.9.0"
+VERSION = "2.0.0"
 USER_AGENT = f"DeltaChat-Uptime-Bot/{VERSION} (https://git.gluek.info/gluek/deltachat_uptime)"
 
 dc_cli = BotCli("uptimebot")
@@ -33,6 +34,10 @@ last_sync_times = {}
 dc_bot_instance = None
 dc_accid = None
 async_event_loop = None
+
+# Peering globals
+pending_peer_checks = {} # req_id -> (Future, expected_count, list_of_responses)
+last_peer_telemetry_broadcast = 0.0
 
 # Canary targets for verifying host outbound internet connectivity
 CANARY_TARGETS = [
@@ -90,6 +95,118 @@ async def check_host_internet_connectivity(timeout: float = 2.5, max_age: float 
                 _host_outage_active = False
                 
         return is_online
+
+async def request_peer_cross_checks(target_dict: dict, timeout: float = 8.0) -> list[dict]:
+    """Broadcasts a cross-check request to all configured remote peers in 1:1 DMs and waits for responses."""
+    peers = await asyncio.to_thread(database.get_all_peers)
+    if not peers or not dc_bot_instance or dc_accid is None:
+        return []
+
+    req_id = secrets.token_hex(6)
+    req_payload = {
+        "req_id": req_id,
+        "url": target_dict["url"],
+        "type": target_dict.get("type", "http"),
+        "expected_keyword": target_dict.get("expected_keyword"),
+        "node_name": database.get_local_node_name()
+    }
+    msg_text = f"[UPTIME_PEER_CHECK_REQ]\n{json.dumps(req_payload)}\n[/UPTIME_PEER_CHECK_REQ]"
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return []
+
+    fut = loop.create_future()
+    responses = []
+
+    valid_peers = []
+    for p in peers:
+        chat_id = p.get("chat_id")
+        if not chat_id and p.get("email"):
+            try:
+                contact_id = await asyncio.to_thread(dc_bot_instance.rpc.create_contact, dc_accid, p["email"], p.get("node_name") or p["email"])
+                chat_id = await asyncio.to_thread(dc_bot_instance.rpc.create_chat_by_contact_id, dc_accid, contact_id)
+                await asyncio.to_thread(database.add_or_update_peer, p["email"], p.get("node_name"), chat_id)
+            except Exception as e:
+                logger.warning(f"Could not resolve chat_id for peer {p['email']}: {e}")
+                continue
+        if chat_id:
+            valid_peers.append((p, chat_id))
+
+    if not valid_peers:
+        return []
+
+    pending_peer_checks[req_id] = (fut, len(valid_peers), responses)
+
+    for p, chat_id in valid_peers:
+        try:
+            await asyncio.to_thread(_dc_send_msg_with_stats, dc_bot_instance, dc_accid, chat_id, MsgData(text=msg_text))
+        except Exception as e:
+            logger.warning(f"Failed to send cross-check request to peer {p.get('email')}: {e}")
+
+    try:
+        await asyncio.wait_for(fut, timeout=timeout)
+    except asyncio.TimeoutError:
+        logger.info(f"Cross-check req_id {req_id} timed out waiting for all peer responses (got {len(responses)}/{len(valid_peers)})")
+    except Exception as e:
+        logger.warning(f"Error during peer cross-check wait: {e}")
+    finally:
+        pending_peer_checks.pop(req_id, None)
+
+    return responses
+
+async def broadcast_telemetry_to_peers():
+    """Periodically sends local monitor telemetry to all configured peers via 1:1 chat."""
+    if not dc_bot_instance or dc_accid is None:
+        return
+    peers = await asyncio.to_thread(database.get_all_peers)
+    if not peers:
+        return
+        
+    resources = await asyncio.to_thread(database.get_all_resources)
+    if not resources:
+        return
+        
+    seen_urls = set()
+    metrics = []
+    now = int(time.time())
+    for r in resources:
+        url = r.get("url")
+        if not url or url in seen_urls:
+            continue
+        seen_urls.add(url)
+        metrics.append({
+            "url": url,
+            "status": r.get("status", "unknown"),
+            "latency_ms": r.get("last_latency_ms"),
+            "last_checked": r.get("last_checked") or now
+        })
+        
+    if not metrics:
+        return
+        
+    payload = {
+        "node_name": database.get_local_node_name(),
+        "timestamp": now,
+        "metrics": metrics[:50]
+    }
+    msg_text = f"[UPTIME_PEER_METRICS]\n{json.dumps(payload)}\n[/UPTIME_PEER_METRICS]"
+    
+    for p in peers:
+        chat_id = p.get("chat_id")
+        if not chat_id and p.get("email"):
+            try:
+                contact_id = await asyncio.to_thread(dc_bot_instance.rpc.create_contact, dc_accid, p["email"], p.get("node_name") or p["email"])
+                chat_id = await asyncio.to_thread(dc_bot_instance.rpc.create_chat_by_contact_id, dc_accid, contact_id)
+                await asyncio.to_thread(database.add_or_update_peer, p["email"], p.get("node_name"), chat_id)
+            except Exception:
+                continue
+        if chat_id:
+            try:
+                await asyncio.to_thread(_dc_send_msg_with_stats, dc_bot_instance, dc_accid, chat_id, MsgData(text=msg_text))
+            except Exception as e:
+                logger.warning(f"Failed to push telemetry to peer {p.get('email')}: {e}")
 
 # Async event loop and task tracking for check scheduler
 async_event_loop = None
@@ -528,6 +645,23 @@ async def check_group_task(group, semaphore):
                     f"Host internet outage detected! Suppressing DOWN check result for {rep['name'] or rep['url']} in chat {rep['dc_chat_id']}"
                 )
                 return
+
+        # Peer Cross-Check: verify failing target with remote probes before marking DOWN
+        if not is_up and any(r["status"] != "down" for r in group):
+            try:
+                peer_results = await request_peer_cross_checks(rep, timeout=8.0)
+                if peer_results:
+                    up_peers = [pr for pr in peer_results if pr.get("status") == "up"]
+                    down_peers = [pr for pr in peer_results if pr.get("status") == "down"]
+                    local_node = database.get_local_node_name()
+                    if up_peers:
+                        reach_details = ", ".join(f"{pr.get('node_name', 'Peer')}: {pr.get('latency_ms', '?')}ms" for pr in up_peers)
+                        error_msg = f"{error_msg} (Reachable from {reach_details})"
+                    elif down_peers:
+                        nodes_confirmed = [pr.get('node_name', 'Peer') for pr in down_peers]
+                        error_msg = f"{error_msg} [Confirmed by {', '.join(nodes_confirmed)}]"
+            except Exception as ex:
+                logger.warning(f"Error during peer cross-check: {ex}")
                     
         for r in group:
             if latency_ms is not None:
@@ -1015,6 +1149,12 @@ async def monitoring_scheduler_loop():
                 logger.info(f"Triggering {len(tasks)} target checks (encompassing {sum(len(g) for g in due_groups.values())} resources)...")
                 asyncio.create_task(run_checks_parallel(tasks))
                 
+            # Periodically broadcast telemetry to configured peers (every 2 minutes)
+            global last_peer_telemetry_broadcast
+            if now - last_peer_telemetry_broadcast >= 120:
+                last_peer_telemetry_broadcast = now
+                asyncio.create_task(broadcast_telemetry_to_peers())
+
             # Audit any ongoing incidents across all chats to ensure self-healing
             active_incidents = await asyncio.to_thread(database.get_all_active_incidents)
             for inc in active_incidents:
@@ -1080,6 +1220,21 @@ def get_dashboard_html(chat_name, resources, overall_uptime, incidents=None) -> 
                 m_left_str = format_duration(m_left_secs)
                 badges_html += f' <span class="monitor-type" style="background: rgba(245, 158, 11, 0.15); color: #f59e0b; border-color: rgba(245, 158, 11, 0.3);">⏸️ Maintenance ({m_left_str} left)</span>'
 
+            probe_badges_html = ""
+            peer_measurements = database.get_peer_measurements_for_url(r["url"])
+            if peer_measurements:
+                local_node = database.get_local_node_name()
+                local_lat = f"{r['last_latency_ms']}ms" if r.get("last_latency_ms") is not None else ("UP" if r["status"] == "up" else "DOWN")
+                local_badge_color = "var(--color-up)" if r["status"] == "up" else ("var(--color-down)" if r["status"] == "down" else "var(--text-muted)")
+                probe_badges_html = f'<div style="display: flex; gap: 0.35rem; flex-wrap: wrap; margin-top: 0.35rem; font-size: 0.75rem;">'
+                probe_badges_html += f'<span style="background: rgba(255, 255, 255, 0.05); padding: 2px 6px; border-radius: 4px; border: 1px solid rgba(255, 255, 255, 0.1);">📍 <b>{html.escape(local_node)}</b>: <span style="color: {local_badge_color};">{local_lat}</span></span>'
+                for pm in peer_measurements:
+                    pm_status = pm.get("status")
+                    pm_lat = f"{pm['latency_ms']}ms" if pm.get("latency_ms") is not None else (pm_status.upper() if pm_status else "UNKNOWN")
+                    pm_color = "var(--color-up)" if pm_status == "up" else ("var(--color-down)" if pm_status == "down" else "var(--text-muted)")
+                    probe_badges_html += f'<span style="background: rgba(255, 255, 255, 0.05); padding: 2px 6px; border-radius: 4px; border: 1px solid rgba(255, 255, 255, 0.1);">🛰️ <b>{html.escape(pm["node_name"])}</b>: <span style="color: {pm_color};">{pm_lat}</span></span>'
+                probe_badges_html += '</div>'
+
             latency_stat_html = ""
             if r.get("last_latency_ms") is not None:
                 lat_ms = r["last_latency_ms"]
@@ -1132,6 +1287,7 @@ def get_dashboard_html(chat_name, resources, overall_uptime, incidents=None) -> 
                         <span class="monitor-name">{html.escape(r["name"] or r["url"])}</span>
                         <span class="monitor-url">{html.escape(r["url"])}</span>
                         <div style="display: flex; gap: 0.35rem; flex-wrap: wrap; margin-top: 0.25rem;">{badges_html}</div>
+                        {probe_badges_html}
                     </div>
                 </div>
                 <div class="monitor-stats">
@@ -2060,6 +2216,10 @@ def help_command(bot, accid, event):
         help_text += (
             f"**Admin Commands:**\n"
             f"/url [base_url] — Set/view base status URL (e.g. `https://up.gluek.info`)\n"
+            f"/nodename [name] — Set/view local probe node name (e.g. `Frankfurt-DE`)\n"
+            f"/peers (or /probes) — List distributed peer bots and their status\n"
+            f"/addpeer <email> [node_name] — Add remote peer bot for cross-checking\n"
+            f"/rmpeer <email> — Remove remote peer bot\n"
             f"/accounts — List configured bot accounts\n"
             f"/rmaccount <id> — Delete a bot account\n"
             f"/transports — Show mail relays & stats\n"
@@ -3080,6 +3240,115 @@ def resilient_command(bot, accid, event):
     except Exception as e:
         _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=f"❌ Failed to update resilient mode: {e}"))
 
+# Peer administration commands
+@dc_cli.on(events.NewMessage(command="/nodename"))
+def nodename_command(bot, accid, event):
+    msg = event.msg
+    if not _is_dc_admin(bot, accid, msg.from_id):
+        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text="❌ This command is only for the administrator."))
+        return
+    payload = (event.payload or "").strip()
+    if payload:
+        database.set_local_node_name(payload)
+        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=f"✅ Local probe node name set to: `{payload}`"))
+    else:
+        current_name = database.get_local_node_name()
+        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=f"📍 Current local probe node name: `{current_name}`\n\nTo change it: `/nodename <name>` (e.g. `/nodename Frankfurt-DE`, `/nodename RU-Moscow`)."))
+
+@dc_cli.on(events.NewMessage(command="/peers"))
+@dc_cli.on(events.NewMessage(command="/probes"))
+def peers_command(bot, accid, event):
+    msg = event.msg
+    if not _is_dc_admin(bot, accid, msg.from_id):
+        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text="❌ This command is only for the administrator."))
+        return
+    peers = database.get_all_peers()
+    local_node = database.get_local_node_name()
+    reply = f"🛰️ **Distributed Monitoring Peers**\nLocal Node: `{local_node}`\n\n"
+    if not peers:
+        reply += (
+            "_No remote peers configured._\n\n"
+            "To link another Delta Chat Uptime bot as a remote probe:\n"
+            "`/addpeer <email> [node_name]` (e.g. `/addpeer ruptimebot@chat.gluek.info RU`)"
+        )
+    else:
+        now = int(time.time())
+        for p in peers:
+            last_seen = p.get("last_seen")
+            if not last_seen or last_seen == 0:
+                seen_str = "Never"
+                status_icon = "⚪"
+            else:
+                diff = max(1, now - last_seen)
+                if diff < 300:
+                    status_icon = "🟢"
+                    seen_str = f"{diff}s ago" if diff < 60 else f"{diff // 60}m ago"
+                elif diff < 3600:
+                    status_icon = "🟡"
+                    seen_str = f"{diff // 60}m ago"
+                else:
+                    status_icon = "🔴"
+                    seen_str = f"{diff // 3600}h ago"
+            chat_lbl = f"Chat ID: `{p.get('chat_id')}`" if p.get('chat_id') else "Chat: `Pending`"
+            reply += f"• {status_icon} **{p.get('node_name') or 'Remote'}** — `{p['email']}`\n  {chat_lbl} | Last seen: `{seen_str}`\n\n"
+        reply += "Commands:\n• `/addpeer <email> [node_name]`\n• `/rmpeer <email>`\n• `/nodename <name>`"
+    _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=reply.strip()))
+
+@dc_cli.on(events.NewMessage(command="/addpeer"))
+def addpeer_command(bot, accid, event):
+    msg = event.msg
+    if not _is_dc_admin(bot, accid, msg.from_id):
+        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text="❌ This command is only for the administrator."))
+        return
+    payload = (event.payload or "").strip()
+    if not payload:
+        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(
+            text="Usage: `/addpeer <email> [node_name]`\nExample: `/addpeer ruptimebot@chat.gluek.info RU`"
+        ))
+        return
+    parts = payload.split(maxsplit=1)
+    email = parts[0].strip().lower()
+    node_name = parts[1].strip() if len(parts) > 1 else "Remote-Node"
+    
+    if "@" not in email or "." not in email:
+        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text="❌ Invalid email address."))
+        return
+        
+    try:
+        contact_id = bot.rpc.create_contact(accid, email, node_name)
+        chat_id = bot.rpc.create_chat_by_contact_id(accid, contact_id)
+        database.add_or_update_peer(email, node_name, chat_id)
+        
+        # Send initial handshake message into private chat
+        hello_payload = {
+            "node_name": database.get_local_node_name(),
+            "version": VERSION
+        }
+        hello_text = f"[UPTIME_PEER_HELLO]\n{json.dumps(hello_payload)}\n[/UPTIME_PEER_HELLO]"
+        _dc_send_msg_with_stats(bot, accid, chat_id, MsgData(text=hello_text))
+        
+        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(
+            text=f"✅ Peer `{email}` (**{node_name}**) added.\nSent peering handshake via private chat (Chat ID: `{chat_id}`)."
+        ))
+    except Exception as e:
+        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=f"❌ Failed to add peer: {e}"))
+
+@dc_cli.on(events.NewMessage(command="/rmpeer"))
+def rmpeer_command(bot, accid, event):
+    msg = event.msg
+    if not _is_dc_admin(bot, accid, msg.from_id):
+        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text="❌ This command is only for the administrator."))
+        return
+    email = (event.payload or "").strip().lower()
+    if not email:
+        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text="Usage: `/rmpeer <email>`"))
+        return
+    removed = database.remove_peer(email)
+    if removed:
+        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=f"✅ Peer `{email}` removed."))
+    else:
+        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=f"❌ Peer `{email}` not found in database."))
+
 resilient_lock = threading.Lock()
 
 def _setup_resilient_mode(bot):
@@ -3542,6 +3811,161 @@ def on_new_message(bot, accid, event):
                 _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text="📥 **Sync Complete!**\nNo new resources to add (already up-to-date)."))
         except Exception as e:
             logger.error(f"Error parsing sync data: {e}")
+        return
+
+    # 1. Peer Handshake: HELLO
+    if "[UPTIME_PEER_HELLO]" in text and "[/UPTIME_PEER_HELLO]" in text:
+        try:
+            start_idx = text.find("[UPTIME_PEER_HELLO]") + len("[UPTIME_PEER_HELLO]")
+            end_idx = text.find("[/UPTIME_PEER_HELLO]")
+            hello_data = json.loads(text[start_idx:end_idx].strip())
+            peer_node = hello_data.get("node_name") or "Remote-Node"
+            try:
+                contact = bot.rpc.get_contact(accid, msg.from_id)
+                sender_addr = getattr(contact, 'address', '') or (contact.get('address') if isinstance(contact, dict) else '')
+                if sender_addr:
+                    database.add_or_update_peer(sender_addr, peer_node, msg.chat_id, int(time.time()))
+            except Exception:
+                pass
+
+            ack_payload = {
+                "node_name": database.get_local_node_name(),
+                "version": VERSION
+            }
+            ack_msg = f"[UPTIME_PEER_HELLO_ACK]\n{json.dumps(ack_payload)}\n[/UPTIME_PEER_HELLO_ACK]"
+            _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=ack_msg))
+        except Exception as e:
+            logger.error(f"Error handling peer hello: {e}")
+        return
+
+    # 2. Peer Handshake: HELLO_ACK
+    if "[UPTIME_PEER_HELLO_ACK]" in text and "[/UPTIME_PEER_HELLO_ACK]" in text:
+        try:
+            start_idx = text.find("[UPTIME_PEER_HELLO_ACK]") + len("[UPTIME_PEER_HELLO_ACK]")
+            end_idx = text.find("[/UPTIME_PEER_HELLO_ACK]")
+            ack_data = json.loads(text[start_idx:end_idx].strip())
+            peer_node = ack_data.get("node_name") or "Remote-Node"
+            try:
+                contact = bot.rpc.get_contact(accid, msg.from_id)
+                sender_addr = getattr(contact, 'address', '') or (contact.get('address') if isinstance(contact, dict) else '')
+                if sender_addr:
+                    database.add_or_update_peer(sender_addr, peer_node, msg.chat_id, int(time.time()))
+            except Exception:
+                pass
+        except Exception as e:
+            logger.error(f"Error handling peer hello ack: {e}")
+        return
+
+    # 3. Peer Cross-Check Request (Instant verification)
+    if "[UPTIME_PEER_CHECK_REQ]" in text and "[/UPTIME_PEER_CHECK_REQ]" in text:
+        try:
+            start_idx = text.find("[UPTIME_PEER_CHECK_REQ]") + len("[UPTIME_PEER_CHECK_REQ]")
+            end_idx = text.find("[/UPTIME_PEER_CHECK_REQ]")
+            req_data = json.loads(text[start_idx:end_idx].strip())
+            req_id = req_data.get("req_id")
+            target_url = req_data.get("url")
+            check_type = req_data.get("type", "http")
+            keyword = req_data.get("expected_keyword")
+            peer_node = req_data.get("node_name") or "Peer"
+
+            try:
+                contact = bot.rpc.get_contact(accid, msg.from_id)
+                sender_addr = getattr(contact, 'address', '') or (contact.get('address') if isinstance(contact, dict) else '')
+                if sender_addr:
+                    database.add_or_update_peer(sender_addr, peer_node, msg.chat_id, int(time.time()))
+            except Exception:
+                pass
+
+            if req_id and target_url:
+                synth_r = {
+                    "id": 0,
+                    "url": target_url,
+                    "type": check_type,
+                    "expected_keyword": keyword
+                }
+                async def _do_cross_check_reply():
+                    res = await run_single_check(synth_r)
+                    if len(res) == 3:
+                        is_up, error_msg, latency_ms = res
+                    else:
+                        is_up, error_msg = res
+                        latency_ms = None
+                    resp_payload = {
+                        "req_id": req_id,
+                        "url": target_url,
+                        "status": "up" if is_up else "down",
+                        "latency_ms": latency_ms,
+                        "error_msg": error_msg,
+                        "node_name": database.get_local_node_name()
+                    }
+                    resp_msg = f"[UPTIME_PEER_CHECK_RESP]\n{json.dumps(resp_payload)}\n[/UPTIME_PEER_CHECK_RESP]"
+                    _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=resp_msg))
+
+                if async_event_loop and async_event_loop.is_running():
+                    asyncio.run_coroutine_threadsafe(_do_cross_check_reply(), async_event_loop)
+                else:
+                    try:
+                        loop = asyncio.get_event_loop()
+                        loop.create_task(_do_cross_check_reply())
+                    except Exception:
+                        asyncio.run(_do_cross_check_reply())
+        except Exception as e:
+            logger.error(f"Error processing peer check request: {e}")
+        return
+
+    # 4. Peer Cross-Check Response
+    if "[UPTIME_PEER_CHECK_RESP]" in text and "[/UPTIME_PEER_CHECK_RESP]" in text:
+        try:
+            start_idx = text.find("[UPTIME_PEER_CHECK_RESP]") + len("[UPTIME_PEER_CHECK_RESP]")
+            end_idx = text.find("[/UPTIME_PEER_CHECK_RESP]")
+            resp_data = json.loads(text[start_idx:end_idx].strip())
+            req_id = resp_data.get("req_id")
+            target_url = resp_data.get("url")
+            status = resp_data.get("status", "unknown")
+            latency_ms = resp_data.get("latency_ms")
+            error_msg = resp_data.get("error_msg")
+            node_name = resp_data.get("node_name") or "Remote-Node"
+
+            if target_url:
+                database.save_peer_measurement(target_url, node_name, status, latency_ms, error_msg, int(time.time()))
+
+            try:
+                contact = bot.rpc.get_contact(accid, msg.from_id)
+                sender_addr = getattr(contact, 'address', '') or (contact.get('address') if isinstance(contact, dict) else '')
+                if sender_addr:
+                    database.update_peer_last_seen(sender_addr)
+            except Exception:
+                pass
+
+            if req_id and req_id in pending_peer_checks:
+                fut, expected_count, resp_list = pending_peer_checks[req_id]
+                resp_list.append(resp_data)
+                if len(resp_list) >= expected_count and not fut.done():
+                    fut.set_result(resp_list)
+        except Exception as e:
+            logger.error(f"Error handling peer check response: {e}")
+        return
+
+    # 5. Peer Telemetry Batch
+    if "[UPTIME_PEER_METRICS]" in text and "[/UPTIME_PEER_METRICS]" in text:
+        try:
+            start_idx = text.find("[UPTIME_PEER_METRICS]") + len("[UPTIME_PEER_METRICS]")
+            end_idx = text.find("[/UPTIME_PEER_METRICS]")
+            metrics_data = json.loads(text[start_idx:end_idx].strip())
+            peer_node = metrics_data.get("node_name") or "Remote-Node"
+            metrics_list = metrics_data.get("metrics", [])
+            try:
+                contact = bot.rpc.get_contact(accid, msg.from_id)
+                sender_addr = getattr(contact, 'address', '') or (contact.get('address') if isinstance(contact, dict) else '')
+                if sender_addr:
+                    database.update_peer_last_seen(sender_addr)
+            except Exception:
+                pass
+
+            if metrics_list:
+                database.save_peer_measurements_batch(peer_node, metrics_list)
+        except Exception as e:
+            logger.error(f"Error handling peer metrics: {e}")
         return
 
     # Auto-greet new users in private chat

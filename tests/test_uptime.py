@@ -1748,5 +1748,253 @@ class TestUptimeBot(unittest.TestCase):
             self.assertFalse(is_up)
             self.assertIn("Database connection error detected", details)
 
+    def test_peer_database_operations(self):
+        # 1. Local node name
+        self.assertEqual(database.get_local_node_name(), "Node-1")
+        database.set_local_node_name("Frankfurt-DE")
+        self.assertEqual(database.get_local_node_name(), "Frankfurt-DE")
+
+        # 2. Add and get peer
+        database.add_or_update_peer("peer1@example.com", "Helsinki-DO", 101, 1700000000)
+        p = database.get_peer("peer1@example.com")
+        self.assertIsNotNone(p)
+        self.assertEqual(p["email"], "peer1@example.com")
+        self.assertEqual(p["node_name"], "Helsinki-DO")
+        self.assertEqual(p["chat_id"], 101)
+        self.assertEqual(p["last_seen"], 1700000000)
+
+        # 3. Update peer
+        database.add_or_update_peer("peer1@example.com", "Helsinki-Updated", 102, 1700000500)
+        p = database.get_peer("peer1@example.com")
+        self.assertEqual(p["node_name"], "Helsinki-Updated")
+        self.assertEqual(p["chat_id"], 102)
+        self.assertEqual(p["last_seen"], 1700000500)
+
+        # 4. Get by chat ID
+        p_by_chat = database.get_peer_by_chat_id(102)
+        self.assertIsNotNone(p_by_chat)
+        self.assertEqual(p_by_chat["email"], "peer1@example.com")
+
+        # 5. List peers
+        database.add_or_update_peer("peer2@example.com", "RU-Moscow", 202)
+        all_peers = database.get_all_peers()
+        self.assertEqual(len(all_peers), 2)
+
+        # 6. Update last seen
+        database.update_peer_last_seen("peer2@example.com", 1700001000)
+        p2 = database.get_peer("peer2@example.com")
+        self.assertEqual(p2["last_seen"], 1700001000)
+
+        # 7. Remove peer
+        self.assertTrue(database.remove_peer("peer1@example.com"))
+        self.assertIsNone(database.get_peer("peer1@example.com"))
+        self.assertFalse(database.remove_peer("nonexistent@example.com"))
+
+        # 8. Peer measurements
+        database.save_peer_measurement("https://mysite.org", "RU-Moscow", "up", 45, "200 - OK", 1700000000)
+        measurements = database.get_peer_measurements_for_url("https://mysite.org")
+        self.assertEqual(len(measurements), 1)
+        self.assertEqual(measurements[0]["node_name"], "RU-Moscow")
+        self.assertEqual(measurements[0]["status"], "up")
+        self.assertEqual(measurements[0]["latency_ms"], 45)
+
+        # 9. Batch peer measurements
+        batch = [
+            {"url": "https://site1.org", "status": "up", "latency_ms": 25},
+            {"url": "https://site2.org", "status": "down", "latency_ms": None, "error_msg": "Timeout"}
+        ]
+        database.save_peer_measurements_batch("Helsinki-DO", batch)
+        all_m = database.get_all_peer_measurements()
+        self.assertEqual(len(all_m), 3) # 1 from previous + 2 from batch
+
+    @patch('bot._is_dc_admin')
+    def test_nodename_command(self, mock_is_admin):
+        mock_is_admin.return_value = True
+        mock_bot = MagicMock()
+        mock_event = MagicMock()
+        mock_event.msg.chat_id = 123
+        mock_event.msg.from_id = 10
+
+        # View current
+        mock_event.payload = ""
+        bot.nodename_command(mock_bot, 1, mock_event)
+        args, kwargs = mock_bot.rpc.send_msg.call_args
+        self.assertIn("Current local probe node name", args[2].text)
+
+        # Set new
+        mock_event.payload = "Frankfurt-Primary"
+        bot.nodename_command(mock_bot, 1, mock_event)
+        self.assertEqual(database.get_local_node_name(), "Frankfurt-Primary")
+
+        # Non-admin denied
+        mock_is_admin.return_value = False
+        bot.nodename_command(mock_bot, 1, mock_event)
+        args, kwargs = mock_bot.rpc.send_msg.call_args
+        self.assertIn("only for the administrator", args[2].text)
+
+    @patch('bot._is_dc_admin')
+    def test_peers_and_addpeer_rmpeer_commands(self, mock_is_admin):
+        mock_is_admin.return_value = True
+        mock_bot = MagicMock()
+        mock_bot.rpc.create_contact.return_value = 50
+        mock_bot.rpc.create_chat_by_contact_id.return_value = 999
+        mock_event = MagicMock()
+        mock_event.msg.chat_id = 123
+        mock_event.msg.from_id = 10
+
+        # 1. Empty peers
+        mock_event.payload = ""
+        bot.peers_command(mock_bot, 1, mock_event)
+        args, kwargs = mock_bot.rpc.send_msg.call_args
+        self.assertIn("No remote peers configured", args[2].text)
+
+        # 2. Add peer invalid email
+        mock_event.payload = "invalidemail RU"
+        bot.addpeer_command(mock_bot, 1, mock_event)
+        args, kwargs = mock_bot.rpc.send_msg.call_args
+        self.assertIn("Invalid email address", args[2].text)
+
+        # 3. Add peer valid
+        mock_event.payload = "ruptime@gluek.info RU-Moscow"
+        bot.addpeer_command(mock_bot, 1, mock_event)
+        peer = database.get_peer("ruptime@gluek.info")
+        self.assertIsNotNone(peer)
+        self.assertEqual(peer["node_name"], "RU-Moscow")
+        self.assertEqual(peer["chat_id"], 999)
+
+        # Verify hello handshake sent to 1:1 chat
+        send_calls = mock_bot.rpc.send_msg.call_args_list
+        hello_sent = any("[UPTIME_PEER_HELLO]" in str(call) for call in send_calls)
+        self.assertTrue(hello_sent)
+
+        # 4. View peers with configured peer
+        bot.peers_command(mock_bot, 1, mock_event)
+        args, kwargs = mock_bot.rpc.send_msg.call_args
+        self.assertIn("RU-Moscow", args[2].text)
+        self.assertIn("ruptime@gluek.info", args[2].text)
+
+        # 5. Remove peer
+        mock_event.payload = "ruptime@gluek.info"
+        bot.rmpeer_command(mock_bot, 1, mock_event)
+        self.assertIsNone(database.get_peer("ruptime@gluek.info"))
+
+    def test_peer_protocol_messages_in_on_new_message(self):
+        mock_bot = MagicMock()
+        contact_mock = MagicMock()
+        contact_mock.address = "probe2@gluek.info"
+        mock_bot.rpc.get_contact.return_value = contact_mock
+
+        mock_event = MagicMock()
+        mock_event.msg.is_info = False
+        mock_event.msg.from_id = 77
+        mock_event.msg.chat_id = 888
+
+        # 1. Incoming [UPTIME_PEER_HELLO]
+        mock_event.msg.text = '[UPTIME_PEER_HELLO]\n{"node_name": "Helsinki-DO", "version": "2.0.0"}\n[/UPTIME_PEER_HELLO]'
+        bot.on_new_message(mock_bot, 1, mock_event)
+        p = database.get_peer("probe2@gluek.info")
+        self.assertIsNotNone(p)
+        self.assertEqual(p["node_name"], "Helsinki-DO")
+        self.assertEqual(p["chat_id"], 888)
+
+        # Check that ACK was sent back
+        args, kwargs = mock_bot.rpc.send_msg.call_args
+        self.assertIn("[UPTIME_PEER_HELLO_ACK]", args[2].text)
+
+        # 2. Incoming [UPTIME_PEER_HELLO_ACK]
+        mock_event.msg.text = '[UPTIME_PEER_HELLO_ACK]\n{"node_name": "Helsinki-Updated", "version": "2.0.0"}\n[/UPTIME_PEER_HELLO_ACK]'
+        bot.on_new_message(mock_bot, 1, mock_event)
+        p = database.get_peer("probe2@gluek.info")
+        self.assertEqual(p["node_name"], "Helsinki-Updated")
+
+        # 3. Incoming [UPTIME_PEER_METRICS]
+        mock_event.msg.text = (
+            '[UPTIME_PEER_METRICS]\n'
+            '{"node_name": "Helsinki-Updated", "timestamp": 1700000000, "metrics": ['
+            '{"url": "https://api.mytest.org", "status": "up", "latency_ms": 38}'
+            ']}\n'
+            '[/UPTIME_PEER_METRICS]'
+        )
+        bot.on_new_message(mock_bot, 1, mock_event)
+        measurements = database.get_peer_measurements_for_url("https://api.mytest.org")
+        self.assertEqual(len(measurements), 1)
+        self.assertEqual(measurements[0]["node_name"], "Helsinki-Updated")
+        self.assertEqual(measurements[0]["latency_ms"], 38)
+
+        # 4. Incoming [UPTIME_PEER_CHECK_RESP]
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        fut = loop.create_future()
+        responses = []
+        bot.pending_peer_checks["req123"] = (fut, 1, responses)
+
+        mock_event.msg.text = (
+            '[UPTIME_PEER_CHECK_RESP]\n'
+            '{"req_id": "req123", "url": "https://api.mytest.org", "status": "up", "latency_ms": 42, "node_name": "Helsinki-Updated"}\n'
+            '[/UPTIME_PEER_CHECK_RESP]'
+        )
+        bot.on_new_message(mock_bot, 1, mock_event)
+        self.assertTrue(fut.done())
+        self.assertEqual(len(responses), 1)
+        self.assertEqual(responses[0]["latency_ms"], 42)
+
+    def test_dashboard_renders_multi_node_badges(self):
+        database.set_local_node_name("Frankfurt-DE")
+        database.save_peer_measurement("https://multinode.org", "Helsinki-DO", "up", 35)
+        database.save_peer_measurement("https://multinode.org", "RU-Moscow", "down", None, "502 Bad Gateway")
+
+        resources = [{
+            "id": 1,
+            "dc_chat_id": 1234,
+            "name": "MultiNode Service",
+            "url": "https://multinode.org",
+            "type": "http",
+            "status": "up",
+            "last_checked": int(time.time()),
+            "last_latency_ms": 18
+        }]
+
+        html_out = bot.get_dashboard_html("Test Chat", resources, 100.0)
+        self.assertIn("Frankfurt-DE", html_out)
+        self.assertIn("Helsinki-DO", html_out)
+        self.assertIn("RU-Moscow", html_out)
+        self.assertIn("35ms", html_out)
+        self.assertIn("18ms", html_out)
+
+    def test_cross_probe_incident_verification(self):
+        database.set_local_node_name("Frankfurt-DE")
+        database.add_or_update_peer("peer@example.com", "Helsinki-DO", 101)
+
+        rep = {"id": 1, "url": "https://cross-check-test.org", "type": "http", "name": "Cross Check"}
+        group = [{"id": 1, "dc_chat_id": 100, "url": "https://cross-check-test.org", "type": "http", "name": "Cross Check", "status": "up"}]
+
+        # 1. Simulate peer confirms DOWN
+        with patch('asyncio.sleep', unittest.mock.AsyncMock()), \
+             patch('bot.run_single_check', unittest.mock.AsyncMock(return_value=(False, "502 Bad Gateway", 100))), \
+             patch('bot.check_host_internet_connectivity', unittest.mock.AsyncMock(return_value=True)), \
+             patch('bot.request_peer_cross_checks', unittest.mock.AsyncMock(return_value=[{"node_name": "Helsinki-DO", "status": "down", "error_msg": "502"}])), \
+             patch('bot.handle_check_result', unittest.mock.AsyncMock()) as mock_handle:
+            sem = asyncio.Semaphore(1)
+            asyncio.run(bot.check_group_task(group, sem))
+            self.assertTrue(mock_handle.called)
+            args, _ = mock_handle.call_args
+            # Verify error message contains confirmed node
+            self.assertIn("Confirmed by Helsinki-DO", args[2])
+
+        # 2. Simulate peer reports UP (Regional issue)
+        with patch('asyncio.sleep', unittest.mock.AsyncMock()), \
+             patch('bot.run_single_check', unittest.mock.AsyncMock(return_value=(False, "502 Bad Gateway", 100))), \
+             patch('bot.check_host_internet_connectivity', unittest.mock.AsyncMock(return_value=True)), \
+             patch('bot.request_peer_cross_checks', unittest.mock.AsyncMock(return_value=[{"node_name": "Helsinki-DO", "status": "up", "latency_ms": 42}])), \
+             patch('bot.handle_check_result', unittest.mock.AsyncMock()) as mock_handle:
+            sem = asyncio.Semaphore(1)
+            asyncio.run(bot.check_group_task(group, sem))
+            self.assertTrue(mock_handle.called)
+            args, _ = mock_handle.call_args
+            # Verify error message contains reachable node info
+            self.assertIn("Reachable from Helsinki-DO: 42ms", args[2])
+
 if __name__ == '__main__':
     unittest.main()
+
+

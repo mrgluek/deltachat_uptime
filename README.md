@@ -38,7 +38,12 @@ Additionally, it automatically generates a secure, beautiful web status dashboar
   - **7-Day Notice:** Sends a notice when a resource is continuously unreachable for 7 days, suggesting removal if decommissioned.
   - **14-Day Warning:** Sends a warning at 14 days of continuous downtime, advising that 30-day unreachable monitors are automatically removed.
   - **30-Day Auto-Cleanup:** Automatically deletes resources with continuous 0% uptime for 30 days and notifies the chat of the removal.
-- 🤖 **Identified User-Agent:** Sends a custom `User-Agent` header (e.g. `DeltaChat-Uptime-Bot/1.9.0 (https://git.gluek.info/gluek/deltachat_uptime)`) during HTTP checks so server administrators can easily identify monitoring requests in server logs.
+- 🛰️ **Distributed Multi-Node Peering & Cross-Probe Verification:**
+  - Link multiple bot instances across different regions/servers as remote probes via private 1:1 Delta Chat DMs (`/addpeer <email> [node_name]`).
+  - **Zero Group Spam:** All protocol handshakes, background telemetry, and instant cross-checks happen in private DMs between bots.
+  - **Cross-Probe Verification:** Outages are verified across remote probes in real-time before alerting, distinguishing global downtime from regional/routing reachability issues.
+  - **Aggregated Web Dashboard:** Web status pages show latency and status badges for all active probe locations (`[📍 Frankfurt-DE: 18ms] [🛰️ RU-Moscow: 45ms]`).
+- 🤖 **Identified User-Agent:** Sends a custom `User-Agent` header (e.g. `DeltaChat-Uptime-Bot/2.0.0 (https://git.gluek.info/gluek/deltachat_uptime)`) during HTTP checks so server administrators can easily identify monitoring requests in server logs.
 
 - 🔄 **Failure Resiliency & Retry Logic:**
   - Checks resources once a minute.
@@ -77,6 +82,10 @@ These commands are only executable by the configured administrator.
 
 - `/url` — View current base external status URL.
 - `/url <url>` — Update the base external status URL (e.g., `/url https://up.gluek.info`) to generate correct status links.
+- `/nodename [name]` — View or set the local probe node identifier (e.g. `/nodename Frankfurt-DE`).
+- `/peers` (or `/probes`) — List distributed monitoring peers, node names, and last seen activity.
+- `/addpeer <email> [node_name]` — Link another Delta Chat Uptime bot as a remote probe (e.g. `/addpeer ruptimebot@chat.gluek.info RU`).
+- `/rmpeer <email>` — Remove a remote peer probe.
 - `/accounts` — List active bot accounts.
 - `/rmaccount <id>` — Delete a bot account.
 - `/transports` — Show configured mail relays, status, and stats.

@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.0] - 2026-08-27
+
+### Added
+- **Distributed Multi-Node Peering & Cross-Probe Verification via 1:1 Direct Messages:**
+  - Link multiple Delta Chat Uptime bots across different datacenters/regions as remote probes (`/addpeer <email> [node_name]`, `/rmpeer <email>`, `/peers` or `/probes`).
+  - **Zero Group Spam:** All peering protocol communications (handshakes, telemetry broadcasts, instant cross-checks) are isolated exclusively inside 1:1 private Delta Chat DMs.
+  - **No Group Invites Needed:** Secondary bots do not need to be invited into every user group chat; the primary bot queries remote probes directly in private chats.
+  - **Cross-Probe Outage Verification:** Before declaring any resource `DOWN`, bots verify availability with configured remote probes in real-time.
+  - **Regional Degradation Detection:** Alerts distinguish between confirmed global outages (`DOWN [Confirmed by RU-Moscow]`) and regional connectivity/routing issues (`DEGRADED (Reachable from RU-Moscow: 42ms)`).
+  - **Multi-Node Web Status Dashboard:** Status pages now display multi-region latency and availability badges per probe location (e.g. `[📍 Frankfurt-DE: 18ms] [🛰️ RU-Moscow: 45ms]`).
+  - **Configurable Node Identifiers (`/nodename [name]`):** Easily name local monitoring probes (e.g. `Frankfurt-DE`, `Helsinki-DO`, `RU-Moscow`).
+
 ## [1.9.0] - 2026-08-25
 
 ### Added

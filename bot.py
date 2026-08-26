@@ -23,7 +23,7 @@ import database
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "2.4.0"
+VERSION = "2.5.0"
 USER_AGENT = f"DeltaChat-Uptime-Bot/{VERSION} (https://git.gluek.info/gluek/deltachat_uptime)"
 
 dc_cli = BotCli("uptimebot")
@@ -423,7 +423,7 @@ def _get_contact_fingerprint(bot, accid, contact_id, contact=None):
         logger.error(f"Error checking fingerprint: {e}")
     return None
 
-def _is_dc_admin(bot, accid, contact_id):
+def _is_dc_admin(bot, accid, contact_id, chat_id: int = None):
     try:
         contact = None
         try:
@@ -436,6 +436,8 @@ def _is_dc_admin(bot, accid, contact_id):
             c_fp = _get_contact_fingerprint(bot, accid, contact_id, contact=contact)
             if c_fp:
                 if admin_fp.upper() in c_fp.upper().split(','):
+                    if chat_id:
+                        database.set_config("admin_chat_id", str(chat_id))
                     return True
             if c_fp:
                  logger.warning(f"Admin fingerprint mismatch for contact {contact_id}")
@@ -445,11 +447,39 @@ def _is_dc_admin(bot, accid, contact_id):
             sender_email = contact.address
             admin_email = database.get_config("admin_dc_email")
             if admin_email and admin_email.lower() == sender_email.lower():
+                if chat_id:
+                    database.set_config("admin_chat_id", str(chat_id))
                 return True
             
     except Exception as e:
         logger.error(f"Error during admin verification: {e}")
     return False
+
+async def send_admin_notification(text: str):
+    """Sends high-priority system and probe health alerts to the configured administrator via DM."""
+    if not dc_bot_instance or dc_accid is None:
+        return
+    admin_chat_id_str = await asyncio.to_thread(database.get_config, "admin_chat_id")
+    chat_id = int(admin_chat_id_str) if admin_chat_id_str and admin_chat_id_str.isdigit() else None
+    
+    if not chat_id:
+        admin_email = await asyncio.to_thread(database.get_config, "admin_dc_email")
+        if not admin_email:
+            return
+        try:
+            contact_id = await asyncio.to_thread(dc_bot_instance.rpc.create_contact, dc_accid, admin_email, "Admin")
+            chat_id = await asyncio.to_thread(dc_bot_instance.rpc.create_chat_by_contact_id, dc_accid, contact_id)
+            if chat_id:
+                await asyncio.to_thread(database.set_config, "admin_chat_id", str(chat_id))
+        except Exception as e:
+            logger.warning(f"Failed to resolve admin chat for {admin_email}: {e}")
+            return
+
+    if chat_id:
+        try:
+            await asyncio.to_thread(_dc_send_msg_with_stats, dc_bot_instance, dc_accid, chat_id, MsgData(text=text))
+        except Exception as e:
+            logger.warning(f"Failed to send admin notification to chat {chat_id}: {e}")
 
 # Uptime checks execution logic
 async def check_ssl_expiry(url: str, timeout: float = 10.0) -> tuple[int | None, str | None]:
@@ -1238,6 +1268,21 @@ async def monitoring_scheduler_loop():
             active_incidents = await asyncio.to_thread(database.get_all_active_incidents)
             for inc in active_incidents:
                 asyncio.create_task(sync_chat_incident_state(inc["dc_chat_id"]))
+
+            # Audit peer probe liveness (alert admin if remote probe stopped responding for > 6 mins)
+            newly_offline_peers = await asyncio.to_thread(database.audit_peers_offline, 360)
+            for p in newly_offline_peers:
+                p_node = p.get("node_name") or "Remote"
+                p_email = p.get("email")
+                diff_secs = max(1, now - (p.get("last_seen") or now))
+                diff_str = format_duration(diff_secs)
+                alert_txt = (
+                    f"🚨 **Monitoring Probe Offline Alert**\n"
+                    f"Probe Node: 🛰️ **{p_node}** (`{p_email}`)\n"
+                    f"Last seen: `{diff_str} ago`\n\n"
+                    f"⚠️ This probe is no longer responding or sending telemetry. Distributed cross-checks and multi-region metrics for this node are paused."
+                )
+                asyncio.create_task(send_admin_notification(alert_txt))
 
         except Exception as e:
             logger.error(f"Error in monitoring scheduler loop: {e}")
@@ -4013,6 +4058,23 @@ def on_start(bot, _args):
         except Exception:
             pass
 
+def _record_peer_activity(sender_addr: str):
+    if not sender_addr:
+        return
+    was_offline, downtime_sec, peer_data = database.update_peer_last_seen(sender_addr)
+    if was_offline and peer_data:
+        p_node = peer_data.get("node_name") or "Remote"
+        p_email = peer_data.get("email")
+        dt_str = format_duration(downtime_sec)
+        rec_txt = (
+            f"✅ **Monitoring Probe Restored**\n"
+            f"Probe Node: 🛰️ **{p_node}** (`{p_email}`)\n"
+            f"Downtime: `{dt_str}`\n\n"
+            f"🟢 Probe is back online and actively exchanging distributed telemetry."
+        )
+        if async_event_loop and async_event_loop.is_running():
+            asyncio.run_coroutine_threadsafe(send_admin_notification(rec_txt), async_event_loop)
+
 @dc_cli.on(events.NewMessage(is_bot=None))
 def on_new_message(bot, accid, event):
     msg = event.msg
@@ -4105,6 +4167,7 @@ def on_new_message(bot, accid, event):
                     pass
             if sender_addr:
                 database.add_or_update_peer(sender_addr, peer_node, msg.chat_id, int(time.time()))
+                _record_peer_activity(sender_addr)
 
             self_addr = _get_self_addr(bot, accid)
             ack_payload = {
@@ -4134,6 +4197,7 @@ def on_new_message(bot, accid, event):
                     pass
             if sender_addr:
                 database.add_or_update_peer(sender_addr, peer_node, msg.chat_id, int(time.time()))
+                _record_peer_activity(sender_addr)
         except Exception as e:
             logger.error(f"Error handling peer hello ack: {e}")
         return
@@ -4155,6 +4219,7 @@ def on_new_message(bot, accid, event):
                 sender_addr = getattr(contact, 'address', '') or (contact.get('address') if isinstance(contact, dict) else '')
                 if sender_addr:
                     database.add_or_update_peer(sender_addr, peer_node, msg.chat_id, int(time.time()))
+                    _record_peer_activity(sender_addr)
             except Exception:
                 pass
 
@@ -4215,7 +4280,7 @@ def on_new_message(bot, accid, event):
                 contact = bot.rpc.get_contact(accid, msg.from_id)
                 sender_addr = getattr(contact, 'address', '') or (contact.get('address') if isinstance(contact, dict) else '')
                 if sender_addr:
-                    database.update_peer_last_seen(sender_addr)
+                    _record_peer_activity(sender_addr)
             except Exception:
                 pass
 
@@ -4244,7 +4309,7 @@ def on_new_message(bot, accid, event):
                 except Exception:
                     pass
             if sender_addr:
-                database.update_peer_last_seen(sender_addr)
+                _record_peer_activity(sender_addr)
 
             if metrics_list:
                 # 1. Save measurements reported from peer to show on web dashboard

@@ -2153,6 +2153,42 @@ class TestUptimeBot(unittest.TestCase):
         urls_after = [a["url"] for a in active_after]
         self.assertIn("https://blocked-in-ru.org", urls_after)
 
+    def test_peer_liveness_audit_and_recovery(self):
+        now = int(time.time())
+        # 1. Setup peer with last_seen 10 minutes ago
+        database.add_or_update_peer("dead_probe@example.com", "Dead-Probe", 111, now - 600)
+        
+        # 2. Audit offline peers (threshold 360s)
+        offline = database.audit_peers_offline(threshold_seconds=360, now=now)
+        self.assertEqual(len(offline), 1)
+        self.assertEqual(offline[0]["email"], "dead_probe@example.com")
+        self.assertEqual(offline[0]["is_offline"], 1)
+
+        # 3. Second audit does not re-alert already offline peers
+        offline2 = database.audit_peers_offline(threshold_seconds=360, now=now)
+        self.assertEqual(len(offline2), 0)
+
+        # 4. Peer recovers after 100 seconds
+        recovered, downtime_sec, peer_data = database.update_peer_last_seen("dead_probe@example.com", now + 100)
+        self.assertTrue(recovered)
+        self.assertEqual(downtime_sec, 100)
+        self.assertEqual(peer_data["node_name"], "Dead-Probe")
+
+        # 5. Subsequent update does not trigger recovery again
+        rec2, _, _ = database.update_peer_last_seen("dead_probe@example.com", now + 120)
+        self.assertFalse(rec2)
+
+    def test_send_admin_notification(self):
+        database.set_config("admin_chat_id", "777")
+        bot.dc_bot_instance = MagicMock()
+        bot.dc_accid = 1
+        with patch.object(bot, '_dc_send_msg_with_stats') as mock_send:
+            asyncio.run(bot.send_admin_notification("Test Admin Alert"))
+            mock_send.assert_called_once()
+            args, _ = mock_send.call_args
+            self.assertEqual(args[2], 777)
+            self.assertIn("Test Admin Alert", args[3].text)
+
 if __name__ == '__main__':
     unittest.main()
 

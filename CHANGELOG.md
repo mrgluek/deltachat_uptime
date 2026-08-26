@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.5.0] - 2026-08-27
+
+### Added
+- **Distributed Probe Heartbeat & Mutual Liveness Monitoring:**
+  - Automated mesh heartbeat tracking: monitors connected remote probes in the background.
+  - **Probe Offline Alerts:** If a remote probe stops sending telemetry for > 6 minutes (3 missed cycles), an alert is dispatched directly to the bot administrator's private Delta Chat inbox (`🚨 Monitoring Probe Offline Alert`).
+  - **Probe Recovery Notifications:** When the probe reconnects, the administrator receives an immediate recovery notification detailing the exact downtime duration (`✅ Monitoring Probe Restored`).
+  - **Zero Group Noise:** All probe infrastructure alerts are isolated strictly to the administrator's private 1:1 chat without disturbing client/user monitoring groups.
+  - Automatic `admin_chat_id` caching to guarantee 100% end-to-end encrypted admin message delivery.
+
 ## [2.4.0] - 2026-08-27
 
 ### Added

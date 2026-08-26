@@ -140,10 +140,20 @@ def init_db():
                 node_name TEXT,
                 chat_id INTEGER,
                 last_seen INTEGER,
-                created_at INTEGER DEFAULT (strftime('%s','now'))
+                created_at INTEGER DEFAULT (strftime('%s','now')),
+                is_offline INTEGER DEFAULT 0,
+                went_offline_at INTEGER DEFAULT 0
             )
         ''')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_peers_chat ON peers(chat_id)')
+
+        # Ensure columns exist in peers for existing DBs
+        cursor.execute("PRAGMA table_info(peers)")
+        peer_cols = [c[1] for c in cursor.fetchall()]
+        if "is_offline" not in peer_cols:
+            cursor.execute("ALTER TABLE peers ADD COLUMN is_offline INTEGER DEFAULT 0")
+        if "went_offline_at" not in peer_cols:
+            cursor.execute("ALTER TABLE peers ADD COLUMN went_offline_at INTEGER DEFAULT 0")
 
         # Telemetry metrics reported from remote peer probes
         cursor.execute('''
@@ -930,15 +940,64 @@ def get_all_peers() -> list[dict]:
         conn.close()
         return [dict(r) for r in rows]
 
-def update_peer_last_seen(email: str, timestamp: int = None):
+def update_peer_last_seen(email: str, timestamp: int = None) -> tuple[bool, int, dict | None]:
+    """
+    Updates peer last_seen timestamp.
+    If the peer was previously marked offline, recovers it and returns:
+    (was_recovered, downtime_seconds, peer_dict).
+    """
     email = email.lower().strip()
     now = timestamp if timestamp is not None else int(time.time())
     with _lock:
         conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
-        cursor.execute("UPDATE peers SET last_seen = ? WHERE email = ?", (now, email))
+        cursor.execute("SELECT * FROM peers WHERE email = ?", (email,))
+        row = cursor.fetchone()
+        if not row:
+            conn.close()
+            return False, 0, None
+            
+        peer = dict(row)
+        was_offline = (peer.get("is_offline") == 1)
+        went_offline_at = peer.get("went_offline_at") or 0
+        downtime = max(1, now - went_offline_at) if was_offline and went_offline_at > 0 else 0
+
+        cursor.execute("UPDATE peers SET last_seen = ?, is_offline = 0, went_offline_at = 0 WHERE email = ?", (now, email))
         conn.commit()
         conn.close()
+        return was_offline, downtime, peer
+
+def audit_peers_offline(threshold_seconds: int = 360, now: int = None) -> list[dict]:
+    """
+    Finds active peers that have stopped responding (last_seen older than threshold)
+    and marks them offline, returning list of newly offline peers.
+    """
+    cur_time = now if now is not None else int(time.time())
+    cutoff = cur_time - threshold_seconds
+    newly_offline = []
+    with _lock:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT * FROM peers 
+            WHERE last_seen > 0 AND last_seen < ? AND (is_offline IS NULL OR is_offline = 0)
+        ''', (cutoff,))
+        rows = cursor.fetchall()
+        for r in rows:
+            p = dict(r)
+            cursor.execute('''
+                UPDATE peers 
+                SET is_offline = 1, went_offline_at = ? 
+                WHERE email = ?
+            ''', (cur_time, p["email"]))
+            p["is_offline"] = 1
+            p["went_offline_at"] = cur_time
+            newly_offline.append(p)
+        conn.commit()
+        conn.close()
+    return newly_offline
 
 # Peer measurements (remote probe telemetry)
 def save_peer_measurement(url: str, node_name: str, status: str, latency_ms: int | None = None, error_msg: str = None, last_checked: int = None):

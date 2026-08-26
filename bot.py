@@ -23,7 +23,7 @@ import database
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "2.2.0"
+VERSION = "2.3.0"
 USER_AGENT = f"DeltaChat-Uptime-Bot/{VERSION} (https://git.gluek.info/gluek/deltachat_uptime)"
 
 dc_cli = BotCli("uptimebot")
@@ -1399,15 +1399,43 @@ def get_dashboard_html(chat_name, resources, overall_uptime, incidents=None) -> 
             resolved_at = inc["resolved_at"]
             start_str = datetime.datetime.fromtimestamp(started_at, tz=datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
             
+            # Fetch affected services for this incident
+            events = database.get_incident_downtime_events(inc_id)
+            affected_services_html = ""
+            if events:
+                service_items = []
+                seen_event_urls = set()
+                for ev in events:
+                    s_name = ev.get("name") or ev.get("url") or f"Resource #{ev.get('resource_id')}"
+                    s_url = ev.get("url")
+                    if s_url in seen_event_urls:
+                        continue
+                    if s_url:
+                        seen_event_urls.add(s_url)
+                    s_err = ev.get("error_msg")
+                    err_badge = f' <span style="color: var(--text-muted); font-size: 0.75rem;">({html.escape(s_err)})</span>' if s_err else ""
+                    service_items.append(f'<li><b>{html.escape(s_name)}</b>{err_badge}</li>')
+                
+                if service_items:
+                    affected_services_html = (
+                        '<div style="margin-top: 0.5rem; padding-top: 0.5rem; border-top: 1px solid rgba(255, 255, 255, 0.08);">'
+                        '<span style="font-size: 0.75rem; font-weight: 600; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em;">Affected Monitors:</span>'
+                        '<ul style="margin: 0.25rem 0 0 1.25rem; font-size: 0.8125rem; color: var(--text-primary); line-height: 1.4;">'
+                        + "".join(service_items) +
+                        '</ul>'
+                        '</div>'
+                    )
+
             if inc_status == "ongoing":
                 d_str = format_duration(int(time.time()) - started_at)
                 inc_items += f"""
                 <div class="monitor-card" style="border-left: 4px solid var(--color-down);">
-                    <div class="monitor-info">
-                        <span class="indicator down"></span>
-                        <div class="monitor-meta">
+                    <div class="monitor-info" style="display: flex; align-items: flex-start;">
+                        <span class="indicator down" style="margin-top: 4px;"></span>
+                        <div class="monitor-meta" style="flex: 1;">
                             <span class="monitor-name" style="color: var(--color-down);">Incident #{inc_id} — Ongoing</span>
                             <span class="monitor-url">Started: {start_str} UTC (active for {d_str})</span>
+                            {affected_services_html}
                         </div>
                     </div>
                 </div>
@@ -1418,11 +1446,12 @@ def get_dashboard_html(chat_name, resources, overall_uptime, incidents=None) -> 
                 d_str = format_duration(duration)
                 inc_items += f"""
                 <div class="monitor-card" style="border-left: 4px solid var(--color-up);">
-                    <div class="monitor-info">
-                        <span class="indicator up"></span>
-                        <div class="monitor-meta">
+                    <div class="monitor-info" style="display: flex; align-items: flex-start;">
+                        <span class="indicator up" style="margin-top: 4px;"></span>
+                        <div class="monitor-meta" style="flex: 1;">
                             <span class="monitor-name">Incident #{inc_id} — Resolved</span>
                             <span class="monitor-url">{start_str} → {resolved_str} UTC ({d_str})</span>
+                            {affected_services_html}
                         </div>
                     </div>
                 </div>
@@ -3354,14 +3383,29 @@ def peers_command(bot, accid, event):
         return
     peers = database.get_all_peers()
     local_node = database.get_local_node_name()
-    reply = f"🛰️ **Distributed Monitoring Peers**\nLocal Node: `{local_node}`\n\n"
+    
+    # Statistics
+    all_resources = database.get_all_resources()
+    unique_local_urls = len(set(r["url"] for r in all_resources if r.get("url")))
+    probe_targets = database.get_active_probe_targets()
+    all_peer_measurements = database.get_all_peer_measurements()
+
+    reply = f"🛰️ **Distributed Monitoring Peers**\n"
+    reply += f"📍 Local Node: `{local_node}`\n\n"
+    reply += f"📊 **Network Stats:**\n"
+    reply += f"• Local Monitored Targets: `{unique_local_urls}` unique URLs (`{len(all_resources)}` across chats)\n"
+    reply += f"• Mirrored Remote Probe Targets: `{len(probe_targets)}`\n"
+    reply += f"• Cached Remote Measurements: `{len(all_peer_measurements)}`\n\n"
+
     if not peers:
         reply += (
             "_No remote peers configured._\n\n"
             "To link another Delta Chat Uptime bot as a remote probe:\n"
-            "`/addpeer <email> [node_name]` (e.g. `/addpeer ruptimebot@chat.gluek.info RU`)"
+            "1. Run `/invitepeer` on the other bot to get its invite link.\n"
+            "2. Run `/addpeer <link> [node_name]` on this bot."
         )
     else:
+        reply += f"🔗 **Connected Probes ({len(peers)}):**\n"
         now = int(time.time())
         for p in peers:
             last_seen = p.get("last_seen")
@@ -3380,8 +3424,10 @@ def peers_command(bot, accid, event):
                     status_icon = "🔴"
                     seen_str = f"{diff // 3600}h ago"
             chat_lbl = f"Chat ID: `{p.get('chat_id')}`" if p.get('chat_id') else "Chat: `Pending`"
-            reply += f"• {status_icon} **{p.get('node_name') or 'Remote'}** — `{p['email']}`\n  {chat_lbl} | Last seen: `{seen_str}`\n\n"
-        reply += "Commands:\n• `/addpeer <email> [node_name]`\n• `/rmpeer <email>`\n• `/nodename <name>`"
+            p_node = p.get('node_name') or 'Remote'
+            node_meas_count = sum(1 for m in all_peer_measurements if m.get("node_name") == p_node)
+            reply += f"• {status_icon} **{p_node}** — `{p['email']}`\n  {chat_lbl} | Last seen: `{seen_str}` | Active metrics: `{node_meas_count}`\n\n"
+        reply += "Commands:\n• `/invitepeer` — Generate E2EE invite link\n• `/addpeer <email|link> [node_name]`\n• `/rmpeer <email>`\n• `/nodename <name>`"
     _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=reply.strip()))
 
 @dc_cli.on(events.NewMessage(command="/invitepeer"))

@@ -4,6 +4,7 @@ import unittest
 import time
 import datetime
 import asyncio
+import sqlite3
 from unittest.mock import MagicMock, patch, ANY
 
 # Setup test environment
@@ -973,11 +974,21 @@ class TestUptimeBot(unittest.TestCase):
                 "summary": "Resolved"
             }
         ]
+        # Link a downtime event for resource 1 to incident 101
+        with database._lock:
+            conn = sqlite3.connect(database.DB_PATH)
+            conn.execute("INSERT INTO downtime_events (resource_id, went_down_at, went_up_at, error_msg, incident_id) VALUES (?, ?, ?, ?, ?)",
+                         (1, now - 3600, now - 1800, "502 Bad Gateway", 101))
+            conn.commit()
+            conn.close()
+
         html_out = bot.get_dashboard_html("Test Chat", resources, 100.0, incidents)
         self.assertIn("SSL Cert", html_out)
         self.assertIn("45d left", html_out)
         self.assertIn("Recent Incidents", html_out)
         self.assertIn("Incident #101 — Resolved", html_out)
+        self.assertIn("Affected Monitors:", html_out)
+        self.assertIn("502 Bad Gateway", html_out)
 
     def test_stale_downtime_7d_notice_and_14d_warning(self):
         import asyncio
@@ -1870,6 +1881,7 @@ class TestUptimeBot(unittest.TestCase):
         # 4. View peers with configured peer
         bot.peers_command(mock_bot, 1, mock_event)
         args, kwargs = mock_bot.rpc.send_msg.call_args
+        self.assertIn("Network Stats:", args[2].text)
         self.assertIn("RU-Moscow", args[2].text)
         self.assertIn("ruptime@gluek.info", args[2].text)
 

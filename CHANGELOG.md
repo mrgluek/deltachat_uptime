@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.3.0] - 2026-08-27
+
+### Added
+- **Detailed Network & Peer Statistics in `/peers` (`/probes`):**
+  - Added summary of total local unique monitored URLs and resources across all chats.
+  - Added count of mirrored remote probe targets actively scanned in the background.
+  - Added total cached peer telemetry measurements count and per-peer active metrics count.
+- **Affected Monitors Breakdown on Web Status Dashboards:**
+  - In the "Recent Incidents" section of the status page, each incident card now lists all affected services and targets along with their specific error messages (e.g. `502 Bad Gateway`, `Connection refused`).
+
 ## [2.2.0] - 2026-08-27
 
 ### Added

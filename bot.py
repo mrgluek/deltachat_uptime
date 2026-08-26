@@ -23,7 +23,7 @@ import database
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "2.3.0"
+VERSION = "2.4.0"
 USER_AGENT = f"DeltaChat-Uptime-Bot/{VERSION} (https://git.gluek.info/gluek/deltachat_uptime)"
 
 dc_cli = BotCli("uptimebot")
@@ -3427,7 +3427,7 @@ def peers_command(bot, accid, event):
             p_node = p.get('node_name') or 'Remote'
             node_meas_count = sum(1 for m in all_peer_measurements if m.get("node_name") == p_node)
             reply += f"• {status_icon} **{p_node}** — `{p['email']}`\n  {chat_lbl} | Last seen: `{seen_str}` | Active metrics: `{node_meas_count}`\n\n"
-        reply += "Commands:\n• `/invitepeer` — Generate E2EE invite link\n• `/addpeer <email|link> [node_name]`\n• `/rmpeer <email>`\n• `/nodename <name>`"
+        reply += "Commands:\n• `/invitepeer` — Generate E2EE invite link\n• `/addpeer <email|link> [node_name]`\n• `/rmpeer <email>`\n• `/nodename <name>`\n• `/probeignore [url]` — Exclude/list ignored targets on this node\n• `/probeunignore <url>` — Resume probing target on this node"
     _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=reply.strip()))
 
 @dc_cli.on(events.NewMessage(command="/invitepeer"))
@@ -3565,6 +3565,65 @@ def rmpeer_command(bot, accid, event):
         _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=f"✅ Peer `{email}` removed."))
     else:
         _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=f"❌ Peer `{email}` not found in database."))
+
+@dc_cli.on(events.NewMessage(command="/probeignore"))
+@dc_cli.on(events.NewMessage(command="/ignoreprobe"))
+def probeignore_command(bot, accid, event):
+    msg = event.msg
+    if not _is_dc_admin(bot, accid, msg.from_id):
+        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text="❌ This command is only for the administrator."))
+        return
+    url = (event.payload or "").strip()
+    local_node = database.get_local_node_name()
+    if not url:
+        ignored = database.get_all_ignored_probe_targets()
+        if not ignored:
+            _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(
+                text=f"ℹ️ No ignored probe targets configured on `{local_node}`.\n\nTo ignore an inaccessible or region-blocked target on this probe:\n`/probeignore <url>`"
+            ))
+            return
+        reply = f"🚫 **Ignored Probe Targets on `{local_node}` ({len(ignored)}):**\n\n"
+        for item in ignored:
+            reply += f"• `{item['url']}`\n"
+        reply += "\nTo unignore and resume monitoring on this probe: `/probeunignore <url>`"
+        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=reply))
+        return
+
+    if not url.startswith(("http://", "https://", "tcp://", "ping://")) and ":" not in url:
+        if "." in url:
+            url = f"https://{url}"
+    database.add_ignored_probe_target(url)
+    _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(
+        text=f"✅ Target `{url}` is now **ignored** on `{local_node}`.\nIt will not be scanned by this probe or synced to peer dashboards."
+    ))
+
+@dc_cli.on(events.NewMessage(command="/probeunignore"))
+@dc_cli.on(events.NewMessage(command="/unignoreprobe"))
+def probeunignore_command(bot, accid, event):
+    msg = event.msg
+    if not _is_dc_admin(bot, accid, msg.from_id):
+        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text="❌ This command is only for the administrator."))
+        return
+    url = (event.payload or "").strip()
+    if not url:
+        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text="Usage: `/probeunignore <url>`"))
+        return
+
+    removed = database.remove_ignored_probe_target(url)
+    if not removed and not url.startswith(("http://", "https://")):
+        removed = database.remove_ignored_probe_target(f"https://{url}")
+        if removed:
+            url = f"https://{url}"
+
+    local_node = database.get_local_node_name()
+    if removed:
+        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(
+            text=f"✅ Target `{url}` removed from probe ignore list on `{local_node}`.\nIt will resume being scanned upon the next peer sync."
+        ))
+    else:
+        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(
+            text=f"❌ Target `{url}` was not found in the ignored probe list on `{local_node}`."
+        ))
 
 resilient_lock = threading.Lock()
 

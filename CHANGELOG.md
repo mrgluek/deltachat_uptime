@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.4.0] - 2026-08-27
+
+### Added
+- **Probe Target Ignore List (`/probeignore` & `/probeunignore`):**
+  - Added `/probeignore <url>` (and `/ignoreprobe`) allowing administrators on a probe node to exclude specific targets (e.g. region-blocked or geo-restricted services) from remote scanning and telemetry syncing.
+  - Added `/probeunignore <url>` to remove targets from the ignore list and resume remote probing upon the next peer sync cycle.
+  - Added list view for `/probeignore` (without arguments) showing all currently ignored targets on the probe node.
+  - Re-entrant database operations using `threading.RLock()` for high-concurrency safety.
+
 ## [2.3.0] - 2026-08-27
 
 ### Added

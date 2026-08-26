@@ -2106,6 +2106,53 @@ class TestUptimeBot(unittest.TestCase):
         meas = database.get_peer_measurements_for_url("https://probeonly.org")
         self.assertTrue(any(m["node_name"] == "RU-Moscow" and m["latency_ms"] == 45 for m in meas))
 
+    @patch('bot._is_dc_admin')
+    def test_probe_ignore_and_unignore_commands(self, mock_is_admin):
+        mock_is_admin.return_value = True
+        mock_bot = MagicMock()
+        mock_event = MagicMock()
+        mock_event.msg.chat_id = 99
+        mock_event.msg.from_id = 1
+        database.set_local_node_name("RU-Probe")
+
+        # 1. Ignore URL
+        mock_event.payload = "https://blocked-in-ru.org"
+        bot.probeignore_command(mock_bot, 1, mock_event)
+        self.assertTrue(database.is_probe_target_ignored("https://blocked-in-ru.org"))
+        args, kwargs = mock_bot.rpc.send_msg.call_args
+        self.assertIn("ignored", args[2].text)
+
+        # 2. Incoming probe targets batch containing the ignored URL
+        database.save_probe_targets_batch([
+            {"url": "https://blocked-in-ru.org", "name": "Blocked"},
+            {"url": "https://allowed.org", "name": "Allowed"}
+        ], "de_node@chatmail.uk")
+        active = database.get_active_probe_targets()
+        urls = [a["url"] for a in active]
+        self.assertNotIn("https://blocked-in-ru.org", urls)
+        self.assertIn("https://allowed.org", urls)
+
+        # 3. List ignored URLs
+        mock_event.payload = ""
+        bot.probeignore_command(mock_bot, 1, mock_event)
+        args, kwargs = mock_bot.rpc.send_msg.call_args
+        self.assertIn("https://blocked-in-ru.org", args[2].text)
+
+        # 4. Unignore URL
+        mock_event.payload = "https://blocked-in-ru.org"
+        bot.probeunignore_command(mock_bot, 1, mock_event)
+        self.assertFalse(database.is_probe_target_ignored("https://blocked-in-ru.org"))
+        args, kwargs = mock_bot.rpc.send_msg.call_args
+        self.assertIn("removed from probe ignore list", args[2].text)
+
+        # 5. Re-sync saves the unignored URL
+        database.save_probe_targets_batch([
+            {"url": "https://blocked-in-ru.org", "name": "Blocked"}
+        ], "de_node@chatmail.uk")
+        active_after = database.get_active_probe_targets()
+        urls_after = [a["url"] for a in active_after]
+        self.assertIn("https://blocked-in-ru.org", urls_after)
+
 if __name__ == '__main__':
     unittest.main()
 

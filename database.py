@@ -7,7 +7,7 @@ import secrets
 import string
 
 DB_PATH = os.getenv("DB_PATH", "uptime.db")
-_lock = threading.Lock()
+_lock = threading.RLock()
 
 def init_db():
     with _lock:
@@ -172,6 +172,15 @@ def init_db():
                 last_status TEXT,
                 last_latency_ms INTEGER,
                 last_error TEXT
+            )
+        ''')
+
+        # Ignored probe targets (excluded from remote scanning on this probe)
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS ignored_probe_targets (
+                url TEXT PRIMARY KEY,
+                reason TEXT,
+                created_at INTEGER DEFAULT (strftime('%s','now'))
             )
         ''')
         
@@ -1003,10 +1012,13 @@ def save_probe_targets_batch(targets: list[dict], source_peer: str = None):
     with _lock:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
+        cursor.execute("SELECT url FROM ignored_probe_targets")
+        ignored_set = set(row[0] for row in cursor.fetchall())
+
         now = int(time.time())
         for item in targets:
             url = item.get("url")
-            if not url:
+            if not url or url in ignored_set:
                 continue
             name = item.get("name") or url
             chk_type = item.get("type", "http")
@@ -1047,6 +1059,49 @@ def update_probe_target_result(url: str, status: str, latency_ms: int = None, er
         ''', (now, status, latency_ms, error_msg, url))
         conn.commit()
         conn.close()
+
+# Ignored probe targets (excluded from remote scanning on this probe node)
+def add_ignored_probe_target(url: str, reason: str = "") -> bool:
+    with _lock:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("INSERT OR REPLACE INTO ignored_probe_targets (url, reason) VALUES (?, ?)", (url, reason))
+        # Immediately remove from active probe targets
+        cursor.execute("DELETE FROM probe_targets WHERE url = ?", (url,))
+        local_node = get_local_node_name()
+        cursor.execute("DELETE FROM peer_measurements WHERE url = ? AND node_name = ?", (url, local_node))
+        conn.commit()
+        conn.close()
+        return True
+
+def remove_ignored_probe_target(url: str) -> bool:
+    with _lock:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM ignored_probe_targets WHERE url = ?", (url,))
+        deleted = cursor.rowcount > 0
+        conn.commit()
+        conn.close()
+        return deleted
+
+def is_probe_target_ignored(url: str) -> bool:
+    with _lock:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("SELECT 1 FROM ignored_probe_targets WHERE url = ?", (url,))
+        row = cursor.fetchone()
+        conn.close()
+        return row is not None
+
+def get_all_ignored_probe_targets() -> list[dict]:
+    with _lock:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM ignored_probe_targets ORDER BY url ASC")
+        rows = cursor.fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
 
 # Initialize DB on module import
 init_db()

@@ -2010,7 +2010,56 @@ class TestUptimeBot(unittest.TestCase):
             # Verify error message contains reachable node info
             self.assertIn("Reachable from Helsinki-DO: 42ms", args[2])
 
+    def test_dynamic_suffix_routing_between_different_bots(self):
+        mock_bot_de = MagicMock()
+        orig_parse_de = MagicMock()
+        mock_bot_de._parse_command = orig_parse_de
+        contact_de = MagicMock()
+        contact_de.address = "uptimebot@chatmail.uk"
+        mock_bot_de.rpc.get_contact.return_value = contact_de
+        mock_bot_de.rpc.get_basic_chat_info.return_value = {"chat_type": "Single"}
+
+        database.set_local_node_name("🇩🇪 DE")
+        bot.setup_custom_command_parser(mock_bot_de)
+
+        # 1. Bot DE with command /status@up -> matches
+        event = MagicMock()
+        event.msg.text = "/status@up"
+        event.msg.chat_id = 100
+        event.msg.__getitem__.side_effect = lambda k: "/status@up" if k == "text" else 100
+        mock_bot_de._parse_command(1, event)
+        # Should call original _parse_command with parsed command
+        self.assertTrue(orig_parse_de.called)
+
+        # 2. Bot RU (address ruptimebot@chat.gluek.info) with /status@up -> rejected
+        mock_bot_ru = MagicMock()
+        orig_parse_ru = MagicMock()
+        mock_bot_ru._parse_command = orig_parse_ru
+        contact_ru = MagicMock()
+        contact_ru.address = "ruptimebot@chat.gluek.info"
+        mock_bot_ru.rpc.get_contact.return_value = contact_ru
+        mock_bot_ru.rpc.get_basic_chat_info.return_value = {"chat_type": "Single"}
+
+        database.set_local_node_name("🇷🇺 RU")
+        bot.setup_custom_command_parser(mock_bot_ru)
+
+        event_ru = MagicMock()
+        event_ru.msg.text = "/status@up"
+        event_ru.msg.chat_id = 100
+        event_ru.msg.__getitem__.side_effect = lambda k: "/status@up" if k == "text" else 100
+        mock_bot_ru._parse_command(1, event_ru)
+        self.assertEqual(event_ru.command, "")
+
+        # 3. Bot RU with /status@ruptime -> matches
+        event_ru_ok = MagicMock()
+        event_ru_ok.msg.text = "/status@ruptime"
+        event_ru_ok.msg.chat_id = 100
+        event_ru_ok.msg.__getitem__.side_effect = lambda k: "/status@ruptime" if k == "text" else 100
+        mock_bot_ru._parse_command(1, event_ru_ok)
+        self.assertTrue(orig_parse_ru.called)
+
 if __name__ == '__main__':
     unittest.main()
+
 
 

@@ -214,10 +214,7 @@ running_resource_ids = set()
 running_lock = asyncio.Lock()
 index_page_html_cache = None
 
-# Custom command parsing configuration
-ALLOWED_PREFIXES = ["up", "uptime"]
-
-def setup_custom_command_parser(bot, allowed_prefixes):
+def setup_custom_command_parser(bot):
     original_parse_command = bot._parse_command
 
     def custom_parse_command(accid: int, event) -> None:
@@ -231,21 +228,52 @@ def setup_custom_command_parser(bot, allowed_prefixes):
         
         if "@" in cmd:
             cmd_name, suffix = cmd.split("@", 1)
-            suffix_lower = suffix.lower()
+            suffix_lower = suffix.lower().strip()
             
             if suffix_lower:
+                # 1. Get bot's self address
                 try:
-                    self_address = bot.rpc.get_contact(accid, 1).address.lower()
+                    contact = bot.rpc.get_contact(accid, 1)
+                    self_address = getattr(contact, 'address', '') or (contact.get('address') if isinstance(contact, dict) else '')
                 except Exception:
                     self_address = ""
+                if not self_address:
+                    try:
+                        self_address = bot.rpc.get_config(accid, "configured_addr") or bot.rpc.get_config(accid, "addr") or ""
+                    except Exception:
+                        self_address = ""
+                self_address = self_address.lower()
+
+                # 2. Derive this bot's unique identifiers
+                bot_identifiers = []
+                if self_address:
+                    bot_identifiers.append(self_address)
+                    local_part = self_address.split("@")[0].lower()
+                    bot_identifiers.append(local_part)
                 
+                try:
+                    node_name = database.get_local_node_name()
+                    if node_name:
+                        clean_node = re.sub(r'[^a-zA-Z0-9_-]', '', node_name).lower()
+                        if clean_node:
+                            bot_identifiers.append(clean_node)
+                            if "-" in clean_node:
+                                bot_identifiers.append(clean_node.split("-")[0])
+                            if "_" in clean_node:
+                                bot_identifiers.append(clean_node.split("_")[0])
+                except Exception:
+                    pass
+
+                # 3. Check if suffix matches this specific bot
                 matched = False
-                for p in allowed_prefixes:
-                    if suffix_lower.startswith(p.lower()) or p.lower().startswith(suffix_lower):
+                for ident in bot_identifiers:
+                    if suffix_lower == ident:
                         matched = True
                         break
-                if not matched and self_address and suffix_lower == self_address:
-                    matched = True
+                    # If suffix is a prefix of this bot's local part (e.g. 'up' is a prefix of 'uptimebot')
+                    if len(suffix_lower) >= 2 and ident.startswith(suffix_lower):
+                        matched = True
+                        break
                 
                 if matched:
                     new_text = cmd_name
@@ -3738,7 +3766,7 @@ def on_msg_failed(bot, accid, event):
 
 @dc_cli.on_init
 def on_init(bot, args):
-    setup_custom_command_parser(bot, ALLOWED_PREFIXES)
+    setup_custom_command_parser(bot)
     bot.logger.info(f"Initializing Uptime Bot v{VERSION}...")
     
     global dc_bot_instance, dc_accid

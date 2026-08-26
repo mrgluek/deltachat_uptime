@@ -602,22 +602,32 @@ def get_resources_matching_text(dc_chat_id: int, text: str) -> list[dict]:
     return matched
 
 def get_resources_by_target(dc_chat_id: int, target: str) -> list[dict]:
-    """Finds resources in dc_chat_id matching a given target string (URL, domain, or name)."""
+    """Finds resources in dc_chat_id matching a given target string (URL, domain, or name), prioritized by match quality."""
     target_clean = target.strip().lower()
     if not target_clean:
         return []
+    target_clean_slash = target_clean.rstrip('/')
     target_no_scheme = re.sub(r'^https?://', '', target_clean).rstrip('/')
     resources = get_resources(dc_chat_id)
-    matched = []
+    
+    exact_url_matches = []
+    exact_name_matches = []
+    scheme_stripped_matches = []
+    
     for r in resources:
         r_url = r.get("url", "").strip().lower()
+        r_url_slash = r_url.rstrip('/')
         r_url_no_scheme = re.sub(r'^https?://', '', r_url).rstrip('/')
         r_name = r.get("name", "").strip().lower()
-        if r_url == target_clean or r_url_no_scheme == target_no_scheme:
-            matched.append(r)
+        
+        if r_url == target_clean or r_url_slash == target_clean_slash:
+            exact_url_matches.append(r)
         elif r_name == target_clean:
-            matched.append(r)
-    return matched
+            exact_name_matches.append(r)
+        elif r_url_no_scheme == target_no_scheme:
+            scheme_stripped_matches.append(r)
+            
+    return exact_url_matches + exact_name_matches + scheme_stripped_matches
 
 def update_incident_msg_id(incident_id: int, msg_id: int | None):
     if msg_id is not None and not isinstance(msg_id, int):

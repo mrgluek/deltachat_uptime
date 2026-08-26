@@ -23,7 +23,7 @@ import database
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "2.6.1"
+VERSION = "2.6.2"
 USER_AGENT = f"DeltaChat-Uptime-Bot/{VERSION} (https://git.gluek.info/gluek/deltachat_uptime)"
 
 dc_cli = BotCli("uptimebot")
@@ -1488,7 +1488,7 @@ def get_dashboard_html(chat_name, resources, overall_uptime, incidents=None) -> 
                 last_checked_str = datetime.datetime.fromtimestamp(r["last_checked"]).strftime('%Y-%m-%d %H:%M:%S')
                 
             badges_html = f'<span class="monitor-type">{r["type"]}</span>'
-            if r.get("expected_keyword"):
+            if r.get("expected_keyword") and r.get("type") == "http":
                 badges_html += f' <span class="monitor-type" style="background: rgba(56, 189, 248, 0.1); color: #38bdf8; border-color: rgba(56, 189, 248, 0.25);" title="Expected content keyword">🔍 {html.escape(r["expected_keyword"])}</span>'
             if is_maintenance:
                 m_left_secs = m_until - now_ts
@@ -3025,7 +3025,16 @@ def keyword_command(bot, accid, event):
         ))
         return
         
-    target = target_res[0]
+    # Prioritize HTTP monitors for keyword assertions if multiple targets match
+    http_matches = [r for r in target_res if r.get("type") == "http"]
+    target = http_matches[0] if http_matches else target_res[0]
+
+    if target.get("type") != "http":
+        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(
+            text=f"❌ Keyword assertions are only supported for HTTP/HTTPS monitors.\nMonitor `ID: {target['id']}` (**{target['name']}**) has type `{target.get('type', '').upper()}`."
+        ))
+        return
+
     if keyword is None:
         current_kw = target.get("expected_keyword")
         if current_kw:
@@ -3038,10 +3047,11 @@ def keyword_command(bot, accid, event):
             ))
         return
         
+    _scheduler_cache["resources"] = None
     if keyword.lower() in ("none", "clear", "remove", "off", "disable", "delete"):
         database.set_resource_keyword(msg.chat_id, target["id"], None)
         _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(
-            text=f"✅ Cleared expected keyword requirement for **{target['name']}**."
+            text=f"✅ Cleared expected keyword requirement for **{target['name']}** (`ID: {target['id']}`)."
         ))
     else:
         database.set_resource_keyword(msg.chat_id, target["id"], keyword)

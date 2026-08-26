@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.6.2] - 2026-08-27
+
+### Fixed
+- **Prioritized Exact URL Matching in `/keyword`:** Fixed target resolution in `get_resources_by_target` so exact URL matches (e.g. `https://dnd.wb.ru/`) take strict priority over scheme-stripped matches (e.g. `dnd.wb.ru` [PING]).
+- **HTTP-Only Keyword Enforcement:** Enforced that `/keyword` exclusively targets HTTP/HTTPS monitors and rejects non-HTTP types (PING/TCP), with automatic preference for HTTP monitors when matching ambiguous domain targets.
+- **Web Dashboard Keyword Badge Scope:** Ensured that content assertion keyword badges (`🔍 keyword`) render exclusively on HTTP monitors on the status dashboard.
+
 ## [2.6.1] - 2026-08-27
 
 ### Fixed

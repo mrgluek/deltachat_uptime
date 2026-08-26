@@ -2266,6 +2266,38 @@ class TestUptimeBot(unittest.TestCase):
             self.assertIn("https://deltachat.wiki/en", payload_text)
             self.assertIn('"latency_ms": 42', payload_text)
 
+    def test_keyword_command_target_resolution_and_http_preference(self):
+        chat_id = 9911
+        # Add PING resource first
+        ping_id = database.add_resource(chat_id, "dnd.wb.ru", "dnd.wb.ru", "ping")
+        # Add HTTP resource second
+        http_id = database.add_resource(chat_id, "https://dnd.wb.ru", "DND.wb.ru", "http")
+
+        # Check that get_resources_by_target for https://dnd.wb.ru/ puts HTTP resource first
+        matched = database.get_resources_by_target(chat_id, "https://dnd.wb.ru/")
+        self.assertEqual(matched[0]["id"], http_id)
+
+        mock_bot = MagicMock()
+        mock_event = MagicMock()
+        mock_event.msg.chat_id = chat_id
+        mock_event.payload = 'https://dnd.wb.ru/ "and enjoy"'
+
+        bot.keyword_command(mock_bot, 1, mock_event)
+
+        # HTTP resource should have keyword set
+        http_res = database.get_resource_by_id(http_id)
+        self.assertEqual(http_res["expected_keyword"], "and enjoy")
+
+        # PING resource should NOT have keyword set
+        ping_res = database.get_resource_by_id(ping_id)
+        self.assertIsNone(ping_res.get("expected_keyword"))
+
+        # If user explicitly targets the PING monitor by ID, keyword command rejects it
+        mock_event.payload = f'{ping_id} "and enjoy"'
+        bot.keyword_command(mock_bot, 1, mock_event)
+        args, _ = mock_bot.rpc.send_msg.call_args
+        self.assertIn("Keyword assertions are only supported for HTTP/HTTPS", args[2].text)
+
 if __name__ == '__main__':
     unittest.main()
 

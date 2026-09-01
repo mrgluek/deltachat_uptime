@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.7.2] - 2026-09-01
+
+### Optimized
+- **Parallel Multi-Region Cross-Check in `/ping`:**
+  - Remote probe cross-checks are now dispatched immediately on millisecond 0 in parallel with local checks, SSL inspections, and HTML title parsing.
+  - Increased federated probe response timeout to 6.5s to reliably accommodate full HTTP GET and TLS handshakes over E2EE email delivery.
+
 ## [2.7.1] - 2026-09-01
 
 ### Added

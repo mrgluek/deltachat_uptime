@@ -2721,6 +2721,12 @@ def ping_command(bot, accid, event):
                 "expected_keyword": keyword
             }
             
+            # Start multi-region peer cross-checks immediately in parallel
+            cross_check_task = None
+            peers = await asyncio.to_thread(database.get_all_peers)
+            if peers:
+                cross_check_task = asyncio.create_task(request_peer_cross_checks(synth_r, timeout=6.5))
+
             # 1. Local check
             res = await run_single_check(synth_r)
             if len(res) == 3:
@@ -2757,12 +2763,11 @@ def ping_command(bot, accid, event):
                 except Exception:
                     pass
 
-            # 4. Multi-region probe cross-check (if peers configured)
+            # 4. Await multi-region probe cross-check results
             peer_responses = []
-            peers = await asyncio.to_thread(database.get_all_peers)
-            if peers:
+            if cross_check_task:
                 try:
-                    peer_responses = await request_peer_cross_checks(synth_r, timeout=4.0)
+                    peer_responses = await cross_check_task
                 except Exception:
                     pass
 

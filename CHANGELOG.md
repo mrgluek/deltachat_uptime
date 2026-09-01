@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.7.0] - 2026-09-01
+
+### Added
+- **On-Demand Target Testing & Diagnostics (`/ping`, `/check`, `/test`):**
+  - Added `/ping <target> ["keyword"]` command allowing users to quickly verify any target before adding it to permanent monitoring.
+  - Tests HTTP status codes, latency, response time, HTML page titles, and SSL certificate expiration.
+  - Supports keyword assertion testing for HTTP/HTTPS endpoints (e.g. `/ping https://gluek.info "and enjoy"`).
+  - Automatically queries connected multi-region probes and displays a synchronized reachability breakdown (e.g. Local DE, Remote RU, US).
+  - Provides a quick 1-click `/add` suggestion upon successful checks.
+
 ## [2.6.2] - 2026-08-27
 
 ### Fixed

@@ -23,7 +23,7 @@ import database
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "2.6.2"
+VERSION = "2.7.0"
 USER_AGENT = f"DeltaChat-Uptime-Bot/{VERSION} (https://git.gluek.info/gluek/deltachat_uptime)"
 
 dc_cli = BotCli("uptimebot")
@@ -2491,6 +2491,7 @@ def help_command(bot, accid, event):
         f"👋 Welcome to Delta Chat Uptime Bot {VERSION}!\n\n"
         f"I monitor resource availability (HTTP, TCP, Ping) and alert this chat if they go offline.\n\n"
         f"**Public Commands:**\n"
+        f"/ping <target> [\"keyword\"] — Quick on-demand test & diagnostics without adding\n"
         f"/add <target> [name] [\"keyword\"] — Monitor a resource. Target formats:\n"
         f"  • `https://example.com` (HTTP/HTTPS)\n"
         f"  • `https://api.site.com Health \"status:ok\"` (Keyword assertion)\n"
@@ -2647,6 +2648,157 @@ def parse_duration_string(s: str) -> int | None:
     elif unit.startswith("d"):
         return val * 86400
     return val * 60
+
+@dc_cli.on(events.NewMessage(command="/ping"))
+@dc_cli.on(events.NewMessage(command="/check"))
+@dc_cli.on(events.NewMessage(command="/test"))
+def ping_command(bot, accid, event):
+    msg = event.msg
+    payload = (event.payload or "").strip()
+    
+    try:
+        tokens = shlex.split(payload) if payload else []
+    except Exception:
+        tokens = payload.split() if payload else []
+        
+    if not tokens:
+        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(
+            text="Usage: `/ping <target> [\"keyword\"]`\n\n"
+                 "Quickly tests target reachability and diagnostics on-demand without adding to monitoring.\n\n"
+                 "Examples:\n"
+                 "• `/ping https://gluek.info` (HTTP)\n"
+                 "• `/ping https://gluek.info \"and enjoy\"` (HTTP + Keyword assertion)\n"
+                 "• `/ping 1.1.1.1` (ICMP Ping)\n"
+                 "• `/ping example.com:443` (TCP Port)"
+        ))
+        return
+        
+    target_input = tokens[0]
+    keyword = tokens[1] if len(tokens) > 1 else None
+
+    try:
+        check_type, validated_url = parse_target(target_input)
+    except ValueError as e:
+        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(
+            text=f"❌ {e}\n\n"
+                 "Examples:\n"
+                 "• `/ping https://example.com`\n"
+                 "• `/ping example.com:443`\n"
+                 "• `/ping 1.1.1.1`"
+        ))
+        return
+
+    if not is_safe_target_url(validated_url, check_type):
+        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(
+            text="❌ Cannot check internal, local, or private network targets."
+        ))
+        return
+
+    if keyword and check_type != "http":
+        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(
+            text=f"❌ Keyword assertions are only supported for HTTP/HTTPS targets.\nTarget `{validated_url}` is type `{check_type.upper()}`."
+        ))
+        return
+
+    async def _do_ping():
+        synth_r = {
+            "id": 0,
+            "url": validated_url,
+            "type": check_type,
+            "expected_keyword": keyword
+        }
+        
+        # 1. Local check
+        res = await run_single_check(synth_r)
+        if len(res) == 3:
+            is_up, details, latency_ms = res
+        else:
+            is_up, details = res
+            latency_ms = None
+
+        # 2. SSL certificate check if HTTPS
+        ssl_info = None
+        if check_type == "http" and validated_url.startswith("https://"):
+            try:
+                exp_epoch, ssl_err = await check_ssl_expiry(validated_url, timeout=4.0)
+                if exp_epoch:
+                    now_epoch = int(time.time())
+                    days_left = (exp_epoch - now_epoch) / 86400
+                    exp_date_str = datetime.datetime.fromtimestamp(exp_epoch, tz=datetime.timezone.utc).strftime('%Y-%m-%d')
+                    if days_left < 0:
+                        ssl_info = f"❌ Expired on `{exp_date_str}`"
+                    else:
+                        ssl_info = f"✅ Valid ({int(days_left)} days left, expires `{exp_date_str}`)"
+                elif ssl_err:
+                    ssl_info = f"⚠️ {ssl_err}"
+            except Exception:
+                pass
+
+        # 3. HTML title if HTTP and UP
+        page_title = None
+        if check_type == "http" and is_up:
+            try:
+                page_title = await asyncio.to_thread(fetch_html_title, validated_url)
+            except Exception:
+                pass
+
+        # 4. Multi-region probe cross-check (if peers configured)
+        peer_responses = []
+        peers = await asyncio.to_thread(database.get_all_peers)
+        if peers:
+            try:
+                peer_responses = await request_peer_cross_checks(synth_r, timeout=4.0)
+            except Exception:
+                pass
+
+        local_node = database.get_local_node_name()
+        status_icon = "🟢" if is_up else "🔴"
+        status_word = "UP" if is_up else "DOWN"
+
+        lines = [
+            f"{status_icon} **Target is {status_word}**\n",
+            f"🔗 Target: `{validated_url}`",
+            f"⚙️ Type: `{check_type.upper()}`",
+        ]
+        if page_title:
+            lines.append(f"🖥️ Title: **{page_title}**")
+
+        if keyword:
+            kw_status = "✅ Found in body" if is_up else "❌ Not found or error"
+            lines.append(f"🔍 Keyword: `\"{keyword}\"` ({kw_status})")
+
+        lat_str = f"`{latency_ms}ms`" if latency_ms is not None else "N/A"
+        lines.append(f"⏱️ Response: {details} ({lat_str})")
+
+        if ssl_info:
+            lines.append(f"🔒 SSL Cert: {ssl_info}")
+
+        if peer_responses or (peers and local_node):
+            lines.append("\n🛰️ **Multi-Region Check:**")
+            lines.append(f"• 📍 **{local_node}** (Local): {status_icon} {lat_str} ({details})")
+            for pr in peer_responses:
+                pr_node = pr.get("node_name") or "Remote"
+                pr_status = pr.get("status")
+                pr_icon = "🟢" if pr_status == "up" else "🔴"
+                pr_lat = f"`{pr['latency_ms']}ms`" if pr.get("latency_ms") is not None else "N/A"
+                pr_err = f" - {pr['error_msg']}" if pr.get("error_msg") else ""
+                lines.append(f"• 🛰️ **{pr_node}**: {pr_icon} {pr_lat}{pr_err}")
+
+        # Add command hint
+        kw_arg = f' "{keyword}"' if keyword else ""
+        lines.append(f"\n💡 _To monitor 24/7, run:_ `/add {validated_url}{kw_arg}`")
+
+        out_text = "\n".join(lines)
+        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=out_text))
+
+    if async_event_loop and async_event_loop.is_running():
+        asyncio.run_coroutine_threadsafe(_do_ping(), async_event_loop)
+    else:
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(_do_ping())
+        except RuntimeError:
+            asyncio.run(_do_ping())
 
 @dc_cli.on(events.NewMessage(command="/add"))
 def add_command(bot, accid, event):

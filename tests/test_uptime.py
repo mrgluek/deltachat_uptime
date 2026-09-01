@@ -2298,6 +2298,69 @@ class TestUptimeBot(unittest.TestCase):
         args, _ = mock_bot.rpc.send_msg.call_args
         self.assertIn("Keyword assertions are only supported for HTTP/HTTPS", args[2].text)
 
+    @patch('bot.run_single_check')
+    def test_ping_command_http_and_keyword(self, mock_check):
+        mock_check.return_value = (True, "200 - OK", 42)
+        mock_bot = MagicMock()
+        mock_event = MagicMock()
+        mock_event.msg.chat_id = 12345
+        mock_event.payload = 'https://gluek.info "and enjoy"'
+
+        bot.ping_command(mock_bot, 1, mock_event)
+
+        args, _ = mock_bot.rpc.send_msg.call_args
+        sent_text = args[2].text
+        self.assertIn("🟢 **Target is UP**", sent_text)
+        self.assertIn("https://gluek.info", sent_text)
+        self.assertIn('🔍 Keyword: `"and enjoy"` (✅ Found in body)', sent_text)
+        self.assertIn("42ms", sent_text)
+        self.assertIn("/add https://gluek.info", sent_text)
+
+    def test_ping_command_usage_and_errors(self):
+        mock_bot = MagicMock()
+        mock_event = MagicMock()
+        mock_event.msg.chat_id = 12345
+
+        # 1. Empty payload -> usage
+        mock_event.payload = ""
+        bot.ping_command(mock_bot, 1, mock_event)
+        args, _ = mock_bot.rpc.send_msg.call_args
+        self.assertIn("Usage: `/ping <target> [\"keyword\"]`", args[2].text)
+
+        # 2. SSRF blocked target
+        mock_event.payload = "http://127.0.0.1:8080"
+        bot.ping_command(mock_bot, 1, mock_event)
+        args, _ = mock_bot.rpc.send_msg.call_args
+        self.assertIn("Cannot check internal, local, or private network targets", args[2].text)
+
+        # 3. Non-HTTP target with keyword
+        mock_event.payload = '1.1.1.1 "welcome"'
+        bot.ping_command(mock_bot, 1, mock_event)
+        args, _ = mock_bot.rpc.send_msg.call_args
+        self.assertIn("Keyword assertions are only supported for HTTP/HTTPS", args[2].text)
+
+    @patch('bot.run_single_check')
+    @patch('bot.request_peer_cross_checks')
+    def test_ping_command_with_peers(self, mock_cross_checks, mock_check):
+        mock_check.return_value = (True, "200 - OK", 35)
+        mock_cross_checks.return_value = [
+            {"node_name": "RU-Moscow", "status": "up", "latency_ms": 65, "error_msg": None}
+        ]
+        database.add_or_update_peer("ru@probe.org", "RU-Moscow", 777)
+
+        mock_bot = MagicMock()
+        mock_event = MagicMock()
+        mock_event.msg.chat_id = 12345
+        mock_event.payload = "https://example.com"
+
+        bot.ping_command(mock_bot, 1, mock_event)
+
+        args, _ = mock_bot.rpc.send_msg.call_args
+        sent_text = args[2].text
+        self.assertIn("Multi-Region Check", sent_text)
+        self.assertIn("RU-Moscow", sent_text)
+        self.assertIn("65ms", sent_text)
+
 if __name__ == '__main__':
     unittest.main()
 

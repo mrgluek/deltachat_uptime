@@ -43,7 +43,7 @@ Additionally, it automatically generates a secure, beautiful web status dashboar
   - **Zero Group Spam:** All protocol handshakes, background telemetry, and instant cross-checks happen in private DMs between bots.
   - **Cross-Probe Verification:** Outages are verified across remote probes in real-time before alerting, distinguishing global downtime from regional/routing reachability issues.
   - **Aggregated Web Dashboard:** Web status pages show latency and status badges for all active probe locations (`[📍 Frankfurt-DE: 18ms] [🛰️ RU-Moscow: 45ms]`).
-- 🤖 **Identified User-Agent:** Sends a custom `User-Agent` header (e.g. `DeltaChat-Uptime-Bot/2.6.2 (https://git.gluek.info/gluek/deltachat_uptime)`) during HTTP checks so server administrators can easily identify monitoring requests in server logs.
+- 🤖 **Identified User-Agent:** Sends a custom `User-Agent` header (e.g. `DeltaChat-Uptime-Bot/2.7.0 (https://git.gluek.info/gluek/deltachat_uptime)`) during HTTP checks so server administrators can easily identify monitoring requests in server logs.
 
 - 🔄 **Failure Resiliency & Retry Logic:**
   - Checks resources once a minute.
@@ -60,6 +60,7 @@ Additionally, it automatically generates a secure, beautiful web status dashboar
 ### User Commands (Public per-chat)
 These commands are available to any member of a chat. They support suffixes (e.g. `/add@up`, `/status@uptime`) to route commands correctly if multiple bots exist in the same chat.
 
+- `/ping <target> ["keyword"]` (or `/check`, `/test`) — Perform an immediate on-demand reachability and diagnostics test without adding to monitoring (supports HTTP/HTTPS, SSL certificate inspection, keyword assertions, TCP port, ICMP Ping, and multi-region cross-checks).
 - `/add <target> [name] ["keyword"]` — Add a monitor. Target formats:
   • `https://google.com Google` (HTTP/HTTPS check)
   • `https://api.site.com Health "status:ok"` (HTTP with keyword assertion)

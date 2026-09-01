@@ -23,7 +23,7 @@ import database
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "2.7.0"
+VERSION = "2.7.1"
 USER_AGENT = f"DeltaChat-Uptime-Bot/{VERSION} (https://git.gluek.info/gluek/deltachat_uptime)"
 
 dc_cli = BotCli("uptimebot")
@@ -2481,6 +2481,15 @@ def _dc_send_msg_with_stats(bot, accid, chat_id, msg_data):
         logger.error(f"Failed to send message: {e}")
         return None
 
+def _react(bot, accid: int, msg_id: int | None, emoji: str):
+    """Add or clear a reaction on a message."""
+    if not bot or not hasattr(bot, "rpc") or not msg_id:
+        return
+    try:
+        bot.rpc.send_reaction(accid, msg_id, [emoji] if emoji else [])
+    except Exception as e:
+        logger.debug(f"Failed to set reaction {emoji} on msg {msg_id}: {e}")
+
 @dc_cli.on(events.NewMessage(command="/help"))
 def help_command(bot, accid, event):
     msg = event.msg
@@ -2700,96 +2709,104 @@ def ping_command(bot, accid, event):
         ))
         return
 
+    _react(bot, accid, getattr(msg, "id", None), "⏳")
+
     async def _do_ping():
-        synth_r = {
-            "id": 0,
-            "url": validated_url,
-            "type": check_type,
-            "expected_keyword": keyword
-        }
-        
-        # 1. Local check
-        res = await run_single_check(synth_r)
-        if len(res) == 3:
-            is_up, details, latency_ms = res
-        else:
-            is_up, details = res
-            latency_ms = None
+        final_reaction = "❌"
+        try:
+            synth_r = {
+                "id": 0,
+                "url": validated_url,
+                "type": check_type,
+                "expected_keyword": keyword
+            }
+            
+            # 1. Local check
+            res = await run_single_check(synth_r)
+            if len(res) == 3:
+                is_up, details, latency_ms = res
+            else:
+                is_up, details = res
+                latency_ms = None
 
-        # 2. SSL certificate check if HTTPS
-        ssl_info = None
-        if check_type == "http" and validated_url.startswith("https://"):
-            try:
-                exp_epoch, ssl_err = await check_ssl_expiry(validated_url, timeout=4.0)
-                if exp_epoch:
-                    now_epoch = int(time.time())
-                    days_left = (exp_epoch - now_epoch) / 86400
-                    exp_date_str = datetime.datetime.fromtimestamp(exp_epoch, tz=datetime.timezone.utc).strftime('%Y-%m-%d')
-                    if days_left < 0:
-                        ssl_info = f"❌ Expired on `{exp_date_str}`"
-                    else:
-                        ssl_info = f"✅ Valid ({int(days_left)} days left, expires `{exp_date_str}`)"
-                elif ssl_err:
-                    ssl_info = f"⚠️ {ssl_err}"
-            except Exception:
-                pass
+            final_reaction = "☑️" if is_up else "❌"
 
-        # 3. HTML title if HTTP and UP
-        page_title = None
-        if check_type == "http" and is_up:
-            try:
-                page_title = await asyncio.to_thread(fetch_html_title, validated_url)
-            except Exception:
-                pass
+            # 2. SSL certificate check if HTTPS
+            ssl_info = None
+            if check_type == "http" and validated_url.startswith("https://"):
+                try:
+                    exp_epoch, ssl_err = await check_ssl_expiry(validated_url, timeout=4.0)
+                    if exp_epoch:
+                        now_epoch = int(time.time())
+                        days_left = (exp_epoch - now_epoch) / 86400
+                        exp_date_str = datetime.datetime.fromtimestamp(exp_epoch, tz=datetime.timezone.utc).strftime('%Y-%m-%d')
+                        if days_left < 0:
+                            ssl_info = f"❌ Expired on `{exp_date_str}`"
+                        else:
+                            ssl_info = f"✅ Valid ({int(days_left)} days left, expires `{exp_date_str}`)"
+                    elif ssl_err:
+                        ssl_info = f"⚠️ {ssl_err}"
+                except Exception:
+                    pass
 
-        # 4. Multi-region probe cross-check (if peers configured)
-        peer_responses = []
-        peers = await asyncio.to_thread(database.get_all_peers)
-        if peers:
-            try:
-                peer_responses = await request_peer_cross_checks(synth_r, timeout=4.0)
-            except Exception:
-                pass
+            # 3. HTML title if HTTP and UP
+            page_title = None
+            if check_type == "http" and is_up:
+                try:
+                    page_title = await asyncio.to_thread(fetch_html_title, validated_url)
+                except Exception:
+                    pass
 
-        local_node = database.get_local_node_name()
-        status_icon = "🟢" if is_up else "🔴"
-        status_word = "UP" if is_up else "DOWN"
+            # 4. Multi-region probe cross-check (if peers configured)
+            peer_responses = []
+            peers = await asyncio.to_thread(database.get_all_peers)
+            if peers:
+                try:
+                    peer_responses = await request_peer_cross_checks(synth_r, timeout=4.0)
+                except Exception:
+                    pass
 
-        lines = [
-            f"{status_icon} **Target is {status_word}**\n",
-            f"🔗 Target: `{validated_url}`",
-            f"⚙️ Type: `{check_type.upper()}`",
-        ]
-        if page_title:
-            lines.append(f"🖥️ Title: **{page_title}**")
+            local_node = database.get_local_node_name()
+            status_icon = "🟢" if is_up else "🔴"
+            status_word = "UP" if is_up else "DOWN"
 
-        if keyword:
-            kw_status = "✅ Found in body" if is_up else "❌ Not found or error"
-            lines.append(f"🔍 Keyword: `\"{keyword}\"` ({kw_status})")
+            lines = [
+                f"{status_icon} **Target is {status_word}**\n",
+                f"🔗 Target: `{validated_url}`",
+                f"⚙️ Type: `{check_type.upper()}`",
+            ]
+            if page_title:
+                lines.append(f"🖥️ Title: **{page_title}**")
 
-        lat_str = f"`{latency_ms}ms`" if latency_ms is not None else "N/A"
-        lines.append(f"⏱️ Response: {details} ({lat_str})")
+            if keyword:
+                kw_status = "✅ Found in body" if is_up else "❌ Not found or error"
+                lines.append(f"🔍 Keyword: `\"{keyword}\"` ({kw_status})")
 
-        if ssl_info:
-            lines.append(f"🔒 SSL Cert: {ssl_info}")
+            lat_str = f"`{latency_ms}ms`" if latency_ms is not None else "N/A"
+            lines.append(f"⏱️ Response: {details} ({lat_str})")
 
-        if peer_responses or (peers and local_node):
-            lines.append("\n🛰️ **Multi-Region Check:**")
-            lines.append(f"• 📍 **{local_node}** (Local): {status_icon} {lat_str} ({details})")
-            for pr in peer_responses:
-                pr_node = pr.get("node_name") or "Remote"
-                pr_status = pr.get("status")
-                pr_icon = "🟢" if pr_status == "up" else "🔴"
-                pr_lat = f"`{pr['latency_ms']}ms`" if pr.get("latency_ms") is not None else "N/A"
-                pr_err = f" - {pr['error_msg']}" if pr.get("error_msg") else ""
-                lines.append(f"• 🛰️ **{pr_node}**: {pr_icon} {pr_lat}{pr_err}")
+            if ssl_info:
+                lines.append(f"🔒 SSL Cert: {ssl_info}")
 
-        # Add command hint
-        kw_arg = f' "{keyword}"' if keyword else ""
-        lines.append(f"\n💡 _To monitor 24/7, run:_ `/add {validated_url}{kw_arg}`")
+            if peer_responses or (peers and local_node):
+                lines.append("\n🛰️ **Multi-Region Check:**")
+                lines.append(f"• 📍 **{local_node}** (Local): {status_icon} {lat_str} ({details})")
+                for pr in peer_responses:
+                    pr_node = pr.get("node_name") or "Remote"
+                    pr_status = pr.get("status")
+                    pr_icon = "🟢" if pr_status == "up" else "🔴"
+                    pr_lat = f"`{pr['latency_ms']}ms`" if pr.get("latency_ms") is not None else "N/A"
+                    pr_err = f" - {pr['error_msg']}" if pr.get("error_msg") else ""
+                    lines.append(f"• 🛰️ **{pr_node}**: {pr_icon} {pr_lat}{pr_err}")
 
-        out_text = "\n".join(lines)
-        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=out_text))
+            # Add command hint
+            kw_arg = f' "{keyword}"' if keyword else ""
+            lines.append(f"\n💡 _To monitor 24/7, run:_ `/add {validated_url}{kw_arg}`")
+
+            out_text = "\n".join(lines)
+            _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=out_text))
+        finally:
+            _react(bot, accid, getattr(msg, "id", None), final_reaction)
 
     if async_event_loop and async_event_loop.is_running():
         asyncio.run_coroutine_threadsafe(_do_ping(), async_event_loop)

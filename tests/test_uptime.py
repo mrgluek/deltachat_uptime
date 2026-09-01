@@ -2316,6 +2316,11 @@ class TestUptimeBot(unittest.TestCase):
         self.assertIn("42ms", sent_text)
         self.assertIn("/add https://gluek.info", sent_text)
 
+        # Verify ⏳ reaction was added on start and ☑️ upon completion
+        reaction_calls = mock_bot.rpc.send_reaction.call_args_list
+        self.assertTrue(any(c[0][2] == ["⏳"] for c in reaction_calls))
+        self.assertEqual(reaction_calls[-1][0][2], ["☑️"])
+
     def test_ping_command_usage_and_errors(self):
         mock_bot = MagicMock()
         mock_event = MagicMock()

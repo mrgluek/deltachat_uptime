@@ -131,7 +131,7 @@ docker compose up -d
 ```
 
 ### 4. Claim Ownership inside Delta Chat
-1. Scan the bot's secure join QR code printed in the logs (`docker compose logs uptime_bot`) or add the bot's email address in Delta Chat.
+1. Scan the bot's secure join QR code printed in the logs (`docker compose logs uptime_bot`), open the root web dashboard (`/`) to scan the high-resolution vector QR code, or copy the invite link / email address into Delta Chat.
 2. Send `/initadmin` to the bot in a private message.
 3. The bot will automatically verify your identity and associate your cryptographic fingerprint. You are now the administrator!
 

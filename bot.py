@@ -23,7 +23,7 @@ import database
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "2.7.3"
+VERSION = "2.7.4"
 USER_AGENT = f"DeltaChat-Uptime-Bot/{VERSION} (https://git.gluek.info/gluek/deltachat_uptime)"
 
 dc_cli = BotCli("uptimebot")
@@ -2352,7 +2352,10 @@ async def handle_index(request):
                     <span class="step-num">1</span>
                     <div class="step-content">
                         <h3>Add Uptime Bot in Delta Chat</h3>
-                        <p>Scan the bot's secure join QR code or add the bot's email address to start chatting.</p>
+                        <p>Scan the bot's secure join QR code or add the bot's email address to start chatting:</p>
+                        <div style="margin: 14px 0 10px 0; display: inline-block; background: #ffffff; padding: 10px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.25);">
+                            <img src="qr.svg" alt="Delta Chat Invite QR Code" style="display: block; width: 190px; height: 190px;" onerror="this.src='qr.png'; this.onerror=function(){this.parentElement.style.display='none'};">
+                        </div>
                     </div>
                 </div>
                 <div class="step-item">
@@ -2436,10 +2439,55 @@ async def handle_icon(request):
         return web.FileResponse(filename, headers=headers)
     return web.Response(status=404)
 
+async def handle_qr_svg(request):
+    global dc_bot_instance, dc_accid
+    if dc_bot_instance and dc_accid:
+        try:
+            import qrcode
+            import qrcode.image.svg
+            link = dc_bot_instance.rpc.get_chat_securejoin_qr_code(dc_accid, None)
+            qr = qrcode.QRCode(image_factory=qrcode.image.svg.SvgPathImage, border=2)
+            qr.add_data(link)
+            qr.make(fit=True)
+            img = qr.make_image()
+            buf = io.BytesIO()
+            img.save(buf)
+            headers = {
+                "Cache-Control": "public, max-age=3600",
+                "Content-Type": "image/svg+xml"
+            }
+            return web.Response(body=buf.getvalue(), headers=headers)
+        except Exception as e:
+            logger.error(f"Error generating qr.svg: {e}")
+    return web.Response(status=404)
+
+async def handle_qr_png(request):
+    global dc_bot_instance, dc_accid
+    if dc_bot_instance and dc_accid:
+        try:
+            import qrcode
+            link = dc_bot_instance.rpc.get_chat_securejoin_qr_code(dc_accid, None)
+            qr = qrcode.QRCode(box_size=6, border=2)
+            qr.add_data(link)
+            qr.make(fit=True)
+            img = qr.make_image(fill_color="black", back_color="white")
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            headers = {
+                "Cache-Control": "public, max-age=3600",
+                "Content-Type": "image/png"
+            }
+            return web.Response(body=buf.getvalue(), headers=headers)
+        except Exception as e:
+            logger.error(f"Error generating qr.png: {e}")
+    return web.Response(status=404)
+
 async def _run_web_server():
     app = web.Application()
     app.router.add_get('/icon.png', handle_icon)
     app.router.add_get('/favicon.ico', handle_icon)
+    app.router.add_get('/qr.svg', handle_qr_svg)
+    app.router.add_get('/qr.png', handle_qr_png)
     app.router.add_get('/robots.txt', handle_robots_txt)
     app.router.add_get('/', handle_index)
     app.router.add_get('/{token:[a-zA-Z0-9]{12}}', handle_status_page)
@@ -4400,7 +4448,7 @@ def on_start(bot, _args):
                 qr.add_data(qrdata)
                 qr.make(fit=True)
                 f = io.StringIO()
-                qr.print_ascii(out=f)
+                qr.print_ascii(out=f, invert=True)
                 print(f.getvalue(), flush=True)
             except Exception as qr_err:
                 bot.logger.warning(f"Could not render ASCII QR code: {qr_err}")

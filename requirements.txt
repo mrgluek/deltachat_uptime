@@ -1,6 +1,6 @@
 deltabot-cli==8.1.2
 deltachat2[full]<1.0.0
 aiohttp
-qrcode
+qrcode[pil]
 emoji
 appdirs

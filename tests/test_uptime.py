@@ -2366,6 +2366,29 @@ class TestUptimeBot(unittest.TestCase):
         self.assertIn("RU-Moscow", sent_text)
         self.assertIn("65ms", sent_text)
 
+    def test_web_qr_endpoints(self):
+        import asyncio
+        mock_bot = MagicMock()
+        mock_bot.rpc.get_chat_securejoin_qr_code.return_value = "https://i.delta.chat/#test_invite_link"
+        bot.dc_bot_instance = mock_bot
+        bot.dc_accid = 1
+
+        mock_request = MagicMock()
+
+        # Test SVG QR endpoint
+        res_svg = asyncio.run(bot.handle_qr_svg(mock_request))
+        self.assertEqual(res_svg.status, 200)
+        self.assertEqual(res_svg.content_type, "image/svg+xml")
+        self.assertTrue(len(res_svg.body) > 0)
+        self.assertIn(b"<svg", res_svg.body)
+
+        # Test PNG QR endpoint
+        res_png = asyncio.run(bot.handle_qr_png(mock_request))
+        self.assertEqual(res_png.status, 200)
+        self.assertEqual(res_png.content_type, "image/png")
+        self.assertTrue(len(res_png.body) > 0)
+        self.assertTrue(res_png.body.startswith(b"\x89PNG"))
+
 if __name__ == '__main__':
     unittest.main()
 

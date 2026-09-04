@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.7.4] - 2026-09-05
+
+### Added
+- **Vector SVG & PNG QR Code Web Endpoints:**
+  - Added `/qr.svg` and `/qr.png` endpoints dynamically serving the bot's securejoin invite QR code.
+  - Embedded vector QR code directly into Step 1 of the web dashboard index page for effortless visual onboarding from Home Assistant Ingress or any browser.
+- **Inverted ASCII QR Rendering:**
+  - Configured `invert=True` for ASCII QR generation in terminal logs to render high-contrast black modules on standard dark terminal and container log backgrounds.
+
 ## [2.7.3] - 2026-09-05
 
 ### Added

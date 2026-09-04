@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.7.3] - 2026-09-05
+
+### Added
+- **ASCII QR Code in Startup Logs:**
+  - Render ASCII QR code directly into stdout on bot startup for easy terminal and container log onboarding.
+  - Added line-buffering and explicit flushing for container environments (Docker, Home Assistant Add-on).
+
+### Fixed
+- **Relative Web Asset URLs for Ingress:**
+  - Changed absolute `/icon.png` and `/favicon.ico` paths to relative (`icon.png`, `favicon.ico`) in both dashboard and index HTML templates so logos and favicons load correctly under Home Assistant Ingress reverse proxy paths.
+
 ## [2.7.2] - 2026-09-01
 
 ### Optimized

@@ -23,7 +23,7 @@ import database
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "2.7.2"
+VERSION = "2.7.3"
 USER_AGENT = f"DeltaChat-Uptime-Bot/{VERSION} (https://git.gluek.info/gluek/deltachat_uptime)"
 
 dc_cli = BotCli("uptimebot")
@@ -1665,8 +1665,8 @@ def get_dashboard_html(chat_name, resources, overall_uptime, incidents=None) -> 
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Delta Chat Uptime Monitor - {html.escape(chat_name)}</title>
-    <link rel="icon" type="image/png" href="/icon.png" />
-    <link rel="shortcut icon" href="/favicon.ico" />
+    <link rel="icon" type="image/png" href="icon.png" />
+    <link rel="shortcut icon" href="favicon.ico" />
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -1952,7 +1952,7 @@ def get_dashboard_html(chat_name, resources, overall_uptime, incidents=None) -> 
 <body>
     <header>
         <div class="logo-container">
-            <img class="logo-img" src="/icon.png" alt="Logo">
+            <img class="logo-img" src="icon.png" alt="Logo">
             <span class="logo-title">Delta Chat Uptime</span>
         </div>
     </header>
@@ -2038,8 +2038,8 @@ async def handle_index(request):
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Delta Chat Uptime Bot</title>
-    <link rel="icon" type="image/png" href="/icon.png" />
-    <link rel="shortcut icon" href="/favicon.ico" />
+    <link rel="icon" type="image/png" href="icon.png" />
+    <link rel="shortcut icon" href="favicon.ico" />
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;700&display=swap" rel="stylesheet">
@@ -2293,7 +2293,7 @@ async def handle_index(request):
 <body>
     <header>
         <div class="logo-container">
-            <img class="logo-img" src="/icon.png" alt="Logo">
+            <img class="logo-img" src="icon.png" alt="Logo">
             <span class="logo-title">Delta Chat Uptime</span>
         </div>
     </header>
@@ -4392,11 +4392,22 @@ def on_start(bot, _args):
 
         try:
             qrdata = bot.rpc.get_chat_securejoin_qr_code(dc_accid, None)
-            print("\nTo add this bot, scan the secure join QR code or copy the link below:\n")
-            print(qrdata)
-            print("\n" + "=" * 50 + "\n")
-        except Exception:
-            pass
+            print("\n" + "=" * 50, flush=True)
+            print("To add this bot, scan the secure join QR code or copy the link below:\n", flush=True)
+            try:
+                import qrcode
+                qr = qrcode.QRCode(version=1, box_size=1, border=2)
+                qr.add_data(qrdata)
+                qr.make(fit=True)
+                f = io.StringIO()
+                qr.print_ascii(out=f)
+                print(f.getvalue(), flush=True)
+            except Exception as qr_err:
+                bot.logger.warning(f"Could not render ASCII QR code: {qr_err}")
+            print(qrdata, flush=True)
+            print("=" * 50 + "\n", flush=True)
+        except Exception as e:
+            bot.logger.error(f"Failed to generate QR code: {e}")
 
 def _record_peer_activity(sender_addr: str):
     if not sender_addr:

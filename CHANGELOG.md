@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.7.5] - 2026-09-05
+
+### Added
+- **Clickable SecureJoin Link & Clickable QR Code:**
+  - In Step 1 of the web dashboard index page, replaced the reference to bot email address with a direct clickable `bot's SecureJoin link` (`https://i.delta.chat/#...`).
+  - Made the QR code image itself clickable, seamlessly opening the Delta Chat invite link when clicked on mobile or desktop devices.
+  - Added in-process invite link caching (`get_bot_invite_link`) for fast zero-cost rendering across index, SVG, and PNG endpoints.
+
 ## [2.7.4] - 2026-09-05
 
 ### Added

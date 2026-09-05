@@ -23,7 +23,7 @@ import database
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "2.7.4"
+VERSION = "2.7.5"
 USER_AGENT = f"DeltaChat-Uptime-Bot/{VERSION} (https://git.gluek.info/gluek/deltachat_uptime)"
 
 dc_cli = BotCli("uptimebot")
@@ -33,6 +33,20 @@ last_sync_times = {}
 # Global references
 dc_bot_instance = None
 dc_accid = None
+
+def get_bot_invite_link() -> str:
+    global dc_bot_instance, dc_accid, bot_qr_cache
+    if "invite_link" in bot_qr_cache:
+        return bot_qr_cache["invite_link"]
+    if dc_bot_instance and dc_accid:
+        try:
+            link = dc_bot_instance.rpc.get_chat_securejoin_qr_code(dc_accid, None)
+            if link:
+                bot_qr_cache["invite_link"] = link
+                return link
+        except Exception as e:
+            logger.warning(f"Could not get securejoin link: {e}")
+    return ""
 async_event_loop = None
 
 # Peering globals
@@ -2352,9 +2366,9 @@ async def handle_index(request):
                     <span class="step-num">1</span>
                     <div class="step-content">
                         <h3>Add Uptime Bot in Delta Chat</h3>
-                        <p>Scan the bot's secure join QR code or add the bot's email address to start chatting:</p>
+                        <p>Scan the bot's secure join QR code or open the __LINK_HTML__ to start chatting:</p>
                         <div style="margin: 14px 0 10px 0; display: inline-block; background: #ffffff; padding: 10px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.25);">
-                            <img src="qr.svg" alt="Delta Chat Invite QR Code" style="display: block; width: 190px; height: 190px;" onerror="this.src='qr.png'; this.onerror=function(){this.parentElement.style.display='none'};">
+                            __QR_HTML__
                         </div>
                     </div>
                 </div>
@@ -2415,10 +2429,20 @@ async def handle_index(request):
     </footer>
 </body>
 </html>"""
+    link = get_bot_invite_link()
+    if link:
+        escaped_link = html.escape(link)
+        link_html = f'<a href="{escaped_link}" target="_blank" rel="noopener noreferrer" style="color: #3b82f6; text-decoration: underline; font-weight: 500;">bot\'s SecureJoin link</a>'
+        qr_html = f'<a href="{escaped_link}" target="_blank" rel="noopener noreferrer" title="Click to open SecureJoin link in Delta Chat" style="display: block; cursor: pointer;"><img src="qr.svg" alt="Delta Chat Invite QR Code" style="display: block; width: 190px; height: 190px;" onerror="this.src=\'qr.png\'; this.onerror=function(){{this.parentElement.parentElement.style.display=\'none\'}};"></a>'
+    else:
+        link_html = "bot's SecureJoin link"
+        qr_html = '<img src="qr.svg" alt="Delta Chat Invite QR Code" style="display: block; width: 190px; height: 190px;" onerror="this.src=\'qr.png\'; this.onerror=function(){this.parentElement.style.display=\'none\'};">'
+
+    content = index_page_html_cache.replace("__LINK_HTML__", link_html).replace("__QR_HTML__", qr_html)
     headers = {
-        "Cache-Control": "public, max-age=3600"
+        "Cache-Control": "public, max-age=300"
     }
-    return web.Response(text=index_page_html_cache, content_type="text/html", headers=headers)
+    return web.Response(text=content, content_type="text/html", headers=headers)
 
 async def handle_robots_txt(request):
     headers = {
@@ -2440,12 +2464,11 @@ async def handle_icon(request):
     return web.Response(status=404)
 
 async def handle_qr_svg(request):
-    global dc_bot_instance, dc_accid
-    if dc_bot_instance and dc_accid:
+    link = get_bot_invite_link()
+    if link:
         try:
             import qrcode
             import qrcode.image.svg
-            link = dc_bot_instance.rpc.get_chat_securejoin_qr_code(dc_accid, None)
             qr = qrcode.QRCode(image_factory=qrcode.image.svg.SvgPathImage, border=2)
             qr.add_data(link)
             qr.make(fit=True)
@@ -2462,11 +2485,10 @@ async def handle_qr_svg(request):
     return web.Response(status=404)
 
 async def handle_qr_png(request):
-    global dc_bot_instance, dc_accid
-    if dc_bot_instance and dc_accid:
+    link = get_bot_invite_link()
+    if link:
         try:
             import qrcode
-            link = dc_bot_instance.rpc.get_chat_securejoin_qr_code(dc_accid, None)
             qr = qrcode.QRCode(box_size=6, border=2)
             qr.add_data(link)
             qr.make(fit=True)

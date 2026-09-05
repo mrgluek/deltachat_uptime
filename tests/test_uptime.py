@@ -2389,6 +2389,16 @@ class TestUptimeBot(unittest.TestCase):
         self.assertTrue(len(res_png.body) > 0)
         self.assertTrue(res_png.body.startswith(b"\x89PNG"))
 
+        # Test index page rendering with clickable link and clickable QR
+        res_idx = asyncio.run(bot.handle_index(mock_request))
+        self.assertEqual(res_idx.status, 200)
+        self.assertEqual(res_idx.content_type, "text/html")
+        self.assertIn("bot's SecureJoin link", res_idx.text)
+        self.assertIn('href="https://i.delta.chat/#test_invite_link"', res_idx.text)
+        self.assertIn('<a href="https://i.delta.chat/#test_invite_link"', res_idx.text)
+        self.assertNotIn("__LINK_HTML__", res_idx.text)
+        self.assertNotIn("__QR_HTML__", res_idx.text)
+
 if __name__ == '__main__':
     unittest.main()
 

@@ -23,7 +23,7 @@ import database
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "2.7.5"
+VERSION = "2.7.6"
 USER_AGENT = f"DeltaChat-Uptime-Bot/{VERSION} (https://git.gluek.info/gluek/deltachat_uptime)"
 
 dc_cli = BotCli("uptimebot")
@@ -4388,10 +4388,28 @@ def on_init(bot, args):
     for accid in bot.rpc.get_all_account_ids():
         dc_accid = accid
         try:
-            bot_name = os.environ.get("DISPLAY_NAME", "Delta Chat Uptime Bot")
+            bot_name = os.environ.get("DISPLAY_NAME")
+            if not bot_name and os.path.exists("/data/options.json"):
+                try:
+                    with open("/data/options.json", "r", encoding="utf-8") as f:
+                        opts = json.load(f)
+                        bot_name = opts.get("display_name", "").strip()
+                except Exception:
+                    pass
+            if not bot_name:
+                bot_name = "Delta Chat Uptime Bot"
             bot.rpc.set_config(accid, "displayname", bot_name)
             
-            status_text = os.environ.get("STATUS_TEXT", "Monitors resource availability (HTTP, TCP, Ping) and alerts on outages: https://github.com/mrgluek/deltachat_uptime")
+            status_text = os.environ.get("STATUS_TEXT")
+            if not status_text and os.path.exists("/data/options.json"):
+                try:
+                    with open("/data/options.json", "r", encoding="utf-8") as f:
+                        opts = json.load(f)
+                        status_text = opts.get("status_text", "").strip()
+                except Exception:
+                    pass
+            if not status_text:
+                status_text = "Monitors resource availability (HTTP, TCP, Ping) and alerts on outages: https://github.com/mrgluek/deltachat_uptime"
             bot.rpc.set_config(accid, "selfstatus", status_text)
             
             # Set bot avatar from custom path if specified, else fallback to defaults

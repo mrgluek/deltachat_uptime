@@ -107,9 +107,11 @@ def init_db():
         if "incident_id" not in columns_dt:
             cursor.execute("ALTER TABLE downtime_events ADD COLUMN incident_id INTEGER")
             
-        # Add index to downtime_events for fast lookups
+        # Add indexes to downtime_events for fast lookups
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_downtime_resource ON downtime_events(resource_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_downtime_went_down ON downtime_events(went_down_at)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_downtime_went_up ON downtime_events(went_up_at)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_downtime_resource_range ON downtime_events(resource_id, went_down_at, went_up_at)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_downtime_incident ON downtime_events(incident_id)')
 
         # Incidents table for tracking grouped chat outages
@@ -127,6 +129,13 @@ def init_db():
         ''')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_incidents_chat ON incidents(dc_chat_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_incidents_status ON incidents(status)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_incidents_chat_status ON incidents(dc_chat_id, status)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_incidents_resolved ON incidents(resolved_at)')
+
+        # Resources indexes for high-frequency queries
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_resources_chat_status ON resources(dc_chat_id, status)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_resources_url ON resources(url)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_resources_status ON resources(status)')
         
         # Transport statistics (multi-transport failover support)
         cursor.execute('''
@@ -152,6 +161,7 @@ def init_db():
             )
         ''')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_peers_chat ON peers(chat_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_peers_last_seen ON peers(last_seen)')
 
         # Ensure columns exist in peers for existing DBs
         cursor.execute("PRAGMA table_info(peers)")
@@ -174,6 +184,7 @@ def init_db():
             )
         ''')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_peer_measurements_url ON peer_measurements(url)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_peer_meas_checked ON peer_measurements(last_checked)')
 
         # Remote probe targets mirrored from peer bots
         cursor.execute('''
@@ -221,11 +232,60 @@ def get_config(key: str) -> str:
         conn.close()
         return row[0] if row else None
 
-def get_admin_fingerprint():
-    return get_config("admin_dc_fingerprint")
+def get_admin_email():
+    db_val = get_config("admin_dc_email")
+    if db_val and db_val.strip():
+        return db_val.strip().lower()
+    env_val = os.getenv("ADMIN_DC_EMAIL")
+    return env_val.strip().lower() if env_val else None
 
-def set_admin_fingerprint(fp):
-    set_config("admin_dc_fingerprint", fp)
+
+def set_admin_email(email: str):
+    if email:
+        email = email.strip().lower()
+    set_config("admin_dc_email", email)
+
+
+def get_admin_fingerprint():
+    fp = get_config("admin_dc_fingerprint")
+    if not fp:
+        fp = os.getenv("ADMIN_DC_FINGERPRINT", "")
+    if fp:
+        cleaned = fp.strip().replace(" ", "").replace(":", "").upper()
+        if re.match(r"^[0-9A-F]{32,64}$", cleaned):
+            return cleaned
+    return None
+
+
+def set_admin_fingerprint(fp: str):
+    if fp:
+        cleaned = fp.strip().replace(" ", "").replace(":", "").upper()
+        if re.match(r"^[0-9A-F]{32,64}$", cleaned):
+            set_config("admin_dc_fingerprint", cleaned)
+        else:
+            set_config("admin_dc_fingerprint", "")
+    else:
+        set_config("admin_dc_fingerprint", "")
+
+
+def is_authorized_sender(sender_addr: str, fingerprint: str = None) -> bool:
+    admin_email = get_admin_email()
+    admin_fp = get_admin_fingerprint()
+
+    if not admin_email and not admin_fp:
+        return False
+
+    sender_addr_clean = (sender_addr or "").strip().lower()
+
+    if admin_email and sender_addr_clean == admin_email:
+        if admin_fp:
+            if fingerprint:
+                fp_clean = fingerprint.strip().replace(" ", "").replace(":", "").upper()
+                return admin_fp in fp_clean
+            return False
+        return True
+
+    return False
 
 # Chat token functions (12-character base62 secure tokens)
 def generate_chat_token() -> str:
@@ -311,13 +371,17 @@ def update_resource_latency(resource_id: int, latency_ms: int):
 
 def delete_resource(dc_chat_id: int, resource_id: int) -> bool:
     with _lock:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM resources WHERE dc_chat_id = ? AND id = ?", (dc_chat_id, resource_id))
-        deleted = cursor.rowcount > 0
-        conn.commit()
-        conn.close()
-        return deleted
+        conn = _connect()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM resources WHERE dc_chat_id = ? AND id = ?", (dc_chat_id, resource_id))
+            deleted = cursor.rowcount > 0
+            conn.commit()
+            if deleted:
+                invalidate_uptime_cache(resource_id)
+            return deleted
+        finally:
+            conn.close()
 
 def get_resources(dc_chat_id: int) -> list[dict]:
     with _lock:
@@ -349,86 +413,106 @@ def get_all_resources() -> list[dict]:
         conn.close()
         return [dict(r) for r in rows]
 
-def update_resource_status(resource_id: int, status: str, consecutive_failures: int, error_msg: str = None, latency_ms: int = None):
-    """Updates the status, last_checked, and optionally last_latency_ms in a single transaction."""
+def batch_update_resource_status(updates: list[dict]):
+    """
+    Batch updates multiple resources' check statuses in a single transaction.
+    Each item in updates is a dict with:
+      {'id': int, 'status': str, 'consecutive_failures': int, 'error_msg': str, 'latency_ms': int | None}
+    """
+    if not updates:
+        return
+
     now = int(time.time())
     with _lock:
         conn = _connect()
-        cursor = conn.cursor()
-        
-        # Get current status
-        cursor.execute("SELECT status, last_changed FROM resources WHERE id = ?", (resource_id,))
-        row = cursor.fetchone()
-        if not row:
-            conn.close()
-            return
-            
-        old_status = row[0]
-        
-        if old_status != status:
-            # Status transition occurred
-            cursor.execute('''
-                UPDATE resources 
-                SET status = ?, last_checked = ?, last_changed = ?, consecutive_failures = ?,
-                    last_latency_ms = COALESCE(?, last_latency_ms)
-                WHERE id = ?
-            ''', (status, now, now, consecutive_failures, latency_ms, resource_id))
-            
-            if status == "down":
-                cursor.execute("SELECT dc_chat_id FROM resources WHERE id = ?", (resource_id,))
-                chat_row = cursor.fetchone()
-                inc_id = None
-                if chat_row:
-                    chat_id = chat_row[0]
-                    cursor.execute('''
-                        SELECT i.id, i.status,
-                               MAX(COALESCE(de.went_down_at, i.started_at)) as last_down_at,
-                               COALESCE(i.resolved_at, MAX(COALESCE(de.went_up_at, de.went_down_at, i.started_at))) as last_event_at
-                        FROM incidents i
-                        LEFT JOIN downtime_events de ON de.incident_id = i.id
-                        WHERE i.dc_chat_id = ?
-                        GROUP BY i.id
-                        HAVING (? - last_event_at) <= 3600 AND (? >= last_event_at)
-                        ORDER BY (CASE WHEN i.status = 'ongoing' THEN 0 ELSE 1 END), i.id DESC LIMIT 1
-                    ''', (chat_id, now, now))
-                    inc_row = cursor.fetchone()
-                    if inc_row:
-                        inc_id = inc_row[0]
-                        inc_status = inc_row[1]
-                        if inc_status == 'resolved':
-                            cursor.execute("UPDATE incidents SET status = 'ongoing', resolved_at = NULL, summary = NULL WHERE id = ?", (inc_id,))
-                    else:
-                        cursor.execute("INSERT INTO incidents (dc_chat_id, status, started_at) VALUES (?, 'ongoing', ?)", (chat_id, now))
-                        inc_id = cursor.lastrowid
+        try:
+            cursor = conn.cursor()
+            for item in updates:
+                resource_id = item["id"]
+                status = item["status"]
+                consecutive_failures = item.get("consecutive_failures", 0)
+                error_msg = item.get("error_msg")
+                latency_ms = item.get("latency_ms")
 
-                # Opened new downtime event with error message and incident_id
-                cursor.execute('''
-                    INSERT INTO downtime_events (resource_id, went_down_at, went_up_at, error_msg, incident_id)
-                    VALUES (?, ?, NULL, ?, ?)
-                ''', (resource_id, now, error_msg, inc_id))
-            elif status == "up" and old_status == "down":
-                # Close existing downtime event and reset stale warning level
-                cursor.execute('''
-                    UPDATE downtime_events 
-                    SET went_up_at = ? 
-                    WHERE resource_id = ? AND went_up_at IS NULL
-                ''', (now, resource_id))
-                cursor.execute('''
-                    UPDATE resources 
-                    SET stale_warning_level = 0 
-                    WHERE id = ?
-                ''', (resource_id,))
-        else:
-            # No status change
-            cursor.execute('''
-                UPDATE resources 
-                SET last_checked = ?, consecutive_failures = ?,
-                    last_latency_ms = COALESCE(?, last_latency_ms)
-                WHERE id = ?
-            ''', (now, consecutive_failures, latency_ms, resource_id))
-            
-        conn.commit()
-        conn.close()
+                cursor.execute("SELECT status, last_changed FROM resources WHERE id = ?", (resource_id,))
+                row = cursor.fetchone()
+                if not row:
+                    continue
+
+                old_status = row[0]
+                if old_status != status:
+                    invalidate_uptime_cache(resource_id)
+                    cursor.execute('''
+                        UPDATE resources 
+                        SET status = ?, last_checked = ?, last_changed = ?, consecutive_failures = ?,
+                            last_latency_ms = COALESCE(?, last_latency_ms)
+                        WHERE id = ?
+                    ''', (status, now, now, consecutive_failures, latency_ms, resource_id))
+
+                    if status == "down":
+                        cursor.execute("SELECT dc_chat_id FROM resources WHERE id = ?", (resource_id,))
+                        chat_row = cursor.fetchone()
+                        inc_id = None
+                        if chat_row:
+                            chat_id = chat_row[0]
+                            cursor.execute('''
+                                SELECT i.id, i.status,
+                                       MAX(COALESCE(de.went_down_at, i.started_at)) as last_down_at,
+                                       COALESCE(i.resolved_at, MAX(COALESCE(de.went_up_at, de.went_down_at, i.started_at))) as last_event_at
+                                FROM incidents i
+                                LEFT JOIN downtime_events de ON de.incident_id = i.id
+                                WHERE i.dc_chat_id = ?
+                                GROUP BY i.id
+                                HAVING (? - last_event_at) <= 3600 AND (? >= last_event_at)
+                                ORDER BY (CASE WHEN i.status = 'ongoing' THEN 0 ELSE 1 END), i.id DESC LIMIT 1
+                            ''', (chat_id, now, now))
+                            inc_row = cursor.fetchone()
+                            if inc_row:
+                                inc_id = inc_row[0]
+                                inc_status = inc_row[1]
+                                if inc_status == 'resolved':
+                                    cursor.execute("UPDATE incidents SET status = 'ongoing', resolved_at = NULL, summary = NULL WHERE id = ?", (inc_id,))
+                            else:
+                                cursor.execute("INSERT INTO incidents (dc_chat_id, status, started_at) VALUES (?, 'ongoing', ?)", (chat_id, now))
+                                inc_id = cursor.lastrowid
+
+                        cursor.execute('''
+                            INSERT INTO downtime_events (resource_id, went_down_at, went_up_at, error_msg, incident_id)
+                            VALUES (?, ?, NULL, ?, ?)
+                        ''', (resource_id, now, error_msg, inc_id))
+                    elif status == "up" and old_status == "down":
+                        cursor.execute('''
+                            UPDATE downtime_events 
+                            SET went_up_at = ? 
+                            WHERE resource_id = ? AND went_up_at IS NULL
+                        ''', (now, resource_id))
+                        cursor.execute('''
+                            UPDATE resources 
+                            SET stale_warning_level = 0 
+                            WHERE id = ?
+                        ''', (resource_id,))
+                else:
+                    cursor.execute('''
+                        UPDATE resources 
+                        SET last_checked = ?, consecutive_failures = ?,
+                            last_latency_ms = COALESCE(?, last_latency_ms)
+                        WHERE id = ?
+                    ''', (now, consecutive_failures, latency_ms, resource_id))
+
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def update_resource_status(resource_id: int, status: str, consecutive_failures: int, error_msg: str = None, latency_ms: int = None):
+    """Updates the status, last_checked, and optionally last_latency_ms in a single transaction."""
+    batch_update_resource_status([{
+        "id": resource_id,
+        "status": status,
+        "consecutive_failures": consecutive_failures,
+        "error_msg": error_msg,
+        "latency_ms": latency_ms,
+    }])
 
 def update_stale_warning_level(resource_id: int, level: int):
     """Update the highest stale downtime warning level sent for this resource (0, 7, 14)."""
@@ -785,57 +869,113 @@ def get_incident_affected_resource_ids(incident_id: int, fallback_chat_id: int =
         conn.close()
         return res_ids
 
-# Uptime calculation functions
-def get_resource_uptime_30d(resource_id: int) -> float:
-    """Calculates the uptime percentage of a resource over the last 30 days."""
-    now = int(time.time())
+# Uptime calculation functions & TTL cache
+_uptime_cache: dict[int, tuple[float, float]] = {}  # resource_id -> (timestamp, uptime_pct)
+_uptime_cache_lock = threading.Lock()
+UPTIME_CACHE_TTL = 60.0  # seconds
+
+
+def invalidate_uptime_cache(resource_id: int = None):
+    """Invalidate uptime cache for a specific resource or all resources."""
+    with _uptime_cache_lock:
+        if resource_id is None:
+            _uptime_cache.clear()
+        else:
+            _uptime_cache.pop(resource_id, None)
+
+
+def get_resources_uptime_30d(resource_ids: list[int]) -> dict[int, float]:
+    """Batch calculates the 30-day uptime percentages for multiple resources in a single query with TTL caching."""
+    if not resource_ids:
+        return {}
+
+    now_ts = time.time()
+    now = int(now_ts)
     start_time = now - 30 * 24 * 3600
-    
+
+    res_dict: dict[int, float] = {}
+    missing_ids = []
+
+    with _uptime_cache_lock:
+        for rid in resource_ids:
+            cached = _uptime_cache.get(rid)
+            if cached and (now_ts - cached[0] < UPTIME_CACHE_TTL):
+                res_dict[rid] = cached[1]
+            else:
+                missing_ids.append(rid)
+
+    if not missing_ids:
+        return res_dict
+
     with _lock:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        
-        # Get resource creation time
-        cursor.execute("SELECT created_at FROM resources WHERE id = ?", (resource_id,))
-        row = cursor.fetchone()
-        if not row:
+        conn = _connect()
+        try:
+            cursor = conn.cursor()
+            placeholders = ",".join("?" for _ in missing_ids)
+            cursor.execute(f"SELECT id, created_at FROM resources WHERE id IN ({placeholders})", missing_ids)
+            created_map = {row[0]: row[1] for row in cursor.fetchall()}
+
+            cursor.execute(f'''
+                SELECT resource_id, went_down_at, went_up_at FROM downtime_events 
+                WHERE resource_id IN ({placeholders}) AND went_down_at < ? AND (went_up_at IS NULL OR went_up_at > ?)
+            ''', (*missing_ids, now, start_time))
+            events = cursor.fetchall()
+        finally:
             conn.close()
-            return 100.0
-            
-        created_at = row[0]
-        tracking_start = max(created_at, start_time)
-        total_time = now - tracking_start
-        if total_time <= 0:
-            conn.close()
-            return 100.0
-            
-        # Get all overlapping downtime events in the last 30 days
-        cursor.execute('''
-            SELECT went_down_at, went_up_at FROM downtime_events 
-            WHERE resource_id = ? AND went_down_at < ? AND (went_up_at IS NULL OR went_up_at > ?)
-        ''', (resource_id, now, tracking_start))
-        
-        events = cursor.fetchall()
-        conn.close()
-        
-        total_downtime = 0
-        for went_down, went_up in events:
-            effective_start = max(went_down, tracking_start)
-            effective_end = min(went_up if went_up else now, now)
-            duration = effective_end - effective_start
-            if duration > 0:
-                total_downtime += duration
-                
-        uptime_pct = ((total_time - total_downtime) / total_time) * 100.0
-        return max(0.0, min(100.0, uptime_pct))
+
+    events_by_res: dict[int, list[tuple[int, int]]] = {rid: [] for rid in missing_ids}
+    for r_id, went_down, went_up in events:
+        events_by_res[r_id].append((went_down, went_up))
+
+    new_cache = {}
+    for rid in missing_ids:
+        created_at = created_map.get(rid)
+        if created_at is None:
+            pct = 100.0
+        else:
+            tracking_start = max(created_at, start_time)
+            total_time = now - tracking_start
+            if total_time <= 0:
+                pct = 100.0
+            else:
+                total_downtime = 0
+                for went_down, went_up in events_by_res.get(rid, []):
+                    effective_start = max(went_down, tracking_start)
+                    effective_end = min(went_up if went_up else now, now)
+                    duration = effective_end - effective_start
+                    if duration > 0:
+                        total_downtime += duration
+                pct = max(0.0, min(100.0, ((total_time - total_downtime) / total_time) * 100.0))
+        res_dict[rid] = pct
+        new_cache[rid] = (now_ts, pct)
+
+    with _uptime_cache_lock:
+        _uptime_cache.update(new_cache)
+
+    return res_dict
+
+
+def get_resource_uptime_30d(resource_id: int) -> float:
+    """Calculates the uptime percentage of a resource over the last 30 days (cached with TTL)."""
+    now_ts = time.time()
+    with _uptime_cache_lock:
+        cached = _uptime_cache.get(resource_id)
+        if cached and (now_ts - cached[0] < UPTIME_CACHE_TTL):
+            return cached[1]
+
+    results = get_resources_uptime_30d([resource_id])
+    return results.get(resource_id, 100.0)
+
 
 def get_chat_uptime_30d(dc_chat_id: int) -> float:
-    """Calculates average uptime percentage for all resources in a chat."""
+    """Calculates average uptime percentage for all resources in a chat using batch query."""
     resources = get_resources(dc_chat_id)
     if not resources:
         return 100.0
-        
-    uptimes = [get_resource_uptime_30d(r["id"]) for r in resources]
+
+    r_ids = [r["id"] for r in resources]
+    uptimes_map = get_resources_uptime_30d(r_ids)
+    uptimes = [uptimes_map.get(rid, 100.0) for rid in r_ids]
     return sum(uptimes) / len(uptimes)
 
 # Transport statistics tracking (buffered in memory)

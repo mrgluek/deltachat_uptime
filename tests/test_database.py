@@ -1,0 +1,160 @@
+import os
+import sys
+import unittest
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import database
+
+TEST_DB = "test_uptime_db.db"
+
+
+class TestDatabase(unittest.TestCase):
+    def setUp(self):
+        self.orig_db = database.DB_PATH
+        database.DB_PATH = TEST_DB
+        database.init_db()
+        database.invalidate_uptime_cache()
+        with database._transport_stats_lock:
+            database._transport_stats_buffer.clear()
+
+    def tearDown(self):
+        database.invalidate_uptime_cache()
+        with database._transport_stats_lock:
+            database._transport_stats_buffer.clear()
+        database.DB_PATH = self.orig_db
+        if os.path.exists(TEST_DB):
+            try:
+                os.remove(TEST_DB)
+            except OSError:
+                pass
+        for suffix in ["-wal", "-shm"]:
+            fpath = TEST_DB + suffix
+            if os.path.exists(fpath):
+                try:
+                    os.remove(fpath)
+                except OSError:
+                    pass
+
+    def test_database_indexes_created(self):
+        """Verify that all performance and scaling indexes are created in init_db."""
+        conn = database._connect()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("SELECT name FROM sqlite_master WHERE type = 'index'")
+            indexes = {row[0] for row in cursor.fetchall()}
+        finally:
+            conn.close()
+
+        expected_indexes = [
+            "idx_downtime_resource",
+            "idx_downtime_went_down",
+            "idx_downtime_went_up",
+            "idx_downtime_resource_range",
+            "idx_downtime_incident",
+            "idx_incidents_chat",
+            "idx_incidents_status",
+            "idx_incidents_chat_status",
+            "idx_incidents_resolved",
+            "idx_resources_chat_status",
+            "idx_resources_url",
+            "idx_resources_status",
+            "idx_peers_chat",
+            "idx_peers_last_seen",
+            "idx_peer_measurements_url",
+            "idx_peer_meas_checked",
+        ]
+        for idx in expected_indexes:
+            self.assertIn(idx, indexes, f"Index {idx} was not found in database")
+
+    def test_config_roundtrip(self):
+        self.assertIsNone(database.get_config("nonexistent_key"))
+        database.set_config("key1", "val1")
+        self.assertEqual(database.get_config("key1"), "val1")
+        database.set_config("key1", "val2")
+        self.assertEqual(database.get_config("key1"), "val2")
+
+    def test_admin_email_normalization(self):
+        self.assertIsNone(database.get_admin_email())
+        database.set_admin_email("  ADMIN@Example.COM  ")
+        self.assertEqual(database.get_admin_email(), "admin@example.com")
+
+    def test_admin_fingerprint_handling(self):
+        self.assertIsNone(database.get_admin_fingerprint())
+        database.set_admin_fingerprint("aa:bb:cc:dd:11:22:33:44:55:66:77:88:99:00:11:22")
+        self.assertEqual(database.get_admin_fingerprint(), "AABBCCDD112233445566778899001122")
+
+    def test_batch_uptime_calculation_and_cache(self):
+        """Test batch 30d uptime calculation and verify TTL caching."""
+        chat_id = 999
+        r1 = database.add_resource(chat_id, "https://r1.example.com", "R1", "http")
+        r2 = database.add_resource(chat_id, "https://r2.example.com", "R2", "http")
+        self.assertIsNotNone(r1)
+        self.assertIsNotNone(r2)
+
+        # Brand new resources should both have 100.0% uptime
+        results = database.get_resources_uptime_30d([r1, r2])
+        self.assertEqual(results[r1], 100.0)
+        self.assertEqual(results[r2], 100.0)
+
+        # Cache should now be populated
+        with database._uptime_cache_lock:
+            self.assertIn(r1, database._uptime_cache)
+            self.assertIn(r2, database._uptime_cache)
+
+        # Single getter should use cache
+        self.assertEqual(database.get_resource_uptime_30d(r1), 100.0)
+        self.assertEqual(database.get_chat_uptime_30d(chat_id), 100.0)
+
+    def test_uptime_cache_invalidation_on_status_change(self):
+        """Status change (transition to DOWN) must invalidate cached uptime."""
+        chat_id = 998
+        r_id = database.add_resource(chat_id, "https://inv.example.com", "Inv", "http")
+        
+        # Populate cache
+        u1 = database.get_resource_uptime_30d(r_id)
+        self.assertEqual(u1, 100.0)
+        with database._uptime_cache_lock:
+            self.assertIn(r_id, database._uptime_cache)
+
+        # Transition to DOWN
+        database.update_resource_status(r_id, "down", 1, error_msg="Timeout")
+
+        # Cache must be invalidated for this resource
+        with database._uptime_cache_lock:
+            self.assertNotIn(r_id, database._uptime_cache)
+
+    def test_batch_update_resource_status(self):
+        """Verify batch_update_resource_status correctly updates multiple resources in one transaction."""
+        chat_id = 997
+        r1 = database.add_resource(chat_id, "https://b1.com", "B1", "http")
+        r2 = database.add_resource(chat_id, "https://b2.com", "B2", "http")
+
+        updates = [
+            {"id": r1, "status": "up", "consecutive_failures": 0, "error_msg": None, "latency_ms": 42},
+            {"id": r2, "status": "down", "consecutive_failures": 1, "error_msg": "Connection refused", "latency_ms": None},
+        ]
+        database.batch_update_resource_status(updates)
+
+        res1 = database.get_resource_by_id(r1)
+        res2 = database.get_resource_by_id(r2)
+
+        self.assertEqual(res1["status"], "up")
+        self.assertEqual(res1["last_latency_ms"], 42)
+        self.assertEqual(res2["status"], "down")
+        self.assertEqual(res2["consecutive_failures"], 1)
+
+    def test_delete_resource_invalidates_cache(self):
+        chat_id = 996
+        r_id = database.add_resource(chat_id, "https://del.com", "Del", "http")
+        database.get_resource_uptime_30d(r_id)
+
+        with database._uptime_cache_lock:
+            self.assertIn(r_id, database._uptime_cache)
+
+        database.delete_resource(chat_id, r_id)
+        with database._uptime_cache_lock:
+            self.assertNotIn(r_id, database._uptime_cache)
+
+
+if __name__ == "__main__":
+    unittest.main()

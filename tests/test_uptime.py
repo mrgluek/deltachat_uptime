@@ -2495,14 +2495,63 @@ class TestUptimeBot(unittest.TestCase):
         incidents = database.get_all_active_incidents()
         self.assertTrue(any(i["dc_chat_id"] == 2 for i in incidents))
 
-    def test_update_resource_status_with_latency(self):
-        res_id = database.add_resource(100, "https://latency-check.org", "Latency Test", "http", 60)
-        database.update_resource_status(res_id, "up", 0, None, latency_ms=88)
+    def test_prune_incident_sync_locks(self):
+        """Test that unlocked incident sync locks are pruned while locked ones are preserved."""
+        with bot._incident_sync_locks_thread_lock:
+            bot._incident_sync_locks.clear()
 
-        res = database.get_resource_by_id(res_id)
-        self.assertEqual(res["status"], "up")
-        self.assertEqual(res["last_latency_ms"], 88)
-        self.assertEqual(res["consecutive_failures"], 0)
+        # Create two locks
+        l1 = bot.get_chat_incident_lock(1001)
+        l2 = bot.get_chat_incident_lock(1002)
+
+        async def run_lock_test():
+            # Acquire l1
+            await l1.acquire()
+            try:
+                # l2 is unlocked, so prune should remove l2 and keep l1
+                pruned = bot.prune_incident_sync_locks()
+                self.assertEqual(pruned, 1)
+                with bot._incident_sync_locks_thread_lock:
+                    self.assertIn(1001, bot._incident_sync_locks)
+                    self.assertNotIn(1002, bot._incident_sync_locks)
+            finally:
+                l1.release()
+
+            # Now that l1 is released, another prune should remove it
+            pruned2 = bot.prune_incident_sync_locks()
+            self.assertEqual(pruned2, 1)
+            with bot._incident_sync_locks_thread_lock:
+                self.assertNotIn(1001, bot._incident_sync_locks)
+
+        asyncio.run(run_lock_test())
+
+    def test_run_db_and_run_rpc(self):
+        """Test that run_db and run_rpc dispatch correctly to dedicated thread pools."""
+        async def run_pool_test():
+            def db_task(x, y):
+                return x + y
+
+            def rpc_task(msg):
+                return f"echo: {msg}"
+
+            db_res = await bot.run_db(db_task, 10, 20)
+            rpc_res = await bot.run_rpc(rpc_task, "hello")
+            self.assertEqual(db_res, 30)
+            self.assertEqual(rpc_res, "echo: hello")
+
+        asyncio.run(run_pool_test())
+
+    def test_check_network_probe_semaphore(self):
+        """Test that check_network_probe acquires semaphore properly during probe."""
+        async def run_probe_test():
+            sem = asyncio.Semaphore(1)
+            target = {"type": "tcp", "url": "tcp://127.0.0.1:1"}
+            with patch('bot.run_single_check', unittest.mock.AsyncMock(return_value=(True, "OK", 5))):
+                res = await bot.check_network_probe(target, sem)
+                self.assertTrue(res[0])
+                self.assertEqual(sem._value, 1)
+
+        asyncio.run(run_probe_test())
 
 if __name__ == '__main__':
     unittest.main()

@@ -18,13 +18,34 @@ from aiohttp import web
 from deltachat2 import events, MsgData
 from deltabot_cli import BotCli
 
+import concurrent.futures
 import database
 
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "2.7.7"
+VERSION = "2.8.0"
 USER_AGENT = f"DeltaChat-Uptime-Bot/{VERSION} (https://git.gluek.info/gluek/deltachat_uptime)"
+
+# Dedicated thread pools for database operations and Delta Chat RPC calls
+db_executor = concurrent.futures.ThreadPoolExecutor(max_workers=10, thread_name_prefix="uptime_db")
+rpc_executor = concurrent.futures.ThreadPoolExecutor(max_workers=10, thread_name_prefix="uptime_rpc")
+
+
+async def run_db(func, *args, **kwargs):
+    """Executes a blocking database operation on the dedicated DB thread pool."""
+    loop = asyncio.get_running_loop()
+    if kwargs:
+        return await loop.run_in_executor(db_executor, lambda: func(*args, **kwargs))
+    return await loop.run_in_executor(db_executor, func, *args)
+
+
+async def run_rpc(func, *args, **kwargs):
+    """Executes a blocking Delta Chat RPC / SMTP operation on the dedicated RPC thread pool."""
+    loop = asyncio.get_running_loop()
+    if kwargs:
+        return await loop.run_in_executor(rpc_executor, lambda: func(*args, **kwargs))
+    return await loop.run_in_executor(rpc_executor, func, *args)
 
 dc_cli = BotCli("uptimebot")
 bot_qr_cache = {}
@@ -831,120 +852,125 @@ async def run_single_check(resource, session=None) -> tuple[bool, str, int | Non
         return False, str(e), elapsed_ms
     return False, "Unknown error", None
 
+async def check_network_probe(target, semaphore, session=None):
+    """Executes a network check acquiring the concurrency semaphore ONLY for the duration of the network probe."""
+    async with semaphore:
+        return await run_single_check(target, session=session)
+
+
 async def check_group_task(group, semaphore, session=None):
     rep = group[0]
-    async with semaphore:
-        if rep.get("is_probe_only"):
-            res = await run_single_check(rep, session=session)
-            if len(res) == 3:
-                is_up, error_msg, latency_ms = res
-            else:
-                is_up, error_msg = res
-                latency_ms = None
-            status_str = "up" if is_up else "down"
-            local_node = database.get_local_node_name()
-            await asyncio.to_thread(database.update_probe_target_result, rep["url"], status_str, latency_ms, error_msg)
-            await asyncio.to_thread(database.save_peer_measurement, rep["url"], local_node, status_str, latency_ms, error_msg)
-            return
-
-        res = await run_single_check(rep, session=session)
+    if rep.get("is_probe_only"):
+        res = await check_network_probe(rep, semaphore, session=session)
         if len(res) == 3:
             is_up, error_msg, latency_ms = res
         else:
             is_up, error_msg = res
             latency_ms = None
-        
-        # Retry logic: retry if check failed and at least one resource in the group was not already DOWN
-        if not is_up and any(r["status"] != "down" for r in group):
-            for retry in range(1, 3):
-                for r in group:
-                    if r["status"] != "down":
-                        logger.info(f"Retry {retry}/2 for resource {r['id']} ({r['name'] or r['url']}) in chat {r['dc_chat_id']}")
-                await asyncio.sleep(30)
-                res = await run_single_check(rep, session=session)
-                if len(res) == 3:
-                    is_up, error_msg, latency_ms = res
-                else:
-                    is_up, error_msg = res
-                    latency_ms = None
-                if is_up:
-                    break
-
-        # Host Outage Protection: If check failed, verify host internet before marking DOWN
-        if not is_up:
-            has_internet = await check_host_internet_connectivity()
-            if not has_internet:
-                logger.warning(
-                    f"Host internet outage detected! Suppressing DOWN check result for {rep['name'] or rep['url']} in chat {rep['dc_chat_id']}"
-                )
-                return
-
-        # Peer Cross-Check: verify failing target with remote probes before marking DOWN
-        if not is_up and any(r["status"] != "down" for r in group):
-            try:
-                peer_results = await request_peer_cross_checks(rep, timeout=8.0)
-                if peer_results:
-                    up_peers = [pr for pr in peer_results if pr.get("status") == "up"]
-                    down_peers = [pr for pr in peer_results if pr.get("status") == "down"]
-                    local_node = database.get_local_node_name()
-                    if up_peers:
-                        reach_details = ", ".join(f"{pr.get('node_name', 'Peer')}: {pr.get('latency_ms', '?')}ms" for pr in up_peers)
-                        error_msg = f"{error_msg} (Reachable from {reach_details})"
-                    elif down_peers:
-                        nodes_confirmed = [pr.get('node_name', 'Peer') for pr in down_peers]
-                        error_msg = f"{error_msg} [Confirmed by {', '.join(nodes_confirmed)}]"
-            except Exception as ex:
-                logger.warning(f"Error during peer cross-check: {ex}")
-                    
-        for r in group:
-            if latency_ms is not None:
-                r["last_latency_ms"] = latency_ms
-                
-            logger.info(f"Check result: {r['name'] or r['url']} (id: {r['id']}) in chat {r['dc_chat_id']} -> {'UP' if is_up else 'DOWN'} ({error_msg})")
-            await handle_check_result(r, is_up, error_msg, latency_ms=latency_ms)
-
-        # Save local node measurement for dashboard and telemetry sync
-        local_node = database.get_local_node_name()
         status_str = "up" if is_up else "down"
-        await asyncio.to_thread(database.save_peer_measurement, rep["url"], local_node, status_str, latency_ms, error_msg)
+        local_node = database.get_local_node_name()
+        await run_db(database.update_probe_target_result, rep["url"], status_str, latency_ms, error_msg)
+        await run_db(database.save_peer_measurement, rep["url"], local_node, status_str, latency_ms, error_msg)
+        return
 
-        # Check SSL Certificate Expiry for HTTPS targets (at most once per hour)
-        if rep.get("type") == "http" and rep.get("url", "").startswith("https://"):
-            now = int(time.time())
-            ssl_last_checked = rep.get("ssl_last_checked") or 0
-            if now - ssl_last_checked >= 3600:
-                ssl_exp_ts, ssl_err = await check_ssl_expiry(rep["url"])
-                for r in group:
-                    cur_state = r.get("ssl_alert_state") if r.get("ssl_alert_state") is not None else 0
-                    new_state = cur_state
-                    if ssl_exp_ts is not None:
-                        days_left = (ssl_exp_ts - now) / 86400.0
-                        exp_date_str = datetime.datetime.fromtimestamp(ssl_exp_ts, tz=datetime.timezone.utc).strftime('%Y-%m-%d')
-                        
-                        if days_left > 7:
-                            if cur_state != 0:
-                                new_state = 0
-                        elif days_left <= 0:
-                            if cur_state != -1:
-                                new_state = -1
-                                await notify_ssl_alert(r, days_left, exp_date_str, alert_stage=-1)
-                        elif days_left <= 1:
-                            if cur_state in (0, 7, 3):
-                                new_state = 1
-                                await notify_ssl_alert(r, days_left, exp_date_str, alert_stage=1)
-                        elif days_left <= 3:
-                            if cur_state in (0, 7):
-                                new_state = 3
-                                await notify_ssl_alert(r, days_left, exp_date_str, alert_stage=3)
-                        elif days_left <= 7:
-                            if cur_state == 0:
-                                new_state = 7
-                                await notify_ssl_alert(r, days_left, exp_date_str, alert_stage=7)
-                                
-                        await asyncio.to_thread(database.update_resource_ssl, r["id"], ssl_exp_ts, now, new_state)
-                    else:
-                        logger.warning(f"SSL check for {rep['url']} failed: {ssl_err}")
-                        await asyncio.to_thread(database.update_resource_ssl, r["id"], r.get("ssl_expiry_date"), now, cur_state)
+    res = await check_network_probe(rep, semaphore, session=session)
+    if len(res) == 3:
+        is_up, error_msg, latency_ms = res
+    else:
+        is_up, error_msg = res
+        latency_ms = None
+
+    # Retry logic: retry if check failed and at least one resource in the group was not already DOWN.
+    # Note: sleep(30) is executed OUTSIDE the semaphore so failing targets do not starve healthy checks!
+    if not is_up and any(r["status"] != "down" for r in group):
+        for retry in range(1, 3):
+            for r in group:
+                if r["status"] != "down":
+                    logger.info(f"Retry {retry}/2 for resource {r['id']} ({r['name'] or r['url']}) in chat {r['dc_chat_id']}")
+            await asyncio.sleep(30)
+            res = await check_network_probe(rep, semaphore, session=session)
+            if len(res) == 3:
+                is_up, error_msg, latency_ms = res
+            else:
+                is_up, error_msg = res
+                latency_ms = None
+            if is_up:
+                break
+
+    # Host Outage Protection: If check failed, verify host internet before marking DOWN
+    if not is_up:
+        has_internet = await check_host_internet_connectivity()
+        if not has_internet:
+            logger.warning(
+                f"Host internet outage detected! Suppressing DOWN check result for {rep['name'] or rep['url']} in chat {rep['dc_chat_id']}"
+            )
+            return
+
+    # Peer Cross-Check: verify failing target with remote probes before marking DOWN
+    if not is_up and any(r["status"] != "down" for r in group):
+        try:
+            peer_results = await request_peer_cross_checks(rep, timeout=8.0)
+            if peer_results:
+                up_peers = [pr for pr in peer_results if pr.get("status") == "up"]
+                down_peers = [pr for pr in peer_results if pr.get("status") == "down"]
+                if up_peers:
+                    reach_details = ", ".join(f"{pr.get('node_name', 'Peer')}: {pr.get('latency_ms', '?')}ms" for pr in up_peers)
+                    error_msg = f"{error_msg} (Reachable from {reach_details})"
+                elif down_peers:
+                    nodes_confirmed = [pr.get('node_name', 'Peer') for pr in down_peers]
+                    error_msg = f"{error_msg} [Confirmed by {', '.join(nodes_confirmed)}]"
+        except Exception as ex:
+            logger.warning(f"Error during peer cross-check: {ex}")
+
+    for r in group:
+        if latency_ms is not None:
+            r["last_latency_ms"] = latency_ms
+
+        logger.info(f"Check result: {r['name'] or r['url']} (id: {r['id']}) in chat {r['dc_chat_id']} -> {'UP' if is_up else 'DOWN'} ({error_msg})")
+        await handle_check_result(r, is_up, error_msg, latency_ms=latency_ms)
+
+    # Save local node measurement for dashboard and telemetry sync
+    local_node = database.get_local_node_name()
+    status_str = "up" if is_up else "down"
+    await run_db(database.save_peer_measurement, rep["url"], local_node, status_str, latency_ms, error_msg)
+
+    # Check SSL Certificate Expiry for HTTPS targets (at most once per hour)
+    if rep.get("type") == "http" and rep.get("url", "").startswith("https://"):
+        now = int(time.time())
+        ssl_last_checked = rep.get("ssl_last_checked") or 0
+        if now - ssl_last_checked >= 3600:
+            ssl_exp_ts, ssl_err = await check_ssl_expiry(rep["url"])
+            for r in group:
+                cur_state = r.get("ssl_alert_state") if r.get("ssl_alert_state") is not None else 0
+                new_state = cur_state
+                if ssl_exp_ts is not None:
+                    days_left = (ssl_exp_ts - now) / 86400.0
+                    exp_date_str = datetime.datetime.fromtimestamp(ssl_exp_ts, tz=datetime.timezone.utc).strftime('%Y-%m-%d')
+
+                    if days_left > 7:
+                        if cur_state != 0:
+                            new_state = 0
+                    elif days_left <= 0:
+                        if cur_state != -1:
+                            new_state = -1
+                            await notify_ssl_alert(r, days_left, exp_date_str, alert_stage=-1)
+                    elif days_left <= 1:
+                        if cur_state in (0, 7, 3):
+                            new_state = 1
+                            await notify_ssl_alert(r, days_left, exp_date_str, alert_stage=1)
+                    elif days_left <= 3:
+                        if cur_state in (0, 7):
+                            new_state = 3
+                            await notify_ssl_alert(r, days_left, exp_date_str, alert_stage=3)
+                    elif days_left <= 7:
+                        if cur_state == 0:
+                            new_state = 7
+                            await notify_ssl_alert(r, days_left, exp_date_str, alert_stage=7)
+
+                    await run_db(database.update_resource_ssl, r["id"], ssl_exp_ts, now, new_state)
+                else:
+                    logger.warning(f"SSL check for {rep['url']} failed: {ssl_err}")
+                    await run_db(database.update_resource_ssl, r["id"], r.get("ssl_expiry_date"), now, cur_state)
 
 def format_incident_message(incident_id: int, started_at: int, resources: list[dict], is_resolved: bool = False, resolved_at: int = None, dc_chat_id: int = None, total_chat_monitors: int = None) -> str:
     start_dt = datetime.datetime.fromtimestamp(started_at, tz=datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
@@ -1031,6 +1057,15 @@ def get_chat_incident_lock(dc_chat_id: int) -> asyncio.Lock:
         if dc_chat_id not in _incident_sync_locks:
             _incident_sync_locks[dc_chat_id] = asyncio.Lock()
         return _incident_sync_locks[dc_chat_id]
+
+
+def prune_incident_sync_locks() -> int:
+    """Removes idle (unlocked) incident sync locks to prevent unbounded memory growth."""
+    with _incident_sync_locks_thread_lock:
+        to_remove = [cid for cid, lock in _incident_sync_locks.items() if not lock.locked()]
+        for cid in to_remove:
+            del _incident_sync_locks[cid]
+        return len(to_remove)
 
 def get_incident_update_interval(duration_seconds: int) -> int:
     """Return the minimum seconds required between live duration edits based on incident age."""
@@ -1442,13 +1477,13 @@ async def monitoring_scheduler_loop():
                 # Audit incidents and peer liveness every 30 seconds (not every 5s)
                 if now - _last_incident_audit >= 30:
                     _last_incident_audit = now
-                    active_incidents = await asyncio.to_thread(database.get_all_active_incidents)
+                    active_incidents = await run_db(database.get_all_active_incidents)
                     for inc in active_incidents:
                         asyncio.create_task(sync_chat_incident_state(inc["dc_chat_id"]))
 
                 if now - _last_peer_audit >= 30:
                     _last_peer_audit = now
-                    newly_offline_peers = await asyncio.to_thread(database.audit_peers_offline, 360)
+                    newly_offline_peers = await run_db(database.audit_peers_offline, 360)
                     for p in newly_offline_peers:
                         p_node = p.get("node_name") or "Remote"
                         p_email = p.get("email")
@@ -1465,12 +1500,15 @@ async def monitoring_scheduler_loop():
                 # Periodic database cleanup (every 24 hours)
                 if now - _last_cleanup >= 86400:
                     _last_cleanup = now
-                    await asyncio.to_thread(database.cleanup_old_records, 90)
+                    await run_db(database.cleanup_old_records, 90)
+                    pruned_locks = prune_incident_sync_locks()
+                    if pruned_locks:
+                        logger.info(f"Pruned {pruned_locks} idle incident sync locks from memory")
 
                 # Periodic transport stats flush (every 10 seconds)
                 if now - _last_transport_flush >= 10:
                     _last_transport_flush = now
-                    await asyncio.to_thread(database.flush_transport_stats)
+                    await run_db(database.flush_transport_stats)
 
             except Exception as e:
                 logger.error(f"Error in monitoring scheduler loop: {e}")
@@ -1478,7 +1516,7 @@ async def monitoring_scheduler_loop():
             await asyncio.sleep(5)
 
 # Web Server handling and dashboard HTML templates
-def get_dashboard_html(chat_name, resources, overall_uptime, incidents=None) -> str:
+def get_dashboard_html(chat_name, resources, overall_uptime, incidents=None, uptimes_map=None) -> str:
     total_monitors = len(resources)
     up_monitors = sum(1 for r in resources if r["status"] == "up")
     down_monitors = sum(1 for r in resources if r["status"] == "down")
@@ -1498,8 +1536,10 @@ def get_dashboard_html(chat_name, resources, overall_uptime, incidents=None) -> 
         """
     else:
         now_ts = int(time.time())
+        if uptimes_map is None and resources:
+            uptimes_map = database.get_resources_uptime_30d([r["id"] for r in resources])
         for r in resources:
-            r_uptime = database.get_resource_uptime_30d(r["id"])
+            r_uptime = (uptimes_map or {}).get(r["id"]) if uptimes_map else database.get_resource_uptime_30d(r["id"])
             m_until = r.get("maintenance_until") or 0
             is_maintenance = (now_ts < m_until)
 
@@ -2039,31 +2079,31 @@ def get_dashboard_html(chat_name, resources, overall_uptime, incidents=None) -> 
 
 async def handle_status_page(request):
     token = request.match_info.get('token')
-    chat_id = await asyncio.to_thread(database.get_chat_id_by_token, token)
+    chat_id = await run_db(database.get_chat_id_by_token, token)
     if not chat_id:
         return web.Response(text="Status Page Not Found", status=404)
         
     chat_name = "Chat Monitor"
     if dc_bot_instance and dc_accid is not None:
         try:
-            chat = await asyncio.to_thread(dc_bot_instance.rpc.get_chat, dc_accid, chat_id)
+            chat = await run_rpc(dc_bot_instance.rpc.get_chat, dc_accid, chat_id)
             chat_name = chat.name
         except Exception:
             pass
             
-    resources = await asyncio.to_thread(database.get_resources, chat_id)
-    incidents = await asyncio.to_thread(database.get_recent_incidents, chat_id, 5)
+    resources = await run_db(database.get_resources, chat_id)
+    incidents = await run_db(database.get_recent_incidents, chat_id, 5)
     
-    # Calculate average uptime
+    # Calculate average uptime using single batch query
     overall_uptime = 100.0
+    uptimes_map = {}
     if resources:
-        uptimes = []
-        for r in resources:
-            u = await asyncio.to_thread(database.get_resource_uptime_30d, r["id"])
-            uptimes.append(u)
+        r_ids = [r["id"] for r in resources]
+        uptimes_map = await run_db(database.get_resources_uptime_30d, r_ids)
+        uptimes = [uptimes_map.get(rid, 100.0) for rid in r_ids]
         overall_uptime = sum(uptimes) / len(uptimes)
         
-    html_content = get_dashboard_html(chat_name, resources, overall_uptime, incidents)
+    html_content = get_dashboard_html(chat_name, resources, overall_uptime, incidents, uptimes_map=uptimes_map)
     return web.Response(text=html_content, content_type="text/html")
 
 async def handle_index(request):
@@ -3353,6 +3393,7 @@ def list_command(bot, accid, event):
         return
         
     now_ts = int(time.time())
+    uptimes_map = database.get_resources_uptime_30d([r["id"] for r in resources])
     reply = "⚙️ **Monitored Resources:**\n\n"
     for r in resources:
         m_until = r.get("maintenance_until") or 0
@@ -3373,7 +3414,7 @@ def list_command(bot, accid, event):
             emoji_status = "⚪"
             status_text = "UNKNOWN"
             
-        uptime = database.get_resource_uptime_30d(r["id"])
+        uptime = uptimes_map.get(r["id"], 100.0)
         
         extra_info = ""
         if r.get("last_latency_ms") is not None:
@@ -3415,8 +3456,7 @@ def status_command(bot, accid, event):
     up_monitors = sum(1 for r in resources if r["status"] == "up")
     down_monitors = sum(1 for r in resources if r["status"] == "down")
     
-    uptimes = [database.get_resource_uptime_30d(r["id"]) for r in resources]
-    avg_uptime = sum(uptimes) / len(uptimes)
+    avg_uptime = database.get_chat_uptime_30d(msg.chat_id)
     
     token = database.get_or_create_chat_token(msg.chat_id)
     base_url = database.get_config("base_url") or "http://localhost:8080"

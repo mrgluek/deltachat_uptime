@@ -43,8 +43,12 @@ Additionally, it automatically generates a secure, beautiful web status dashboar
   - **Zero Group Spam:** All protocol handshakes, background telemetry, and instant cross-checks happen in private DMs between bots.
   - **Cross-Probe Verification:** Outages are verified across remote probes in real-time before alerting, distinguishing global downtime from regional/routing reachability issues.
   - **Aggregated Web Dashboard:** Web status pages show latency and status badges for all active probe locations (`[📍 Frankfurt-DE: 18ms] [🛰️ RU-Moscow: 45ms]`).
-- 🤖 **Identified User-Agent:** Sends a custom `User-Agent` header (e.g. `DeltaChat-Uptime-Bot/2.7.2 (https://git.gluek.info/gluek/deltachat_uptime)`) during HTTP checks so server administrators can easily identify monitoring requests in server logs.
-
+- 🤖 **Identified User-Agent:** Sends a custom `User-Agent` header (e.g. `DeltaChat-Uptime-Bot/2.8.0 (https://git.gluek.info/gluek/deltachat_uptime)`) during HTTP checks so server administrators can easily identify monitoring requests in server logs.
+- 🚀 **High-Concurrency Scaling Architecture:**
+  - **Non-Blocking Semaphore:** Concurrency semaphore slots are held exclusively for the milliseconds of network probes; retry backoffs (30s) and remote peer checks execute asynchronously without starving healthy checks.
+  - **Dedicated Thread Pools:** Separate thread executors for database queries (`uptime_db`) and Delta Chat JSON-RPC / SMTP calls (`uptime_rpc`) prevent slow email delivery from stalling database operations.
+  - **Single-Query Batch Metrics & In-Memory TTL Cache:** Single SQL batch queries and 60-second TTL caching eliminate N+1 queries across web status pages, `/list`, and `/status`.
+  - **Optimized SQLite Indexes:** Comprehensive indexes on downtime intervals, incident states, and peer telemetry ensure sub-millisecond query execution even with tens of thousands of historical records.
 - 🔄 **Failure Resiliency & Retry Logic:**
   - Checks resources once a minute.
   - If a resource check fails, the bot does not alert immediately. It retries **2 more times at 30-second intervals**.

@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.9.1] - 2026-09-10
+
+### Fixed
+- **Container Environment Compatibility (`socket.getprotobyname("icmp")` / `OSError: protocol not found`)**:
+  - Added a defensive IANA protocol number fallback (`IPPROTO_ICMP = 1`, `IPPROTO_ICMPV6 = 58`) for `socket.getprotobyname` during `aioping` initialization, preventing startup crashes in minimal container base images lacking `/etc/protocols` (such as Debian minimal without `netbase` or minimal Alpine in Home Assistant Add-ons).
+  - Widened `import aioping` and `import aiodns` exception handling to catch all `Exception`/`OSError` types, guaranteeing safe fallback to `/bin/ping` subprocesses if socket initialization fails for any reason.
+  - Added `netbase` to `Dockerfile` dependencies to supply `/etc/protocols` out-of-the-box.
+
 ## [2.9.0] - 2026-09-10
 
 ### Added

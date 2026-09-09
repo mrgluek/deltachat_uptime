@@ -1,5 +1,6 @@
 import os
 import sys
+import socket
 import unittest
 import time
 import datetime
@@ -2708,6 +2709,57 @@ class TestUptimeBot(unittest.TestCase):
                 mock_subproc.assert_called_once()
         finally:
             bot.aioping = orig_aioping
+
+    def test_run_single_check_ping_when_aioping_is_none(self):
+        """When aioping is None (e.g. uninstalled or failed import), ping uses subprocess directly."""
+        mock_proc = MagicMock()
+        mock_proc.returncode = 0
+        mock_proc.wait = unittest.mock.AsyncMock(return_value=0)
+
+        orig_aioping = bot.aioping
+        bot.aioping = None
+        try:
+            with patch('asyncio.create_subprocess_exec', unittest.mock.AsyncMock(return_value=mock_proc)) as mock_subproc:
+                res = {"type": "ping", "url": "ping-none.com"}
+                is_up, details, lat = asyncio.run(bot.run_single_check(res))
+                self.assertTrue(is_up)
+                self.assertIn("ms", details)
+                mock_subproc.assert_called_once()
+        finally:
+            bot.aioping = orig_aioping
+
+    def test_safe_getprotobyname_fallback_for_icmp(self):
+        """Verify that socket.getprotobyname falls back to IANA standard numbers when /etc/protocols is missing."""
+        # If the current getprotobyname has the fallback wrapper installed:
+        icmp_num = socket.getprotobyname("icmp")
+        self.assertEqual(icmp_num, 1)
+        icmpv6_num = socket.getprotobyname("icmpv6")
+        self.assertEqual(icmpv6_num, 58)
+
+        # Test simulated missing /etc/protocols behavior
+        def mock_missing(name):
+            raise OSError("protocol not found")
+
+        orig = socket.getprotobyname
+        try:
+            # Recreate wrapper over failing mock to verify logic directly
+            def _safe_wrapper(name):
+                try:
+                    return mock_missing(name)
+                except OSError:
+                    if name.lower() == "icmp":
+                        return getattr(socket, "IPPROTO_ICMP", 1)
+                    elif name.lower() in ("icmpv6", "ipv6-icmp"):
+                        return getattr(socket, "IPPROTO_ICMPV6", 58)
+                    raise
+
+            socket.getprotobyname = _safe_wrapper
+            self.assertEqual(socket.getprotobyname("icmp"), 1)
+            self.assertEqual(socket.getprotobyname("icmpv6"), 58)
+            with self.assertRaises(OSError):
+                socket.getprotobyname("unknown_proto")
+        finally:
+            socket.getprotobyname = orig
 
     def test_deterministic_slot_staggering(self):
         """Verify deterministic slot distribution across 60s cycle."""

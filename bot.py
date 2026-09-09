@@ -20,12 +20,31 @@ from deltabot_cli import BotCli
 
 try:
     import aiodns
-except ImportError:
+except Exception:
     aiodns = None
 
+# On minimal container environments lacking /etc/protocols (e.g. minimal Debian/Alpine without netbase),
+# socket.getprotobyname("icmp") raises OSError: protocol not found during aioping import.
+# Provide standard IANA protocol number fallback so aioping can initialize safely.
 try:
-    import aioping
-except ImportError:
+    _orig_getprotobyname = socket.getprotobyname
+
+    def _safe_getprotobyname(name):
+        try:
+            return _orig_getprotobyname(name)
+        except OSError:
+            if name.lower() == "icmp":
+                return getattr(socket, "IPPROTO_ICMP", 1)
+            elif name.lower() in ("icmpv6", "ipv6-icmp"):
+                return getattr(socket, "IPPROTO_ICMPV6", 58)
+            raise
+
+    socket.getprotobyname = _safe_getprotobyname
+    try:
+        import aioping
+    except Exception:
+        aioping = None
+except Exception:
     aioping = None
 
 import concurrent.futures
@@ -34,7 +53,7 @@ import database
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "2.9.0"
+VERSION = "2.9.1"
 USER_AGENT = f"DeltaChat-Uptime-Bot/{VERSION} (https://git.gluek.info/gluek/deltachat_uptime)"
 
 # Dedicated thread pools for database operations and Delta Chat RPC calls

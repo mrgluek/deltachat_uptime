@@ -60,7 +60,7 @@ Additionally, it automatically generates a secure, beautiful web status dashboar
 ### User Commands (Public per-chat)
 These commands are available to any member of a chat. They support suffixes (e.g. `/add@up`, `/status@uptime`) to route commands correctly if multiple bots exist in the same chat.
 
-- `/ping <target> ["keyword"]` (or `/check`, `/test`) — Perform an immediate on-demand reachability and diagnostics test without adding to monitoring (supports HTTP/HTTPS, SSL certificate inspection, keyword assertions, TCP port, ICMP Ping, and multi-region cross-checks).
+- `/ping <target> ["keyword"]` (or `/check`, `/test`) — Perform an immediate on-demand reachability and diagnostics test without adding to monitoring (rate-limited to 1 request per 15s per chat for non-admins; supports HTTP/HTTPS, SSL certificate inspection, keyword assertions, TCP port, ICMP Ping, and multi-region cross-checks).
 - `/add <target> [name] ["keyword"]` — Add a monitor. Target formats:
   • `https://google.com Google` (HTTP/HTTPS check)
   • `https://api.site.com Health "status:ok"` (HTTP with keyword assertion)
@@ -91,7 +91,7 @@ These commands are only executable by the configured administrator.
 - `/accounts` — List active bot accounts.
 - `/rmaccount <id>` — Delete a bot account.
 - `/transports` — Show configured mail relays, status, and stats.
-- `/addtransport` — Add backup mail relays (either chatmail URIs or address/password).
+- `/addtransport` — Add backup mail relays (either chatmail URIs or address/password). Restricted to private 1:1 chat with the bot for security.
 - `/rmtransport <addr>` — Remove backup mail relay.
 - `/setprimary <addr>` — Switch primary SMTP transport.
 - `/resilient` — Toggle resilient sending mode (all relays). Outgoing messages are broadcasted across all connected transports.

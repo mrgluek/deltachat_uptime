@@ -9,12 +9,18 @@ import string
 DB_PATH = os.getenv("DB_PATH", "uptime.db")
 _lock = threading.RLock()
 
+def _connect(timeout: float = 10.0) -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH, timeout=timeout)
+    conn.execute("PRAGMA busy_timeout = 5000;")
+    return conn
+
 def init_db():
     with _lock:
-        conn = sqlite3.connect(DB_PATH)
-        # Enable WAL mode for high concurrency
+        conn = _connect()
+        # Enable WAL mode and concurrency PRAGMAs
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")
+        conn.execute("PRAGMA cache_size=-4000;")
         cursor = conn.cursor()
         
         # Config table for admin_dc_email, admin_dc_fingerprint, etc.
@@ -343,11 +349,11 @@ def get_all_resources() -> list[dict]:
         conn.close()
         return [dict(r) for r in rows]
 
-def update_resource_status(resource_id: int, status: str, consecutive_failures: int, error_msg: str = None):
-    """Updates the status and last_checked fields. Manages downtime events for monthly statistics."""
+def update_resource_status(resource_id: int, status: str, consecutive_failures: int, error_msg: str = None, latency_ms: int = None):
+    """Updates the status, last_checked, and optionally last_latency_ms in a single transaction."""
     now = int(time.time())
     with _lock:
-        conn = sqlite3.connect(DB_PATH)
+        conn = _connect()
         cursor = conn.cursor()
         
         # Get current status
@@ -363,9 +369,10 @@ def update_resource_status(resource_id: int, status: str, consecutive_failures: 
             # Status transition occurred
             cursor.execute('''
                 UPDATE resources 
-                SET status = ?, last_checked = ?, last_changed = ?, consecutive_failures = ? 
+                SET status = ?, last_checked = ?, last_changed = ?, consecutive_failures = ?,
+                    last_latency_ms = COALESCE(?, last_latency_ms)
                 WHERE id = ?
-            ''', (status, now, now, consecutive_failures, resource_id))
+            ''', (status, now, now, consecutive_failures, latency_ms, resource_id))
             
             if status == "down":
                 cursor.execute("SELECT dc_chat_id FROM resources WHERE id = ?", (resource_id,))
@@ -415,9 +422,10 @@ def update_resource_status(resource_id: int, status: str, consecutive_failures: 
             # No status change
             cursor.execute('''
                 UPDATE resources 
-                SET last_checked = ?, consecutive_failures = ? 
+                SET last_checked = ?, consecutive_failures = ?,
+                    last_latency_ms = COALESCE(?, last_latency_ms)
                 WHERE id = ?
-            ''', (now, consecutive_failures, resource_id))
+            ''', (now, consecutive_failures, latency_ms, resource_id))
             
         conn.commit()
         conn.close()
@@ -830,44 +838,115 @@ def get_chat_uptime_30d(dc_chat_id: int) -> float:
     uptimes = [get_resource_uptime_30d(r["id"]) for r in resources]
     return sum(uptimes) / len(uptimes)
 
-# Transport statistics tracking
+# Transport statistics tracking (buffered in memory)
+_transport_stats_buffer: dict[str, dict[str, int]] = {}
+_transport_stats_lock = threading.Lock()
+_last_transport_flush = time.time()
+TRANSPORT_FLUSH_INTERVAL = 30.0  # seconds
+
 def increment_transport_sent(addr: str):
-    with _lock:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute('''
-            INSERT INTO transport_stats (addr, msgs_sent, msgs_received, last_sent_at)
-            VALUES (?, 1, 0, CAST(strftime('%s','now') AS INTEGER))
-            ON CONFLICT(addr) DO UPDATE SET
-                msgs_sent = msgs_sent + 1,
-                last_sent_at = CAST(strftime('%s','now') AS INTEGER)
-        ''', (addr,))
-        conn.commit()
-        conn.close()
+    """Increment the sent counter for a transport address (buffered in memory)."""
+    if not addr or not isinstance(addr, str) or "@" not in addr:
+        return
+    now = int(time.time())
+    should_flush = False
+    with _transport_stats_lock:
+        if addr not in _transport_stats_buffer:
+            _transport_stats_buffer[addr] = {"sent": 0, "recv": 0, "last_sent": 0, "last_recv": 0}
+        _transport_stats_buffer[addr]["sent"] += 1
+        _transport_stats_buffer[addr]["last_sent"] = now
+        global _last_transport_flush
+        if now - _last_transport_flush >= TRANSPORT_FLUSH_INTERVAL:
+            should_flush = True
+    if should_flush:
+        flush_transport_stats()
 
 def increment_transport_received(addr: str):
+    """Increment the received counter for a transport address (buffered in memory)."""
+    if not addr or not isinstance(addr, str) or "@" not in addr:
+        return
+    now = int(time.time())
+    should_flush = False
+    with _transport_stats_lock:
+        if addr not in _transport_stats_buffer:
+            _transport_stats_buffer[addr] = {"sent": 0, "recv": 0, "last_sent": 0, "last_recv": 0}
+        _transport_stats_buffer[addr]["recv"] += 1
+        _transport_stats_buffer[addr]["last_recv"] = now
+        global _last_transport_flush
+        if now - _last_transport_flush >= TRANSPORT_FLUSH_INTERVAL:
+            should_flush = True
+    if should_flush:
+        flush_transport_stats()
+
+def flush_transport_stats():
+    """Flush buffered transport stats to the database in a single transaction."""
+    global _last_transport_flush
+    with _transport_stats_lock:
+        if not _transport_stats_buffer:
+            _last_transport_flush = time.time()
+            return
+        pending = dict(_transport_stats_buffer)
+        _transport_stats_buffer.clear()
+        _last_transport_flush = time.time()
+
     with _lock:
-        conn = sqlite3.connect(DB_PATH)
+        conn = _connect()
         cursor = conn.cursor()
-        cursor.execute('''
-            INSERT INTO transport_stats (addr, msgs_sent, msgs_received, last_received_at)
-            VALUES (?, 0, 1, CAST(strftime('%s','now') AS INTEGER))
-            ON CONFLICT(addr) DO UPDATE SET
-                msgs_received = msgs_received + 1,
-                last_received_at = CAST(strftime('%s','now') AS INTEGER)
-        ''', (addr,))
+        for addr, counts in pending.items():
+            if not isinstance(addr, str) or "@" not in addr:
+                continue
+            sent = int(counts.get("sent", 0))
+            recv = int(counts.get("recv", 0))
+            last_s = counts.get("last_sent") or None
+            last_r = counts.get("last_recv") or None
+            cursor.execute('''
+                INSERT INTO transport_stats (addr, msgs_sent, msgs_received, last_sent_at, last_received_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(addr) DO UPDATE SET
+                    msgs_sent = msgs_sent + excluded.msgs_sent,
+                    msgs_received = msgs_received + excluded.msgs_received,
+                    last_sent_at = COALESCE(excluded.last_sent_at, transport_stats.last_sent_at),
+                    last_received_at = COALESCE(excluded.last_received_at, transport_stats.last_received_at)
+            ''', (addr, sent, recv, last_s, last_r))
         conn.commit()
         conn.close()
 
 def get_all_transport_stats() -> list[dict]:
+    flush_transport_stats()
     with _lock:
-        conn = sqlite3.connect(DB_PATH)
+        conn = _connect()
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM transport_stats ORDER BY msgs_sent + msgs_received DESC")
         rows = cursor.fetchall()
         conn.close()
         return [dict(r) for r in rows]
+
+def cleanup_old_records(retention_days: int = 90) -> dict[str, int]:
+    """Prune old downtime events, resolved incidents, and stale peer measurements."""
+    now = int(time.time())
+    cutoff = now - (retention_days * 86400)
+    cleaned = {}
+    with _lock:
+        conn = _connect()
+        cursor = conn.cursor()
+        
+        # 1. Prune resolved downtime events older than retention_days
+        cursor.execute("DELETE FROM downtime_events WHERE went_up_at IS NOT NULL AND went_up_at < ?", (cutoff,))
+        cleaned["downtime_events"] = cursor.rowcount
+        
+        # 2. Prune resolved incidents older than retention_days
+        cursor.execute("DELETE FROM incidents WHERE status = 'resolved' AND resolved_at < ?", (cutoff,))
+        cleaned["incidents"] = cursor.rowcount
+        
+        # 3. Prune old peer measurements (older than 7 days)
+        meas_cutoff = now - (7 * 86400)
+        cursor.execute("DELETE FROM peer_measurements WHERE last_checked < ?", (meas_cutoff,))
+        cleaned["peer_measurements"] = cursor.rowcount
+        
+        conn.commit()
+        conn.close()
+    return cleaned
 
 # Peer management functions
 def get_local_node_name() -> str:

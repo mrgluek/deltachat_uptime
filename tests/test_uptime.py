@@ -57,6 +57,8 @@ class TestUptimeBot(unittest.TestCase):
     def setUp(self):
         database.DB_PATH = TEST_DB
         database.init_db()
+        bot._chat_ping_anti_spam.clear()
+        database._transport_stats_buffer.clear()
 
     def tearDown(self):
         if os.path.exists(TEST_DB):
@@ -2398,6 +2400,109 @@ class TestUptimeBot(unittest.TestCase):
         self.assertIn('<a href="https://i.delta.chat/#test_invite_link"', res_idx.text)
         self.assertNotIn("__LINK_HTML__", res_idx.text)
         self.assertNotIn("__QR_HTML__", res_idx.text)
+
+    @patch('bot.run_single_check')
+    def test_ping_rate_limit_and_admin_bypass(self, mock_check):
+        mock_check.return_value = (True, "200 - OK", 42)
+        mock_bot = MagicMock()
+        mock_event = MagicMock()
+        mock_event.msg.chat_id = 9999
+        mock_event.msg.from_id = 8888
+        mock_event.payload = "https://example.com"
+
+        # 1. First ping succeeds
+        bot.ping_command(mock_bot, 1, mock_event)
+        args, _ = mock_bot.rpc.send_msg.call_args
+        self.assertIn("Target is UP", args[2].text)
+
+        # 2. Second ping within cooldown from non-admin gets rate-limited
+        bot.ping_command(mock_bot, 1, mock_event)
+        args, _ = mock_bot.rpc.send_msg.call_args
+        self.assertIn("Please wait", args[2].text)
+
+        # 3. Admin user bypasses cooldown
+        with patch('bot._is_dc_admin', return_value=True):
+            bot.ping_command(mock_bot, 1, mock_event)
+            args, _ = mock_bot.rpc.send_msg.call_args
+            self.assertIn("Target is UP", args[2].text)
+
+    def test_addtransport_group_chat_rejected(self):
+        mock_bot = MagicMock()
+        mock_event = MagicMock()
+        mock_event.msg.chat_id = 1234
+        mock_event.msg.from_id = 5678
+        mock_event.payload = "user@example.com secretpassword"
+
+        # Group chat rejects command
+        mock_bot.rpc.get_basic_chat_info.return_value = {"chat_type": "Group"}
+        with patch('bot._is_dc_admin', return_value=True):
+            bot.addtransport_command(mock_bot, 1, mock_event)
+            args, _ = mock_bot.rpc.send_msg.call_args
+            self.assertIn("can only be used in a private 1:1 chat", args[2].text)
+            mock_bot.rpc.add_or_update_transport.assert_not_called()
+
+        # Single chat succeeds
+        mock_bot.rpc.get_basic_chat_info.return_value = {"chat_type": "Single"}
+        with patch('bot._is_dc_admin', return_value=True):
+            bot.addtransport_command(mock_bot, 1, mock_event)
+            args, _ = mock_bot.rpc.send_msg.call_args
+            self.assertIn("Backup transport `user@example.com` added", args[2].text)
+            mock_bot.rpc.add_or_update_transport.assert_called_once()
+
+    def test_buffered_transport_stats(self):
+        addr1 = "t1@example.com"
+        addr2 = "t2@example.com"
+
+        # Buffer increments
+        database.increment_transport_sent(addr1)
+        database.increment_transport_sent(addr1)
+        database.increment_transport_received(addr1)
+        database.increment_transport_sent(addr2)
+
+        # Before flush, database query flushes automatically
+        stats = database.get_all_transport_stats()
+        stats_by_addr = {s["addr"]: s for s in stats}
+        self.assertEqual(stats_by_addr[addr1]["msgs_sent"], 2)
+        self.assertEqual(stats_by_addr[addr1]["msgs_received"], 1)
+        self.assertEqual(stats_by_addr[addr2]["msgs_sent"], 1)
+
+    def test_database_cleanup_old_records(self):
+        now = int(time.time())
+        old_ts = now - (95 * 86400)
+        recent_ts = now - (10 * 86400)
+
+        # 1. Old and recent downtime events & incidents
+        conn = database._connect()
+        c = conn.cursor()
+        c.execute("INSERT INTO downtime_events (resource_id, went_down_at, went_up_at) VALUES (1, ?, ?)", (old_ts, old_ts + 300))
+        c.execute("INSERT INTO downtime_events (resource_id, went_down_at, went_up_at) VALUES (1, ?, ?)", (recent_ts, recent_ts + 300))
+        c.execute("INSERT INTO incidents (dc_chat_id, status, started_at, resolved_at) VALUES (1, 'resolved', ?, ?)", (old_ts, old_ts + 500))
+        c.execute("INSERT INTO incidents (dc_chat_id, status, started_at) VALUES (2, 'ongoing', ?)", (old_ts,))
+        conn.commit()
+        conn.close()
+
+        # 2. Old and recent peer measurements
+        database.save_peer_measurement("https://peer.org", "Node-A", "up", 50, last_checked=old_ts)
+        database.save_peer_measurement("https://peer.org", "Node-B", "up", 50, last_checked=recent_ts)
+
+        # Run cleanup
+        pruned = database.cleanup_old_records(retention_days=90)
+        self.assertGreaterEqual(pruned["downtime_events"], 1)
+        self.assertGreaterEqual(pruned["peer_measurements"], 1)
+        self.assertGreaterEqual(pruned["incidents"], 1)
+
+        # Active incident must remain
+        incidents = database.get_all_active_incidents()
+        self.assertTrue(any(i["dc_chat_id"] == 2 for i in incidents))
+
+    def test_update_resource_status_with_latency(self):
+        res_id = database.add_resource(100, "https://latency-check.org", "Latency Test", "http", 60)
+        database.update_resource_status(res_id, "up", 0, None, latency_ms=88)
+
+        res = database.get_resource_by_id(res_id)
+        self.assertEqual(res["status"], "up")
+        self.assertEqual(res["last_latency_ms"], 88)
+        self.assertEqual(res["consecutive_failures"], 0)
 
 if __name__ == '__main__':
     unittest.main()

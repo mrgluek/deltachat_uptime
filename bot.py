@@ -23,7 +23,7 @@ import database
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "2.7.6"
+VERSION = "2.7.7"
 USER_AGENT = f"DeltaChat-Uptime-Bot/{VERSION} (https://git.gluek.info/gluek/deltachat_uptime)"
 
 dc_cli = BotCli("uptimebot")
@@ -728,7 +728,7 @@ async def notify_ssl_alert(resource, days_left: float, exp_date_str: str, alert_
         except Exception as e:
             logger.error(f"Failed to send SSL alert to chat {chat_id}: {e}")
 
-async def run_single_check(resource) -> tuple[bool, str, int | None]:
+async def run_single_check(resource, session=None) -> tuple[bool, str, int | None]:
     import http
     rtype = resource["type"]
     url = resource["url"]
@@ -738,53 +738,62 @@ async def run_single_check(resource) -> tuple[bool, str, int | None]:
     try:
         if rtype == "http":
             headers = {"User-Agent": USER_AGENT}
-            async with aiohttp.ClientSession(headers=headers, timeout=aiohttp.ClientTimeout(total=timeout)) as session:
-                async with session.get(url, allow_redirects=True) as resp:
-                    elapsed_ms = int((time.time() - start_time) * 1000)
+            req_timeout = aiohttp.ClientTimeout(total=timeout)
+
+            async def _process_resp(resp):
+                elapsed_ms = int((time.time() - start_time) * 1000)
+                try:
+                    phrase = http.HTTPStatus(resp.status).phrase
+                except ValueError:
+                    phrase = "Unknown Status"
+                details = f"{resp.status} - {phrase}"
+                if 200 <= resp.status < 400:
+                    # Read body up to 256KB
                     try:
-                        phrase = http.HTTPStatus(resp.status).phrase
-                    except ValueError:
-                        phrase = "Unknown Status"
-                    details = f"{resp.status} - {phrase}"
-                    if 200 <= resp.status < 400:
-                        # Read body up to 256KB
+                        body_bytes = await resp.content.read(262144)
+                        charset = 'utf-8'
+                        content_type = resp.headers.get('Content-Type', '')
+                        charset_match = re.search(r'charset=([\w-]+)', content_type, re.IGNORECASE)
+                        if charset_match:
+                            charset = charset_match.group(1)
                         try:
-                            body_bytes = await resp.content.read(262144)
-                            charset = 'utf-8'
-                            content_type = resp.headers.get('Content-Type', '')
-                            charset_match = re.search(r'charset=([\w-]+)', content_type, re.IGNORECASE)
-                            if charset_match:
-                                charset = charset_match.group(1)
-                            try:
-                                body_text = body_bytes.decode(charset, errors='ignore')
-                            except Exception:
-                                body_text = body_bytes.decode('utf-8', errors='ignore')
-                        except Exception as read_ex:
-                            logger.warning(f"Failed to read body for {url}: {read_ex}")
-                            body_text = ""
+                            body_text = body_bytes.decode(charset, errors='ignore')
+                        except Exception:
+                            body_text = body_bytes.decode('utf-8', errors='ignore')
+                    except Exception as read_ex:
+                        logger.warning(f"Failed to read body for {url}: {read_ex}")
+                        body_text = ""
 
-                        # 1. Custom Keyword assertion if configured
-                        expected_kw = (resource.get("expected_keyword") or "").strip()
-                        if expected_kw:
-                            if expected_kw.lower() not in body_text.lower():
-                                return False, f"200 OK (Missing keyword: \"{expected_kw}\")", elapsed_ms
-                        else:
-                            # 2. Background Auto-detection of hidden server error pages in 200 OK
-                            body_lower = body_text.lower()
-                            if "error establishing a database connection" in body_lower:
-                                return False, "200 OK (Database connection error detected)", elapsed_ms
-                            if "database connection failed" in body_lower and len(body_text) < 16384:
-                                return False, "200 OK (Database connection failed detected)", elapsed_ms
-                            title_match = re.search(r'<title>(.*?)</title>', body_text, re.IGNORECASE | re.DOTALL)
-                            if title_match:
-                                title_text = title_match.group(1).strip().lower()
-                                for err_pat in ("502 bad gateway", "503 service unavailable", "504 gateway time-out", "database error", "error 521", "error 522", "error 523", "error 524"):
-                                    if err_pat in title_text:
-                                        return False, f"200 OK (Error in title: \"{err_pat.title()}\")", elapsed_ms
-
-                        return True, details, elapsed_ms
+                    # 1. Custom Keyword assertion if configured
+                    expected_kw = (resource.get("expected_keyword") or "").strip()
+                    if expected_kw:
+                        if expected_kw.lower() not in body_text.lower():
+                            return False, f"200 OK (Missing keyword: \"{expected_kw}\")", elapsed_ms
                     else:
-                        return False, details, elapsed_ms
+                        # 2. Background Auto-detection of hidden server error pages in 200 OK
+                        body_lower = body_text.lower()
+                        if "error establishing a database connection" in body_lower:
+                            return False, "200 OK (Database connection error detected)", elapsed_ms
+                        if "database connection failed" in body_lower and len(body_text) < 16384:
+                            return False, "200 OK (Database connection failed detected)", elapsed_ms
+                        title_match = re.search(r'<title>(.*?)</title>', body_text, re.IGNORECASE | re.DOTALL)
+                        if title_match:
+                            title_text = title_match.group(1).strip().lower()
+                            for err_pat in ("502 bad gateway", "503 service unavailable", "504 gateway time-out", "database error", "error 521", "error 522", "error 523", "error 524"):
+                                if err_pat in title_text:
+                                    return False, f"200 OK (Error in title: \"{err_pat.title()}\")", elapsed_ms
+
+                    return True, details, elapsed_ms
+                else:
+                    return False, details, elapsed_ms
+
+            if session is not None and not getattr(session, "closed", False):
+                async with session.get(url, allow_redirects=True, timeout=req_timeout) as resp:
+                    return await _process_resp(resp)
+            else:
+                async with aiohttp.ClientSession(headers=headers, timeout=req_timeout) as local_session:
+                    async with local_session.get(url, allow_redirects=True) as resp:
+                        return await _process_resp(resp)
         elif rtype == "tcp":
             parts = url.rsplit(":", 1)
             host, port = parts[0], int(parts[1])
@@ -822,11 +831,11 @@ async def run_single_check(resource) -> tuple[bool, str, int | None]:
         return False, str(e), elapsed_ms
     return False, "Unknown error", None
 
-async def check_group_task(group, semaphore):
+async def check_group_task(group, semaphore, session=None):
     rep = group[0]
     async with semaphore:
         if rep.get("is_probe_only"):
-            res = await run_single_check(rep)
+            res = await run_single_check(rep, session=session)
             if len(res) == 3:
                 is_up, error_msg, latency_ms = res
             else:
@@ -838,7 +847,7 @@ async def check_group_task(group, semaphore):
             await asyncio.to_thread(database.save_peer_measurement, rep["url"], local_node, status_str, latency_ms, error_msg)
             return
 
-        res = await run_single_check(rep)
+        res = await run_single_check(rep, session=session)
         if len(res) == 3:
             is_up, error_msg, latency_ms = res
         else:
@@ -852,7 +861,7 @@ async def check_group_task(group, semaphore):
                     if r["status"] != "down":
                         logger.info(f"Retry {retry}/2 for resource {r['id']} ({r['name'] or r['url']}) in chat {r['dc_chat_id']}")
                 await asyncio.sleep(30)
-                res = await run_single_check(rep)
+                res = await run_single_check(rep, session=session)
                 if len(res) == 3:
                     is_up, error_msg, latency_ms = res
                 else:
@@ -889,11 +898,10 @@ async def check_group_task(group, semaphore):
                     
         for r in group:
             if latency_ms is not None:
-                await asyncio.to_thread(database.update_resource_latency, r["id"], latency_ms)
                 r["last_latency_ms"] = latency_ms
                 
             logger.info(f"Check result: {r['name'] or r['url']} (id: {r['id']}) in chat {r['dc_chat_id']} -> {'UP' if is_up else 'DOWN'} ({error_msg})")
-            await handle_check_result(r, is_up, error_msg)
+            await handle_check_result(r, is_up, error_msg, latency_ms=latency_ms)
 
         # Save local node measurement for dashboard and telemetry sync
         local_node = database.get_local_node_name()
@@ -1299,21 +1307,21 @@ async def check_stale_downtime_notifications(resource, now: int):
             logger.error(f"Failed to send 7d notice message to chat {dc_chat_id}: {ex}")
 
 
-async def handle_check_result(resource, is_up, error_msg):
+async def handle_check_result(resource, is_up, error_msg, latency_ms=None):
     now = int(time.time())
     m_until = resource.get("maintenance_until") or 0
     in_maintenance = (now < m_until)
 
     if in_maintenance:
         # Resource is in maintenance window. Suppress failure transitions and incident creation.
-        await asyncio.to_thread(database.update_resource_status, resource["id"], resource["status"], 0, error_msg)
+        await asyncio.to_thread(database.update_resource_status, resource["id"], resource["status"], 0, error_msg, latency_ms)
         return
 
     status = "up" if is_up else "down"
     old_status = resource["status"]
     
     failures = 0 if is_up else (resource["consecutive_failures"] + 1)
-    await asyncio.to_thread(database.update_resource_status, resource["id"], status, failures, error_msg)
+    await asyncio.to_thread(database.update_resource_status, resource["id"], status, failures, error_msg, latency_ms)
     
     should_sync = False
     if old_status != status:
@@ -1327,9 +1335,9 @@ async def handle_check_result(resource, is_up, error_msg):
     if not is_up:
         await check_stale_downtime_notifications(resource, now)
 
-async def run_and_track_group(group, semaphore):
+async def run_and_track_group(group, semaphore, session=None):
     try:
-        await check_group_task(group, semaphore)
+        await check_group_task(group, semaphore, session=session)
     finally:
         async with running_lock:
             for r in group:
@@ -1343,116 +1351,131 @@ async def monitoring_scheduler_loop():
     semaphore = asyncio.Semaphore(50)
     _last_peer_audit = 0
     _last_incident_audit = 0
-    while True:
-        try:
-            # If host network outage was detected, verify connectivity before launching checks
-            if _host_outage_active:
-                is_online = await check_host_internet_connectivity(timeout=2.0, max_age=0.0)
-                if not is_online:
-                    logger.warning("Host network outage is still active. Pausing monitoring checks for 10 seconds...")
-                    await asyncio.sleep(10)
-                    continue
-
-            now = int(time.time())
-
-            # Cached DB reads with TTL to reduce full-table scan frequency
-            cache = _scheduler_cache
-            if cache["resources"] is None or now - cache["resources_ts"] >= cache["ttl"]:
-                cache["resources"] = await asyncio.to_thread(database.get_all_resources)
-                cache["resources_ts"] = now
-            if cache["probe_targets"] is None or now - cache["probe_targets_ts"] >= cache["ttl"]:
-                cache["probe_targets"] = await asyncio.to_thread(database.get_active_probe_targets)
-                cache["probe_targets_ts"] = now
-
-            resources = cache["resources"]
-            probe_targets = cache["probe_targets"]
-            
-            # Group due resources by (type, url)
-            due_groups = collections.defaultdict(list)
-            seen_urls = set()
-            async with running_lock:
-                for r in resources:
-                    r_id = r["id"]
-                    if r_id in running_resource_ids:
+    _last_cleanup = 0
+    _last_transport_flush = 0
+    connector = aiohttp.TCPConnector(limit=100)
+    async with aiohttp.ClientSession(connector=connector, headers={"User-Agent": USER_AGENT}) as shared_session:
+        while True:
+            try:
+                # If host network outage was detected, verify connectivity before launching checks
+                if _host_outage_active:
+                    is_online = await check_host_internet_connectivity(timeout=2.0, max_age=0.0)
+                    if not is_online:
+                        logger.warning("Host network outage is still active. Pausing monitoring checks for 10 seconds...")
+                        await asyncio.sleep(10)
                         continue
+
+                now = int(time.time())
+
+                # Cached DB reads with TTL to reduce full-table scan frequency
+                cache = _scheduler_cache
+                if cache["resources"] is None or now - cache["resources_ts"] >= cache["ttl"]:
+                    cache["resources"] = await asyncio.to_thread(database.get_all_resources)
+                    cache["resources_ts"] = now
+                if cache["probe_targets"] is None or now - cache["probe_targets_ts"] >= cache["ttl"]:
+                    cache["probe_targets"] = await asyncio.to_thread(database.get_active_probe_targets)
+                    cache["probe_targets_ts"] = now
+
+                resources = cache["resources"]
+                probe_targets = cache["probe_targets"]
+                
+                # Group due resources by (type, url)
+                due_groups = collections.defaultdict(list)
+                seen_urls = set()
+                async with running_lock:
+                    for r in resources:
+                        r_id = r["id"]
+                        if r_id in running_resource_ids:
+                            continue
+                            
+                        last_checked = r["last_checked"] or 0
+                        interval = r["interval"] or 60
                         
-                    last_checked = r["last_checked"] or 0
-                    interval = r["interval"] or 60
+                        if now - last_checked >= interval:
+                            running_resource_ids.add(r_id)
+                            target_key = (r["type"], r["url"])
+                            due_groups[target_key].append(r)
+                            seen_urls.add(r["url"])
+                        else:
+                            seen_urls.add(r["url"])
+
+                    # Add probe-only targets mirrored from peers if not already checked by local chats
+                    for pt in probe_targets:
+                        pt_url = pt.get("url")
+                        if not pt_url or pt_url in seen_urls:
+                            continue
+                        pt_key = f"probe_{pt_url}"
+                        if pt_key in running_resource_ids:
+                            continue
+                        last_checked = pt.get("last_checked") or 0
+                        if now - last_checked >= 60:
+                            running_resource_ids.add(pt_key)
+                            probe_rep = {
+                                "id": pt_key,
+                                "dc_chat_id": 0,
+                                "url": pt_url,
+                                "name": pt.get("name") or pt_url,
+                                "type": pt.get("type") or "http",
+                                "expected_keyword": pt.get("expected_keyword"),
+                                "status": pt.get("last_status") or "unknown",
+                                "is_probe_only": True
+                            }
+                            due_groups[(probe_rep["type"], pt_url)].append(probe_rep)
+                
+                tasks = []
+                for target_key, group in due_groups.items():
+                    for r in group:
+                        if isinstance(r.get("id"), int):
+                            r["last_checked"] = now
+                    tasks.append(run_and_track_group(group, semaphore, session=shared_session))
                     
-                    if now - last_checked >= interval:
-                        running_resource_ids.add(r_id)
-                        target_key = (r["type"], r["url"])
-                        due_groups[target_key].append(r)
-                        seen_urls.add(r["url"])
-                    else:
-                        seen_urls.add(r["url"])
+                if tasks:
+                    logger.info(f"Triggering {len(tasks)} target checks (encompassing {sum(len(g) for g in due_groups.values())} resources)...")
+                    asyncio.create_task(run_checks_parallel(tasks))
+                    
+                # Periodically broadcast telemetry to configured peers (every 2 minutes)
+                global last_peer_telemetry_broadcast
+                if now - last_peer_telemetry_broadcast >= 120:
+                    last_peer_telemetry_broadcast = now
+                    asyncio.create_task(broadcast_telemetry_to_peers())
 
-                # Add probe-only targets mirrored from peers if not already checked by local chats
-                for pt in probe_targets:
-                    pt_url = pt.get("url")
-                    if not pt_url or pt_url in seen_urls:
-                        continue
-                    pt_key = f"probe_{pt_url}"
-                    if pt_key in running_resource_ids:
-                        continue
-                    last_checked = pt.get("last_checked") or 0
-                    if now - last_checked >= 60:
-                        running_resource_ids.add(pt_key)
-                        probe_rep = {
-                            "id": pt_key,
-                            "dc_chat_id": 0,
-                            "url": pt_url,
-                            "name": pt.get("name") or pt_url,
-                            "type": pt.get("type") or "http",
-                            "expected_keyword": pt.get("expected_keyword"),
-                            "status": pt.get("last_status") or "unknown",
-                            "is_probe_only": True
-                        }
-                        due_groups[(probe_rep["type"], pt_url)].append(probe_rep)
-            
-            tasks = []
-            for target_key, group in due_groups.items():
-                tasks.append(run_and_track_group(group, semaphore))
+                # Audit incidents and peer liveness every 30 seconds (not every 5s)
+                if now - _last_incident_audit >= 30:
+                    _last_incident_audit = now
+                    active_incidents = await asyncio.to_thread(database.get_all_active_incidents)
+                    for inc in active_incidents:
+                        asyncio.create_task(sync_chat_incident_state(inc["dc_chat_id"]))
+
+                if now - _last_peer_audit >= 30:
+                    _last_peer_audit = now
+                    newly_offline_peers = await asyncio.to_thread(database.audit_peers_offline, 360)
+                    for p in newly_offline_peers:
+                        p_node = p.get("node_name") or "Remote"
+                        p_email = p.get("email")
+                        diff_secs = max(1, now - (p.get("last_seen") or now))
+                        diff_str = format_duration(diff_secs)
+                        alert_txt = (
+                            f"🚨 **Monitoring Probe Offline Alert**\n"
+                            f"Probe Node: 🛰️ **{p_node}** (`{p_email}`)\n"
+                            f"Last seen: `{diff_str} ago`\n\n"
+                            f"⚠️ This probe is no longer responding or sending telemetry. Distributed cross-checks and multi-region metrics for this node are paused."
+                        )
+                        asyncio.create_task(send_admin_notification(alert_txt))
+
+                # Periodic database cleanup (every 24 hours)
+                if now - _last_cleanup >= 86400:
+                    _last_cleanup = now
+                    await asyncio.to_thread(database.cleanup_old_records, 90)
+
+                # Periodic transport stats flush (every 10 seconds)
+                if now - _last_transport_flush >= 10:
+                    _last_transport_flush = now
+                    await asyncio.to_thread(database.flush_transport_stats)
+
+            except Exception as e:
+                logger.error(f"Error in monitoring scheduler loop: {e}")
                 
-            if tasks:
-                logger.info(f"Triggering {len(tasks)} target checks (encompassing {sum(len(g) for g in due_groups.values())} resources)...")
-                asyncio.create_task(run_checks_parallel(tasks))
-                # Invalidate resource cache after launching checks so next iteration picks up updated last_checked
-                cache["resources"] = None
-                
-            # Periodically broadcast telemetry to configured peers (every 2 minutes)
-            global last_peer_telemetry_broadcast
-            if now - last_peer_telemetry_broadcast >= 120:
-                last_peer_telemetry_broadcast = now
-                asyncio.create_task(broadcast_telemetry_to_peers())
-
-            # Audit incidents and peer liveness every 30 seconds (not every 5s)
-            if now - _last_incident_audit >= 30:
-                _last_incident_audit = now
-                active_incidents = await asyncio.to_thread(database.get_all_active_incidents)
-                for inc in active_incidents:
-                    asyncio.create_task(sync_chat_incident_state(inc["dc_chat_id"]))
-
-            if now - _last_peer_audit >= 30:
-                _last_peer_audit = now
-                newly_offline_peers = await asyncio.to_thread(database.audit_peers_offline, 360)
-                for p in newly_offline_peers:
-                    p_node = p.get("node_name") or "Remote"
-                    p_email = p.get("email")
-                    diff_secs = max(1, now - (p.get("last_seen") or now))
-                    diff_str = format_duration(diff_secs)
-                    alert_txt = (
-                        f"🚨 **Monitoring Probe Offline Alert**\n"
-                        f"Probe Node: 🛰️ **{p_node}** (`{p_email}`)\n"
-                        f"Last seen: `{diff_str} ago`\n\n"
-                        f"⚠️ This probe is no longer responding or sending telemetry. Distributed cross-checks and multi-region metrics for this node are paused."
-                    )
-                    asyncio.create_task(send_admin_notification(alert_txt))
-
-        except Exception as e:
-            logger.error(f"Error in monitoring scheduler loop: {e}")
-            
-        await asyncio.sleep(5)
+            await asyncio.sleep(5)
 
 # Web Server handling and dashboard HTML templates
 def get_dashboard_html(chat_name, resources, overall_uptime, incidents=None) -> str:
@@ -2728,6 +2751,9 @@ def parse_duration_string(s: str) -> int | None:
         return val * 86400
     return val * 60
 
+_chat_ping_anti_spam: dict[int, float] = {}
+PING_COOLDOWN_SECONDS = 15
+
 @dc_cli.on(events.NewMessage(command="/ping"))
 @dc_cli.on(events.NewMessage(command="/check"))
 @dc_cli.on(events.NewMessage(command="/test"))
@@ -2778,6 +2804,21 @@ def ping_command(bot, accid, event):
             text=f"❌ Keyword assertions are only supported for HTTP/HTTPS targets.\nTarget `{validated_url}` is type `{check_type.upper()}`."
         ))
         return
+
+    now = time.time()
+    if not _is_dc_admin(bot, accid, msg.from_id):
+        last_ping = _chat_ping_anti_spam.get(msg.chat_id, 0.0)
+        if now - last_ping < PING_COOLDOWN_SECONDS:
+            remaining = int(PING_COOLDOWN_SECONDS - (now - last_ping)) + 1
+            _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(
+                text=f"⏳ Please wait {remaining}s before running another diagnostic check."
+            ))
+            return
+        _chat_ping_anti_spam[msg.chat_id] = now
+        if len(_chat_ping_anti_spam) > 1000:
+            expired = [k for k, v in _chat_ping_anti_spam.items() if now - v > 300]
+            for k in expired:
+                _chat_ping_anti_spam.pop(k, None)
 
     _react(bot, accid, getattr(msg, "id", None), "⏳")
 
@@ -3599,7 +3640,8 @@ def rmaccount_command(bot, accid, event):
         bot.rpc.remove_account(target_id)
         _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=f"✅ Account `{target_id}` deleted."))
     except Exception as e:
-        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=f"❌ Failed to delete account: {e}"))
+        logger.error(f"Failed to delete account: {e}")
+        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text="❌ Failed to delete account. Check server logs for details."))
 
 @dc_cli.on(events.NewMessage(command="/transports"))
 def transports_command(bot, accid, event):
@@ -3700,6 +3742,13 @@ def addtransport_command(bot, accid, event):
         _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text="❌ This command is only for the administrator."))
         return
 
+    chat_info = bot.rpc.get_basic_chat_info(accid, msg.chat_id)
+    if not is_single_chat(chat_info):
+        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(
+            text="⚠️ For security, `/addtransport` can only be used in a private 1:1 chat with the bot to protect your credentials."
+        ))
+        return
+
     payload = event.payload.strip()
     if not payload:
         _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(
@@ -3725,7 +3774,8 @@ def addtransport_command(bot, accid, event):
             bot.rpc.add_or_update_transport(accid, {"addr": addr, "password": password})
             _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=f"✅ Backup transport `{addr}` added."))
     except Exception as e:
-        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=f"❌ Failed to add transport: {e}"))
+        logger.error(f"Failed to add transport: {e}")
+        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text="❌ Failed to add transport. Check server logs for details."))
 
 @dc_cli.on(events.NewMessage(command="/rmtransport"))
 def rmtransport_command(bot, accid, event):
@@ -3752,7 +3802,8 @@ def rmtransport_command(bot, accid, event):
         bot.rpc.delete_transport(accid, addr)
         _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=f"✅ Transport `{addr}` removed."))
     except Exception as e:
-        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=f"❌ Failed to remove transport: {e}"))
+        logger.error(f"Failed to remove transport: {e}")
+        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text="❌ Failed to remove transport. Check server logs for details."))
 
 @dc_cli.on(events.NewMessage(command="/setprimary"))
 def setprimary_command(bot, accid, event):
@@ -3776,7 +3827,8 @@ def setprimary_command(bot, accid, event):
         bot.rpc.set_config(accid, "configured_addr", addr)
         _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=f"✅ Primary SMTP transport switched to `{addr}`."))
     except Exception as e:
-        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=f"❌ Failed to set primary transport: {e}"))
+        logger.error(f"Failed to set primary transport: {e}")
+        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text="❌ Failed to set primary transport. Check server logs for details."))
 
 @dc_cli.on(events.NewMessage(command="/resilient"))
 def resilient_command(bot, accid, event):
@@ -3803,7 +3855,8 @@ def resilient_command(bot, accid, event):
         else:
             _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text="❌ Invalid argument. Use '/resilient on', '/resilient off', or '/resilient' to get status."))
     except Exception as e:
-        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=f"❌ Failed to update resilient mode: {e}"))
+        logger.error(f"Failed to update resilient mode: {e}")
+        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text="❌ Failed to update resilient mode. Check server logs for details."))
 
 def _get_self_addr(bot, accid) -> str:
     try:
@@ -3907,7 +3960,8 @@ def invitepeer_command(bot, accid, event):
         )
         _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=reply))
     except Exception as e:
-        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=f"❌ Failed to generate invite link: {e}"))
+        logger.error(f"Failed to generate invite link: {e}")
+        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text="❌ Failed to generate invite link. Check server logs for details."))
 
 @dc_cli.on(events.NewMessage(command="/addpeer"))
 def addpeer_command(bot, accid, event):
@@ -3975,7 +4029,8 @@ def addpeer_command(bot, accid, event):
                 text=f"✅ SecureJoin E2EE established with **{node_name}** (`{peer_email}`).\nChat ID: `{chat_id}`."
             ))
         except Exception as e:
-            _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=f"❌ Failed to process SecureJoin invite: {e}"))
+            logger.error(f"Failed to process SecureJoin invite: {e}")
+            _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text="❌ Failed to process SecureJoin invite. Check server logs for details."))
         return
         
     # Email address flow
@@ -4003,7 +4058,8 @@ def addpeer_command(bot, accid, event):
                  f"💡 _Note: If your provider requires strict E2EE (e.g. chatmail), generate an invite on the other bot with `/invitepeer` and add it via `/addpeer <link>`._"
         ))
     except Exception as e:
-        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=f"❌ Failed to add peer: {e}"))
+        logger.error(f"Failed to add peer: {e}")
+        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text="❌ Failed to add peer. Check server logs for details."))
 
 @dc_cli.on(events.NewMessage(command="/rmpeer"))
 def rmpeer_command(bot, accid, event):
@@ -4110,7 +4166,8 @@ def _setup_resilient_mode(bot):
 
         # 1. Send the message normally via the current primary transport (non-blocking queueing)
         try:
-            msg_id = original_send_msg(account_id, chat_id, msg_data)
+            with resilient_lock:
+                msg_id = original_send_msg(account_id, chat_id, msg_data)
             bot.logger.info(f"Resilient send: initial msg queued with ID {msg_id} on transport {initial_addr}.")
         except Exception as send_err:
             bot.logger.error(f"Resilient send: failed to queue initial message: {send_err}")

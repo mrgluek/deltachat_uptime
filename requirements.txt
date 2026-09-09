@@ -4,3 +4,5 @@ aiohttp
 qrcode[pil]
 emoji
 appdirs
+aiodns
+aioping

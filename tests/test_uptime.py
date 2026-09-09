@@ -2553,6 +2553,177 @@ class TestUptimeBot(unittest.TestCase):
 
         asyncio.run(run_probe_test())
 
+    def test_run_single_check_head_first_success(self):
+        """When expected_keyword is None, run_single_check uses HEAD first and avoids GET / body download."""
+        mock_head_resp = MagicMock()
+        mock_head_resp.status = 200
+
+        class MockSession:
+            def __init__(self):
+                self.head_called = False
+                self.get_called = False
+
+            def head(self, url, **kwargs):
+                self.head_called = True
+                class Ctx:
+                    async def __aenter__(self):
+                        return mock_head_resp
+                    async def __aexit__(self, *args):
+                        pass
+                return Ctx()
+
+            def get(self, url, **kwargs):
+                self.get_called = True
+                raise AssertionError("GET should not be called when HEAD succeeds with 200")
+
+        sess = MockSession()
+        res = {"type": "http", "url": "https://head-first.org", "expected_keyword": None}
+        is_up, details, lat = asyncio.run(bot.run_single_check(res, session=sess))
+        self.assertTrue(is_up)
+        self.assertIn("200 - OK", details)
+        self.assertTrue(sess.head_called)
+        self.assertFalse(sess.get_called)
+
+    def test_run_single_check_head_fallback_to_get_on_405(self):
+        """When HEAD returns 405 Method Not Allowed, fallback to GET and read max 16KB."""
+        mock_head_resp = MagicMock()
+        mock_head_resp.status = 405
+
+        mock_get_resp = MagicMock()
+        mock_get_resp.status = 200
+        mock_get_resp.headers = {"Content-Type": "text/html"}
+        read_args = []
+        async def mock_read(n=None):
+            read_args.append(n)
+            return b"<html><head><title>Welcome</title></head><body>All good</body></html>"
+        mock_get_resp.content.read = mock_read
+
+        class MockSession:
+            def head(self, url, **kwargs):
+                class Ctx:
+                    async def __aenter__(self):
+                        return mock_head_resp
+                    async def __aexit__(self, *args):
+                        pass
+                return Ctx()
+
+            def get(self, url, **kwargs):
+                class Ctx:
+                    async def __aenter__(self):
+                        return mock_get_resp
+                    async def __aexit__(self, *args):
+                        pass
+                return Ctx()
+
+        sess = MockSession()
+        res = {"type": "http", "url": "https://fallback-405.org", "expected_keyword": None}
+        is_up, details, lat = asyncio.run(bot.run_single_check(res, session=sess))
+        self.assertTrue(is_up)
+        self.assertIn("200 - OK", details)
+        self.assertEqual(read_args, [16384])  # Max 16 KB read on GET fallback
+
+    def test_run_single_check_keyword_reads_up_to_128kb(self):
+        """When expected_keyword is set, HEAD is skipped and GET reads up to 128KB."""
+        mock_get_resp = MagicMock()
+        mock_get_resp.status = 200
+        mock_get_resp.headers = {"Content-Type": "text/html"}
+        read_args = []
+        async def mock_read(n=None):
+            read_args.append(n)
+            return b"<html><body>Status: System OK</body></html>"
+        mock_get_resp.content.read = mock_read
+
+        class MockSession:
+            def head(self, url, **kwargs):
+                raise AssertionError("HEAD must not be called when expected_keyword is set")
+
+            def get(self, url, **kwargs):
+                class Ctx:
+                    async def __aenter__(self):
+                        return mock_get_resp
+                    async def __aexit__(self, *args):
+                        pass
+                return Ctx()
+
+        sess = MockSession()
+        res = {"type": "http", "url": "https://kw-test.org", "expected_keyword": "System OK"}
+        is_up, details, lat = asyncio.run(bot.run_single_check(res, session=sess))
+        self.assertTrue(is_up)
+        self.assertIn("200 - OK", details)
+        self.assertEqual(read_args, [131072])  # Max 128 KB read
+
+    def test_fetch_html_title_16kb_limit(self):
+        """fetch_html_title must read at most 16384 bytes."""
+        read_args = []
+        class MockHttpResponse:
+            headers = {"Content-Type": "text/html"}
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                pass
+            def read(self, n=None):
+                read_args.append(n)
+                return b"<html><head><title>My 16KB Site</title></head><body>Content</body></html>"
+
+        with patch('urllib.request.urlopen', return_value=MockHttpResponse()):
+            title = bot.fetch_html_title("https://title-test.org")
+            self.assertEqual(title, "My 16KB Site")
+            self.assertEqual(read_args, [16384])
+
+    def test_run_single_check_ping_with_aioping(self):
+        """Native ICMP ping via aioping returns latency directly without spawning subprocess."""
+        mock_aioping = MagicMock()
+        mock_aioping.ping = unittest.mock.AsyncMock(return_value=0.024)
+
+        orig_aioping = bot.aioping
+        bot.aioping = mock_aioping
+        try:
+            with patch('asyncio.create_subprocess_exec') as mock_subproc:
+                res = {"type": "ping", "url": "ping-host.com"}
+                is_up, details, lat = asyncio.run(bot.run_single_check(res))
+                self.assertTrue(is_up)
+                self.assertEqual(lat, 24)
+                self.assertEqual(details, "24 ms")
+                mock_subproc.assert_not_called()
+        finally:
+            bot.aioping = orig_aioping
+
+    def test_run_single_check_ping_aioping_fallback_on_oserror(self):
+        """When aioping encounters raw socket permission error, fall back gracefully to subprocess ping."""
+        mock_aioping = MagicMock()
+        mock_aioping.ping = unittest.mock.AsyncMock(side_effect=PermissionError("Operation not permitted"))
+
+        mock_proc = MagicMock()
+        mock_proc.returncode = 0
+        mock_proc.wait = unittest.mock.AsyncMock(return_value=0)
+
+        orig_aioping = bot.aioping
+        bot.aioping = mock_aioping
+        try:
+            with patch('asyncio.create_subprocess_exec', unittest.mock.AsyncMock(return_value=mock_proc)) as mock_subproc:
+                res = {"type": "ping", "url": "ping-fallback.com"}
+                is_up, details, lat = asyncio.run(bot.run_single_check(res))
+                self.assertTrue(is_up)
+                self.assertIn("ms", details)
+                mock_subproc.assert_called_once()
+        finally:
+            bot.aioping = orig_aioping
+
+    def test_deterministic_slot_staggering(self):
+        """Verify deterministic slot distribution across 60s cycle."""
+        interval = 60
+        slots = [((r_id * 11) % interval) for r_id in range(1, 61)]
+        # Since gcd(11, 60) == 1, all 60 distinct slots must be hit
+        self.assertEqual(len(set(slots)), 60)
+        # Verify even distribution across twelve 5-second buckets (0..11)
+        bucket_counts = {}
+        for s in slots:
+            b = s // 5
+            bucket_counts[b] = bucket_counts.get(b, 0) + 1
+        for b in range(12):
+            self.assertEqual(bucket_counts[b], 5, f"Bucket {b} should have exactly 5 slots")
+
+
 if __name__ == '__main__':
     unittest.main()
 

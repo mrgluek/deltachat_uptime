@@ -43,8 +43,13 @@ Additionally, it automatically generates a secure, beautiful web status dashboar
   - **Zero Group Spam:** All protocol handshakes, background telemetry, and instant cross-checks happen in private DMs between bots.
   - **Cross-Probe Verification:** Outages are verified across remote probes in real-time before alerting, distinguishing global downtime from regional/routing reachability issues.
   - **Aggregated Web Dashboard:** Web status pages show latency and status badges for all active probe locations (`[📍 Frankfurt-DE: 18ms] [🛰️ RU-Moscow: 45ms]`).
-- 🤖 **Identified User-Agent:** Sends a custom `User-Agent` header (e.g. `DeltaChat-Uptime-Bot/2.8.0 (https://git.gluek.info/gluek/deltachat_uptime)`) during HTTP checks so server administrators can easily identify monitoring requests in server logs.
+- 🤖 **Identified User-Agent:** Sends a custom `User-Agent` header (e.g. `DeltaChat-Uptime-Bot/2.9.0 (https://git.gluek.info/gluek/deltachat_uptime)`) during HTTP checks so server administrators can easily identify monitoring requests in server logs.
 - 🚀 **High-Concurrency Scaling Architecture:**
+  - **Two-Tier HTTP Probing (`HEAD` -> `GET`):** Zero body download (0 bytes) and 0 CPU decoding for standard HTTP checks via `HEAD`, with automatic 16 KB `GET` fallback on 405 or errors, and 128 KB limit for keyword assertions.
+  - **Async DNS Resolution & 5m TTL Cache:** `aiodns` (`AsyncResolver`) support with 300s TTL cache prevents blocking DNS lookups and reduces repeated nameserver queries.
+  - **Native Async ICMP Ping (`aioping`):** Native in-process raw socket pinging eliminates subprocess creation overhead, with automatic fallback to `/bin/ping` if raw socket permissions are restricted.
+  - **Deterministic Time Slot Staggering:** Uniform phase slotting (`(r_id * 11) % interval`) spreads checks across 5-second windows, preventing thundering-herd spikes on startup and interval boundaries.
+  - **Lock-Free SQLite WAL Concurrent Reads:** Dedicated `_write_lock` protects write transactions while enabling concurrent lock-free reads for web dashboards and chat status commands.
   - **Non-Blocking Semaphore:** Concurrency semaphore slots are held exclusively for the milliseconds of network probes; retry backoffs (30s) and remote peer checks execute asynchronously without starving healthy checks.
   - **Dedicated Thread Pools:** Separate thread executors for database queries (`uptime_db`) and Delta Chat JSON-RPC / SMTP calls (`uptime_rpc`) prevent slow email delivery from stalling database operations.
   - **Single-Query Batch Metrics & In-Memory TTL Cache:** Single SQL batch queries and 60-second TTL caching eliminate N+1 queries across web status pages, `/list`, and `/status`.

@@ -18,13 +18,23 @@ from aiohttp import web
 from deltachat2 import events, MsgData
 from deltabot_cli import BotCli
 
+try:
+    import aiodns
+except ImportError:
+    aiodns = None
+
+try:
+    import aioping
+except ImportError:
+    aioping = None
+
 import concurrent.futures
 import database
 
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "2.8.0"
+VERSION = "2.9.0"
 USER_AGENT = f"DeltaChat-Uptime-Bot/{VERSION} (https://git.gluek.info/gluek/deltachat_uptime)"
 
 # Dedicated thread pools for database operations and Delta Chat RPC calls
@@ -760,61 +770,86 @@ async def run_single_check(resource, session=None) -> tuple[bool, str, int | Non
         if rtype == "http":
             headers = {"User-Agent": USER_AGENT}
             req_timeout = aiohttp.ClientTimeout(total=timeout)
+            expected_kw = (resource.get("expected_keyword") or "").strip()
 
-            async def _process_resp(resp):
-                elapsed_ms = int((time.time() - start_time) * 1000)
-                try:
-                    phrase = http.HTTPStatus(resp.status).phrase
-                except ValueError:
-                    phrase = "Unknown Status"
-                details = f"{resp.status} - {phrase}"
-                if 200 <= resp.status < 400:
-                    # Read body up to 256KB
+            async def _do_get(sess, max_bytes: int, is_local: bool):
+                get_kwargs = {"allow_redirects": True}
+                if not is_local:
+                    get_kwargs["timeout"] = req_timeout
+                async with sess.get(url, **get_kwargs) as resp:
+                    elapsed_ms = int((time.time() - start_time) * 1000)
                     try:
-                        body_bytes = await resp.content.read(262144)
-                        charset = 'utf-8'
-                        content_type = resp.headers.get('Content-Type', '')
-                        charset_match = re.search(r'charset=([\w-]+)', content_type, re.IGNORECASE)
-                        if charset_match:
-                            charset = charset_match.group(1)
+                        phrase = http.HTTPStatus(resp.status).phrase
+                    except ValueError:
+                        phrase = "Unknown Status"
+                    details = f"{resp.status} - {phrase}"
+                    if 200 <= resp.status < 400:
                         try:
-                            body_text = body_bytes.decode(charset, errors='ignore')
-                        except Exception:
-                            body_text = body_bytes.decode('utf-8', errors='ignore')
-                    except Exception as read_ex:
-                        logger.warning(f"Failed to read body for {url}: {read_ex}")
-                        body_text = ""
+                            body_bytes = await resp.content.read(max_bytes)
+                            charset = 'utf-8'
+                            content_type = resp.headers.get('Content-Type', '')
+                            charset_match = re.search(r'charset=([\w-]+)', content_type, re.IGNORECASE)
+                            if charset_match:
+                                charset = charset_match.group(1)
+                            try:
+                                body_text = body_bytes.decode(charset, errors='ignore')
+                            except Exception:
+                                body_text = body_bytes.decode('utf-8', errors='ignore')
+                        except Exception as read_ex:
+                            logger.warning(f"Failed to read body for {url}: {read_ex}")
+                            body_text = ""
 
-                    # 1. Custom Keyword assertion if configured
-                    expected_kw = (resource.get("expected_keyword") or "").strip()
-                    if expected_kw:
-                        if expected_kw.lower() not in body_text.lower():
-                            return False, f"200 OK (Missing keyword: \"{expected_kw}\")", elapsed_ms
+                        if expected_kw:
+                            if expected_kw.lower() not in body_text.lower():
+                                return False, f"200 OK (Missing keyword: \"{expected_kw}\")", elapsed_ms
+                        else:
+                            body_lower = body_text.lower()
+                            if "error establishing a database connection" in body_lower:
+                                return False, "200 OK (Database connection error detected)", elapsed_ms
+                            if "database connection failed" in body_lower and len(body_text) < 16384:
+                                return False, "200 OK (Database connection failed detected)", elapsed_ms
+                            title_match = re.search(r'<title>(.*?)</title>', body_text, re.IGNORECASE | re.DOTALL)
+                            if title_match:
+                                title_text = title_match.group(1).strip().lower()
+                                for err_pat in ("502 bad gateway", "503 service unavailable", "504 gateway time-out", "database error", "error 521", "error 522", "error 523", "error 524"):
+                                    if err_pat in title_text:
+                                        return False, f"200 OK (Error in title: \"{err_pat.title()}\")", elapsed_ms
+
+                        return True, details, elapsed_ms
                     else:
-                        # 2. Background Auto-detection of hidden server error pages in 200 OK
-                        body_lower = body_text.lower()
-                        if "error establishing a database connection" in body_lower:
-                            return False, "200 OK (Database connection error detected)", elapsed_ms
-                        if "database connection failed" in body_lower and len(body_text) < 16384:
-                            return False, "200 OK (Database connection failed detected)", elapsed_ms
-                        title_match = re.search(r'<title>(.*?)</title>', body_text, re.IGNORECASE | re.DOTALL)
-                        if title_match:
-                            title_text = title_match.group(1).strip().lower()
-                            for err_pat in ("502 bad gateway", "503 service unavailable", "504 gateway time-out", "database error", "error 521", "error 522", "error 523", "error 524"):
-                                if err_pat in title_text:
-                                    return False, f"200 OK (Error in title: \"{err_pat.title()}\")", elapsed_ms
+                        return False, details, elapsed_ms
 
-                    return True, details, elapsed_ms
+            async def _check_http(sess, is_local: bool):
+                if not expected_kw and hasattr(sess, "head"):
+                    # 1. Try lightweight HEAD first (0 bytes body read)
+                    head_kwargs = {"allow_redirects": True}
+                    if not is_local:
+                        head_kwargs["timeout"] = req_timeout
+                    try:
+                        async with sess.head(url, **head_kwargs) as resp:
+                            if 200 <= resp.status < 400:
+                                elapsed_ms = int((time.time() - start_time) * 1000)
+                                try:
+                                    phrase = http.HTTPStatus(resp.status).phrase
+                                except ValueError:
+                                    phrase = "Unknown Status"
+                                details = f"{resp.status} - {phrase}"
+                                return True, details, elapsed_ms
+                    except Exception as head_ex:
+                        logger.debug(f"HEAD check failed for {url} ({head_ex}), falling back to GET")
+                    # If HEAD was not 2xx/3xx or threw an exception, fall back to GET (max 16KB)
+                    return await _do_get(sess, 16384, is_local)
+                elif not expected_kw:
+                    return await _do_get(sess, 16384, is_local)
                 else:
-                    return False, details, elapsed_ms
+                    # Keyword check requires body reading (max 128KB)
+                    return await _do_get(sess, 131072, is_local)
 
             if session is not None and not getattr(session, "closed", False):
-                async with session.get(url, allow_redirects=True, timeout=req_timeout) as resp:
-                    return await _process_resp(resp)
+                return await _check_http(session, is_local=False)
             else:
                 async with aiohttp.ClientSession(headers=headers, timeout=req_timeout) as local_session:
-                    async with local_session.get(url, allow_redirects=True) as resp:
-                        return await _process_resp(resp)
+                    return await _check_http(local_session, is_local=True)
         elif rtype == "tcp":
             parts = url.rsplit(":", 1)
             host, port = parts[0], int(parts[1])
@@ -833,14 +868,35 @@ async def run_single_check(resource, session=None) -> tuple[bool, str, int | Non
             host = url.strip()
             if not re.match(r'^[a-zA-Z0-9.-]+$', host):
                 return False, "Invalid hostname format", None
-            proc = await asyncio.create_subprocess_exec(
-                "ping", "-c", "1", "-W", "2", host,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL
-            )
-            await proc.wait()
-            elapsed_ms = int((time.time() - start_time) * 1000)
-            if proc.returncode == 0:
+
+            ping_success = False
+            elapsed_ms = None
+
+            if aioping is not None:
+                try:
+                    delay = await aioping.ping(host, timeout=2.0)
+                    elapsed_ms = max(1, int(delay * 1000))
+                    ping_success = True
+                except (PermissionError, OSError) as perm_ex:
+                    logger.debug(f"aioping raw socket failed for {host} ({perm_ex}), falling back to ping subprocess")
+                except asyncio.TimeoutError:
+                    elapsed_ms = int((time.time() - start_time) * 1000)
+                    return False, "Timeout", elapsed_ms
+                except Exception as ex:
+                    logger.debug(f"aioping failed for {host} ({ex}), falling back to ping subprocess")
+
+            if not ping_success and elapsed_ms is None:
+                proc = await asyncio.create_subprocess_exec(
+                    "ping", "-c", "1", "-W", "2", host,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL
+                )
+                await proc.wait()
+                elapsed_ms = int((time.time() - start_time) * 1000)
+                if proc.returncode == 0:
+                    ping_success = True
+
+            if ping_success:
                 return True, f"{elapsed_ms} ms", elapsed_ms
             else:
                 return False, "Ping failed", elapsed_ms
@@ -1388,7 +1444,17 @@ async def monitoring_scheduler_loop():
     _last_incident_audit = 0
     _last_cleanup = 0
     _last_transport_flush = 0
-    connector = aiohttp.TCPConnector(limit=100)
+    connector_kwargs = {
+        "limit": 100,
+        "ttl_dns_cache": 300,
+        "use_dns_cache": True,
+    }
+    if aiodns is not None:
+        try:
+            connector_kwargs["resolver"] = aiohttp.AsyncResolver()
+        except Exception as e:
+            logger.warning(f"Could not initialize aiohttp.AsyncResolver: {e}")
+    connector = aiohttp.TCPConnector(**connector_kwargs)
     async with aiohttp.ClientSession(connector=connector, headers={"User-Agent": USER_AGENT}) as shared_session:
         while True:
             try:
@@ -1424,9 +1490,18 @@ async def monitoring_scheduler_loop():
                             continue
                             
                         last_checked = r["last_checked"] or 0
-                        interval = r["interval"] or 60
+                        interval = max(10, r["interval"] or 60)
                         
-                        if now - last_checked >= interval:
+                        slot_offset = (r_id * 11) % interval if isinstance(r_id, int) else (sum(str(r_id).encode()) * 11) % interval
+                        slot_bucket = slot_offset // 5
+                        current_bucket = (now % interval) // 5
+                        
+                        if last_checked == 0:
+                            is_due = (current_bucket == slot_bucket)
+                        else:
+                            is_due = (now - last_checked >= interval) and (current_bucket == slot_bucket or now - last_checked >= interval + 15)
+                        
+                        if is_due:
                             running_resource_ids.add(r_id)
                             target_key = (r["type"], r["url"])
                             due_groups[target_key].append(r)
@@ -2752,7 +2827,7 @@ def fetch_html_title(url, timeout=3.0):
             headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)'}
         )
         with urllib.request.urlopen(req, timeout=timeout) as response:
-            html_bytes = response.read(65536)
+            html_bytes = response.read(16384)
             charset = 'utf-8'
             content_type = response.headers.get('Content-Type', '')
             charset_match = re.search(r'charset=([\w-]+)', content_type, re.IGNORECASE)

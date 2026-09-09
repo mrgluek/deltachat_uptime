@@ -7,7 +7,8 @@ import secrets
 import string
 
 DB_PATH = os.getenv("DB_PATH", "uptime.db")
-_lock = threading.RLock()
+_write_lock = threading.RLock()
+_lock = _write_lock  # Backwards compatibility
 
 def _connect(timeout: float = 10.0) -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, timeout=timeout)
@@ -15,7 +16,7 @@ def _connect(timeout: float = 10.0) -> sqlite3.Connection:
     return conn
 
 def init_db():
-    with _lock:
+    with _write_lock:
         conn = _connect()
         # Enable WAL mode and concurrency PRAGMAs
         conn.execute("PRAGMA journal_mode=WAL;")
@@ -216,21 +217,24 @@ def init_db():
 
 # Config functions
 def set_config(key: str, value: str):
-    with _lock:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)", (key, value))
-        conn.commit()
-        conn.close()
+    with _write_lock:
+        conn = _connect()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)", (key, value))
+            conn.commit()
+        finally:
+            conn.close()
 
 def get_config(key: str) -> str:
-    with _lock:
-        conn = sqlite3.connect(DB_PATH)
+    conn = _connect()
+    try:
         cursor = conn.cursor()
         cursor.execute("SELECT value FROM config WHERE key = ?", (key,))
         row = cursor.fetchone()
-        conn.close()
         return row[0] if row else None
+    finally:
+        conn.close()
 
 def get_admin_email():
     db_val = get_config("admin_dc_email")
@@ -293,42 +297,43 @@ def generate_chat_token() -> str:
     return ''.join(secrets.choice(alphabet) for _ in range(12))
 
 def get_or_create_chat_token(dc_chat_id: int) -> str:
-    with _lock:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute("SELECT token FROM chats WHERE dc_chat_id = ?", (dc_chat_id,))
-        row = cursor.fetchone()
-        if row:
-            token = row[0]
-        else:
+    with _write_lock:
+        conn = _connect()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("SELECT token FROM chats WHERE dc_chat_id = ?", (dc_chat_id,))
+            row = cursor.fetchone()
+            if row:
+                return row[0]
             # Generate a unique token
             while True:
                 token = generate_chat_token()
                 try:
                     cursor.execute("INSERT INTO chats (dc_chat_id, token) VALUES (?, ?)", (dc_chat_id, token))
                     conn.commit()
-                    break
+                    return token
                 except sqlite3.IntegrityError:
                     # Token collision, retry
                     continue
-        conn.close()
-        return token
+        finally:
+            conn.close()
 
 def get_chat_id_by_token(token: str) -> int:
-    with _lock:
-        conn = sqlite3.connect(DB_PATH)
+    conn = _connect()
+    try:
         cursor = conn.cursor()
         cursor.execute("SELECT dc_chat_id FROM chats WHERE token = ?", (token,))
         row = cursor.fetchone()
-        conn.close()
         return row[0] if row else None
+    finally:
+        conn.close()
 
 # Resource functions
 def add_resource(dc_chat_id: int, url: str, name: str, check_type: str, interval: int = 60, expected_keyword: str = None) -> int:
-    with _lock:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
+    with _write_lock:
+        conn = _connect()
         try:
+            cursor = conn.cursor()
             cursor.execute('''
                 INSERT INTO resources (dc_chat_id, url, name, type, interval, status, last_changed, expected_keyword) 
                 VALUES (?, ?, ?, ?, ?, 'unknown', ?, ?)
@@ -342,35 +347,41 @@ def add_resource(dc_chat_id: int, url: str, name: str, check_type: str, interval
             conn.close()
 
 def set_resource_keyword(dc_chat_id: int, resource_id: int, keyword: str | None) -> bool:
-    with _lock:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute("UPDATE resources SET expected_keyword = ? WHERE dc_chat_id = ? AND id = ?", (keyword, dc_chat_id, resource_id))
-        updated = cursor.rowcount > 0
-        conn.commit()
-        conn.close()
-        return updated
+    with _write_lock:
+        conn = _connect()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("UPDATE resources SET expected_keyword = ? WHERE dc_chat_id = ? AND id = ?", (keyword, dc_chat_id, resource_id))
+            updated = cursor.rowcount > 0
+            conn.commit()
+            return updated
+        finally:
+            conn.close()
 
 def set_resource_maintenance(dc_chat_id: int, resource_id: int, until_ts: int) -> bool:
-    with _lock:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute("UPDATE resources SET maintenance_until = ? WHERE dc_chat_id = ? AND id = ?", (until_ts, dc_chat_id, resource_id))
-        updated = cursor.rowcount > 0
-        conn.commit()
-        conn.close()
-        return updated
+    with _write_lock:
+        conn = _connect()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("UPDATE resources SET maintenance_until = ? WHERE dc_chat_id = ? AND id = ?", (until_ts, dc_chat_id, resource_id))
+            updated = cursor.rowcount > 0
+            conn.commit()
+            return updated
+        finally:
+            conn.close()
 
 def update_resource_latency(resource_id: int, latency_ms: int):
-    with _lock:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute("UPDATE resources SET last_latency_ms = ? WHERE id = ?", (latency_ms, resource_id))
-        conn.commit()
-        conn.close()
+    with _write_lock:
+        conn = _connect()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("UPDATE resources SET last_latency_ms = ? WHERE id = ?", (latency_ms, resource_id))
+            conn.commit()
+        finally:
+            conn.close()
 
 def delete_resource(dc_chat_id: int, resource_id: int) -> bool:
-    with _lock:
+    with _write_lock:
         conn = _connect()
         try:
             cursor = conn.cursor()
@@ -384,34 +395,37 @@ def delete_resource(dc_chat_id: int, resource_id: int) -> bool:
             conn.close()
 
 def get_resources(dc_chat_id: int) -> list[dict]:
-    with _lock:
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    try:
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM resources WHERE dc_chat_id = ? ORDER BY id ASC", (dc_chat_id,))
         rows = cursor.fetchall()
-        conn.close()
         return [dict(r) for r in rows]
+    finally:
+        conn.close()
 
 def get_resource_by_id(resource_id: int) -> dict | None:
-    with _lock:
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    try:
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM resources WHERE id = ?", (resource_id,))
         row = cursor.fetchone()
-        conn.close()
         return dict(row) if row else None
+    finally:
+        conn.close()
 
 def get_all_resources() -> list[dict]:
-    with _lock:
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    try:
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM resources ORDER BY id ASC")
         rows = cursor.fetchall()
-        conn.close()
         return [dict(r) for r in rows]
+    finally:
+        conn.close()
 
 def batch_update_resource_status(updates: list[dict]):
     """
@@ -423,7 +437,7 @@ def batch_update_resource_status(updates: list[dict]):
         return
 
     now = int(time.time())
-    with _lock:
+    with _write_lock:
         conn = _connect()
         try:
             cursor = conn.cursor()
@@ -516,69 +530,79 @@ def update_resource_status(resource_id: int, status: str, consecutive_failures: 
 
 def update_stale_warning_level(resource_id: int, level: int):
     """Update the highest stale downtime warning level sent for this resource (0, 7, 14)."""
-    with _lock:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute("UPDATE resources SET stale_warning_level = ? WHERE id = ?", (level, resource_id))
-        conn.commit()
-        conn.close()
+    with _write_lock:
+        conn = _connect()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("UPDATE resources SET stale_warning_level = ? WHERE id = ?", (level, resource_id))
+            conn.commit()
+        finally:
+            conn.close()
 
 def update_resource_ssl(resource_id: int, ssl_expiry_date: int | None, ssl_last_checked: int, ssl_alert_state: int = 0):
-    with _lock:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute('''
-            UPDATE resources 
-            SET ssl_expiry_date = ?, ssl_last_checked = ?, ssl_alert_state = ? 
-            WHERE id = ?
-        ''', (ssl_expiry_date, ssl_last_checked, ssl_alert_state, resource_id))
-        conn.commit()
-        conn.close()
+    with _write_lock:
+        conn = _connect()
+        try:
+            cursor = conn.cursor()
+            cursor.execute('''
+                UPDATE resources 
+                SET ssl_expiry_date = ?, ssl_last_checked = ?, ssl_alert_state = ? 
+                WHERE id = ?
+            ''', (ssl_expiry_date, ssl_last_checked, ssl_alert_state, resource_id))
+            conn.commit()
+        finally:
+            conn.close()
 
 def update_ssl_alert_state(resource_id: int, ssl_alert_state: int):
-    with _lock:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute('''
-            UPDATE resources 
-            SET ssl_alert_state = ? 
-            WHERE id = ?
-        ''', (ssl_alert_state, resource_id))
-        conn.commit()
-        conn.close()
+    with _write_lock:
+        conn = _connect()
+        try:
+            cursor = conn.cursor()
+            cursor.execute('''
+                UPDATE resources 
+                SET ssl_alert_state = ? 
+                WHERE id = ?
+            ''', (ssl_alert_state, resource_id))
+            conn.commit()
+        finally:
+            conn.close()
 
 def update_resource_down_msg_id(resource_id: int, msg_id: int | None):
-    with _lock:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute('''
-            UPDATE resources 
-            SET last_down_msg_id = ? 
-            WHERE id = ?
-        ''', (msg_id, resource_id))
-        conn.commit()
-        conn.close()
+    with _write_lock:
+        conn = _connect()
+        try:
+            cursor = conn.cursor()
+            cursor.execute('''
+                UPDATE resources 
+                SET last_down_msg_id = ? 
+                WHERE id = ?
+            ''', (msg_id, resource_id))
+            conn.commit()
+        finally:
+            conn.close()
 
 # Incident management functions
 def create_incident(dc_chat_id: int, started_at: int = None) -> int:
     if started_at is None:
         started_at = int(time.time())
-    with _lock:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute('''
-            INSERT INTO incidents (dc_chat_id, status, started_at)
-            VALUES (?, 'ongoing', ?)
-        ''', (dc_chat_id, started_at))
-        incident_id = cursor.lastrowid
-        conn.commit()
-        conn.close()
-        return incident_id
+    with _write_lock:
+        conn = _connect()
+        try:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO incidents (dc_chat_id, status, started_at)
+                VALUES (?, 'ongoing', ?)
+            ''', (dc_chat_id, started_at))
+            incident_id = cursor.lastrowid
+            conn.commit()
+            return incident_id
+        finally:
+            conn.close()
 
 def get_active_incident(dc_chat_id: int) -> dict | None:
-    with _lock:
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    try:
         cursor = conn.cursor()
         cursor.execute('''
             SELECT * FROM incidents 
@@ -586,14 +610,15 @@ def get_active_incident(dc_chat_id: int) -> dict | None:
             ORDER BY id DESC LIMIT 1
         ''', (dc_chat_id,))
         row = cursor.fetchone()
-        conn.close()
         return dict(row) if row else None
+    finally:
+        conn.close()
 
 def get_active_incidents_for_chat(dc_chat_id: int) -> list[dict]:
     """Returns all currently ongoing incidents for a specific chat."""
-    with _lock:
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    try:
         cursor = conn.cursor()
         cursor.execute('''
             SELECT * FROM incidents 
@@ -601,14 +626,15 @@ def get_active_incidents_for_chat(dc_chat_id: int) -> list[dict]:
             ORDER BY id ASC
         ''', (dc_chat_id,))
         rows = cursor.fetchall()
-        conn.close()
         return [dict(r) for r in rows]
+    finally:
+        conn.close()
 
 def get_active_incident_for_outage(dc_chat_id: int, outage_time: int, max_gap_seconds: int = 3600, allow_reopen: bool = True) -> dict | None:
     """Finds an ongoing or recently resolved incident in dc_chat_id within max_gap_seconds of outage_time."""
-    with _lock:
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    try:
         cursor = conn.cursor()
         if allow_reopen:
             cursor.execute('''
@@ -634,36 +660,40 @@ def get_active_incident_for_outage(dc_chat_id: int, outage_time: int, max_gap_se
                 ORDER BY i.id DESC LIMIT 1
             ''', (dc_chat_id, outage_time, max_gap_seconds, outage_time))
         row = cursor.fetchone()
-        conn.close()
         return dict(row) if row else None
+    finally:
+        conn.close()
 
 def reopen_incident(incident_id: int):
-    with _lock:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute('''
-            UPDATE incidents 
-            SET status = 'ongoing', resolved_at = NULL, summary = NULL 
-            WHERE id = ?
-        ''', (incident_id,))
-        conn.commit()
-        conn.close()
+    with _write_lock:
+        conn = _connect()
+        try:
+            cursor = conn.cursor()
+            cursor.execute('''
+                UPDATE incidents 
+                SET status = 'ongoing', resolved_at = NULL, summary = NULL 
+                WHERE id = ?
+            ''', (incident_id,))
+            conn.commit()
+        finally:
+            conn.close()
 
 def get_all_active_incidents() -> list[dict]:
-    with _lock:
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    try:
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM incidents WHERE status = 'ongoing' ORDER BY id ASC")
         rows = cursor.fetchall()
-        conn.close()
         return [dict(r) for r in rows]
+    finally:
+        conn.close()
 
 def get_incident_by_msg_id(dc_chat_id: int, msg_id: int) -> dict | None:
     """Finds incident record matching chat and message ID."""
-    with _lock:
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    try:
         cursor = conn.cursor()
         cursor.execute('''
             SELECT * FROM incidents 
@@ -671,8 +701,9 @@ def get_incident_by_msg_id(dc_chat_id: int, msg_id: int) -> dict | None:
             ORDER BY id DESC LIMIT 1
         ''', (dc_chat_id, msg_id))
         row = cursor.fetchone()
-        conn.close()
         return dict(row) if row else None
+    finally:
+        conn.close()
 
 def get_resources_matching_text(dc_chat_id: int, text: str) -> list[dict]:
     """Finds all resources in dc_chat_id whose url or name appears in text."""
@@ -724,35 +755,39 @@ def get_resources_by_target(dc_chat_id: int, target: str) -> list[dict]:
 def update_incident_msg_id(incident_id: int, msg_id: int | None):
     if msg_id is not None and not isinstance(msg_id, int):
         return
-    with _lock:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute('''
-            UPDATE incidents 
-            SET msg_id = ? 
-            WHERE id = ?
-        ''', (msg_id, incident_id))
-        conn.commit()
-        conn.close()
+    with _write_lock:
+        conn = _connect()
+        try:
+            cursor = conn.cursor()
+            cursor.execute('''
+                UPDATE incidents 
+                SET msg_id = ? 
+                WHERE id = ?
+            ''', (msg_id, incident_id))
+            conn.commit()
+        finally:
+            conn.close()
 
 def resolve_incident(incident_id: int, resolved_at: int = None, summary: str = ""):
     if resolved_at is None:
         resolved_at = int(time.time())
-    with _lock:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute('''
-            UPDATE incidents 
-            SET status = 'resolved', resolved_at = ?, summary = ? 
-            WHERE id = ?
-        ''', (resolved_at, summary, incident_id))
-        conn.commit()
-        conn.close()
+    with _write_lock:
+        conn = _connect()
+        try:
+            cursor = conn.cursor()
+            cursor.execute('''
+                UPDATE incidents 
+                SET status = 'resolved', resolved_at = ?, summary = ? 
+                WHERE id = ?
+            ''', (resolved_at, summary, incident_id))
+            conn.commit()
+        finally:
+            conn.close()
 
 def get_recent_incidents(dc_chat_id: int, limit: int = 10) -> list[dict]:
-    with _lock:
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    try:
         cursor = conn.cursor()
         cursor.execute('''
             SELECT * FROM incidents 
@@ -760,27 +795,29 @@ def get_recent_incidents(dc_chat_id: int, limit: int = 10) -> list[dict]:
             ORDER BY id DESC LIMIT ?
         ''', (dc_chat_id, limit))
         rows = cursor.fetchall()
-        conn.close()
         return [dict(r) for r in rows]
+    finally:
+        conn.close()
 
 def get_incident_by_id(dc_chat_id: int, incident_id: int) -> dict | None:
-    with _lock:
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    try:
         cursor = conn.cursor()
         cursor.execute('''
             SELECT * FROM incidents 
             WHERE dc_chat_id = ? AND id = ?
         ''', (dc_chat_id, incident_id))
         row = cursor.fetchone()
-        conn.close()
         return dict(row) if row else None
+    finally:
+        conn.close()
 
 def get_unlinked_open_downtime_events(dc_chat_id: int) -> list[dict]:
     """Returns open downtime events in this chat that are not yet linked to any incident."""
-    with _lock:
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    try:
         cursor = conn.cursor()
         cursor.execute('''
             SELECT de.*, r.name, r.url, r.type, r.status as resource_status
@@ -790,22 +827,25 @@ def get_unlinked_open_downtime_events(dc_chat_id: int) -> list[dict]:
             ORDER BY de.went_down_at ASC
         ''', (dc_chat_id,))
         rows = cursor.fetchall()
-        conn.close()
         return [dict(r) for r in rows]
+    finally:
+        conn.close()
 
 def link_downtime_event_to_incident(downtime_event_id: int, incident_id: int):
-    with _lock:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute("UPDATE downtime_events SET incident_id = ? WHERE id = ?", (incident_id, downtime_event_id))
-        conn.commit()
-        conn.close()
+    with _write_lock:
+        conn = _connect()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("UPDATE downtime_events SET incident_id = ? WHERE id = ?", (incident_id, downtime_event_id))
+            conn.commit()
+        finally:
+            conn.close()
 
 def get_incident_downtime_events(incident_id: int) -> list[dict]:
     """Returns all downtime events associated with an incident."""
-    with _lock:
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    try:
         cursor = conn.cursor()
         cursor.execute('''
             SELECT de.*, r.name, r.url, r.type, r.status as resource_status, r.last_changed, r.consecutive_failures
@@ -815,23 +855,26 @@ def get_incident_downtime_events(incident_id: int) -> list[dict]:
             ORDER BY de.went_down_at ASC
         ''', (incident_id,))
         rows = cursor.fetchall()
-        conn.close()
         return [dict(r) for r in rows]
+    finally:
+        conn.close()
 
 def close_resource_downtime_events(resource_id: int, now: int = None):
     if now is None:
         now = int(time.time())
-    with _lock:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute("UPDATE downtime_events SET went_up_at = ? WHERE resource_id = ? AND went_up_at IS NULL", (now, resource_id))
-        conn.commit()
-        conn.close()
+    with _write_lock:
+        conn = _connect()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("UPDATE downtime_events SET went_up_at = ? WHERE resource_id = ? AND went_up_at IS NULL", (now, resource_id))
+            conn.commit()
+        finally:
+            conn.close()
 
 def get_resource_downtime_events(resource_id: int, limit: int = 10) -> list[dict]:
-    with _lock:
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    try:
         cursor = conn.cursor()
         cursor.execute('''
             SELECT * FROM downtime_events 
@@ -839,13 +882,14 @@ def get_resource_downtime_events(resource_id: int, limit: int = 10) -> list[dict
             ORDER BY went_down_at DESC LIMIT ?
         ''', (resource_id, limit))
         rows = cursor.fetchall()
-        conn.close()
         return [dict(r) for r in rows]
+    finally:
+        conn.close()
 
 def get_incident_affected_resource_ids(incident_id: int, fallback_chat_id: int = None, fallback_started_at: int = None) -> set[int]:
     """Return set of resource IDs that experienced downtime in this incident."""
-    with _lock:
-        conn = sqlite3.connect(DB_PATH)
+    conn = _connect()
+    try:
         cursor = conn.cursor()
         cursor.execute('''
             SELECT DISTINCT resource_id FROM downtime_events
@@ -866,8 +910,9 @@ def get_incident_affected_resource_ids(incident_id: int, fallback_chat_id: int =
             rows = cursor.fetchall()
             res_ids = {r[0] for r in rows if r[0] is not None}
             
-        conn.close()
         return res_ids
+    finally:
+        conn.close()
 
 # Uptime calculation functions & TTL cache
 _uptime_cache: dict[int, tuple[float, float]] = {}  # resource_id -> (timestamp, uptime_pct)
@@ -907,21 +952,20 @@ def get_resources_uptime_30d(resource_ids: list[int]) -> dict[int, float]:
     if not missing_ids:
         return res_dict
 
-    with _lock:
-        conn = _connect()
-        try:
-            cursor = conn.cursor()
-            placeholders = ",".join("?" for _ in missing_ids)
-            cursor.execute(f"SELECT id, created_at FROM resources WHERE id IN ({placeholders})", missing_ids)
-            created_map = {row[0]: row[1] for row in cursor.fetchall()}
+    conn = _connect()
+    try:
+        cursor = conn.cursor()
+        placeholders = ",".join("?" for _ in missing_ids)
+        cursor.execute(f"SELECT id, created_at FROM resources WHERE id IN ({placeholders})", missing_ids)
+        created_map = {row[0]: row[1] for row in cursor.fetchall()}
 
-            cursor.execute(f'''
-                SELECT resource_id, went_down_at, went_up_at FROM downtime_events 
-                WHERE resource_id IN ({placeholders}) AND went_down_at < ? AND (went_up_at IS NULL OR went_up_at > ?)
-            ''', (*missing_ids, now, start_time))
-            events = cursor.fetchall()
-        finally:
-            conn.close()
+        cursor.execute(f'''
+            SELECT resource_id, went_down_at, went_up_at FROM downtime_events 
+            WHERE resource_id IN ({placeholders}) AND went_down_at < ? AND (went_up_at IS NULL OR went_up_at > ?)
+        ''', (*missing_ids, now, start_time))
+        events = cursor.fetchall()
+    finally:
+        conn.close()
 
     events_by_res: dict[int, list[tuple[int, int]]] = {rid: [] for rid in missing_ids}
     for r_id, went_down, went_up in events:
@@ -1029,63 +1073,68 @@ def flush_transport_stats():
         _transport_stats_buffer.clear()
         _last_transport_flush = time.time()
 
-    with _lock:
+    with _write_lock:
         conn = _connect()
-        cursor = conn.cursor()
-        for addr, counts in pending.items():
-            if not isinstance(addr, str) or "@" not in addr:
-                continue
-            sent = int(counts.get("sent", 0))
-            recv = int(counts.get("recv", 0))
-            last_s = counts.get("last_sent") or None
-            last_r = counts.get("last_recv") or None
-            cursor.execute('''
-                INSERT INTO transport_stats (addr, msgs_sent, msgs_received, last_sent_at, last_received_at)
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(addr) DO UPDATE SET
-                    msgs_sent = msgs_sent + excluded.msgs_sent,
-                    msgs_received = msgs_received + excluded.msgs_received,
-                    last_sent_at = COALESCE(excluded.last_sent_at, transport_stats.last_sent_at),
-                    last_received_at = COALESCE(excluded.last_received_at, transport_stats.last_received_at)
-            ''', (addr, sent, recv, last_s, last_r))
-        conn.commit()
-        conn.close()
+        try:
+            cursor = conn.cursor()
+            for addr, counts in pending.items():
+                if not isinstance(addr, str) or "@" not in addr:
+                    continue
+                sent = int(counts.get("sent", 0))
+                recv = int(counts.get("recv", 0))
+                last_s = counts.get("last_sent") or None
+                last_r = counts.get("last_recv") or None
+                cursor.execute('''
+                    INSERT INTO transport_stats (addr, msgs_sent, msgs_received, last_sent_at, last_received_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(addr) DO UPDATE SET
+                        msgs_sent = msgs_sent + excluded.msgs_sent,
+                        msgs_received = msgs_received + excluded.msgs_received,
+                        last_sent_at = COALESCE(excluded.last_sent_at, transport_stats.last_sent_at),
+                        last_received_at = COALESCE(excluded.last_received_at, transport_stats.last_received_at)
+                ''', (addr, sent, recv, last_s, last_r))
+            conn.commit()
+        finally:
+            conn.close()
 
 def get_all_transport_stats() -> list[dict]:
     flush_transport_stats()
-    with _lock:
-        conn = _connect()
-        conn.row_factory = sqlite3.Row
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    try:
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM transport_stats ORDER BY msgs_sent + msgs_received DESC")
         rows = cursor.fetchall()
-        conn.close()
         return [dict(r) for r in rows]
+    finally:
+        conn.close()
 
 def cleanup_old_records(retention_days: int = 90) -> dict[str, int]:
     """Prune old downtime events, resolved incidents, and stale peer measurements."""
     now = int(time.time())
     cutoff = now - (retention_days * 86400)
     cleaned = {}
-    with _lock:
+    with _write_lock:
         conn = _connect()
-        cursor = conn.cursor()
-        
-        # 1. Prune resolved downtime events older than retention_days
-        cursor.execute("DELETE FROM downtime_events WHERE went_up_at IS NOT NULL AND went_up_at < ?", (cutoff,))
-        cleaned["downtime_events"] = cursor.rowcount
-        
-        # 2. Prune resolved incidents older than retention_days
-        cursor.execute("DELETE FROM incidents WHERE status = 'resolved' AND resolved_at < ?", (cutoff,))
-        cleaned["incidents"] = cursor.rowcount
-        
-        # 3. Prune old peer measurements (older than 7 days)
-        meas_cutoff = now - (7 * 86400)
-        cursor.execute("DELETE FROM peer_measurements WHERE last_checked < ?", (meas_cutoff,))
-        cleaned["peer_measurements"] = cursor.rowcount
-        
-        conn.commit()
-        conn.close()
+        try:
+            cursor = conn.cursor()
+            
+            # 1. Prune resolved downtime events older than retention_days
+            cursor.execute("DELETE FROM downtime_events WHERE went_up_at IS NOT NULL AND went_up_at < ?", (cutoff,))
+            cleaned["downtime_events"] = cursor.rowcount
+            
+            # 2. Prune resolved incidents older than retention_days
+            cursor.execute("DELETE FROM incidents WHERE status = 'resolved' AND resolved_at < ?", (cutoff,))
+            cleaned["incidents"] = cursor.rowcount
+            
+            # 3. Prune old peer measurements (older than 7 days)
+            meas_cutoff = now - (7 * 86400)
+            cursor.execute("DELETE FROM peer_measurements WHERE last_checked < ?", (meas_cutoff,))
+            cleaned["peer_measurements"] = cursor.rowcount
+            
+            conn.commit()
+        finally:
+            conn.close()
     return cleaned
 
 # Peer management functions
@@ -1100,74 +1149,81 @@ def set_local_node_name(name: str):
 
 def add_or_update_peer(email: str, node_name: str = None, chat_id: int = None, last_seen: int = None):
     email = email.lower().strip()
-    with _lock:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute("SELECT node_name, chat_id, last_seen FROM peers WHERE email = ?", (email,))
-        row = cursor.fetchone()
-        
-        now = int(time.time())
-        if row:
-            curr_node, curr_chat, curr_seen = row
-            new_node = node_name if node_name is not None else curr_node
-            new_chat = chat_id if chat_id is not None else curr_chat
-            new_seen = last_seen if last_seen is not None else (curr_seen or now)
-            cursor.execute(
-                "UPDATE peers SET node_name = ?, chat_id = ?, last_seen = ? WHERE email = ?",
-                (new_node, new_chat, new_seen, email)
-            )
-        else:
-            n_name = node_name or "Remote-Node"
-            c_id = chat_id
-            s_time = last_seen or now
-            cursor.execute(
-                "INSERT INTO peers (email, node_name, chat_id, last_seen) VALUES (?, ?, ?, ?)",
-                (email, n_name, c_id, s_time)
-            )
-        conn.commit()
-        conn.close()
+    with _write_lock:
+        conn = _connect()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("SELECT node_name, chat_id, last_seen FROM peers WHERE email = ?", (email,))
+            row = cursor.fetchone()
+            
+            now = int(time.time())
+            if row:
+                curr_node, curr_chat, curr_seen = row
+                new_node = node_name if node_name is not None else curr_node
+                new_chat = chat_id if chat_id is not None else curr_chat
+                new_seen = last_seen if last_seen is not None else (curr_seen or now)
+                cursor.execute(
+                    "UPDATE peers SET node_name = ?, chat_id = ?, last_seen = ? WHERE email = ?",
+                    (new_node, new_chat, new_seen, email)
+                )
+            else:
+                n_name = node_name or "Remote-Node"
+                c_id = chat_id
+                s_time = last_seen or now
+                cursor.execute(
+                    "INSERT INTO peers (email, node_name, chat_id, last_seen) VALUES (?, ?, ?, ?)",
+                    (email, n_name, c_id, s_time)
+                )
+            conn.commit()
+        finally:
+            conn.close()
 
 def remove_peer(email: str) -> bool:
     email = email.lower().strip()
-    with _lock:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM peers WHERE email = ?", (email,))
-        changed = cursor.rowcount > 0
-        conn.commit()
-        conn.close()
-        return changed
+    with _write_lock:
+        conn = _connect()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM peers WHERE email = ?", (email,))
+            changed = cursor.rowcount > 0
+            conn.commit()
+            return changed
+        finally:
+            conn.close()
 
 def get_peer(email: str) -> dict | None:
     email = email.lower().strip()
-    with _lock:
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    try:
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM peers WHERE email = ?", (email,))
         row = cursor.fetchone()
-        conn.close()
         return dict(row) if row else None
+    finally:
+        conn.close()
 
 def get_peer_by_chat_id(chat_id: int) -> dict | None:
-    with _lock:
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    try:
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM peers WHERE chat_id = ?", (chat_id,))
         row = cursor.fetchone()
-        conn.close()
         return dict(row) if row else None
+    finally:
+        conn.close()
 
 def get_all_peers() -> list[dict]:
-    with _lock:
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    try:
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM peers ORDER BY node_name ASC")
         rows = cursor.fetchall()
-        conn.close()
         return [dict(r) for r in rows]
+    finally:
+        conn.close()
 
 def update_peer_last_seen(email: str, timestamp: int = None) -> tuple[bool, int, dict | None]:
     """
@@ -1177,25 +1233,26 @@ def update_peer_last_seen(email: str, timestamp: int = None) -> tuple[bool, int,
     """
     email = email.lower().strip()
     now = timestamp if timestamp is not None else int(time.time())
-    with _lock:
-        conn = sqlite3.connect(DB_PATH)
+    with _write_lock:
+        conn = _connect()
         conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM peers WHERE email = ?", (email,))
-        row = cursor.fetchone()
-        if not row:
-            conn.close()
-            return False, 0, None
-            
-        peer = dict(row)
-        was_offline = (peer.get("is_offline") == 1)
-        went_offline_at = peer.get("went_offline_at") or 0
-        downtime = max(1, now - went_offline_at) if was_offline and went_offline_at > 0 else 0
+        try:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM peers WHERE email = ?", (email,))
+            row = cursor.fetchone()
+            if not row:
+                return False, 0, None
+                
+            peer = dict(row)
+            was_offline = (peer.get("is_offline") == 1)
+            went_offline_at = peer.get("went_offline_at") or 0
+            downtime = max(1, now - went_offline_at) if was_offline and went_offline_at > 0 else 0
 
-        cursor.execute("UPDATE peers SET last_seen = ?, is_offline = 0, went_offline_at = 0 WHERE email = ?", (now, email))
-        conn.commit()
-        conn.close()
-        return was_offline, downtime, peer
+            cursor.execute("UPDATE peers SET last_seen = ?, is_offline = 0, went_offline_at = 0 WHERE email = ?", (now, email))
+            conn.commit()
+            return was_offline, downtime, peer
+        finally:
+            conn.close()
 
 def audit_peers_offline(threshold_seconds: int = 360, now: int = None) -> list[dict]:
     """
@@ -1205,46 +1262,50 @@ def audit_peers_offline(threshold_seconds: int = 360, now: int = None) -> list[d
     cur_time = now if now is not None else int(time.time())
     cutoff = cur_time - threshold_seconds
     newly_offline = []
-    with _lock:
-        conn = sqlite3.connect(DB_PATH)
+    with _write_lock:
+        conn = _connect()
         conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        cursor.execute('''
-            SELECT * FROM peers 
-            WHERE last_seen > 0 AND last_seen < ? AND (is_offline IS NULL OR is_offline = 0)
-        ''', (cutoff,))
-        rows = cursor.fetchall()
-        for r in rows:
-            p = dict(r)
+        try:
+            cursor = conn.cursor()
             cursor.execute('''
-                UPDATE peers 
-                SET is_offline = 1, went_offline_at = ? 
-                WHERE email = ?
-            ''', (cur_time, p["email"]))
-            p["is_offline"] = 1
-            p["went_offline_at"] = cur_time
-            newly_offline.append(p)
-        conn.commit()
-        conn.close()
+                SELECT * FROM peers 
+                WHERE last_seen > 0 AND last_seen < ? AND (is_offline IS NULL OR is_offline = 0)
+            ''', (cutoff,))
+            rows = cursor.fetchall()
+            for r in rows:
+                p = dict(r)
+                cursor.execute('''
+                    UPDATE peers 
+                    SET is_offline = 1, went_offline_at = ? 
+                    WHERE email = ?
+                ''', (cur_time, p["email"]))
+                p["is_offline"] = 1
+                p["went_offline_at"] = cur_time
+                newly_offline.append(p)
+            conn.commit()
+        finally:
+            conn.close()
     return newly_offline
 
 # Peer measurements (remote probe telemetry)
 def save_peer_measurement(url: str, node_name: str, status: str, latency_ms: int | None = None, error_msg: str = None, last_checked: int = None):
     now = last_checked if last_checked is not None else int(time.time())
-    with _lock:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute('''
-            INSERT INTO peer_measurements (url, node_name, status, latency_ms, error_msg, last_checked)
-            VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(url, node_name) DO UPDATE SET
-                status = excluded.status,
-                latency_ms = excluded.latency_ms,
-                error_msg = excluded.error_msg,
-                last_checked = excluded.last_checked
-        ''', (url, node_name, status, latency_ms, error_msg, now))
-        conn.commit()
-        conn.close()
+    with _write_lock:
+        conn = _connect()
+        try:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO peer_measurements (url, node_name, status, latency_ms, error_msg, last_checked)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(url, node_name) DO UPDATE SET
+                    status = excluded.status,
+                    latency_ms = excluded.latency_ms,
+                    error_msg = excluded.error_msg,
+                    last_checked = excluded.last_checked
+            ''', (url, node_name, status, latency_ms, error_msg, now))
+            conn.commit()
+        finally:
+            conn.close()
 
 def save_peer_measurements_batch(node_name: str, metrics_list: list[dict]):
     if not metrics_list:
@@ -1283,149 +1344,162 @@ def save_peer_measurements_batch(node_name: str, metrics_list: list[dict]):
     if not rows:
         return
 
-    with _lock:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.executemany('''
-            INSERT INTO peer_measurements (url, node_name, status, latency_ms, error_msg, last_checked)
-            VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(url, node_name) DO UPDATE SET
-                status = excluded.status,
-                latency_ms = excluded.latency_ms,
-                error_msg = excluded.error_msg,
-                last_checked = excluded.last_checked
-        ''', rows)
-        conn.commit()
-        conn.close()
+    with _write_lock:
+        conn = _connect()
+        try:
+            cursor = conn.cursor()
+            cursor.executemany('''
+                INSERT INTO peer_measurements (url, node_name, status, latency_ms, error_msg, last_checked)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(url, node_name) DO UPDATE SET
+                    status = excluded.status,
+                    latency_ms = excluded.latency_ms,
+                    error_msg = excluded.error_msg,
+                    last_checked = excluded.last_checked
+            ''', rows)
+            conn.commit()
+        finally:
+            conn.close()
 
 def get_peer_measurements_for_url(url: str) -> list[dict]:
-    with _lock:
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    try:
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM peer_measurements WHERE url = ? ORDER BY node_name ASC", (url,))
         rows = cursor.fetchall()
-        conn.close()
         return [dict(r) for r in rows]
+    finally:
+        conn.close()
 
 def get_all_peer_measurements() -> list[dict]:
-    with _lock:
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    try:
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM peer_measurements ORDER BY url, node_name ASC")
         rows = cursor.fetchall()
-        conn.close()
         return [dict(r) for r in rows]
+    finally:
+        conn.close()
 
 # Remote probe targets functions
 def save_probe_targets_batch(targets: list[dict], source_peer: str = None):
     if not targets:
         return
-    with _lock:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute("SELECT url FROM ignored_probe_targets")
-        ignored_set = set(row[0] for row in cursor.fetchall())
+    with _write_lock:
+        conn = _connect()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("SELECT url FROM ignored_probe_targets")
+            ignored_set = set(row[0] for row in cursor.fetchall())
 
-        now = int(time.time())
-        rows = []
-        for item in targets[:200]:
-            if not isinstance(item, dict):
-                continue
-            url = str(item.get("url") or "").strip()[:500]
-            if not url or url in ignored_set:
-                continue
-            name = str(item.get("name") or url).strip()[:200]
-            chk_type = str(item.get("type") or "http").strip().lower()
-            if chk_type not in ("http", "tcp", "ping"):
-                chk_type = "http"
-            raw_kw = item.get("expected_keyword")
-            kw = str(raw_kw).strip()[:200] if raw_kw else None
-            rows.append((url, name, chk_type, kw, source_peer, now))
+            now = int(time.time())
+            rows = []
+            for item in targets[:200]:
+                if not isinstance(item, dict):
+                    continue
+                url = str(item.get("url") or "").strip()[:500]
+                if not url or url in ignored_set:
+                    continue
+                name = str(item.get("name") or url).strip()[:200]
+                chk_type = str(item.get("type") or "http").strip().lower()
+                if chk_type not in ("http", "tcp", "ping"):
+                    chk_type = "http"
+                raw_kw = item.get("expected_keyword")
+                kw = str(raw_kw).strip()[:200] if raw_kw else None
+                rows.append((url, name, chk_type, kw, source_peer, now))
 
-        if rows:
-            cursor.executemany('''
-                INSERT INTO probe_targets (url, name, type, expected_keyword, source_peer, last_seen)
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(url) DO UPDATE SET
-                    name = excluded.name,
-                    type = excluded.type,
-                    expected_keyword = excluded.expected_keyword,
-                    source_peer = COALESCE(excluded.source_peer, probe_targets.source_peer),
-                    last_seen = excluded.last_seen
-            ''', rows)
-        conn.commit()
-        conn.close()
+            if rows:
+                cursor.executemany('''
+                    INSERT INTO probe_targets (url, name, type, expected_keyword, source_peer, last_seen)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(url) DO UPDATE SET
+                        name = excluded.name,
+                        type = excluded.type,
+                        expected_keyword = excluded.expected_keyword,
+                        source_peer = COALESCE(excluded.source_peer, probe_targets.source_peer),
+                        last_seen = excluded.last_seen
+                ''', rows)
+            conn.commit()
+        finally:
+            conn.close()
 
 def get_active_probe_targets(max_age_seconds: int = 86400) -> list[dict]:
-    with _lock:
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    try:
         cursor = conn.cursor()
         min_seen = int(time.time()) - max_age_seconds
         cursor.execute("SELECT * FROM probe_targets WHERE last_seen >= ? ORDER BY url ASC", (min_seen,))
         rows = cursor.fetchall()
-        conn.close()
         return [dict(r) for r in rows]
+    finally:
+        conn.close()
 
 def update_probe_target_result(url: str, status: str, latency_ms: int = None, error_msg: str = None):
-    with _lock:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        now = int(time.time())
-        cursor.execute('''
-            UPDATE probe_targets
-            SET last_checked = ?, last_status = ?, last_latency_ms = ?, last_error = ?
-            WHERE url = ?
-        ''', (now, status, latency_ms, error_msg, url))
-        conn.commit()
-        conn.close()
+    with _write_lock:
+        conn = _connect()
+        try:
+            cursor = conn.cursor()
+            now = int(time.time())
+            cursor.execute('''
+                UPDATE probe_targets
+                SET last_checked = ?, last_status = ?, last_latency_ms = ?, last_error = ?
+                WHERE url = ?
+            ''', (now, status, latency_ms, error_msg, url))
+            conn.commit()
+        finally:
+            conn.close()
 
 # Ignored probe targets (excluded from remote scanning on this probe node)
 def add_ignored_probe_target(url: str, reason: str = "") -> bool:
-    with _lock:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute("INSERT OR REPLACE INTO ignored_probe_targets (url, reason) VALUES (?, ?)", (url, reason))
-        # Immediately remove from active probe targets
-        cursor.execute("DELETE FROM probe_targets WHERE url = ?", (url,))
-        local_node = get_local_node_name()
-        cursor.execute("DELETE FROM peer_measurements WHERE url = ? AND node_name = ?", (url, local_node))
-        conn.commit()
-        conn.close()
-        return True
+    with _write_lock:
+        conn = _connect()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("INSERT OR REPLACE INTO ignored_probe_targets (url, reason) VALUES (?, ?)", (url, reason))
+            # Immediately remove from active probe targets
+            cursor.execute("DELETE FROM probe_targets WHERE url = ?", (url,))
+            local_node = get_local_node_name()
+            cursor.execute("DELETE FROM peer_measurements WHERE url = ? AND node_name = ?", (url, local_node))
+            conn.commit()
+            return True
+        finally:
+            conn.close()
 
 def remove_ignored_probe_target(url: str) -> bool:
-    with _lock:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM ignored_probe_targets WHERE url = ?", (url,))
-        deleted = cursor.rowcount > 0
-        conn.commit()
-        conn.close()
-        return deleted
+    with _write_lock:
+        conn = _connect()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM ignored_probe_targets WHERE url = ?", (url,))
+            deleted = cursor.rowcount > 0
+            conn.commit()
+            return deleted
+        finally:
+            conn.close()
 
 def is_probe_target_ignored(url: str) -> bool:
-    with _lock:
-        conn = sqlite3.connect(DB_PATH)
+    conn = _connect()
+    try:
         cursor = conn.cursor()
         cursor.execute("SELECT 1 FROM ignored_probe_targets WHERE url = ?", (url,))
         row = cursor.fetchone()
-        conn.close()
         return row is not None
+    finally:
+        conn.close()
 
 def get_all_ignored_probe_targets() -> list[dict]:
-    with _lock:
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    try:
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM ignored_probe_targets ORDER BY url ASC")
         rows = cursor.fetchall()
-        conn.close()
         return [dict(r) for r in rows]
+    finally:
+        conn.close()
 
 # Initialize DB on module import
 init_db()
-
-

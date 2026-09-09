@@ -1,5 +1,6 @@
 import os
 import sys
+import threading
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -154,6 +155,38 @@ class TestDatabase(unittest.TestCase):
         database.delete_resource(chat_id, r_id)
         with database._uptime_cache_lock:
             self.assertNotIn(r_id, database._uptime_cache)
+
+    def test_write_lock_backwards_compatibility(self):
+        """Verify _write_lock exists and _lock is an alias to _write_lock."""
+        self.assertTrue(hasattr(database, "_write_lock"))
+        self.assertIs(database._lock, database._write_lock)
+
+    def test_concurrent_read_while_write_lock_held(self):
+        """Verify that reader queries execute without blocking even while _write_lock is held by another thread."""
+        database.set_config("concurrency_key", "initial_value")
+        chat_id = 995
+        database.add_resource(chat_id, "https://concur.example.com", "Concur", "http")
+
+        read_results = {}
+        read_done = threading.Event()
+
+        # Thread 1 holds _write_lock
+        with database._write_lock:
+            def reader_thread():
+                # Readers should execute freely without acquiring _write_lock
+                cfg = database.get_config("concurrency_key")
+                res = database.get_resources(chat_id)
+                read_results["config"] = cfg
+                read_results["resources_count"] = len(res)
+                read_done.set()
+
+            t = threading.Thread(target=reader_thread)
+            t.start()
+            t.join(timeout=2.0)
+
+        self.assertTrue(read_done.is_set(), "Reader thread was blocked by _write_lock")
+        self.assertEqual(read_results["config"], "initial_value")
+        self.assertEqual(read_results["resources_count"], 1)
 
 
 if __name__ == "__main__":

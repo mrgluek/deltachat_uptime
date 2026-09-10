@@ -48,6 +48,26 @@ try:
 except ImportError:
     sys.modules['emoji'] = MagicMock()
 
+try:
+    import aiohttp
+    from aiohttp import web
+except ImportError:
+    mock_aiohttp = MagicMock()
+    mock_web = MagicMock()
+    mock_aiohttp.web = mock_web
+    sys.modules['aiohttp'] = mock_aiohttp
+    sys.modules['aiohttp.web'] = mock_web
+
+try:
+    import aioping
+except ImportError:
+    sys.modules['aioping'] = MagicMock()
+
+try:
+    import qrcode
+except ImportError:
+    sys.modules['qrcode'] = MagicMock()
+
 # Add parent directory to sys.path so we can import database and bot
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -56,12 +76,14 @@ import bot
 
 class TestUptimeBot(unittest.TestCase):
     def setUp(self):
+        database.close_db()
         database.DB_PATH = TEST_DB
         database.init_db()
         bot._chat_ping_anti_spam.clear()
         database._transport_stats_buffer.clear()
 
     def tearDown(self):
+        database.close_db()
         if os.path.exists(TEST_DB):
             try:
                 os.remove(TEST_DB)
@@ -662,11 +684,11 @@ class TestUptimeBot(unittest.TestCase):
         
         # 1. HTTPS with valid cert (>7d)
         r1 = database.add_resource(chat_id, "https://site-valid.com", "Site Valid", "http")
-        database.update_resource_ssl(r1, now + 86400 * 60, now, 0)
+        database.update_resource_ssl(r1, now + 86400 * 60 + 60, now, 0)
         
         # 2. HTTPS with expiring cert (2d)
         r2 = database.add_resource(chat_id, "https://site-expiring.com", "Site Expiring", "http")
-        database.update_resource_ssl(r2, now + 86400 * 2, now, 3)
+        database.update_resource_ssl(r2, now + 86400 * 2 + 60, now, 3)
         
         # 3. HTTPS with expired cert (-1d)
         r3 = database.add_resource(chat_id, "https://site-expired.com", "Site Expired", "http")

@@ -49,7 +49,8 @@ Additionally, it automatically generates a secure, beautiful web status dashboar
   - **Async DNS Resolution & 5m TTL Cache:** `aiodns` (`AsyncResolver`) support with 300s TTL cache prevents blocking DNS lookups and reduces repeated nameserver queries.
   - **Native Async ICMP Ping (`aioping`):** Native in-process raw socket pinging eliminates subprocess creation overhead, with automatic fallback to `/bin/ping` if raw socket permissions are restricted.
   - **Deterministic Time Slot Staggering:** Uniform phase slotting (`(r_id * 11) % interval`) spreads checks across 5-second windows, preventing thundering-herd spikes on startup and interval boundaries.
-  - **Lock-Free SQLite WAL Concurrent Reads:** Dedicated `_write_lock` protects write transactions while enabling concurrent lock-free reads for web dashboards and chat status commands.
+  - **Lock-Free SQLite WAL Concurrent Reads & Persistent Writer:** Dedicated `_write_lock` protects write transactions with a persistent connection (`_writer_conn`) while enabling concurrent lock-free reads for web dashboards and chat status commands.
+  - **Zero-Churn Disk I/O (`synchronous=NORMAL`):** Uses SQLite WAL mode with `PRAGMA synchronous = NORMAL`, eliminating fsync overhead during commits and reducing continuous disk writes by >98%.
   - **Non-Blocking Semaphore:** Concurrency semaphore slots are held exclusively for the milliseconds of network probes; retry backoffs (30s) and remote peer checks execute asynchronously without starving healthy checks.
   - **Dedicated Thread Pools:** Separate thread executors for database queries (`uptime_db`) and Delta Chat JSON-RPC / SMTP calls (`uptime_rpc`) prevent slow email delivery from stalling database operations.
   - **Single-Query Batch Metrics & In-Memory TTL Cache:** Single SQL batch queries and 60-second TTL caching eliminate N+1 queries across web status pages, `/list`, and `/status`.

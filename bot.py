@@ -53,7 +53,7 @@ import database
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "2.9.1"
+VERSION = "2.9.2"
 USER_AGENT = f"DeltaChat-Uptime-Bot/{VERSION} (https://git.gluek.info/gluek/deltachat_uptime)"
 
 # Dedicated thread pools for database operations and Delta Chat RPC calls

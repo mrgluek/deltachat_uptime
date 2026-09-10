@@ -1,3 +1,4 @@
+import contextlib
 import os
 import re
 import sqlite3
@@ -10,14 +11,63 @@ DB_PATH = os.getenv("DB_PATH", "uptime.db")
 _write_lock = threading.RLock()
 _lock = _write_lock  # Backwards compatibility
 
+_writer_conn = None
+_writer_conn_db_path = None
+
+def close_db():
+    """Explicitly closes the persistent writer connection (useful for tests and shutdown)."""
+    global _writer_conn, _writer_conn_db_path
+    with _write_lock:
+        if _writer_conn is not None:
+            try:
+                _writer_conn.close()
+            except Exception:
+                pass
+            _writer_conn = None
+            _writer_conn_db_path = None
+
+def _get_writer_conn() -> sqlite3.Connection:
+    """Returns a shared, persistent connection for write operations guarded by _write_lock."""
+    global _writer_conn, _writer_conn_db_path
+    if _writer_conn is not None and _writer_conn_db_path != DB_PATH:
+        try:
+            _writer_conn.close()
+        except Exception:
+            pass
+        _writer_conn = None
+
+    if _writer_conn is None:
+        _writer_conn = sqlite3.connect(DB_PATH, timeout=15.0, check_same_thread=False)
+        _writer_conn.execute("PRAGMA busy_timeout = 5000;")
+        _writer_conn.execute("PRAGMA synchronous = NORMAL;")
+        _writer_conn.execute("PRAGMA journal_mode = WAL;")
+        _writer_conn.execute("PRAGMA wal_autocheckpoint = 1000;")
+        _writer_conn_db_path = DB_PATH
+    return _writer_conn
+
+@contextlib.contextmanager
+def _writer_transaction():
+    """Context manager for write transactions reusing _writer_conn under _write_lock."""
+    with _write_lock:
+        conn = _get_writer_conn()
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
+
 def _connect(timeout: float = 10.0) -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, timeout=timeout)
     conn.execute("PRAGMA busy_timeout = 5000;")
+    conn.execute("PRAGMA synchronous = NORMAL;")
     return conn
 
 def init_db():
-    with _write_lock:
-        conn = _connect()
+    with _writer_transaction() as conn:
         # Enable WAL mode and concurrency PRAGMAs
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")
@@ -211,20 +261,12 @@ def init_db():
                 created_at INTEGER DEFAULT (strftime('%s','now'))
             )
         ''')
-        
-        conn.commit()
-        conn.close()
 
 # Config functions
 def set_config(key: str, value: str):
-    with _write_lock:
-        conn = _connect()
-        try:
-            cursor = conn.cursor()
-            cursor.execute("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)", (key, value))
-            conn.commit()
-        finally:
-            conn.close()
+    with _writer_transaction() as conn:
+        cursor = conn.cursor()
+        cursor.execute("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)", (key, value))
 
 def get_config(key: str) -> str:
     conn = _connect()
@@ -297,26 +339,21 @@ def generate_chat_token() -> str:
     return ''.join(secrets.choice(alphabet) for _ in range(12))
 
 def get_or_create_chat_token(dc_chat_id: int) -> str:
-    with _write_lock:
-        conn = _connect()
-        try:
-            cursor = conn.cursor()
-            cursor.execute("SELECT token FROM chats WHERE dc_chat_id = ?", (dc_chat_id,))
-            row = cursor.fetchone()
-            if row:
-                return row[0]
-            # Generate a unique token
-            while True:
-                token = generate_chat_token()
-                try:
-                    cursor.execute("INSERT INTO chats (dc_chat_id, token) VALUES (?, ?)", (dc_chat_id, token))
-                    conn.commit()
-                    return token
-                except sqlite3.IntegrityError:
-                    # Token collision, retry
-                    continue
-        finally:
-            conn.close()
+    with _writer_transaction() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT token FROM chats WHERE dc_chat_id = ?", (dc_chat_id,))
+        row = cursor.fetchone()
+        if row:
+            return row[0]
+        # Generate a unique token
+        while True:
+            token = generate_chat_token()
+            try:
+                cursor.execute("INSERT INTO chats (dc_chat_id, token) VALUES (?, ?)", (dc_chat_id, token))
+                return token
+            except sqlite3.IntegrityError:
+                # Token collision, retry
+                continue
 
 def get_chat_id_by_token(token: str) -> int:
     conn = _connect()
@@ -330,69 +367,43 @@ def get_chat_id_by_token(token: str) -> int:
 
 # Resource functions
 def add_resource(dc_chat_id: int, url: str, name: str, check_type: str, interval: int = 60, expected_keyword: str = None) -> int:
-    with _write_lock:
-        conn = _connect()
+    with _writer_transaction() as conn:
+        cursor = conn.cursor()
         try:
-            cursor = conn.cursor()
             cursor.execute('''
                 INSERT INTO resources (dc_chat_id, url, name, type, interval, status, last_changed, expected_keyword) 
                 VALUES (?, ?, ?, ?, ?, 'unknown', ?, ?)
             ''', (dc_chat_id, url, name, check_type, interval, int(time.time()), expected_keyword))
-            resource_id = cursor.lastrowid
-            conn.commit()
-            return resource_id
+            return cursor.lastrowid
         except sqlite3.IntegrityError:
+            conn.rollback()
             return None
-        finally:
-            conn.close()
 
 def set_resource_keyword(dc_chat_id: int, resource_id: int, keyword: str | None) -> bool:
-    with _write_lock:
-        conn = _connect()
-        try:
-            cursor = conn.cursor()
-            cursor.execute("UPDATE resources SET expected_keyword = ? WHERE dc_chat_id = ? AND id = ?", (keyword, dc_chat_id, resource_id))
-            updated = cursor.rowcount > 0
-            conn.commit()
-            return updated
-        finally:
-            conn.close()
+    with _writer_transaction() as conn:
+        cursor = conn.cursor()
+        cursor.execute("UPDATE resources SET expected_keyword = ? WHERE dc_chat_id = ? AND id = ?", (keyword, dc_chat_id, resource_id))
+        return cursor.rowcount > 0
 
 def set_resource_maintenance(dc_chat_id: int, resource_id: int, until_ts: int) -> bool:
-    with _write_lock:
-        conn = _connect()
-        try:
-            cursor = conn.cursor()
-            cursor.execute("UPDATE resources SET maintenance_until = ? WHERE dc_chat_id = ? AND id = ?", (until_ts, dc_chat_id, resource_id))
-            updated = cursor.rowcount > 0
-            conn.commit()
-            return updated
-        finally:
-            conn.close()
+    with _writer_transaction() as conn:
+        cursor = conn.cursor()
+        cursor.execute("UPDATE resources SET maintenance_until = ? WHERE dc_chat_id = ? AND id = ?", (until_ts, dc_chat_id, resource_id))
+        return cursor.rowcount > 0
 
 def update_resource_latency(resource_id: int, latency_ms: int):
-    with _write_lock:
-        conn = _connect()
-        try:
-            cursor = conn.cursor()
-            cursor.execute("UPDATE resources SET last_latency_ms = ? WHERE id = ?", (latency_ms, resource_id))
-            conn.commit()
-        finally:
-            conn.close()
+    with _writer_transaction() as conn:
+        cursor = conn.cursor()
+        cursor.execute("UPDATE resources SET last_latency_ms = ? WHERE id = ?", (latency_ms, resource_id))
 
 def delete_resource(dc_chat_id: int, resource_id: int) -> bool:
-    with _write_lock:
-        conn = _connect()
-        try:
-            cursor = conn.cursor()
-            cursor.execute("DELETE FROM resources WHERE dc_chat_id = ? AND id = ?", (dc_chat_id, resource_id))
-            deleted = cursor.rowcount > 0
-            conn.commit()
-            if deleted:
-                invalidate_uptime_cache(resource_id)
-            return deleted
-        finally:
-            conn.close()
+    with _writer_transaction() as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM resources WHERE dc_chat_id = ? AND id = ?", (dc_chat_id, resource_id))
+        deleted = cursor.rowcount > 0
+        if deleted:
+            invalidate_uptime_cache(resource_id)
+        return deleted
 
 def get_resources(dc_chat_id: int) -> list[dict]:
     conn = _connect()
@@ -437,85 +448,79 @@ def batch_update_resource_status(updates: list[dict]):
         return
 
     now = int(time.time())
-    with _write_lock:
-        conn = _connect()
-        try:
-            cursor = conn.cursor()
-            for item in updates:
-                resource_id = item["id"]
-                status = item["status"]
-                consecutive_failures = item.get("consecutive_failures", 0)
-                error_msg = item.get("error_msg")
-                latency_ms = item.get("latency_ms")
+    with _writer_transaction() as conn:
+        cursor = conn.cursor()
+        for item in updates:
+            resource_id = item["id"]
+            status = item["status"]
+            consecutive_failures = item.get("consecutive_failures", 0)
+            error_msg = item.get("error_msg")
+            latency_ms = item.get("latency_ms")
 
-                cursor.execute("SELECT status, last_changed FROM resources WHERE id = ?", (resource_id,))
-                row = cursor.fetchone()
-                if not row:
-                    continue
+            cursor.execute("SELECT status, last_changed FROM resources WHERE id = ?", (resource_id,))
+            row = cursor.fetchone()
+            if not row:
+                continue
 
-                old_status = row[0]
-                if old_status != status:
-                    invalidate_uptime_cache(resource_id)
+            old_status = row[0]
+            if old_status != status:
+                invalidate_uptime_cache(resource_id)
+                cursor.execute('''
+                    UPDATE resources 
+                    SET status = ?, last_checked = ?, last_changed = ?, consecutive_failures = ?,
+                        last_latency_ms = COALESCE(?, last_latency_ms)
+                    WHERE id = ?
+                ''', (status, now, now, consecutive_failures, latency_ms, resource_id))
+
+                if status == "down":
+                    cursor.execute("SELECT dc_chat_id FROM resources WHERE id = ?", (resource_id,))
+                    chat_row = cursor.fetchone()
+                    inc_id = None
+                    if chat_row:
+                        chat_id = chat_row[0]
+                        cursor.execute('''
+                            SELECT i.id, i.status,
+                                   MAX(COALESCE(de.went_down_at, i.started_at)) as last_down_at,
+                                   COALESCE(i.resolved_at, MAX(COALESCE(de.went_up_at, de.went_down_at, i.started_at))) as last_event_at
+                            FROM incidents i
+                            LEFT JOIN downtime_events de ON de.incident_id = i.id
+                            WHERE i.dc_chat_id = ?
+                            GROUP BY i.id
+                            HAVING (? - last_event_at) <= 3600 AND (? >= last_event_at)
+                            ORDER BY (CASE WHEN i.status = 'ongoing' THEN 0 ELSE 1 END), i.id DESC LIMIT 1
+                        ''', (chat_id, now, now))
+                        inc_row = cursor.fetchone()
+                        if inc_row:
+                            inc_id = inc_row[0]
+                            inc_status = inc_row[1]
+                            if inc_status == 'resolved':
+                                cursor.execute("UPDATE incidents SET status = 'ongoing', resolved_at = NULL, summary = NULL WHERE id = ?", (inc_id,))
+                        else:
+                            cursor.execute("INSERT INTO incidents (dc_chat_id, status, started_at) VALUES (?, 'ongoing', ?)", (chat_id, now))
+                            inc_id = cursor.lastrowid
+
+                    cursor.execute('''
+                        INSERT INTO downtime_events (resource_id, went_down_at, went_up_at, error_msg, incident_id)
+                        VALUES (?, ?, NULL, ?, ?)
+                    ''', (resource_id, now, error_msg, inc_id))
+                elif status == "up" and old_status == "down":
+                    cursor.execute('''
+                        UPDATE downtime_events 
+                        SET went_up_at = ? 
+                        WHERE resource_id = ? AND went_up_at IS NULL
+                    ''', (now, resource_id))
                     cursor.execute('''
                         UPDATE resources 
-                        SET status = ?, last_checked = ?, last_changed = ?, consecutive_failures = ?,
-                            last_latency_ms = COALESCE(?, last_latency_ms)
+                        SET stale_warning_level = 0 
                         WHERE id = ?
-                    ''', (status, now, now, consecutive_failures, latency_ms, resource_id))
-
-                    if status == "down":
-                        cursor.execute("SELECT dc_chat_id FROM resources WHERE id = ?", (resource_id,))
-                        chat_row = cursor.fetchone()
-                        inc_id = None
-                        if chat_row:
-                            chat_id = chat_row[0]
-                            cursor.execute('''
-                                SELECT i.id, i.status,
-                                       MAX(COALESCE(de.went_down_at, i.started_at)) as last_down_at,
-                                       COALESCE(i.resolved_at, MAX(COALESCE(de.went_up_at, de.went_down_at, i.started_at))) as last_event_at
-                                FROM incidents i
-                                LEFT JOIN downtime_events de ON de.incident_id = i.id
-                                WHERE i.dc_chat_id = ?
-                                GROUP BY i.id
-                                HAVING (? - last_event_at) <= 3600 AND (? >= last_event_at)
-                                ORDER BY (CASE WHEN i.status = 'ongoing' THEN 0 ELSE 1 END), i.id DESC LIMIT 1
-                            ''', (chat_id, now, now))
-                            inc_row = cursor.fetchone()
-                            if inc_row:
-                                inc_id = inc_row[0]
-                                inc_status = inc_row[1]
-                                if inc_status == 'resolved':
-                                    cursor.execute("UPDATE incidents SET status = 'ongoing', resolved_at = NULL, summary = NULL WHERE id = ?", (inc_id,))
-                            else:
-                                cursor.execute("INSERT INTO incidents (dc_chat_id, status, started_at) VALUES (?, 'ongoing', ?)", (chat_id, now))
-                                inc_id = cursor.lastrowid
-
-                        cursor.execute('''
-                            INSERT INTO downtime_events (resource_id, went_down_at, went_up_at, error_msg, incident_id)
-                            VALUES (?, ?, NULL, ?, ?)
-                        ''', (resource_id, now, error_msg, inc_id))
-                    elif status == "up" and old_status == "down":
-                        cursor.execute('''
-                            UPDATE downtime_events 
-                            SET went_up_at = ? 
-                            WHERE resource_id = ? AND went_up_at IS NULL
-                        ''', (now, resource_id))
-                        cursor.execute('''
-                            UPDATE resources 
-                            SET stale_warning_level = 0 
-                            WHERE id = ?
-                        ''', (resource_id,))
-                else:
-                    cursor.execute('''
-                        UPDATE resources 
-                        SET last_checked = ?, consecutive_failures = ?,
-                            last_latency_ms = COALESCE(?, last_latency_ms)
-                        WHERE id = ?
-                    ''', (now, consecutive_failures, latency_ms, resource_id))
-
-            conn.commit()
-        finally:
-            conn.close()
+                    ''', (resource_id,))
+            else:
+                cursor.execute('''
+                    UPDATE resources 
+                    SET last_checked = ?, consecutive_failures = ?,
+                        last_latency_ms = COALESCE(?, last_latency_ms)
+                    WHERE id = ?
+                ''', (now, consecutive_failures, latency_ms, resource_id))
 
 
 def update_resource_status(resource_id: int, status: str, consecutive_failures: int, error_msg: str = None, latency_ms: int = None):
@@ -530,74 +535,48 @@ def update_resource_status(resource_id: int, status: str, consecutive_failures: 
 
 def update_stale_warning_level(resource_id: int, level: int):
     """Update the highest stale downtime warning level sent for this resource (0, 7, 14)."""
-    with _write_lock:
-        conn = _connect()
-        try:
-            cursor = conn.cursor()
-            cursor.execute("UPDATE resources SET stale_warning_level = ? WHERE id = ?", (level, resource_id))
-            conn.commit()
-        finally:
-            conn.close()
+    with _writer_transaction() as conn:
+        cursor = conn.cursor()
+        cursor.execute("UPDATE resources SET stale_warning_level = ? WHERE id = ?", (level, resource_id))
 
 def update_resource_ssl(resource_id: int, ssl_expiry_date: int | None, ssl_last_checked: int, ssl_alert_state: int = 0):
-    with _write_lock:
-        conn = _connect()
-        try:
-            cursor = conn.cursor()
-            cursor.execute('''
-                UPDATE resources 
-                SET ssl_expiry_date = ?, ssl_last_checked = ?, ssl_alert_state = ? 
-                WHERE id = ?
-            ''', (ssl_expiry_date, ssl_last_checked, ssl_alert_state, resource_id))
-            conn.commit()
-        finally:
-            conn.close()
+    with _writer_transaction() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            UPDATE resources 
+            SET ssl_expiry_date = ?, ssl_last_checked = ?, ssl_alert_state = ? 
+            WHERE id = ?
+        ''', (ssl_expiry_date, ssl_last_checked, ssl_alert_state, resource_id))
 
 def update_ssl_alert_state(resource_id: int, ssl_alert_state: int):
-    with _write_lock:
-        conn = _connect()
-        try:
-            cursor = conn.cursor()
-            cursor.execute('''
-                UPDATE resources 
-                SET ssl_alert_state = ? 
-                WHERE id = ?
-            ''', (ssl_alert_state, resource_id))
-            conn.commit()
-        finally:
-            conn.close()
+    with _writer_transaction() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            UPDATE resources 
+            SET ssl_alert_state = ? 
+            WHERE id = ?
+        ''', (ssl_alert_state, resource_id))
 
 def update_resource_down_msg_id(resource_id: int, msg_id: int | None):
-    with _write_lock:
-        conn = _connect()
-        try:
-            cursor = conn.cursor()
-            cursor.execute('''
-                UPDATE resources 
-                SET last_down_msg_id = ? 
-                WHERE id = ?
-            ''', (msg_id, resource_id))
-            conn.commit()
-        finally:
-            conn.close()
+    with _writer_transaction() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            UPDATE resources 
+            SET last_down_msg_id = ? 
+            WHERE id = ?
+        ''', (msg_id, resource_id))
 
 # Incident management functions
 def create_incident(dc_chat_id: int, started_at: int = None) -> int:
     if started_at is None:
         started_at = int(time.time())
-    with _write_lock:
-        conn = _connect()
-        try:
-            cursor = conn.cursor()
-            cursor.execute('''
-                INSERT INTO incidents (dc_chat_id, status, started_at)
-                VALUES (?, 'ongoing', ?)
-            ''', (dc_chat_id, started_at))
-            incident_id = cursor.lastrowid
-            conn.commit()
-            return incident_id
-        finally:
-            conn.close()
+    with _writer_transaction() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO incidents (dc_chat_id, status, started_at)
+            VALUES (?, 'ongoing', ?)
+        ''', (dc_chat_id, started_at))
+        return cursor.lastrowid
 
 def get_active_incident(dc_chat_id: int) -> dict | None:
     conn = _connect()
@@ -665,18 +644,13 @@ def get_active_incident_for_outage(dc_chat_id: int, outage_time: int, max_gap_se
         conn.close()
 
 def reopen_incident(incident_id: int):
-    with _write_lock:
-        conn = _connect()
-        try:
-            cursor = conn.cursor()
-            cursor.execute('''
-                UPDATE incidents 
-                SET status = 'ongoing', resolved_at = NULL, summary = NULL 
-                WHERE id = ?
-            ''', (incident_id,))
-            conn.commit()
-        finally:
-            conn.close()
+    with _writer_transaction() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            UPDATE incidents 
+            SET status = 'ongoing', resolved_at = NULL, summary = NULL 
+            WHERE id = ?
+        ''', (incident_id,))
 
 def get_all_active_incidents() -> list[dict]:
     conn = _connect()
@@ -755,34 +729,24 @@ def get_resources_by_target(dc_chat_id: int, target: str) -> list[dict]:
 def update_incident_msg_id(incident_id: int, msg_id: int | None):
     if msg_id is not None and not isinstance(msg_id, int):
         return
-    with _write_lock:
-        conn = _connect()
-        try:
-            cursor = conn.cursor()
-            cursor.execute('''
-                UPDATE incidents 
-                SET msg_id = ? 
-                WHERE id = ?
-            ''', (msg_id, incident_id))
-            conn.commit()
-        finally:
-            conn.close()
+    with _writer_transaction() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            UPDATE incidents 
+            SET msg_id = ? 
+            WHERE id = ?
+        ''', (msg_id, incident_id))
 
 def resolve_incident(incident_id: int, resolved_at: int = None, summary: str = ""):
     if resolved_at is None:
         resolved_at = int(time.time())
-    with _write_lock:
-        conn = _connect()
-        try:
-            cursor = conn.cursor()
-            cursor.execute('''
-                UPDATE incidents 
-                SET status = 'resolved', resolved_at = ?, summary = ? 
-                WHERE id = ?
-            ''', (resolved_at, summary, incident_id))
-            conn.commit()
-        finally:
-            conn.close()
+    with _writer_transaction() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            UPDATE incidents 
+            SET status = 'resolved', resolved_at = ?, summary = ? 
+            WHERE id = ?
+        ''', (resolved_at, summary, incident_id))
 
 def get_recent_incidents(dc_chat_id: int, limit: int = 10) -> list[dict]:
     conn = _connect()
@@ -832,14 +796,9 @@ def get_unlinked_open_downtime_events(dc_chat_id: int) -> list[dict]:
         conn.close()
 
 def link_downtime_event_to_incident(downtime_event_id: int, incident_id: int):
-    with _write_lock:
-        conn = _connect()
-        try:
-            cursor = conn.cursor()
-            cursor.execute("UPDATE downtime_events SET incident_id = ? WHERE id = ?", (incident_id, downtime_event_id))
-            conn.commit()
-        finally:
-            conn.close()
+    with _writer_transaction() as conn:
+        cursor = conn.cursor()
+        cursor.execute("UPDATE downtime_events SET incident_id = ? WHERE id = ?", (incident_id, downtime_event_id))
 
 def get_incident_downtime_events(incident_id: int) -> list[dict]:
     """Returns all downtime events associated with an incident."""
@@ -862,14 +821,9 @@ def get_incident_downtime_events(incident_id: int) -> list[dict]:
 def close_resource_downtime_events(resource_id: int, now: int = None):
     if now is None:
         now = int(time.time())
-    with _write_lock:
-        conn = _connect()
-        try:
-            cursor = conn.cursor()
-            cursor.execute("UPDATE downtime_events SET went_up_at = ? WHERE resource_id = ? AND went_up_at IS NULL", (now, resource_id))
-            conn.commit()
-        finally:
-            conn.close()
+    with _writer_transaction() as conn:
+        cursor = conn.cursor()
+        cursor.execute("UPDATE downtime_events SET went_up_at = ? WHERE resource_id = ? AND went_up_at IS NULL", (now, resource_id))
 
 def get_resource_downtime_events(resource_id: int, limit: int = 10) -> list[dict]:
     conn = _connect()
@@ -1073,29 +1027,24 @@ def flush_transport_stats():
         _transport_stats_buffer.clear()
         _last_transport_flush = time.time()
 
-    with _write_lock:
-        conn = _connect()
-        try:
-            cursor = conn.cursor()
-            for addr, counts in pending.items():
-                if not isinstance(addr, str) or "@" not in addr:
-                    continue
-                sent = int(counts.get("sent", 0))
-                recv = int(counts.get("recv", 0))
-                last_s = counts.get("last_sent") or None
-                last_r = counts.get("last_recv") or None
-                cursor.execute('''
-                    INSERT INTO transport_stats (addr, msgs_sent, msgs_received, last_sent_at, last_received_at)
-                    VALUES (?, ?, ?, ?, ?)
-                    ON CONFLICT(addr) DO UPDATE SET
-                        msgs_sent = msgs_sent + excluded.msgs_sent,
-                        msgs_received = msgs_received + excluded.msgs_received,
-                        last_sent_at = COALESCE(excluded.last_sent_at, transport_stats.last_sent_at),
-                        last_received_at = COALESCE(excluded.last_received_at, transport_stats.last_received_at)
-                ''', (addr, sent, recv, last_s, last_r))
-            conn.commit()
-        finally:
-            conn.close()
+    with _writer_transaction() as conn:
+        cursor = conn.cursor()
+        for addr, counts in pending.items():
+            if not isinstance(addr, str) or "@" not in addr:
+                continue
+            sent = int(counts.get("sent", 0))
+            recv = int(counts.get("recv", 0))
+            last_s = counts.get("last_sent") or None
+            last_r = counts.get("last_recv") or None
+            cursor.execute('''
+                INSERT INTO transport_stats (addr, msgs_sent, msgs_received, last_sent_at, last_received_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(addr) DO UPDATE SET
+                    msgs_sent = msgs_sent + excluded.msgs_sent,
+                    msgs_received = msgs_received + excluded.msgs_received,
+                    last_sent_at = COALESCE(excluded.last_sent_at, transport_stats.last_sent_at),
+                    last_received_at = COALESCE(excluded.last_received_at, transport_stats.last_received_at)
+            ''', (addr, sent, recv, last_s, last_r))
 
 def get_all_transport_stats() -> list[dict]:
     flush_transport_stats()
@@ -1114,27 +1063,21 @@ def cleanup_old_records(retention_days: int = 90) -> dict[str, int]:
     now = int(time.time())
     cutoff = now - (retention_days * 86400)
     cleaned = {}
-    with _write_lock:
-        conn = _connect()
-        try:
-            cursor = conn.cursor()
-            
-            # 1. Prune resolved downtime events older than retention_days
-            cursor.execute("DELETE FROM downtime_events WHERE went_up_at IS NOT NULL AND went_up_at < ?", (cutoff,))
-            cleaned["downtime_events"] = cursor.rowcount
-            
-            # 2. Prune resolved incidents older than retention_days
-            cursor.execute("DELETE FROM incidents WHERE status = 'resolved' AND resolved_at < ?", (cutoff,))
-            cleaned["incidents"] = cursor.rowcount
-            
-            # 3. Prune old peer measurements (older than 7 days)
-            meas_cutoff = now - (7 * 86400)
-            cursor.execute("DELETE FROM peer_measurements WHERE last_checked < ?", (meas_cutoff,))
-            cleaned["peer_measurements"] = cursor.rowcount
-            
-            conn.commit()
-        finally:
-            conn.close()
+    with _writer_transaction() as conn:
+        cursor = conn.cursor()
+        
+        # 1. Prune resolved downtime events older than retention_days
+        cursor.execute("DELETE FROM downtime_events WHERE went_up_at IS NOT NULL AND went_up_at < ?", (cutoff,))
+        cleaned["downtime_events"] = cursor.rowcount
+        
+        # 2. Prune resolved incidents older than retention_days
+        cursor.execute("DELETE FROM incidents WHERE status = 'resolved' AND resolved_at < ?", (cutoff,))
+        cleaned["incidents"] = cursor.rowcount
+        
+        # 3. Prune old peer measurements (older than 7 days)
+        meas_cutoff = now - (7 * 86400)
+        cursor.execute("DELETE FROM peer_measurements WHERE last_checked < ?", (meas_cutoff,))
+        cleaned["peer_measurements"] = cursor.rowcount
     return cleaned
 
 # Peer management functions
@@ -1149,47 +1092,36 @@ def set_local_node_name(name: str):
 
 def add_or_update_peer(email: str, node_name: str = None, chat_id: int = None, last_seen: int = None):
     email = email.lower().strip()
-    with _write_lock:
-        conn = _connect()
-        try:
-            cursor = conn.cursor()
-            cursor.execute("SELECT node_name, chat_id, last_seen FROM peers WHERE email = ?", (email,))
-            row = cursor.fetchone()
-            
-            now = int(time.time())
-            if row:
-                curr_node, curr_chat, curr_seen = row
-                new_node = node_name if node_name is not None else curr_node
-                new_chat = chat_id if chat_id is not None else curr_chat
-                new_seen = last_seen if last_seen is not None else (curr_seen or now)
-                cursor.execute(
-                    "UPDATE peers SET node_name = ?, chat_id = ?, last_seen = ? WHERE email = ?",
-                    (new_node, new_chat, new_seen, email)
-                )
-            else:
-                n_name = node_name or "Remote-Node"
-                c_id = chat_id
-                s_time = last_seen or now
-                cursor.execute(
-                    "INSERT INTO peers (email, node_name, chat_id, last_seen) VALUES (?, ?, ?, ?)",
-                    (email, n_name, c_id, s_time)
-                )
-            conn.commit()
-        finally:
-            conn.close()
+    with _writer_transaction() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT node_name, chat_id, last_seen FROM peers WHERE email = ?", (email,))
+        row = cursor.fetchone()
+        
+        now = int(time.time())
+        if row:
+            curr_node, curr_chat, curr_seen = row
+            new_node = node_name if node_name is not None else curr_node
+            new_chat = chat_id if chat_id is not None else curr_chat
+            new_seen = last_seen if last_seen is not None else (curr_seen or now)
+            cursor.execute(
+                "UPDATE peers SET node_name = ?, chat_id = ?, last_seen = ? WHERE email = ?",
+                (new_node, new_chat, new_seen, email)
+            )
+        else:
+            n_name = node_name or "Remote-Node"
+            c_id = chat_id
+            s_time = last_seen or now
+            cursor.execute(
+                "INSERT INTO peers (email, node_name, chat_id, last_seen) VALUES (?, ?, ?, ?)",
+                (email, n_name, c_id, s_time)
+            )
 
 def remove_peer(email: str) -> bool:
     email = email.lower().strip()
-    with _write_lock:
-        conn = _connect()
-        try:
-            cursor = conn.cursor()
-            cursor.execute("DELETE FROM peers WHERE email = ?", (email,))
-            changed = cursor.rowcount > 0
-            conn.commit()
-            return changed
-        finally:
-            conn.close()
+    with _writer_transaction() as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM peers WHERE email = ?", (email,))
+        return cursor.rowcount > 0
 
 def get_peer(email: str) -> dict | None:
     email = email.lower().strip()
@@ -1233,26 +1165,27 @@ def update_peer_last_seen(email: str, timestamp: int = None) -> tuple[bool, int,
     """
     email = email.lower().strip()
     now = timestamp if timestamp is not None else int(time.time())
-    with _write_lock:
-        conn = _connect()
-        conn.row_factory = sqlite3.Row
-        try:
-            cursor = conn.cursor()
-            cursor.execute("SELECT * FROM peers WHERE email = ?", (email,))
-            row = cursor.fetchone()
-            if not row:
-                return False, 0, None
-                
-            peer = dict(row)
-            was_offline = (peer.get("is_offline") == 1)
-            went_offline_at = peer.get("went_offline_at") or 0
-            downtime = max(1, now - went_offline_at) if was_offline and went_offline_at > 0 else 0
+    with _writer_transaction() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT email, node_name, chat_id, last_seen, is_offline, went_offline_at FROM peers WHERE email = ?", (email,))
+        row = cursor.fetchone()
+        if not row:
+            return False, 0, None
+            
+        peer = {
+            "email": row[0],
+            "node_name": row[1],
+            "chat_id": row[2],
+            "last_seen": row[3],
+            "is_offline": row[4],
+            "went_offline_at": row[5],
+        }
+        was_offline = (peer.get("is_offline") == 1)
+        went_offline_at = peer.get("went_offline_at") or 0
+        downtime = max(1, now - went_offline_at) if was_offline and went_offline_at > 0 else 0
 
-            cursor.execute("UPDATE peers SET last_seen = ?, is_offline = 0, went_offline_at = 0 WHERE email = ?", (now, email))
-            conn.commit()
-            return was_offline, downtime, peer
-        finally:
-            conn.close()
+        cursor.execute("UPDATE peers SET last_seen = ?, is_offline = 0, went_offline_at = 0 WHERE email = ?", (now, email))
+        return was_offline, downtime, peer
 
 def audit_peers_offline(threshold_seconds: int = 360, now: int = None) -> list[dict]:
     """
@@ -1262,50 +1195,44 @@ def audit_peers_offline(threshold_seconds: int = 360, now: int = None) -> list[d
     cur_time = now if now is not None else int(time.time())
     cutoff = cur_time - threshold_seconds
     newly_offline = []
-    with _write_lock:
-        conn = _connect()
-        conn.row_factory = sqlite3.Row
-        try:
-            cursor = conn.cursor()
+    with _writer_transaction() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT email, node_name, chat_id, last_seen, is_offline, went_offline_at FROM peers 
+            WHERE last_seen > 0 AND last_seen < ? AND (is_offline IS NULL OR is_offline = 0)
+        ''', (cutoff,))
+        rows = cursor.fetchall()
+        for r in rows:
+            p = {
+                "email": r[0],
+                "node_name": r[1],
+                "chat_id": r[2],
+                "last_seen": r[3],
+                "is_offline": 1,
+                "went_offline_at": cur_time,
+            }
             cursor.execute('''
-                SELECT * FROM peers 
-                WHERE last_seen > 0 AND last_seen < ? AND (is_offline IS NULL OR is_offline = 0)
-            ''', (cutoff,))
-            rows = cursor.fetchall()
-            for r in rows:
-                p = dict(r)
-                cursor.execute('''
-                    UPDATE peers 
-                    SET is_offline = 1, went_offline_at = ? 
-                    WHERE email = ?
-                ''', (cur_time, p["email"]))
-                p["is_offline"] = 1
-                p["went_offline_at"] = cur_time
-                newly_offline.append(p)
-            conn.commit()
-        finally:
-            conn.close()
+                UPDATE peers 
+                SET is_offline = 1, went_offline_at = ? 
+                WHERE email = ?
+            ''', (cur_time, p["email"]))
+            newly_offline.append(p)
     return newly_offline
 
 # Peer measurements (remote probe telemetry)
 def save_peer_measurement(url: str, node_name: str, status: str, latency_ms: int | None = None, error_msg: str = None, last_checked: int = None):
     now = last_checked if last_checked is not None else int(time.time())
-    with _write_lock:
-        conn = _connect()
-        try:
-            cursor = conn.cursor()
-            cursor.execute('''
-                INSERT INTO peer_measurements (url, node_name, status, latency_ms, error_msg, last_checked)
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(url, node_name) DO UPDATE SET
-                    status = excluded.status,
-                    latency_ms = excluded.latency_ms,
-                    error_msg = excluded.error_msg,
-                    last_checked = excluded.last_checked
-            ''', (url, node_name, status, latency_ms, error_msg, now))
-            conn.commit()
-        finally:
-            conn.close()
+    with _writer_transaction() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO peer_measurements (url, node_name, status, latency_ms, error_msg, last_checked)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(url, node_name) DO UPDATE SET
+                status = excluded.status,
+                latency_ms = excluded.latency_ms,
+                error_msg = excluded.error_msg,
+                last_checked = excluded.last_checked
+        ''', (url, node_name, status, latency_ms, error_msg, now))
 
 def save_peer_measurements_batch(node_name: str, metrics_list: list[dict]):
     if not metrics_list:
@@ -1344,22 +1271,17 @@ def save_peer_measurements_batch(node_name: str, metrics_list: list[dict]):
     if not rows:
         return
 
-    with _write_lock:
-        conn = _connect()
-        try:
-            cursor = conn.cursor()
-            cursor.executemany('''
-                INSERT INTO peer_measurements (url, node_name, status, latency_ms, error_msg, last_checked)
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(url, node_name) DO UPDATE SET
-                    status = excluded.status,
-                    latency_ms = excluded.latency_ms,
-                    error_msg = excluded.error_msg,
-                    last_checked = excluded.last_checked
-            ''', rows)
-            conn.commit()
-        finally:
-            conn.close()
+    with _writer_transaction() as conn:
+        cursor = conn.cursor()
+        cursor.executemany('''
+            INSERT INTO peer_measurements (url, node_name, status, latency_ms, error_msg, last_checked)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(url, node_name) DO UPDATE SET
+                status = excluded.status,
+                latency_ms = excluded.latency_ms,
+                error_msg = excluded.error_msg,
+                last_checked = excluded.last_checked
+        ''', rows)
 
 def get_peer_measurements_for_url(url: str) -> list[dict]:
     conn = _connect()
@@ -1387,43 +1309,38 @@ def get_all_peer_measurements() -> list[dict]:
 def save_probe_targets_batch(targets: list[dict], source_peer: str = None):
     if not targets:
         return
-    with _write_lock:
-        conn = _connect()
-        try:
-            cursor = conn.cursor()
-            cursor.execute("SELECT url FROM ignored_probe_targets")
-            ignored_set = set(row[0] for row in cursor.fetchall())
+    with _writer_transaction() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT url FROM ignored_probe_targets")
+        ignored_set = set(row[0] for row in cursor.fetchall())
 
-            now = int(time.time())
-            rows = []
-            for item in targets[:200]:
-                if not isinstance(item, dict):
-                    continue
-                url = str(item.get("url") or "").strip()[:500]
-                if not url or url in ignored_set:
-                    continue
-                name = str(item.get("name") or url).strip()[:200]
-                chk_type = str(item.get("type") or "http").strip().lower()
-                if chk_type not in ("http", "tcp", "ping"):
-                    chk_type = "http"
-                raw_kw = item.get("expected_keyword")
-                kw = str(raw_kw).strip()[:200] if raw_kw else None
-                rows.append((url, name, chk_type, kw, source_peer, now))
+        now = int(time.time())
+        rows = []
+        for item in targets[:200]:
+            if not isinstance(item, dict):
+                continue
+            url = str(item.get("url") or "").strip()[:500]
+            if not url or url in ignored_set:
+                continue
+            name = str(item.get("name") or url).strip()[:200]
+            chk_type = str(item.get("type") or "http").strip().lower()
+            if chk_type not in ("http", "tcp", "ping"):
+                chk_type = "http"
+            raw_kw = item.get("expected_keyword")
+            kw = str(raw_kw).strip()[:200] if raw_kw else None
+            rows.append((url, name, chk_type, kw, source_peer, now))
 
-            if rows:
-                cursor.executemany('''
-                    INSERT INTO probe_targets (url, name, type, expected_keyword, source_peer, last_seen)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(url) DO UPDATE SET
-                        name = excluded.name,
-                        type = excluded.type,
-                        expected_keyword = excluded.expected_keyword,
-                        source_peer = COALESCE(excluded.source_peer, probe_targets.source_peer),
-                        last_seen = excluded.last_seen
-                ''', rows)
-            conn.commit()
-        finally:
-            conn.close()
+        if rows:
+            cursor.executemany('''
+                INSERT INTO probe_targets (url, name, type, expected_keyword, source_peer, last_seen)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(url) DO UPDATE SET
+                    name = excluded.name,
+                    type = excluded.type,
+                    expected_keyword = excluded.expected_keyword,
+                    source_peer = COALESCE(excluded.source_peer, probe_targets.source_peer),
+                    last_seen = excluded.last_seen
+            ''', rows)
 
 def get_active_probe_targets(max_age_seconds: int = 86400) -> list[dict]:
     conn = _connect()
@@ -1438,47 +1355,31 @@ def get_active_probe_targets(max_age_seconds: int = 86400) -> list[dict]:
         conn.close()
 
 def update_probe_target_result(url: str, status: str, latency_ms: int = None, error_msg: str = None):
-    with _write_lock:
-        conn = _connect()
-        try:
-            cursor = conn.cursor()
-            now = int(time.time())
-            cursor.execute('''
-                UPDATE probe_targets
-                SET last_checked = ?, last_status = ?, last_latency_ms = ?, last_error = ?
-                WHERE url = ?
-            ''', (now, status, latency_ms, error_msg, url))
-            conn.commit()
-        finally:
-            conn.close()
+    with _writer_transaction() as conn:
+        cursor = conn.cursor()
+        now = int(time.time())
+        cursor.execute('''
+            UPDATE probe_targets
+            SET last_checked = ?, last_status = ?, last_latency_ms = ?, last_error = ?
+            WHERE url = ?
+        ''', (now, status, latency_ms, error_msg, url))
 
 # Ignored probe targets (excluded from remote scanning on this probe node)
 def add_ignored_probe_target(url: str, reason: str = "") -> bool:
-    with _write_lock:
-        conn = _connect()
-        try:
-            cursor = conn.cursor()
-            cursor.execute("INSERT OR REPLACE INTO ignored_probe_targets (url, reason) VALUES (?, ?)", (url, reason))
-            # Immediately remove from active probe targets
-            cursor.execute("DELETE FROM probe_targets WHERE url = ?", (url,))
-            local_node = get_local_node_name()
-            cursor.execute("DELETE FROM peer_measurements WHERE url = ? AND node_name = ?", (url, local_node))
-            conn.commit()
-            return True
-        finally:
-            conn.close()
+    with _writer_transaction() as conn:
+        cursor = conn.cursor()
+        cursor.execute("INSERT OR REPLACE INTO ignored_probe_targets (url, reason) VALUES (?, ?)", (url, reason))
+        # Immediately remove from active probe targets
+        cursor.execute("DELETE FROM probe_targets WHERE url = ?", (url,))
+        local_node = get_local_node_name()
+        cursor.execute("DELETE FROM peer_measurements WHERE url = ? AND node_name = ?", (url, local_node))
+        return True
 
 def remove_ignored_probe_target(url: str) -> bool:
-    with _write_lock:
-        conn = _connect()
-        try:
-            cursor = conn.cursor()
-            cursor.execute("DELETE FROM ignored_probe_targets WHERE url = ?", (url,))
-            deleted = cursor.rowcount > 0
-            conn.commit()
-            return deleted
-        finally:
-            conn.close()
+    with _writer_transaction() as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM ignored_probe_targets WHERE url = ?", (url,))
+        return cursor.rowcount > 0
 
 def is_probe_target_ignored(url: str) -> bool:
     conn = _connect()

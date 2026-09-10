@@ -12,6 +12,7 @@ TEST_DB = "test_uptime_db.db"
 class TestDatabase(unittest.TestCase):
     def setUp(self):
         self.orig_db = database.DB_PATH
+        database.close_db()
         database.DB_PATH = TEST_DB
         database.init_db()
         database.invalidate_uptime_cache()
@@ -19,6 +20,7 @@ class TestDatabase(unittest.TestCase):
             database._transport_stats_buffer.clear()
 
     def tearDown(self):
+        database.close_db()
         database.invalidate_uptime_cache()
         with database._transport_stats_lock:
             database._transport_stats_buffer.clear()
@@ -187,6 +189,32 @@ class TestDatabase(unittest.TestCase):
         self.assertTrue(read_done.is_set(), "Reader thread was blocked by _write_lock")
         self.assertEqual(read_results["config"], "initial_value")
         self.assertEqual(read_results["resources_count"], 1)
+
+    def test_persistent_writer_and_pragmas(self):
+        """Verify writer connection is persistent and connections use synchronous=NORMAL and WAL."""
+        w_conn1 = database._get_writer_conn()
+        w_conn2 = database._get_writer_conn()
+        self.assertIs(w_conn1, w_conn2, "Writer connection must be reused and persistent")
+
+        # Check PRAGMAs on writer connection
+        sync_mode = w_conn1.execute("PRAGMA synchronous;").fetchone()[0]
+        # synchronous: 1 = NORMAL
+        self.assertEqual(sync_mode, 1, "Writer connection should have synchronous=NORMAL (1)")
+
+        j_mode = w_conn1.execute("PRAGMA journal_mode;").fetchone()[0]
+        self.assertEqual(j_mode.lower(), "wal", "Writer connection should be in WAL mode")
+
+        # Check PRAGMA on reader connection
+        r_conn = database._connect()
+        try:
+            r_sync = r_conn.execute("PRAGMA synchronous;").fetchone()[0]
+            self.assertEqual(r_sync, 1, "Reader connection should have synchronous=NORMAL (1)")
+        finally:
+            r_conn.close()
+
+        # Check close_db resets writer connection
+        database.close_db()
+        self.assertIsNone(database._writer_conn)
 
 
 if __name__ == "__main__":

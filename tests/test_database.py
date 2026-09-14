@@ -216,6 +216,46 @@ class TestDatabase(unittest.TestCase):
         database.close_db()
         self.assertIsNone(database._writer_conn)
 
+    def test_http_method_database_operations(self):
+        """Test setting and inheriting http_method on resources and probe_targets."""
+        chat_id = 1234
+        url = "https://gotosocial.example.com"
+        r_id = database.add_resource(chat_id, url, "GoToSocial", "http")
+        self.assertIsNotNone(r_id)
+
+        # Initially http_method is None
+        res = database.get_resource_by_id(r_id)
+        self.assertIsNone(res.get("http_method"))
+
+        # Set by resource ID
+        ok = database.set_resource_http_method(r_id, "GET")
+        self.assertTrue(ok)
+        res = database.get_resource_by_id(r_id)
+        self.assertEqual(res["http_method"], "GET")
+
+        # Also add a probe target with the same URL
+        database.save_probe_targets_batch([
+            {"url": url, "name": "GTS Remote", "type": "http"}
+        ], source_peer="peer@example.com")
+        pts = database.get_active_probe_targets()
+        pt = next((p for p in pts if p["url"] == url), None)
+        self.assertIsNotNone(pt)
+
+        # Set by URL updates both resources and probe_targets
+        updated_count = database.set_url_http_method(url, "GET")
+        self.assertGreaterEqual(updated_count, 2)
+
+        res = database.get_resource_by_id(r_id)
+        self.assertEqual(res["http_method"], "GET")
+        pts = database.get_active_probe_targets()
+        pt = next((p for p in pts if p["url"] == url), None)
+        self.assertEqual(pt["http_method"], "GET")
+
+        # Adding a new resource with the same URL inherits learned http_method
+        r2_id = database.add_resource(5678, url, "GoToSocial Chat 2", "http")
+        res2 = database.get_resource_by_id(r2_id)
+        self.assertEqual(res2["http_method"], "GET")
+
 
 if __name__ == "__main__":
     unittest.main()

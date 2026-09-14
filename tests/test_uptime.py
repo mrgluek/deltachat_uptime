@@ -2608,7 +2608,7 @@ class TestUptimeBot(unittest.TestCase):
         self.assertFalse(sess.get_called)
 
     def test_run_single_check_head_fallback_to_get_on_405(self):
-        """When HEAD returns 405 Method Not Allowed, fallback to GET and read max 16KB."""
+        """When HEAD returns 405 Method Not Allowed, fallback to GET, memorize GET, and avoid HEAD subsequently."""
         mock_head_resp = MagicMock()
         mock_head_resp.status = 405
 
@@ -2621,14 +2621,64 @@ class TestUptimeBot(unittest.TestCase):
             return b"<html><head><title>Welcome</title></head><body>All good</body></html>"
         mock_get_resp.content.read = mock_read
 
+        head_calls = []
+        get_calls = []
         class MockSession:
             def head(self, url, **kwargs):
+                head_calls.append(url)
                 class Ctx:
                     async def __aenter__(self):
                         return mock_head_resp
                     async def __aexit__(self, *args):
                         pass
                 return Ctx()
+
+            def get(self, url, **kwargs):
+                get_calls.append(url)
+                class Ctx:
+                    async def __aenter__(self):
+                        return mock_get_resp
+                    async def __aexit__(self, *args):
+                        pass
+                return Ctx()
+
+        sess = MockSession()
+        r_id = database.add_resource(12345, "https://fallback-405.org", "Fallback Site", "http")
+        res = database.get_resource_by_id(r_id)
+
+        # 1. First check: calls HEAD -> 405, then GET -> 200, and memorizes http_method="GET"
+        is_up, details, lat = asyncio.run(bot.run_single_check(res, session=sess))
+        self.assertTrue(is_up)
+        self.assertIn("200 - OK", details)
+        self.assertEqual(len(head_calls), 1)
+        self.assertEqual(len(get_calls), 1)
+        self.assertEqual(read_args, [16384])  # Max 16 KB read on GET fallback
+        self.assertEqual(res.get("http_method"), "GET")
+
+        # Verify persisted in database
+        db_res = database.get_resource_by_id(r_id)
+        self.assertEqual(db_res["http_method"], "GET")
+
+        # 2. Subsequent check: skips HEAD completely! Only GET is called!
+        head_calls.clear()
+        get_calls.clear()
+        is_up2, details2, lat2 = asyncio.run(bot.run_single_check(res, session=sess))
+        self.assertTrue(is_up2)
+        self.assertEqual(len(head_calls), 0, "Subsequent check should not call HEAD after memorizing GET")
+        self.assertEqual(len(get_calls), 1, "Subsequent check should call GET directly")
+
+    def test_run_single_check_skips_head_when_method_is_get(self):
+        """When resource already has http_method='GET', run_single_check directly issues GET without calling HEAD."""
+        mock_get_resp = MagicMock()
+        mock_get_resp.status = 200
+        mock_get_resp.headers = {"Content-Type": "text/html"}
+        async def mock_read(n=None):
+            return b"OK"
+        mock_get_resp.content.read = mock_read
+
+        class MockSession:
+            def head(self, url, **kwargs):
+                raise AssertionError("HEAD must not be called when http_method is GET")
 
             def get(self, url, **kwargs):
                 class Ctx:
@@ -2639,11 +2689,10 @@ class TestUptimeBot(unittest.TestCase):
                 return Ctx()
 
         sess = MockSession()
-        res = {"type": "http", "url": "https://fallback-405.org", "expected_keyword": None}
+        res = {"type": "http", "url": "https://get-only.org", "http_method": "GET", "expected_keyword": None}
         is_up, details, lat = asyncio.run(bot.run_single_check(res, session=sess))
         self.assertTrue(is_up)
         self.assertIn("200 - OK", details)
-        self.assertEqual(read_args, [16384])  # Max 16 KB read on GET fallback
 
     def test_run_single_check_keyword_reads_up_to_128kb(self):
         """When expected_keyword is set, HEAD is skipped and GET reads up to 128KB."""

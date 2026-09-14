@@ -112,6 +112,7 @@ def init_db():
                 expected_keyword TEXT,
                 maintenance_until INTEGER DEFAULT 0,
                 last_latency_ms INTEGER,
+                http_method TEXT,
                 UNIQUE(dc_chat_id, url)
             )
         ''')
@@ -135,6 +136,8 @@ def init_db():
             cursor.execute("ALTER TABLE resources ADD COLUMN maintenance_until INTEGER DEFAULT 0")
         if "last_latency_ms" not in columns:
             cursor.execute("ALTER TABLE resources ADD COLUMN last_latency_ms INTEGER")
+        if "http_method" not in columns:
+            cursor.execute("ALTER TABLE resources ADD COLUMN http_method TEXT")
         
         # Downtime events for uptime calculations
         cursor.execute('''
@@ -244,6 +247,7 @@ def init_db():
                 name TEXT,
                 type TEXT DEFAULT 'http',
                 expected_keyword TEXT,
+                http_method TEXT,
                 source_peer TEXT,
                 last_seen INTEGER,
                 last_checked INTEGER,
@@ -252,6 +256,11 @@ def init_db():
                 last_error TEXT
             )
         ''')
+
+        cursor.execute("PRAGMA table_info(probe_targets)")
+        pt_columns = [row[1] for row in cursor.fetchall()]
+        if "http_method" not in pt_columns:
+            cursor.execute("ALTER TABLE probe_targets ADD COLUMN http_method TEXT")
 
         # Ignored probe targets (excluded from remote scanning on this probe)
         cursor.execute('''
@@ -366,18 +375,45 @@ def get_chat_id_by_token(token: str) -> int:
         conn.close()
 
 # Resource functions
-def add_resource(dc_chat_id: int, url: str, name: str, check_type: str, interval: int = 60, expected_keyword: str = None) -> int:
+def add_resource(dc_chat_id: int, url: str, name: str, check_type: str, interval: int = 60, expected_keyword: str = None, http_method: str = None) -> int:
     with _writer_transaction() as conn:
         cursor = conn.cursor()
         try:
+            if not http_method and check_type == "http":
+                # Inherit learned http_method if this URL was already known in resources or probe_targets
+                cursor.execute("SELECT http_method FROM resources WHERE url = ? AND http_method IS NOT NULL LIMIT 1", (url,))
+                row = cursor.fetchone()
+                if row and row[0]:
+                    http_method = row[0]
+                else:
+                    cursor.execute("SELECT http_method FROM probe_targets WHERE url = ? AND http_method IS NOT NULL LIMIT 1", (url,))
+                    row_pt = cursor.fetchone()
+                    if row_pt and row_pt[0]:
+                        http_method = row_pt[0]
+
             cursor.execute('''
-                INSERT INTO resources (dc_chat_id, url, name, type, interval, status, last_changed, expected_keyword) 
-                VALUES (?, ?, ?, ?, ?, 'unknown', ?, ?)
-            ''', (dc_chat_id, url, name, check_type, interval, int(time.time()), expected_keyword))
+                INSERT INTO resources (dc_chat_id, url, name, type, interval, status, last_changed, expected_keyword, http_method) 
+                VALUES (?, ?, ?, ?, ?, 'unknown', ?, ?, ?)
+            ''', (dc_chat_id, url, name, check_type, interval, int(time.time()), expected_keyword, http_method))
             return cursor.lastrowid
         except sqlite3.IntegrityError:
             conn.rollback()
             return None
+
+def set_resource_http_method(resource_id: int, http_method: str | None) -> bool:
+    with _writer_transaction() as conn:
+        cursor = conn.cursor()
+        cursor.execute("UPDATE resources SET http_method = ? WHERE id = ?", (http_method, resource_id))
+        return cursor.rowcount > 0
+
+def set_url_http_method(url: str, http_method: str | None) -> int:
+    with _writer_transaction() as conn:
+        cursor = conn.cursor()
+        cursor.execute("UPDATE resources SET http_method = ? WHERE url = ?", (http_method, url))
+        count = cursor.rowcount
+        cursor.execute("UPDATE probe_targets SET http_method = ? WHERE url = ?", (http_method, url))
+        count += cursor.rowcount
+        return count
 
 def set_resource_keyword(dc_chat_id: int, resource_id: int, keyword: str | None) -> bool:
     with _writer_transaction() as conn:
@@ -1328,16 +1364,19 @@ def save_probe_targets_batch(targets: list[dict], source_peer: str = None):
                 chk_type = "http"
             raw_kw = item.get("expected_keyword")
             kw = str(raw_kw).strip()[:200] if raw_kw else None
-            rows.append((url, name, chk_type, kw, source_peer, now))
+            raw_method = item.get("http_method")
+            method = str(raw_method).strip().upper()[:10] if raw_method else None
+            rows.append((url, name, chk_type, kw, method, source_peer, now))
 
         if rows:
             cursor.executemany('''
-                INSERT INTO probe_targets (url, name, type, expected_keyword, source_peer, last_seen)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO probe_targets (url, name, type, expected_keyword, http_method, source_peer, last_seen)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(url) DO UPDATE SET
                     name = excluded.name,
                     type = excluded.type,
                     expected_keyword = excluded.expected_keyword,
+                    http_method = COALESCE(excluded.http_method, probe_targets.http_method),
                     source_peer = COALESCE(excluded.source_peer, probe_targets.source_peer),
                     last_seen = excluded.last_seen
             ''', rows)

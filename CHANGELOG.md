@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.9.3] - 2026-09-14
+
+### Added
+- **Auto-Memorization of GET Method on HTTP 405 (Method Not Allowed)**:
+  - When a target server responds with `405 Method Not Allowed` to a lightweight `HEAD` probe (common on GoToSocial, Mastodon, and specialized web frameworks that disallow HEAD on root or API endpoints), the bot now automatically remembers `GET` as the preferred method for that monitor and URL.
+  - Persisted to database via new `http_method` column in `resources` and `probe_targets` tables, and synchronized with active in-memory scheduler caches.
+  - Subsequent minute checks bypass the `HEAD` attempt and directly issue `GET` requests, eliminating redundant `405` error log entries on target servers and halving network overhead for those endpoints.
+
 ## [2.9.2] - 2026-09-10
 
 ### Fixed

@@ -53,7 +53,7 @@ import database
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "2.9.2"
+VERSION = "2.9.3"
 USER_AGENT = f"DeltaChat-Uptime-Bot/{VERSION} (https://git.gluek.info/gluek/deltachat_uptime)"
 
 # Dedicated thread pools for database operations and Delta Chat RPC calls
@@ -839,11 +839,13 @@ async def run_single_check(resource, session=None) -> tuple[bool, str, int | Non
                         return False, details, elapsed_ms
 
             async def _check_http(sess, is_local: bool):
-                if not expected_kw and hasattr(sess, "head"):
+                http_method = (resource.get("http_method") or "").strip().upper()
+                if not expected_kw and http_method != "GET" and hasattr(sess, "head"):
                     # 1. Try lightweight HEAD first (0 bytes body read)
                     head_kwargs = {"allow_redirects": True}
                     if not is_local:
                         head_kwargs["timeout"] = req_timeout
+                    head_405 = False
                     try:
                         async with sess.head(url, **head_kwargs) as resp:
                             if 200 <= resp.status < 400:
@@ -854,8 +856,34 @@ async def run_single_check(resource, session=None) -> tuple[bool, str, int | Non
                                     phrase = "Unknown Status"
                                 details = f"{resp.status} - {phrase}"
                                 return True, details, elapsed_ms
+                            elif resp.status == 405:
+                                head_405 = True
                     except Exception as head_ex:
                         logger.debug(f"HEAD check failed for {url} ({head_ex}), falling back to GET")
+
+                    if head_405:
+                        logger.info(f"HEAD check returned 405 Method Not Allowed for {url}. Memorizing GET method for this monitor.")
+                        resource["http_method"] = "GET"
+                        try:
+                            await run_db(database.set_url_http_method, url, "GET")
+                        except Exception as db_err:
+                            logger.warning(f"Failed to persist http_method for {url}: {db_err}")
+
+                        # Update in-memory scheduler cache if present
+                        try:
+                            cached_res = _scheduler_cache.get("resources")
+                            if cached_res:
+                                for cr in cached_res:
+                                    if cr.get("url") == url:
+                                        cr["http_method"] = "GET"
+                            cached_pt = _scheduler_cache.get("probe_targets")
+                            if cached_pt:
+                                for cpt in cached_pt:
+                                    if cpt.get("url") == url:
+                                        cpt["http_method"] = "GET"
+                        except Exception:
+                            pass
+
                     # If HEAD was not 2xx/3xx or threw an exception, fall back to GET (max 16KB)
                     return await _do_get(sess, 16384, is_local)
                 elif not expected_kw:
@@ -1000,6 +1028,8 @@ async def check_group_task(group, semaphore, session=None):
     for r in group:
         if latency_ms is not None:
             r["last_latency_ms"] = latency_ms
+        if rep.get("http_method"):
+            r["http_method"] = rep["http_method"]
 
         logger.info(f"Check result: {r['name'] or r['url']} (id: {r['id']}) in chat {r['dc_chat_id']} -> {'UP' if is_up else 'DOWN'} ({error_msg})")
         await handle_check_result(r, is_up, error_msg, latency_ms=latency_ms)
@@ -1546,6 +1576,7 @@ async def monitoring_scheduler_loop():
                                 "name": pt.get("name") or pt_url,
                                 "type": pt.get("type") or "http",
                                 "expected_keyword": pt.get("expected_keyword"),
+                                "http_method": pt.get("http_method"),
                                 "status": pt.get("last_status") or "unknown",
                                 "is_probe_only": True
                             }

@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.9.4] - 2026-09-16
+
+### Security
+- **SSRF & DNS Rebinding Hardening (`is_safe_target_url`)**:
+  - Enforced DNS resolution checks in `is_safe_target_url()` to verify that resolved IP addresses do not map to loopback (`127.0.0.0/8`, `::1`), private networks (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`), link-local/cloud metadata (`169.254.169.254`), multicast, or reserved ranges.
+  - Added blocking for local domain name suffixes (`.local`, `.internal`, `.lan`, `.localdomain`).
+  - Added SSRF checks in `/add` command, preventing users from registering internal or metadata endpoints.
+  - Added SSRF checks in `fetch_html_title()`, preventing title resolution on internal addresses.
+  - Added direct SSRF guard in `run_single_check()` as defense-in-depth against malicious targets.
+- **Request Body Limits & Rate Limiting**:
+  - Configured `client_max_size = 256 * 1024` (256 KB) on `web.Application` to protect web endpoints from unbounded payload DoS.
+  - Added sliding-window rate limiting on public web endpoints (`GET /` and `GET /{token}`) with HTTP 429 `Retry-After: 60` headers.
+- **Dependency Pinning**:
+  - Pinned `aiohttp>=3.10.5,<4.0.0`, `qrcode[pil]>=7.4.2,<8.0.0`, `pillow>=10.4.0,<11.0.0`, `emoji>=2.12.0,<3.0.0`, `appdirs>=1.4.4,<2.0.0`, `aiodns>=3.2.0,<4.0.0`, and `aioping>=0.3.3,<1.0.0` in `requirements.txt`.
+
 ## [2.9.3] - 2026-09-14
 
 ### Added

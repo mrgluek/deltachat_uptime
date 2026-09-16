@@ -53,12 +53,39 @@ import database
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "2.9.3"
+VERSION = "2.9.4"
 USER_AGENT = f"DeltaChat-Uptime-Bot/{VERSION} (https://git.gluek.info/gluek/deltachat_uptime)"
 
 # Dedicated thread pools for database operations and Delta Chat RPC calls
 db_executor = concurrent.futures.ThreadPoolExecutor(max_workers=10, thread_name_prefix="uptime_db")
 rpc_executor = concurrent.futures.ThreadPoolExecutor(max_workers=10, thread_name_prefix="uptime_rpc")
+
+# Sliding-window rate limiter per client IP and bucket
+_rate_limits: dict[str, list[float]] = {}
+_rate_limit_lock = threading.Lock()
+
+def get_client_ip(request) -> str:
+    """Extract client IP from request, taking into account reverse proxy headers."""
+    forwarded = request.headers.get("X-Forwarded-For")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.remote or "unknown"
+
+def check_rate_limit(request, bucket: str = "default", max_requests: int = 60, window_seconds: int = 60) -> bool:
+    """In-memory sliding window rate limiter per client IP and bucket.
+    Returns True if allowed, False if limit exceeded.
+    """
+    client_ip = get_client_ip(request) or "unknown"
+    key = f"{bucket}:{client_ip}"
+    now = time.time()
+    with _rate_limit_lock:
+        timestamps = [t for t in _rate_limits.get(key, []) if now - t < window_seconds]
+        if len(timestamps) >= max_requests:
+            _rate_limits[key] = timestamps
+            return False
+        timestamps.append(now)
+        _rate_limits[key] = timestamps
+        return True
 
 
 async def run_db(func, *args, **kwargs):
@@ -546,13 +573,40 @@ def is_safe_target_url(url: str, check_type: str = "http") -> bool:
         if host in blocked_names:
             return False
 
-        # Check for private/reserved/loopback IP address
+        if host.endswith(".local") or host.endswith(".internal") or host.endswith(".lan") or host.endswith(".localdomain"):
+            return False
+
+        import ipaddress
+
+        # Check for literal private/reserved/loopback IP address
         try:
-            import ipaddress
             ip = ipaddress.ip_address(host)
+            if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+                ip = ip.ipv4_mapped
             if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved or ip.is_unspecified:
                 return False
+            return True
         except ValueError:
+            pass
+
+        # DNS resolution check (prevent DNS rebinding to internal/private IPs)
+        try:
+            addr_info = socket.getaddrinfo(host, None)
+            if not addr_info:
+                return False
+            for family, _, _, _, sockaddr in addr_info:
+                ip_str = sockaddr[0]
+                try:
+                    ip_obj = ipaddress.ip_address(ip_str)
+                    if isinstance(ip_obj, ipaddress.IPv6Address) and ip_obj.ipv4_mapped:
+                        ip_obj = ip_obj.ipv4_mapped
+                    if (ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_link_local or
+                            ip_obj.is_reserved or ip_obj.is_multicast or ip_obj.is_unspecified):
+                        return False
+                except ValueError:
+                    return False
+        except socket.gaierror:
+            # Domain could not be resolved; allow in offline/test environment if name is syntactically valid
             pass
 
         return True
@@ -784,6 +838,9 @@ async def run_single_check(resource, session=None) -> tuple[bool, str, int | Non
     url = resource["url"]
     timeout = 10
     
+    if not is_safe_target_url(url, rtype):
+        return False, "Target blocked: internal or private network address", None
+
     start_time = time.time()
     try:
         if rtype == "http":
@@ -2203,6 +2260,9 @@ def get_dashboard_html(chat_name, resources, overall_uptime, incidents=None, upt
 """
 
 async def handle_status_page(request):
+    if not check_rate_limit(request, bucket="web_status", max_requests=120, window_seconds=60):
+        return web.Response(text="Rate limit exceeded. Try again later.", status=429, headers={"Retry-After": "60"})
+
     token = request.match_info.get('token')
     chat_id = await run_db(database.get_chat_id_by_token, token)
     if not chat_id:
@@ -2232,6 +2292,9 @@ async def handle_status_page(request):
     return web.Response(text=html_content, content_type="text/html")
 
 async def handle_index(request):
+    if not check_rate_limit(request, bucket="web_index", max_requests=120, window_seconds=60):
+        return web.Response(text="Rate limit exceeded. Try again later.", status=429, headers={"Retry-After": "60"})
+
     global index_page_html_cache
     if index_page_html_cache is None:
         index_page_html_cache = """<!DOCTYPE html>
@@ -2693,7 +2756,7 @@ async def handle_qr_png(request):
     return web.Response(status=404)
 
 async def _run_web_server():
-    app = web.Application()
+    app = web.Application(client_max_size=256 * 1024)
     app.router.add_get('/icon.png', handle_icon)
     app.router.add_get('/favicon.ico', handle_icon)
     app.router.add_get('/qr.svg', handle_qr_svg)
@@ -2870,6 +2933,8 @@ def url_command(bot, accid, event):
     _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=f"✅ Base status URL set to: `{url}`"))
 
 def fetch_html_title(url, timeout=3.0):
+    if not is_safe_target_url(url, "http"):
+        return None
     import urllib.request
     try:
         req = urllib.request.Request(
@@ -3127,6 +3192,12 @@ def add_command(bot, accid, event):
         check_type, url = parse_target(target)
     except ValueError as e:
         _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=f"❌ {e}"))
+        return
+
+    if not is_safe_target_url(url, check_type):
+        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(
+            text="❌ Cannot check internal, local, or private network targets."
+        ))
         return
         
     name = tokens[1] if len(tokens) > 1 else None

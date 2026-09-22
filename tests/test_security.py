@@ -64,6 +64,18 @@ class TestSecurity(unittest.TestCase):
             mock_dns.return_value = [(2, 1, 6, '', ('93.184.216.34', 0))]
             self.assertTrue(bot.is_safe_target_url("https://example.com", "http"))
 
+    def test_is_safe_target_url_allows_yggdrasil_ipv6(self):
+        """Hosts with a Yggdrasil (200::/7) AAAA record alongside a public A record must not be blocked."""
+        with patch('socket.getaddrinfo') as mock_dns:
+            mock_dns.return_value = [
+                (2, 1, 6, '', ('176.109.110.102', 0)),
+                (30, 1, 6, '', ('200:d2ac:1e73:514f:1fae:84b:717c:e04d', 0, 0, 0)),
+            ]
+            self.assertTrue(bot.is_safe_target_url("https://cm1.wwire.su", "http"))
+        self.assertTrue(bot.is_safe_target_url("http://[200:d2ac:1e73:514f:1fae:84b:717c:e04d]", "http"))
+        # Other reserved ranges stay blocked
+        self.assertFalse(bot.is_safe_target_url("http://240.0.0.1", "http"))
+
     def test_fetch_html_title_blocks_unsafe_urls(self):
         """Verify fetch_html_title returns None for unsafe URLs without making HTTP requests."""
         with patch('urllib.request.urlopen') as mock_urlopen:

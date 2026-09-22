@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.9.5] - 2026-09-22
+
+### Fixed
+- **False SSRF block for hosts with Yggdrasil IPv6 records**: Domains publishing an AAAA record in the Yggdrasil mesh range (`200::/7`, e.g. `cm1.wwire.su`) were rejected with "Target blocked: internal or private network address", because Python's `ipaddress` flags that range as reserved. Yggdrasil addresses are now treated as routable, while other reserved ranges stay blocked. IP checks are consolidated in a new `_is_blocked_ip()` helper.
+
 ## [2.9.4] - 2026-09-16
 
 ### Security

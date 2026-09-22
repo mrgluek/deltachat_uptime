@@ -53,7 +53,7 @@ import database
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "2.9.4"
+VERSION = "2.9.5"
 USER_AGENT = f"DeltaChat-Uptime-Bot/{VERSION} (https://git.gluek.info/gluek/deltachat_uptime)"
 
 # Dedicated thread pools for database operations and Delta Chat RPC calls
@@ -545,6 +545,28 @@ def parse_target(target: str) -> tuple[str, str]:
         raise ValueError("Invalid target format. Provide an HTTP/HTTPS URL, a host:port, or a hostname/IP.")
     return "ping", host
 
+_YGGDRASIL_NET = None
+
+def _is_blocked_ip(ip) -> bool:
+    """Returns True if an IP address points to an internal/private/non-routable destination.
+
+    Yggdrasil overlay addresses (200::/7) are flagged as reserved by Python's ipaddress
+    module but are publicly routable mesh addresses, so they are not treated as internal.
+    """
+    import ipaddress
+    global _YGGDRASIL_NET
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+        ip = ip.ipv4_mapped
+    if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_unspecified:
+        return True
+    if ip.is_reserved:
+        if _YGGDRASIL_NET is None:
+            _YGGDRASIL_NET = ipaddress.ip_network("200::/7")
+        if isinstance(ip, ipaddress.IPv6Address) and ip in _YGGDRASIL_NET:
+            return False
+        return True
+    return False
+
 def is_safe_target_url(url: str, check_type: str = "http") -> bool:
     """Validates target format and blocks dangerous internal/private/metadata IP addresses (SSRF prevention)."""
     try:
@@ -581,9 +603,7 @@ def is_safe_target_url(url: str, check_type: str = "http") -> bool:
         # Check for literal private/reserved/loopback IP address
         try:
             ip = ipaddress.ip_address(host)
-            if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
-                ip = ip.ipv4_mapped
-            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved or ip.is_unspecified:
+            if _is_blocked_ip(ip):
                 return False
             return True
         except ValueError:
@@ -598,10 +618,7 @@ def is_safe_target_url(url: str, check_type: str = "http") -> bool:
                 ip_str = sockaddr[0]
                 try:
                     ip_obj = ipaddress.ip_address(ip_str)
-                    if isinstance(ip_obj, ipaddress.IPv6Address) and ip_obj.ipv4_mapped:
-                        ip_obj = ip_obj.ipv4_mapped
-                    if (ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_link_local or
-                            ip_obj.is_reserved or ip_obj.is_multicast or ip_obj.is_unspecified):
+                    if _is_blocked_ip(ip_obj):
                         return False
                 except ValueError:
                     return False

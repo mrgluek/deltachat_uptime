@@ -53,7 +53,7 @@ import database
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "2.9.5"
+VERSION = "2.9.6"
 USER_AGENT = f"DeltaChat-Uptime-Bot/{VERSION} (https://git.gluek.info/gluek/deltachat_uptime)"
 
 # Dedicated thread pools for database operations and Delta Chat RPC calls
@@ -439,7 +439,8 @@ def setup_custom_command_parser(bot):
         else:
             original_parse_command(accid, event)
             
-            if event.command in ("/help", "/status", "/list"):
+            # /help is not suppressed: plain /help in a group is answered privately (see help_command)
+            if event.command in ("/status", "/list"):
                 try:
                     chat_info = bot.rpc.get_basic_chat_info(accid, event.msg.chat_id)
                     if isinstance(chat_info, dict):
@@ -2828,6 +2829,22 @@ def _react(bot, accid: int, msg_id: int | None, emoji: str):
     except Exception as e:
         logger.debug(f"Failed to set reaction {emoji} on msg {msg_id}: {e}")
 
+HELP_PRIVATE_NOTE = "\n\n💬 Sent privately because you asked in a group. Use /help@uptime there to show it to everyone."
+
+def _get_help_chat_id(bot, accid, msg):
+    """Plain /help in a group is answered privately to the sender so several bots
+    don't flood the group; /help@<bot> is still answered in the group itself."""
+    cmd = msg.text.split(maxsplit=1)[0] if msg.text else ""
+    if "@" in cmd:
+        return msg.chat_id
+    try:
+        chat = bot.rpc.get_basic_chat_info(accid, msg.chat_id)
+    except Exception:
+        chat = None
+    if is_single_chat(chat):
+        return msg.chat_id
+    return bot.rpc.create_chat_by_contact_id(accid, msg.from_id)
+
 @dc_cli.on(events.NewMessage(command="/help"))
 def help_command(bot, accid, event):
     msg = event.msg
@@ -2888,7 +2905,10 @@ def help_command(bot, accid, event):
         f"GitHub: https://github.com/mrgluek/deltachat_uptime\n"
         f"Mirror: https://git.gluek.info/gluek/deltachat_uptime\n"
     )
-    _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=help_text))
+    chat_id = _get_help_chat_id(bot, accid, msg)
+    if chat_id != msg.chat_id:
+        help_text += HELP_PRIVATE_NOTE
+    _dc_send_msg_with_stats(bot, accid, chat_id, MsgData(text=help_text))
 
 @dc_cli.on(events.NewMessage(command="/donate"))
 def donate_command(bot, accid, event):

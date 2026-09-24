@@ -70,6 +70,8 @@ Additionally, it automatically generates a secure, beautiful web status dashboar
 ### User Commands (Public per-chat)
 These commands are available to any member of a chat. They support suffixes (e.g. `/add@up`, `/status@uptime`) to route commands correctly if multiple bots exist in the same chat.
 
+A plain `/help` sent in a group chat is answered in a private 1:1 chat with the sender, so several bots don't flood the group with help texts. Use `/help@uptime` to show the help in the group itself.
+
 - `/ping <target> ["keyword"]` (or `/check`, `/test`) — Perform an immediate on-demand reachability and diagnostics test without adding to monitoring (rate-limited to 1 request per 15s per chat for non-admins; supports HTTP/HTTPS, SSL certificate inspection, keyword assertions, TCP port, ICMP Ping, and multi-region cross-checks).
 - `/add <target> [name] ["keyword"]` — Add a monitor. Target formats:
   • `https://google.com Google` (HTTP/HTTPS check)

@@ -2847,6 +2847,54 @@ class TestUptimeBot(unittest.TestCase):
             self.assertEqual(bucket_counts[b], 5, f"Bucket {b} should have exactly 5 slots")
 
 
+class TestHelpPrivateReply(unittest.TestCase):
+    """Plain /help in a group goes to the sender privately; /help@<bot> stays in the group."""
+
+    def _msg(self, text):
+        msg = MagicMock()
+        msg.text = text
+        msg.chat_id = 42
+        msg.from_id = 7
+        return msg
+
+    def _bot(self):
+        mock_bot = MagicMock()
+        mock_bot.rpc.create_chat_by_contact_id.return_value = 555
+        return mock_bot
+
+    @patch("bot.is_single_chat", return_value=False)
+    def test_plain_help_in_group_goes_private(self, _mock_chat):
+        mock_bot = self._bot()
+        self.assertEqual(bot._get_help_chat_id(mock_bot, 1, self._msg("/help")), 555)
+        mock_bot.rpc.create_chat_by_contact_id.assert_called_once_with(1, 7)
+
+    @patch("bot.is_single_chat", return_value=False)
+    def test_addressed_help_in_group_stays_in_group(self, _mock_chat):
+        mock_bot = self._bot()
+        self.assertEqual(bot._get_help_chat_id(mock_bot, 1, self._msg("/help@uptime extra")), 42)
+        mock_bot.rpc.create_chat_by_contact_id.assert_not_called()
+
+    @patch("bot.is_single_chat", return_value=True)
+    def test_plain_help_in_private_chat_stays(self, _mock_chat):
+        mock_bot = self._bot()
+        self.assertEqual(bot._get_help_chat_id(mock_bot, 1, self._msg("/help")), 42)
+        mock_bot.rpc.create_chat_by_contact_id.assert_not_called()
+
+    @patch("bot.is_single_chat", return_value=False)
+    @patch("bot._dc_send_msg_with_stats")
+    @patch("bot.MsgData", side_effect=lambda text: text)
+    @patch("bot.database.get_config", return_value=None)
+    @patch("bot._is_dc_admin", return_value=False)
+    def test_help_command_in_group_sends_private_with_note(self, _mock_admin, _mock_cfg, _mock_msgdata, mock_send, _mock_chat):
+        mock_bot = self._bot()
+        event = MagicMock()
+        event.msg = self._msg("/help")
+        bot.help_command(mock_bot, 1, event)
+        mock_send.assert_called_once()
+        self.assertEqual(mock_send.call_args[0][2], 555)
+        self.assertIn("/help@uptime", mock_send.call_args[0][3])
+
+
 if __name__ == '__main__':
     unittest.main()
 

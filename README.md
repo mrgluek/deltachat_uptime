@@ -61,7 +61,7 @@ Additionally, it automatically generates a secure, beautiful web status dashboar
   - Alerts are only triggered if all 3 checks fail, avoiding false positives.
   - Once a DOWN resource recovers, it is marked UP on the first successful check.
 - 📊 **Uptime Dashboards:** Generates a secure, 12-character unguessable base62 URL (e.g. `https://up.example.com/k8D2x9mPqL1a`) hosting a modern dark-themed web status dashboard with active status, latency metrics, SSL countdowns, and recent incident logs for each chat.
-- ✉️ **Multi-Transport & Resilient Sending:** Supports multiple SMTP servers and resilient broadcast sending across all connected relays, with automatic exponential backoff failover if a primary transport encounters errors.
+- ✉️ **Multiple Mail Relays:** Supports multiple mail servers. Relay selection and failover are handled by the Delta Chat core (2.61+), which sends via the newest relay first and falls back to the next one if a relay is unreachable.
 
 ---
 
@@ -105,8 +105,8 @@ These commands are only executable by the configured administrator.
 - `/transports` — Show configured mail relays, status, and stats.
 - `/addtransport` — Add backup mail relays (either chatmail URIs or address/password). Restricted to private 1:1 chat with the bot for security.
 - `/rmtransport <addr>` — Remove backup mail relay.
-- `/setprimary <addr>` — Switch primary SMTP transport.
-- `/resilient` — Toggle resilient sending mode (all relays). Outgoing messages are broadcasted across all connected transports.
+
+Relay selection and failover are handled by the Delta Chat core (2.61+): it sends via the newest relay first and falls back to the next one if a relay is unreachable. `/transports` lists relays in that order. The former `/setprimary` and `/resilient` commands are deprecated and only reply with this explanation.
 
 ---
 

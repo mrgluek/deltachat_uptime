@@ -102,11 +102,11 @@ These commands are only executable by the configured administrator.
 - `/rmpeer <email>` — Remove a remote peer probe.
 - `/accounts` — List active bot accounts.
 - `/rmaccount <id>` — Delete a bot account.
-- `/transports` — Show configured mail relays, status, and stats.
+- `/transports` — Show mail relays: relay used for sending, send queue, incoming status and storage.
 - `/addtransport` — Add backup mail relays (either chatmail URIs or address/password). Restricted to private 1:1 chat with the bot for security.
 - `/rmtransport <addr>` — Remove backup mail relay.
 
-Relay selection and failover are handled by the Delta Chat core (2.61+): it sends via the newest relay first and falls back to the next one if a relay is unreachable. `/transports` lists relays in that order. The former `/setprimary` and `/resilient` commands are deprecated and only reply with this explanation.
+Relay selection and failover are handled by the Delta Chat core (2.61+): it keeps sending through the relay that last worked and moves to the next one only if it cannot connect, so the relay used for sending can differ from the account's main address. `/transports` shows which relay that is, the core's send queue, and per relay the incoming status, the last received message and mailbox storage. The former `/setprimary` and `/resilient` commands are deprecated and only reply with this explanation.
 
 ---
 

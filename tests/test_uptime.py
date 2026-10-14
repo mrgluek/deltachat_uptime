@@ -258,13 +258,14 @@ class TestUptimeBot(unittest.TestCase):
         mock_event.msg.from_id = 123
         mock_event.msg.chat_id = 456
 
-        # The core tries the newest (last added) relay first, so it is listed first.
+        # Without the core database the sending relay is unknown; the report still lists the relays.
         bot.transports_command(mock_bot, 1, mock_event)
         text = mock_send_with_stats.call_args[0][3].text
         self.assertIn("🔌 **Mail Relays (Transports)**", text)
-        self.assertIn("1. **🔄 Working:** `uptimebot@chat.gluek.info`", text)
-        self.assertIn("2. **🔄 Working:** `uptimebot@chatmail.uk`", text)
-        self.assertNotIn("Used for sending", text)
+        self.assertIn("`uptimebot@chat.gluek.info`", text)
+        self.assertIn("`uptimebot@chatmail.uk`", text)
+        self.assertIn("could not read the core database", text)
+        self.assertNotIn("Sent:", text)
 
     def test_send_msg_is_not_patched(self):
         self.assertFalse(hasattr(bot, "_setup_resilient_mode"))

@@ -464,9 +464,10 @@ class TestUptimeBot(unittest.TestCase):
     def test_user_agent_header(self):
         self.assertEqual(
             bot.USER_AGENT,
-            f"DeltaChat-Uptime-Bot/{bot.VERSION} (https://git.gluek.info/gluek/deltachat_uptime)"
+            f"Delta Chat Uptime Monitor/{bot.VERSION} (+https://git.gluek.info/gluek/deltachat_uptime)"
         )
-        self.assertIn("DeltaChat-Uptime-Bot/", bot.USER_AGENT)
+        # Services like Hiddify reject any User-Agent containing "bot"
+        self.assertNotIn("bot", bot.USER_AGENT.lower())
 
     def test_database_ssl_fields(self):
         chat_id = 777

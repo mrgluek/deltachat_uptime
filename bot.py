@@ -54,8 +54,9 @@ import transports_view
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "2.11.0"
-USER_AGENT = f"DeltaChat-Uptime-Bot/{VERSION} (https://git.gluek.info/gluek/deltachat_uptime)"
+VERSION = "2.11.1"
+# No "bot" in the name: some services (e.g. Hiddify subscription links) reply 400 to any User-Agent containing "bot".
+USER_AGENT = f"Delta Chat Uptime Monitor/{VERSION} (+https://git.gluek.info/gluek/deltachat_uptime)"
 
 # Dedicated thread pools for database operations and Delta Chat RPC calls
 db_executor = concurrent.futures.ThreadPoolExecutor(max_workers=10, thread_name_prefix="uptime_db")

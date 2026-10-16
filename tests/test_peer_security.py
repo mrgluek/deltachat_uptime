@@ -30,6 +30,11 @@ class TestPeerFederationSecurity(unittest.TestCase):
         bot._telemetry_rotation_offsets.clear()
         self.orig_dc_bot = bot.dc_bot_instance
         self.orig_accid = bot.dc_accid
+        # No real DNS in unit tests (CI has network access; queries would stay in flight)
+        bot._dns_cache.clear()
+        dns_patcher = patch("bot.resolve_host_safe", AsyncMock(return_value=["93.184.216.34"]))
+        dns_patcher.start()
+        self.addCleanup(dns_patcher.stop)
 
     def tearDown(self):
         bot.dc_bot_instance = self.orig_dc_bot
@@ -469,6 +474,9 @@ class _FakeSession:
 class TestSafeRedirects(unittest.TestCase):
     def setUp(self):
         bot._dns_cache.clear()
+        query_patcher = patch("bot._query_with_ttl", AsyncMock(return_value=(["93.184.216.34"], 60)))
+        query_patcher.start()
+        self.addCleanup(query_patcher.stop)
 
     def _run(self, coro):
         return asyncio.run(coro)

@@ -350,6 +350,30 @@ class TestDnsPinning(unittest.TestCase):
             self.assertIsNone(bot.fetch_html_title("http://title-rebind.example.org/"))
             mock_connect.assert_not_called()
 
+    def test_aiodns_resolver_is_reused_per_event_loop(self):
+        """Queries share one long-lived resolver per loop; channels are not created and closed per query."""
+        created = []
+
+        def fake_resolver(*args, **kwargs):
+            resolver = MagicMock()
+            resolver.query = AsyncMock(return_value=[MagicMock(host="93.184.216.34", ttl=60)])
+            created.append(resolver)
+            return resolver
+
+        async def run():
+            for i in range(5):
+                bot._dns_cache.clear()
+                await bot.resolve_host_safe(f"reuse{i}.example.org")
+
+        with patch.object(bot.aiodns, "DNSResolver", side_effect=fake_resolver):
+            asyncio.run(run())
+            self.assertEqual(len(created), 1)
+            self.assertEqual(created[0].query.await_count, 10)  # A + AAAA per lookup
+            created[0].close.assert_not_called()
+
+            asyncio.run(run())  # a new event loop gets its own resolver
+            self.assertEqual(len(created), 2)
+
     def test_cache_is_bounded(self):
         with patch.object(bot, 'DNS_CACHE_MAX_ENTRIES', 3):
             for i in range(10):

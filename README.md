@@ -39,11 +39,13 @@ Additionally, it automatically generates a secure, beautiful web status dashboar
   - **14-Day Warning:** Sends a warning at 14 days of continuous downtime, advising that 30-day unreachable monitors are automatically removed.
   - **30-Day Auto-Cleanup:** Automatically deletes resources with continuous 0% uptime for 30 days and notifies the chat of the removal.
 - 🛰️ **Distributed Multi-Node Peering & Cross-Probe Verification:**
-  - Link multiple bot instances across different regions/servers as remote probes via private 1:1 Delta Chat DMs (`/addpeer <email> [node_name]`).
+  - Link multiple bot instances across different regions/servers as remote probes via private 1:1 Delta Chat DMs. Run `/invitepeer` on the other bot and send the `/addpeer <link> token=<token> [node_name]` command it prints to this bot; both bots then exchange telemetry.
+  - **Closed Peering:** A bot only becomes a peer if the admin added it with `/addpeer`, or if it presents a single-use `/invitepeer` token (valid 24h). Telemetry and cross-check messages are only accepted from configured peers, in a 1:1 chat, end-to-end encrypted.
+  - **Controlled Disclosure (`/peershare`):** By default peers only see monitors from chats the administrator is a member of (`admin`); `all` shares every chat, `none` shares no local monitors. Monitor names are never sent, and targets a peer asked this node to probe are only reported back to that peer, never relayed to others.
   - **Zero Group Spam:** All protocol handshakes, background telemetry, and instant cross-checks happen in private DMs between bots.
   - **Cross-Probe Verification:** Outages are verified across remote probes in real-time before alerting, distinguishing global downtime from regional/routing reachability issues.
   - **Aggregated Web Dashboard:** Web status pages show latency and status badges for all active probe locations (`[📍 Frankfurt-DE: 18ms] [🛰️ RU-Moscow: 45ms]`).
-- 🤖 **Identified User-Agent:** Sends a custom `User-Agent` header (e.g. `Delta Chat Uptime Monitor/2.11.1 (+https://git.gluek.info/gluek/deltachat_uptime)`) during HTTP checks so server administrators can easily identify monitoring requests in server logs. The name deliberately avoids the word "bot", because some services (e.g. Hiddify subscription links) answer `400 Bad Request` to bot User-Agents.
+- 🤖 **Identified User-Agent:** Sends a custom `User-Agent` header (e.g. `Delta Chat Uptime Monitor/2.12.0 (+https://git.gluek.info/gluek/deltachat_uptime)`) during HTTP checks so server administrators can easily identify monitoring requests in server logs. The name deliberately avoids the word "bot", because some services (e.g. Hiddify subscription links) answer `400 Bad Request` to bot User-Agents.
 - 🚀 **High-Concurrency Scaling Architecture:**
   - **Two-Tier HTTP Probing (`HEAD` -> `GET` with Auto-Memorization):** Zero body download (0 bytes) and 0 CPU decoding for standard HTTP checks via `HEAD`, with automatic 16 KB `GET` fallback on 405 or errors, and 128 KB limit for keyword assertions. When a server responds with `405 Method Not Allowed` to `HEAD` (e.g. GoToSocial, Mastodon, specialized APIs), the bot automatically memorizes `GET` for that monitor and database record so all subsequent checks use `GET` directly without generating repeated `405` log entries.
   - **Async DNS Resolution & 5m TTL Cache:** `aiodns` (`AsyncResolver`) support with 300s TTL cache prevents blocking DNS lookups and reduces repeated nameserver queries.
@@ -96,10 +98,11 @@ These commands are only executable by the configured administrator.
 - `/url` — View current base external status URL.
 - `/url <url>` — Update the base external status URL (e.g., `/url https://up.gluek.info`) to generate correct status links.
 - `/nodename [name]` — View or set the local probe node identifier (e.g. `/nodename Frankfurt-DE`).
-- `/invitepeer` — Generate a SecureJoin E2E encrypted invite link (`https://i.delta.chat/#...`) for pairing with other bots.
+- `/invitepeer` — Generate a SecureJoin E2E encrypted invite link (`https://i.delta.chat/#...`) with a single-use pairing token (valid 24h) for linking another bot.
 - `/peers` (or `/probes`) — List distributed monitoring peers, node names, and last seen activity.
-- `/addpeer <email|link> [node_name]` — Link another Delta Chat Uptime bot as a remote probe using its email address or SecureJoin invite link (e.g. `/addpeer https://i.delta.chat/#... RU` or `/addpeer ruptimebot@chat.gluek.info RU`).
-- `/rmpeer <email>` — Remove a remote peer probe.
+- `/addpeer <email|link> [token=<token>] [node_name]` — Link another Delta Chat Uptime bot as a remote probe using the command printed by its `/invitepeer` (e.g. `/addpeer https://i.delta.chat/#... token=... RU`). Without a token (e.g. `/addpeer ruptimebot@chat.gluek.info RU`) the other bot's admin must add this bot too.
+- `/rmpeer <email>` — Remove a remote peer probe (also stops probing targets it mirrored to this node).
+- `/peershare [admin|all|none]` — Choose which local monitors are disclosed to peers (default `admin`: only chats the administrator is a member of).
 - `/accounts` — List active bot accounts.
 - `/rmaccount <id>` — Delete a bot account.
 - `/transports` — Show mail relays: relay used for sending, send queue, incoming status and storage.

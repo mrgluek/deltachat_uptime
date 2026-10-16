@@ -180,3 +180,7 @@ Reload Caddy to apply changes:
 ```bash
 sudo systemctl reload caddy
 ```
+
+## License
+
+MIT, see [LICENSE](LICENSE).

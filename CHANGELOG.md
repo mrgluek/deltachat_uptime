@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [2.12.1] - 2026-10-16
 
+### Added
+- **MIT License**: the project is now licensed under MIT (`LICENSE`).
+
 ### Fixed
 - **Crash Risk in DNS Pinning**: 2.12.0 created and closed a new aiodns/pycares resolver for every lookup. Queries cancelled by a timeout were torn down mid-flight, and pycares destroys channels in a background thread that can crash the interpreter at shutdown (the test run on `main` ended with SIGBUS, exit code 135, after the PR run had passed). Lookups now share one long-lived resolver per event loop, which is how aiodns is meant to be used.
 - **Tests Made Hermetic**: Some peer and redirect tests performed real DNS queries, which only happened in CI (where the network is reachable). All tests now stub DNS, and CI runs with `-X faulthandler` so a native crash prints a traceback.

@@ -6,6 +6,7 @@ import json
 import os
 import ssl
 import threading
+import weakref
 import time
 import datetime
 import html
@@ -56,7 +57,7 @@ import transports_view
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "2.12.0"
+VERSION = "2.12.1"
 # No "bot" in the name: some services (e.g. Hiddify subscription links) reply 400 to any User-Agent containing "bot".
 USER_AGENT = f"Delta Chat Uptime Monitor/{VERSION} (+https://git.gluek.info/gluek/deltachat_uptime)"
 
@@ -708,18 +709,27 @@ def resolve_host_safe_sync(host: str) -> list[str]:
     return _validated_ips(host, cached)
 
 
+_aiodns_resolvers = weakref.WeakKeyDictionary()  # event loop -> long-lived aiodns.DNSResolver
+
+
+def _get_aiodns_resolver():
+    """One resolver per event loop, kept for the loop's lifetime.
+
+    Creating and closing a pycares channel per query destroys channels while queries are still in
+    flight (timeouts, cancellation), and pycares tears channels down in a background thread that can
+    crash the interpreter at shutdown. A long-lived resolver is how aiodns is meant to be used."""
+    loop = asyncio.get_running_loop()
+    resolver = _aiodns_resolvers.get(loop)
+    if resolver is None:
+        resolver = aiodns.DNSResolver(loop=loop, timeout=3.0, tries=2)
+        _aiodns_resolvers[loop] = resolver
+    return resolver
+
+
 async def _query_with_ttl(host: str):
     """Returns (ips, ttl) using aiodns so the record TTL is known; raises if nothing resolves."""
-    resolver = aiodns.DNSResolver(timeout=3.0, tries=2)
-    try:
-        results = await asyncio.gather(resolver.query(host, "A"), resolver.query(host, "AAAA"), return_exceptions=True)
-    finally:
-        try:
-            close = resolver.close()
-            if asyncio.iscoroutine(close):
-                await close
-        except Exception:
-            pass
+    resolver = _get_aiodns_resolver()
+    results = await asyncio.gather(resolver.query(host, "A"), resolver.query(host, "AAAA"), return_exceptions=True)
     ips, ttls = [], []
     for res in results:
         if isinstance(res, BaseException):

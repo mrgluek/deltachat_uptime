@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import io
 import logging
 import json
@@ -12,7 +13,7 @@ import re
 import socket
 import shlex
 import secrets
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 import aiohttp
 from aiohttp import web
 from deltachat2 import events, MsgData
@@ -54,7 +55,7 @@ import transports_view
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "2.11.1"
+VERSION = "2.12.0"
 # No "bot" in the name: some services (e.g. Hiddify subscription links) reply 400 to any User-Agent containing "bot".
 USER_AGENT = f"Delta Chat Uptime Monitor/{VERSION} (+https://git.gluek.info/gluek/deltachat_uptime)"
 
@@ -129,9 +130,9 @@ def get_bot_invite_link() -> str:
 async_event_loop = None
 
 # Peering globals
-pending_peer_checks = {} # req_id -> (Future, expected_count, list_of_responses)
+pending_peer_checks = {} # req_id -> (Future, expected_count, list_of_responses, expected_sender_emails)
 last_peer_telemetry_broadcast = 0.0
-_telemetry_rotation_offset = 0
+_telemetry_rotation_offsets = {}  # peer email -> rotation offset
 
 # Protocol message deduplication cache (bounded set of recent msg_ids)
 _processed_msg_ids = set()
@@ -203,13 +204,72 @@ async def check_host_internet_connectivity(timeout: float = 2.5, max_age: float 
                 
         return is_online
 
+_ADMIN_CHAT_MEMBERSHIP_TTL = 600
+_admin_chat_membership_cache = {}  # chat_id -> (checked_at, admin_is_member)
+
+def _get_admin_chat_ids(bot, accid, chat_ids) -> set:
+    """Returns the subset of chat_ids that the administrator belongs to (1:1 admin chat or groups with the admin)."""
+    allowed = set()
+    admin_chat = database.get_config("admin_chat_id")
+    if admin_chat and str(admin_chat).isdigit():
+        allowed.add(int(admin_chat))
+
+    admin_contact_id = None
+    admin_email = database.get_admin_email()
+    if admin_email and bot is not None and accid is not None:
+        try:
+            admin_contact_id = bot.rpc.lookup_contact_id_by_addr(accid, admin_email)
+        except Exception as e:
+            logger.debug(f"Could not look up admin contact: {e}")
+    if not admin_contact_id:
+        return allowed & set(chat_ids)
+
+    now = time.time()
+    for chat_id in chat_ids:
+        if not chat_id or chat_id in allowed:
+            continue
+        cached = _admin_chat_membership_cache.get(chat_id)
+        if cached and now - cached[0] < _ADMIN_CHAT_MEMBERSHIP_TTL:
+            is_member = cached[1]
+        else:
+            try:
+                is_member = admin_contact_id in (bot.rpc.get_chat_contacts(accid, chat_id) or [])
+            except Exception:
+                is_member = False
+            _admin_chat_membership_cache[chat_id] = (now, is_member)
+        if is_member:
+            allowed.add(chat_id)
+    return allowed & set(chat_ids)
+
+def _filter_peer_shareable_resources(bot, accid, resources: list[dict]) -> list[dict]:
+    """Applies the peer share scope (/peershare) to local monitors before disclosing them to peers."""
+    scope = database.get_peer_share_scope()
+    if scope == "all":
+        return list(resources)
+    if scope == "none":
+        return []
+    allowed = _get_admin_chat_ids(bot, accid, {r.get("dc_chat_id") for r in resources})
+    return [r for r in resources if r.get("dc_chat_id") in allowed]
+
+async def _resolve_peer_chat_id(p: dict):
+    chat_id = p.get("chat_id")
+    if not chat_id and p.get("email") and not p["email"].endswith("@securejoin"):
+        try:
+            contact_id = await asyncio.to_thread(dc_bot_instance.rpc.create_contact, dc_accid, p["email"], p.get("node_name") or p["email"])
+            chat_id = await asyncio.to_thread(dc_bot_instance.rpc.create_chat_by_contact_id, dc_accid, contact_id)
+            await asyncio.to_thread(database.add_or_update_peer, p["email"], p.get("node_name"), chat_id)
+        except Exception as e:
+            logger.warning(f"Could not resolve chat_id for peer {p['email']}: {e}")
+            return None
+    return chat_id
+
 async def request_peer_cross_checks(target_dict: dict, timeout: float = 8.0) -> list[dict]:
     """Broadcasts a cross-check request to all configured remote peers in 1:1 DMs and waits for responses."""
     peers = await asyncio.to_thread(database.get_all_peers)
     if not peers or not dc_bot_instance or dc_accid is None:
         return []
 
-    req_id = secrets.token_hex(6)
+    req_id = secrets.token_hex(12)
     req_payload = {
         "req_id": req_id,
         "url": target_dict["url"],
@@ -229,22 +289,16 @@ async def request_peer_cross_checks(target_dict: dict, timeout: float = 8.0) -> 
 
     valid_peers = []
     for p in peers:
-        chat_id = p.get("chat_id")
-        if not chat_id and p.get("email"):
-            try:
-                contact_id = await asyncio.to_thread(dc_bot_instance.rpc.create_contact, dc_accid, p["email"], p.get("node_name") or p["email"])
-                chat_id = await asyncio.to_thread(dc_bot_instance.rpc.create_chat_by_contact_id, dc_accid, contact_id)
-                await asyncio.to_thread(database.add_or_update_peer, p["email"], p.get("node_name"), chat_id)
-            except Exception as e:
-                logger.warning(f"Could not resolve chat_id for peer {p['email']}: {e}")
-                continue
+        chat_id = await _resolve_peer_chat_id(p)
         if chat_id:
             valid_peers.append((p, chat_id))
 
     if not valid_peers:
         return []
 
-    pending_peer_checks[req_id] = (fut, len(valid_peers), responses)
+    # Only the peers this request was sent to may answer it, and each of them only once
+    expected_senders = {p["email"].lower() for p, _ in valid_peers}
+    pending_peer_checks[req_id] = (fut, len(valid_peers), responses, expected_senders)
 
     for p, chat_id in valid_peers:
         try:
@@ -263,92 +317,95 @@ async def request_peer_cross_checks(target_dict: dict, timeout: float = 8.0) -> 
 
     return responses
 
+async def _peer_cross_check_allowed(resources: list[dict]) -> bool:
+    """A failing monitor's URL is only sent to peers if at least one of its chats is within the share scope."""
+    if not await asyncio.to_thread(database.get_all_peers):
+        return False
+    shareable = await asyncio.to_thread(_filter_peer_shareable_resources, dc_bot_instance, dc_accid, resources)
+    return bool(shareable)
+
 async def broadcast_telemetry_to_peers():
     """Periodically sends local monitor telemetry to all configured peers via 1:1 chat.
-    Uses rotating offset for >100 unique URLs to ensure all targets eventually get broadcast."""
-    global _telemetry_rotation_offset
+
+    Each peer receives the local monitors allowed by the share scope plus the results for the
+    probe targets it asked this node to scan. Targets mirrored from one peer are never relayed
+    to other peers. Uses a rotating per-peer offset when there are more than 200 entries."""
     if not dc_bot_instance or dc_accid is None:
         return
     peers = await asyncio.to_thread(database.get_all_peers)
     if not peers:
         return
-        
+
     resources = await asyncio.to_thread(database.get_all_resources)
+    resources = await asyncio.to_thread(_filter_peer_shareable_resources, dc_bot_instance, dc_accid, resources or [])
     probe_targets = await asyncio.to_thread(database.get_active_probe_targets)
     if not resources and not probe_targets:
         return
-        
-    seen_urls = set()
-    all_metrics = []
+
     now = int(time.time())
 
-    # 1. Local chat resources
-    if resources:
-        for r in resources:
-            url = r.get("url")
-            if not url or url in seen_urls:
-                continue
-            seen_urls.add(url)
-            all_metrics.append({
-                "url": url,
-                "name": r.get("name") or url,
-                "type": r.get("type") or "http",
-                "expected_keyword": r.get("expected_keyword"),
-                "status": r.get("status", "unknown"),
-                "latency_ms": r.get("last_latency_ms"),
-                "last_checked": r.get("last_checked") or now
-            })
+    # 1. Local chat resources within the share scope (names are not disclosed)
+    shared_metrics = []
+    shared_urls = set()
+    for r in resources:
+        url = r.get("url")
+        if not url or url in shared_urls:
+            continue
+        shared_urls.add(url)
+        shared_metrics.append({
+            "url": url,
+            "type": r.get("type") or "http",
+            "expected_keyword": r.get("expected_keyword"),
+            "status": r.get("status", "unknown"),
+            "latency_ms": r.get("last_latency_ms"),
+            "last_checked": r.get("last_checked") or now
+        })
 
-    # 2. Mirrored probe targets measured by this probe node
-    if probe_targets:
-        for pt in probe_targets:
-            url = pt.get("url")
-            if not url or url in seen_urls:
-                continue
-            seen_urls.add(url)
-            all_metrics.append({
-                "url": url,
-                "name": pt.get("name") or url,
-                "type": pt.get("type") or "http",
-                "expected_keyword": pt.get("expected_keyword"),
-                "status": pt.get("last_status") or "unknown",
-                "latency_ms": pt.get("last_latency_ms"),
-                "last_checked": pt.get("last_checked") or now
-            })
-        
-    if not all_metrics:
-        return
+    # 2. Results for probe targets, grouped by the peer that requested them
+    probe_by_source = {}
+    for pt in probe_targets or []:
+        url = pt.get("url")
+        source = (pt.get("source_peer") or "").lower()
+        if not url or not source or url in shared_urls:
+            continue
+        probe_by_source.setdefault(source, []).append({
+            "url": url,
+            "type": pt.get("type") or "http",
+            "expected_keyword": pt.get("expected_keyword"),
+            "status": pt.get("last_status") or "unknown",
+            "latency_ms": pt.get("last_latency_ms"),
+            "last_checked": pt.get("last_checked") or now
+        })
 
-    # Rotating window: send up to 200 metrics per cycle, advancing offset each time
-    batch_size = 200
-    total = len(all_metrics)
-    if total <= batch_size:
-        metrics_batch = all_metrics
-        _telemetry_rotation_offset = 0
-    else:
-        offset = _telemetry_rotation_offset % total
-        metrics_batch = (all_metrics[offset:] + all_metrics[:offset])[:batch_size]
-        _telemetry_rotation_offset = (offset + batch_size) % total
-        
     self_addr = _get_self_addr(dc_bot_instance, dc_accid)
-    payload = {
-        "node_name": database.get_local_node_name(),
-        "sender_email": self_addr,
-        "timestamp": now,
-        "msg_id": f"{now}_{secrets.token_hex(4)}",
-        "metrics": metrics_batch
-    }
-    msg_text = f"[UPTIME_PEER_METRICS]\n{json.dumps(payload)}\n[/UPTIME_PEER_METRICS]"
-    
+    node_name = database.get_local_node_name()
+    batch_size = 200
+
     for p in peers:
-        chat_id = p.get("chat_id")
-        if not chat_id and p.get("email"):
-            try:
-                contact_id = await asyncio.to_thread(dc_bot_instance.rpc.create_contact, dc_accid, p["email"], p.get("node_name") or p["email"])
-                chat_id = await asyncio.to_thread(dc_bot_instance.rpc.create_chat_by_contact_id, dc_accid, contact_id)
-                await asyncio.to_thread(database.add_or_update_peer, p["email"], p.get("node_name"), chat_id)
-            except Exception:
-                continue
+        email = (p.get("email") or "").lower()
+        all_metrics = probe_by_source.get(email, []) + shared_metrics
+        if not all_metrics:
+            continue
+
+        total = len(all_metrics)
+        if total <= batch_size:
+            metrics_batch = all_metrics
+            _telemetry_rotation_offsets[email] = 0
+        else:
+            offset = _telemetry_rotation_offsets.get(email, 0) % total
+            metrics_batch = (all_metrics[offset:] + all_metrics[:offset])[:batch_size]
+            _telemetry_rotation_offsets[email] = (offset + batch_size) % total
+
+        payload = {
+            "node_name": node_name,
+            "sender_email": self_addr,
+            "timestamp": now,
+            "msg_id": f"{now}_{secrets.token_hex(4)}",
+            "metrics": metrics_batch
+        }
+        msg_text = f"[UPTIME_PEER_METRICS]\n{json.dumps(payload)}\n[/UPTIME_PEER_METRICS]"
+
+        chat_id = await _resolve_peer_chat_id(p)
         if chat_id:
             try:
                 await asyncio.to_thread(_dc_send_msg_with_stats, dc_bot_instance, dc_accid, chat_id, MsgData(text=msg_text))
@@ -633,24 +690,40 @@ def is_safe_target_url(url: str, check_type: str = "http") -> bool:
     except Exception:
         return False
 
-def _get_verified_peer_for_msg(bot, accid, msg, sender_email_from_payload: str = None) -> tuple[dict | None, str]:
-    """Resolves and authenticates the peer sending a protocol message using Delta Chat contact data."""
+def _get_verified_peer_for_msg(bot, accid, msg, is_private_chat: bool = True) -> tuple[dict | None, str]:
+    """Resolves the peer sending a protocol message from Delta Chat contact data.
+
+    The sender address always comes from the Delta Chat contact, never from the message payload.
+    Returns (peer_row_or_None, sender_addr)."""
     sender_addr = ""
     try:
         contact = bot.rpc.get_contact(accid, msg.from_id)
         sender_addr = getattr(contact, 'address', '') or (contact.get('address') if isinstance(contact, dict) else '')
     except Exception:
         pass
-    
-    if not sender_addr and sender_email_from_payload:
-        sender_addr = sender_email_from_payload
 
-    sender_addr = sender_addr.lower().strip() if sender_addr else ""
+    sender_addr = sender_addr.lower().strip() if isinstance(sender_addr, str) else ""
     if not sender_addr:
         return None, ""
 
     peer = database.get_peer(sender_addr)
+    if not peer and is_private_chat:
+        # A SecureJoin peer whose address could not be resolved at /addpeer time is stored under a
+        # placeholder bound to the 1:1 chat created by the admin; replace it with the real address.
+        placeholder = database.get_peer_by_chat_id(msg.chat_id)
+        if placeholder and str(placeholder.get("email", "")).endswith("@securejoin"):
+            if database.rename_peer(placeholder["email"], sender_addr):
+                peer = database.get_peer(sender_addr)
     return peer, sender_addr
+
+def _is_trusted_peer_msg(msg, peer: dict | None, is_private_chat: bool) -> bool:
+    """Peer data messages are only accepted from a configured peer, in a 1:1 chat, end-to-end encrypted."""
+    if not peer or not is_private_chat:
+        return False
+    if not getattr(msg, "show_padlock", False):
+        logger.warning(f"Dropping unencrypted peer protocol message from {peer.get('email')}")
+        return False
+    return True
 
 # Admin detection helper
 def _get_contact_fingerprint(bot, accid, contact_id, contact=None):
@@ -852,6 +925,30 @@ async def notify_ssl_alert(resource, days_left: float, exp_date_str: str, alert_
         except Exception as e:
             logger.error(f"Failed to send SSL alert to chat {chat_id}: {e}")
 
+_REDIRECT_STATUSES = (301, 302, 303, 307, 308)
+_MAX_SAFE_REDIRECTS = 10
+
+@contextlib.asynccontextmanager
+async def _safe_http_request(sess, method: str, url: str, **kwargs):
+    """Performs an HTTP request following redirects manually, re-validating every hop
+    against the SSRF filter so a public URL cannot redirect the probe into a private network."""
+    kwargs["allow_redirects"] = False
+    current_url = url
+    for _ in range(_MAX_SAFE_REDIRECTS + 1):
+        request_fn = getattr(sess, method.lower())
+        async with request_fn(current_url, **kwargs) as resp:
+            location = resp.headers.get("Location") if resp.status in _REDIRECT_STATUSES else None
+            if not isinstance(location, str) or not location:
+                yield resp
+                return
+            next_url = urljoin(str(resp.url) if getattr(resp, "url", None) else current_url, location)
+            if not is_safe_target_url(next_url, "http"):
+                raise aiohttp.ClientError(f"Redirect to blocked address: {next_url[:200]}")
+            if resp.status == 303 and method.upper() != "HEAD":
+                method = "GET"
+            current_url = next_url
+    raise aiohttp.ClientError("Too many redirects")
+
 async def run_single_check(resource, session=None) -> tuple[bool, str, int | None]:
     import http
     rtype = resource["type"]
@@ -869,10 +966,10 @@ async def run_single_check(resource, session=None) -> tuple[bool, str, int | Non
             expected_kw = (resource.get("expected_keyword") or "").strip()
 
             async def _do_get(sess, max_bytes: int, is_local: bool):
-                get_kwargs = {"allow_redirects": True}
+                get_kwargs = {}
                 if not is_local:
                     get_kwargs["timeout"] = req_timeout
-                async with sess.get(url, **get_kwargs) as resp:
+                async with _safe_http_request(sess, "GET", url, **get_kwargs) as resp:
                     elapsed_ms = int((time.time() - start_time) * 1000)
                     try:
                         phrase = http.HTTPStatus(resp.status).phrase
@@ -919,12 +1016,12 @@ async def run_single_check(resource, session=None) -> tuple[bool, str, int | Non
                 http_method = (resource.get("http_method") or "").strip().upper()
                 if not expected_kw and http_method != "GET" and hasattr(sess, "head"):
                     # 1. Try lightweight HEAD first (0 bytes body read)
-                    head_kwargs = {"allow_redirects": True}
+                    head_kwargs = {}
                     if not is_local:
                         head_kwargs["timeout"] = req_timeout
                     head_405 = False
                     try:
-                        async with sess.head(url, **head_kwargs) as resp:
+                        async with _safe_http_request(sess, "HEAD", url, **head_kwargs) as resp:
                             if 200 <= resp.status < 400:
                                 elapsed_ms = int((time.time() - start_time) * 1000)
                                 try:
@@ -1087,7 +1184,7 @@ async def check_group_task(group, semaphore, session=None):
             return
 
     # Peer Cross-Check: verify failing target with remote probes before marking DOWN
-    if not is_up and any(r["status"] != "down" for r in group):
+    if not is_up and any(r["status"] != "down" for r in group) and await _peer_cross_check_allowed(group):
         try:
             peer_results = await request_peer_cross_checks(rep, timeout=8.0)
             if peer_results:
@@ -2890,6 +2987,7 @@ def help_command(bot, accid, event):
             f"/peers (or /probes) — List distributed peer bots and their status\n"
             f"/addpeer <email|link> [node_name] — Add remote peer bot (via email or SecureJoin invite)\n"
             f"/rmpeer <email> — Remove remote peer bot\n"
+            f"/peershare [admin|all|none] — Choose which local monitors are disclosed to peers\n"
             f"/accounts — List configured bot accounts\n"
             f"/rmaccount <id> — Delete a bot account\n"
             f"/transports — Show mail relays & stats\n"
@@ -2966,6 +3064,19 @@ def url_command(bot, accid, event):
     database.set_config("base_url", url)
     _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=f"✅ Base status URL set to: `{url}`"))
 
+def _safe_url_opener():
+    """urllib opener whose redirects are re-validated against the SSRF filter."""
+    import urllib.request
+    import urllib.error
+
+    class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            if not is_safe_target_url(newurl, "http"):
+                raise urllib.error.HTTPError(newurl, code, "Redirect to blocked address", headers, fp)
+            return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+    return urllib.request.build_opener(_SafeRedirectHandler)
+
 def fetch_html_title(url, timeout=3.0):
     if not is_safe_target_url(url, "http"):
         return None
@@ -2975,7 +3086,7 @@ def fetch_html_title(url, timeout=3.0):
             url, 
             headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)'}
         )
-        with urllib.request.urlopen(req, timeout=timeout) as response:
+        with _safe_url_opener().open(req, timeout=timeout) as response:
             html_bytes = response.read(16384)
             charset = 'utf-8'
             content_type = response.headers.get('Content-Type', '')
@@ -3070,7 +3181,8 @@ def ping_command(bot, accid, event):
         return
 
     now = time.time()
-    if not _is_dc_admin(bot, accid, msg.from_id):
+    is_admin_user = _is_dc_admin(bot, accid, msg.from_id)
+    if not is_admin_user:
         last_ping = _chat_ping_anti_spam.get(msg.chat_id, 0.0)
         if now - last_ping < PING_COOLDOWN_SECONDS:
             remaining = int(PING_COOLDOWN_SECONDS - (now - last_ping)) + 1
@@ -3099,7 +3211,8 @@ def ping_command(bot, accid, event):
             # Start multi-region peer cross-checks immediately in parallel
             cross_check_task = None
             peers = await asyncio.to_thread(database.get_all_peers)
-            if peers:
+            # Ad-hoc targets from non-admin users are only shown to peers when sharing is unrestricted
+            if peers and (database.get_peer_share_scope() == "all" or (is_admin_user and database.get_peer_share_scope() != "none")):
                 cross_check_task = asyncio.create_task(request_peer_cross_checks(synth_r, timeout=6.5))
 
             # 1. Local check
@@ -4077,7 +4190,7 @@ def peers_command(bot, accid, event):
             "_No remote peers configured._\n\n"
             "To link another Delta Chat Uptime bot as a remote probe:\n"
             "1. Run `/invitepeer` on the other bot to get its invite link.\n"
-            "2. Run `/addpeer <link> [node_name]` on this bot."
+            "2. Send the `/addpeer ... token=...` command it prints to this bot."
         )
     else:
         reply += f"🔗 **Connected Probes ({len(peers)}):**\n"
@@ -4102,7 +4215,7 @@ def peers_command(bot, accid, event):
             p_node = p.get('node_name') or 'Remote'
             node_meas_count = sum(1 for m in all_peer_measurements if m.get("node_name") == p_node)
             reply += f"• {status_icon} **{p_node}** — `{p['email']}`\n  {chat_lbl} | Last seen: `{seen_str}` | Active metrics: `{node_meas_count}`\n\n"
-        reply += "Commands:\n• `/invitepeer` — Generate E2EE invite link\n• `/addpeer <email|link> [node_name]`\n• `/rmpeer <email>`\n• `/nodename <name>`\n• `/probeignore [url]` — Exclude/list ignored targets on this node\n• `/probeunignore <url>` — Resume probing target on this node"
+        reply += "Commands:\n• `/invitepeer` — Generate E2EE invite link\n• `/addpeer <email|link> [node_name]`\n• `/rmpeer <email>`\n• `/peershare [admin|all|none]`\n• `/nodename <name>`\n• `/probeignore [url]` — Exclude/list ignored targets on this node\n• `/probeunignore <url>` — Resume probing target on this node"
     _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=reply.strip()))
 
 @dc_cli.on(events.NewMessage(command="/invitepeer"))
@@ -4116,14 +4229,19 @@ def invitepeer_command(bot, accid, event):
         qr_link = bot.rpc.get_chat_securejoin_qr_code(accid, None)
         node_name = database.get_local_node_name()
         addr = bot.rpc.get_config(accid, "configured_addr") or bot.rpc.get_config(accid, "addr")
-        
+        token = database.create_peer_invite_token()
+        ttl_hours = database.PEER_INVITE_TTL_SECONDS // 3600
+
         reply = (
             f"🔗 **Peering Invite Link (E2E Encrypted SecureJoin)**\n\n"
             f"Local Node: **{node_name}** (`{addr}`)\n\n"
             f"To link this bot to another Delta Chat Uptime bot:\n"
             f"1. Copy this command:\n"
-            f"`/addpeer {qr_link} {node_name}`\n\n"
-            f"2. Send it to your other bot (in private chat)."
+            f"`/addpeer {qr_link} token={token} {node_name}`\n\n"
+            f"2. Send it to your other bot (in private chat).\n\n"
+            f"🔐 The token is single-use and expires in {ttl_hours}h. Both bots will then exchange telemetry; "
+            f"what this bot discloses is controlled by `/peershare` (now: `{database.get_peer_share_scope()}`).\n"
+            f"⚠️ Keep this message private: whoever uses the token becomes a peer of this bot."
         )
         _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=reply))
     except Exception as e:
@@ -4141,16 +4259,39 @@ def addpeer_command(bot, accid, event):
         _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(
             text="Usage:\n"
                  "• Via SecureJoin Invite Link (Recommended for Chatmail/Strict E2EE):\n"
-                 "  `/addpeer https://i.delta.chat/#... [node_name]`\n"
-                 "• Via Email Address:\n"
+                 "  `/addpeer https://i.delta.chat/#... token=<token> [node_name]`\n"
+                 "• Via Email Address (the other bot must add this one too):\n"
                  "  `/addpeer user@example.com [node_name]`\n\n"
                  "💡 Tip: Use `/invitepeer` on your other bot to generate a SecureJoin invite link."
         ))
         return
-    parts = payload.split(maxsplit=1)
+    parts = payload.split()
     target = parts[0].strip()
-    node_name = parts[1].strip() if len(parts) > 1 else "Remote-Node"
-    
+    invite_token = None
+    name_parts = []
+    for part in parts[1:]:
+        if part.lower().startswith("token=") and invite_token is None:
+            invite_token = part[len("token="):].strip() or None
+        else:
+            name_parts.append(part)
+    node_name = " ".join(name_parts).strip()[:64] or "Remote-Node"
+
+    def _hello_text():
+        hello_payload = {
+            "node_name": database.get_local_node_name(),
+            "sender_email": _get_self_addr(bot, accid),
+            "version": VERSION
+        }
+        if invite_token:
+            hello_payload["invite_token"] = invite_token
+        return f"[UPTIME_PEER_HELLO]\n{json.dumps(hello_payload)}\n[/UPTIME_PEER_HELLO]"
+
+    mutual_note = (
+        "" if invite_token else
+        "\n\n💡 _No invite token given: the other bot will only accept this link if its admin also runs "
+        "`/addpeer` for this bot. Use `/invitepeer` on the other bot for one-step pairing._"
+    )
+
     if "i.delta.chat" in target or target.startswith("OPENPGP4FPR:") or target.startswith("DCACCOUNT:"):
         try:
             # SecureJoin flow for strict E2EE
@@ -4182,18 +4323,10 @@ def addpeer_command(bot, accid, event):
                 peer_email = f"peer_{chat_id}@securejoin"
                 
             database.add_or_update_peer(peer_email, node_name, chat_id)
-            
-            self_addr = _get_self_addr(bot, accid)
-            hello_payload = {
-                "node_name": database.get_local_node_name(),
-                "sender_email": self_addr,
-                "version": VERSION
-            }
-            hello_text = f"[UPTIME_PEER_HELLO]\n{json.dumps(hello_payload)}\n[/UPTIME_PEER_HELLO]"
-            _dc_send_msg_with_stats(bot, accid, chat_id, MsgData(text=hello_text))
-            
+            _dc_send_msg_with_stats(bot, accid, chat_id, MsgData(text=_hello_text()))
+
             _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(
-                text=f"✅ SecureJoin E2EE established with **{node_name}** (`{peer_email}`).\nChat ID: `{chat_id}`."
+                text=f"✅ SecureJoin E2EE established with **{node_name}** (`{peer_email}`).\nChat ID: `{chat_id}`." + mutual_note
             ))
         except Exception as e:
             logger.error(f"Failed to process SecureJoin invite: {e}")
@@ -4210,23 +4343,41 @@ def addpeer_command(bot, accid, event):
         contact_id = bot.rpc.create_contact(accid, email, node_name)
         chat_id = bot.rpc.create_chat_by_contact_id(accid, contact_id)
         database.add_or_update_peer(email, node_name, chat_id)
-        
-        self_addr = _get_self_addr(bot, accid)
-        hello_payload = {
-            "node_name": database.get_local_node_name(),
-            "sender_email": self_addr,
-            "version": VERSION
-        }
-        hello_text = f"[UPTIME_PEER_HELLO]\n{json.dumps(hello_payload)}\n[/UPTIME_PEER_HELLO]"
-        _dc_send_msg_with_stats(bot, accid, chat_id, MsgData(text=hello_text))
-        
+        _dc_send_msg_with_stats(bot, accid, chat_id, MsgData(text=_hello_text()))
+
         _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(
             text=f"✅ Peer `{email}` (**{node_name}**) added.\nSent peering handshake via private chat (Chat ID: `{chat_id}`).\n\n"
-                 f"💡 _Note: If your provider requires strict E2EE (e.g. chatmail), generate an invite on the other bot with `/invitepeer` and add it via `/addpeer <link>`._"
+                 f"💡 _Note: Peer telemetry is only accepted end-to-end encrypted. If your provider requires strict E2EE (e.g. chatmail), generate an invite on the other bot with `/invitepeer` and add it via `/addpeer <link>`._"
+                 + mutual_note
         ))
     except Exception as e:
         logger.error(f"Failed to add peer: {e}")
         _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text="❌ Failed to add peer. Check server logs for details."))
+
+@dc_cli.on(events.NewMessage(command="/peershare"))
+def peershare_command(bot, accid, event):
+    msg = event.msg
+    if not _is_dc_admin(bot, accid, msg.from_id):
+        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text="❌ This command is only for the administrator."))
+        return
+    payload = (event.payload or "").strip().lower()
+    if payload:
+        try:
+            database.set_peer_share_scope(payload)
+        except ValueError:
+            _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text="❌ Usage: `/peershare admin|all|none`"))
+            return
+        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=f"✅ Peer share scope set to `{payload}`."))
+        return
+    scope = database.get_peer_share_scope()
+    _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(
+        text=f"🔐 **Peer share scope:** `{scope}`\n\n"
+             f"Controls which local monitors are sent to peers in telemetry and cross-check requests:\n"
+             f"• `admin` — only monitors from chats the administrator is a member of (default)\n"
+             f"• `all` — monitors from every chat on this bot (all users)\n"
+             f"• `none` — no local monitors; this node only returns results for targets peers asked it to probe\n\n"
+             f"Change with `/peershare admin|all|none`."
+    ))
 
 @dc_cli.on(events.NewMessage(command="/rmpeer"))
 def rmpeer_command(bot, accid, event):
@@ -4525,15 +4676,29 @@ def on_new_message(bot, accid, event):
             start_idx = text.find("[UPTIME_PEER_HELLO]") + len("[UPTIME_PEER_HELLO]")
             end_idx = text.find("[/UPTIME_PEER_HELLO]")
             hello_data = json.loads(text[start_idx:end_idx].strip())
+            if not isinstance(hello_data, dict):
+                return
             peer_node = str(hello_data.get("node_name") or "Remote-Node").strip()[:64]
-            peer, sender_addr = _get_verified_peer_for_msg(bot, accid, msg, hello_data.get("sender_email"))
-            if not sender_addr:
+            peer, sender_addr = _get_verified_peer_for_msg(bot, accid, msg, is_private_chat)
+            if not sender_addr or not is_private_chat:
                 return
 
-            if peer or is_private_chat:
-                saved_chat_id = msg.chat_id if is_private_chat else (peer.get("chat_id") if peer else msg.chat_id)
-                database.add_or_update_peer(sender_addr, peer_node, saved_chat_id, int(time.time()))
-                _record_peer_activity(sender_addr)
+            if not peer:
+                # Unknown bots are only accepted with a one-time token issued by /invitepeer on this node
+                invite_token = hello_data.get("invite_token")
+                if not database.consume_peer_invite_token(invite_token):
+                    logger.warning(f"Ignoring peer HELLO from unknown sender {sender_addr} without a valid invite token")
+                    return
+                database.add_or_update_peer(sender_addr, peer_node, msg.chat_id, int(time.time()))
+                if async_event_loop and async_event_loop.is_running():
+                    asyncio.run_coroutine_threadsafe(send_admin_notification(
+                        f"🔗 **New Monitoring Peer Linked**\n"
+                        f"Probe Node: 🛰️ **{peer_node}** (`{sender_addr}`)\n\n"
+                        f"Linked using a `/invitepeer` token. Remove it with `/rmpeer {sender_addr}`."
+                    ), async_event_loop)
+            else:
+                database.add_or_update_peer(sender_addr, peer_node, msg.chat_id, int(time.time()))
+            _record_peer_activity(sender_addr)
 
             self_addr = _get_self_addr(bot, accid)
             ack_payload = {
@@ -4547,20 +4712,21 @@ def on_new_message(bot, accid, event):
             logger.error(f"Error handling peer hello: {e}")
         return
 
-    # 2. Peer Handshake: HELLO_ACK
+    # 2. Peer Handshake: HELLO_ACK (only from bots this node added itself)
     if "[UPTIME_PEER_HELLO_ACK]" in text and "[/UPTIME_PEER_HELLO_ACK]" in text:
         try:
             start_idx = text.find("[UPTIME_PEER_HELLO_ACK]") + len("[UPTIME_PEER_HELLO_ACK]")
             end_idx = text.find("[/UPTIME_PEER_HELLO_ACK]")
             ack_data = json.loads(text[start_idx:end_idx].strip())
-            peer_node = str(ack_data.get("node_name") or "Remote-Node").strip()[:64]
-            peer, sender_addr = _get_verified_peer_for_msg(bot, accid, msg, ack_data.get("sender_email"))
-            if not sender_addr:
+            if not isinstance(ack_data, dict):
                 return
-            if peer or is_private_chat:
-                saved_chat_id = msg.chat_id if is_private_chat else (peer.get("chat_id") if peer else msg.chat_id)
-                database.add_or_update_peer(sender_addr, peer_node, saved_chat_id, int(time.time()))
-                _record_peer_activity(sender_addr)
+            peer_node = str(ack_data.get("node_name") or "Remote-Node").strip()[:64]
+            peer, sender_addr = _get_verified_peer_for_msg(bot, accid, msg, is_private_chat)
+            if not peer or not is_private_chat:
+                logger.warning(f"Ignoring peer HELLO_ACK from unknown sender {sender_addr or msg.from_id}")
+                return
+            database.add_or_update_peer(sender_addr, peer_node, msg.chat_id, int(time.time()))
+            _record_peer_activity(sender_addr)
         except Exception as e:
             logger.error(f"Error handling peer hello ack: {e}")
         return
@@ -4576,12 +4742,11 @@ def on_new_message(bot, accid, event):
             check_type = req_data.get("type", "http")
             keyword = req_data.get("expected_keyword")
 
-            peer, sender_addr = _get_verified_peer_for_msg(bot, accid, msg, req_data.get("node_name"))
-            if not peer and not sender_addr:
-                logger.warning(f"Dropping check request from unverified sender in chat {msg.chat_id}")
+            peer, sender_addr = _get_verified_peer_for_msg(bot, accid, msg, is_private_chat)
+            if not _is_trusted_peer_msg(msg, peer, is_private_chat):
+                logger.warning(f"Dropping check request from untrusted sender {sender_addr or msg.from_id} in chat {msg.chat_id}")
                 return
-            if sender_addr:
-                _record_peer_activity(sender_addr)
+            _record_peer_activity(sender_addr)
 
             # Security: Validate target_url against SSRF (no localhost / private IPs)
             if not is_safe_target_url(target_url, check_type):
@@ -4637,28 +4802,48 @@ def on_new_message(bot, accid, event):
             latency_ms = resp_data.get("latency_ms")
             error_msg = resp_data.get("error_msg")
 
-            peer, sender_addr = _get_verified_peer_for_msg(bot, accid, msg)
-            if sender_addr:
-                _record_peer_activity(sender_addr)
+            peer, sender_addr = _get_verified_peer_for_msg(bot, accid, msg, is_private_chat)
+            if not _is_trusted_peer_msg(msg, peer, is_private_chat):
+                logger.warning(f"Dropping check response from untrusted sender {sender_addr or msg.from_id}")
+                return
+            _record_peer_activity(sender_addr)
 
-            # Use verified node name from DB if available, falling back to payload
-            node_name = (peer.get("node_name") if peer else None) or resp_data.get("node_name") or "Remote-Node"
+            # Only answers to a request this node sent to this very peer are accepted
+            pending = pending_peer_checks.get(req_id) if req_id else None
+            if not pending:
+                return
+            fut, expected_count, resp_list, expected_senders = pending
+            if sender_addr not in expected_senders:
+                logger.warning(f"Dropping check response for req_id {req_id} from unexpected peer {sender_addr}")
+                return
+            expected_senders.discard(sender_addr)
+
+            node_name = peer.get("node_name") or "Remote-Node"
+            if status not in ("up", "down"):
+                status = "unknown"
+            if not isinstance(latency_ms, int) or isinstance(latency_ms, bool):
+                latency_ms = None
+            error_msg = str(error_msg)[:500] if error_msg else None
 
             if target_url and is_safe_target_url(target_url, "http" if target_url.startswith("http") else ("tcp" if ":" in target_url else "ping")):
                 database.save_peer_measurement(target_url, node_name, status, latency_ms, error_msg, int(time.time()))
 
-            if req_id and req_id in pending_peer_checks:
-                fut, expected_count, resp_list = pending_peer_checks[req_id]
-                resp_data["node_name"] = node_name
-                resp_list.append(resp_data)
-                if len(resp_list) >= expected_count and not fut.done():
-                    if async_event_loop and async_event_loop.is_running():
-                        async_event_loop.call_soon_threadsafe(fut.set_result, resp_list)
-                    else:
-                        try:
-                            fut.set_result(resp_list)
-                        except Exception:
-                            pass
+            resp_list.append({
+                "req_id": req_id,
+                "url": target_url,
+                "status": status,
+                "latency_ms": latency_ms,
+                "error_msg": error_msg,
+                "node_name": node_name,
+            })
+            if len(resp_list) >= expected_count and not fut.done():
+                if async_event_loop and async_event_loop.is_running():
+                    async_event_loop.call_soon_threadsafe(fut.set_result, resp_list)
+                else:
+                    try:
+                        fut.set_result(resp_list)
+                    except Exception:
+                        pass
         except Exception as e:
             logger.error(f"Error handling peer check response: {e}")
         return
@@ -4672,9 +4857,13 @@ def on_new_message(bot, accid, event):
             metrics_list = metrics_data.get("metrics", [])
             msg_id = metrics_data.get("msg_id")
 
-            peer, sender_addr = _get_verified_peer_for_msg(bot, accid, msg, metrics_data.get("sender_email"))
-            if sender_addr:
-                _record_peer_activity(sender_addr)
+            peer, sender_addr = _get_verified_peer_for_msg(bot, accid, msg, is_private_chat)
+            if not _is_trusted_peer_msg(msg, peer, is_private_chat):
+                logger.warning(f"Dropping telemetry from untrusted sender {sender_addr or msg.from_id}")
+                return
+            _record_peer_activity(sender_addr)
+            if not isinstance(metrics_list, list):
+                return
 
             # Deduplication by msg_id
             if msg_id:
@@ -4688,7 +4877,7 @@ def on_new_message(bot, accid, event):
                     except Exception:
                         pass
 
-            peer_node = (peer.get("node_name") if peer else None) or metrics_data.get("node_name") or "Remote-Node"
+            peer_node = peer.get("node_name") or "Remote-Node"
 
             if metrics_list:
                 # Sanitize metrics targets before saving
@@ -4698,7 +4887,7 @@ def on_new_message(bot, accid, event):
                 ]
                 if safe_metrics:
                     database.save_peer_measurements_batch(peer_node, safe_metrics)
-                    database.save_probe_targets_batch(safe_metrics, sender_addr or peer_node)
+                    database.save_probe_targets_batch(safe_metrics, sender_addr)
                     _scheduler_cache["probe_targets"] = None
         except Exception as e:
             logger.error(f"Error handling peer metrics: {e}")

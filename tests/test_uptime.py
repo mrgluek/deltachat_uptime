@@ -1896,9 +1896,15 @@ class TestUptimeBot(unittest.TestCase):
         mock_event.msg.is_info = False
         mock_event.msg.from_id = 77
         mock_event.msg.chat_id = 888
+        mock_event.msg.show_padlock = True
 
-        # 1. Incoming [UPTIME_PEER_HELLO]
-        mock_event.msg.text = '[UPTIME_PEER_HELLO]\n{"node_name": "Helsinki-DO", "version": "2.0.0"}\n[/UPTIME_PEER_HELLO]'
+        # 1. Incoming [UPTIME_PEER_HELLO] from an unknown bot carrying a valid invite token
+        token = database.create_peer_invite_token()
+        mock_event.msg.text = (
+            '[UPTIME_PEER_HELLO]\n'
+            f'{{"node_name": "Helsinki-DO", "version": "2.0.0", "invite_token": "{token}"}}\n'
+            '[/UPTIME_PEER_HELLO]'
+        )
         bot.on_new_message(mock_bot, 1, mock_event)
         p = database.get_peer("probe2@gluek.info")
         self.assertIsNotNone(p)
@@ -1934,7 +1940,7 @@ class TestUptimeBot(unittest.TestCase):
         asyncio.set_event_loop(loop)
         fut = loop.create_future()
         responses = []
-        bot.pending_peer_checks["req123"] = (fut, 1, responses)
+        bot.pending_peer_checks["req123"] = (fut, 1, responses, {"probe2@gluek.info"})
 
         mock_event.msg.text = (
             '[UPTIME_PEER_CHECK_RESP]\n'
@@ -1945,6 +1951,8 @@ class TestUptimeBot(unittest.TestCase):
         self.assertTrue(fut.done())
         self.assertEqual(len(responses), 1)
         self.assertEqual(responses[0]["latency_ms"], 42)
+        bot.pending_peer_checks.pop("req123", None)
+        loop.close()
 
     def test_dashboard_renders_multi_node_badges(self):
         database.set_local_node_name("Frankfurt-DE")
@@ -1972,6 +1980,8 @@ class TestUptimeBot(unittest.TestCase):
     def test_cross_probe_incident_verification(self):
         database.set_local_node_name("Frankfurt-DE")
         database.add_or_update_peer("peer@example.com", "Helsinki-DO", 101)
+        # Monitor lives in the admin's chat, so it is within the default "admin" peer share scope
+        database.set_config("admin_chat_id", "100")
 
         rep = {"id": 1, "url": "https://cross-check-test.org", "type": "http", "name": "Cross Check"}
         group = [{"id": 1, "dc_chat_id": 100, "url": "https://cross-check-test.org", "type": "http", "name": "Cross Check", "status": "up"}]
@@ -2324,9 +2334,10 @@ class TestUptimeBot(unittest.TestCase):
         args, _ = mock_bot.rpc.send_msg.call_args
         self.assertIn("Keyword assertions are only supported for HTTP/HTTPS", args[2].text)
 
+    @patch('bot._is_dc_admin', return_value=True)
     @patch('bot.run_single_check')
     @patch('bot.request_peer_cross_checks')
-    def test_ping_command_with_peers(self, mock_cross_checks, mock_check):
+    def test_ping_command_with_peers(self, mock_cross_checks, mock_check, mock_is_admin):
         mock_check.return_value = (True, "200 - OK", 35)
         mock_cross_checks.return_value = [
             {"node_name": "RU-Moscow", "status": "up", "latency_ms": 65, "error_msg": None}
@@ -2692,7 +2703,7 @@ class TestUptimeBot(unittest.TestCase):
                 read_args.append(n)
                 return b"<html><head><title>My 16KB Site</title></head><body>Content</body></html>"
 
-        with patch('urllib.request.urlopen', return_value=MockHttpResponse()):
+        with patch('urllib.request.OpenerDirector.open', return_value=MockHttpResponse()):
             title = bot.fetch_html_title("https://title-test.org")
             self.assertEqual(title, "My 16KB Site")
             self.assertEqual(read_args, [16384])

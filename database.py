@@ -215,6 +215,12 @@ def init_db():
             )
         ''')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_peers_chat ON peers(chat_id)')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS peer_invites (
+                token TEXT PRIMARY KEY,
+                expires_at INTEGER NOT NULL
+            )
+        ''')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_peers_last_seen ON peers(last_seen)')
 
         # Ensure columns exist in peers for existing DBs
@@ -1157,7 +1163,10 @@ def remove_peer(email: str) -> bool:
     with _writer_transaction() as conn:
         cursor = conn.cursor()
         cursor.execute("DELETE FROM peers WHERE email = ?", (email,))
-        return cursor.rowcount > 0
+        removed = cursor.rowcount > 0
+        # Stop scanning targets that were mirrored from this peer
+        cursor.execute("DELETE FROM probe_targets WHERE source_peer = ?", (email,))
+        return removed
 
 def get_peer(email: str) -> dict | None:
     email = email.lower().strip()
@@ -1170,6 +1179,18 @@ def get_peer(email: str) -> dict | None:
         return dict(row) if row else None
     finally:
         conn.close()
+
+def rename_peer(old_email: str, new_email: str) -> bool:
+    """Re-keys a peer row (used to replace a SecureJoin placeholder address with the real one)."""
+    old_email = old_email.lower().strip()
+    new_email = new_email.lower().strip()
+    with _writer_transaction() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT 1 FROM peers WHERE email = ?", (new_email,))
+        if cursor.fetchone():
+            return False
+        cursor.execute("UPDATE peers SET email = ? WHERE email = ?", (new_email, old_email))
+        return cursor.rowcount > 0
 
 def get_peer_by_chat_id(chat_id: int) -> dict | None:
     conn = _connect()
@@ -1254,6 +1275,41 @@ def audit_peers_offline(threshold_seconds: int = 360, now: int = None) -> list[d
             ''', (cur_time, p["email"]))
             newly_offline.append(p)
     return newly_offline
+
+# One-time peering invite tokens (issued by /invitepeer, consumed by an incoming HELLO)
+PEER_INVITE_TTL_SECONDS = 24 * 3600
+
+def create_peer_invite_token(ttl_seconds: int = PEER_INVITE_TTL_SECONDS, now: int = None) -> str:
+    cur_time = now if now is not None else int(time.time())
+    token = secrets.token_urlsafe(18)
+    with _writer_transaction() as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM peer_invites WHERE expires_at < ?", (cur_time,))
+        cursor.execute("INSERT INTO peer_invites (token, expires_at) VALUES (?, ?)", (token, cur_time + ttl_seconds))
+    return token
+
+def consume_peer_invite_token(token: str, now: int = None) -> bool:
+    """Returns True and invalidates the token if it is known and not expired."""
+    if not token or not isinstance(token, str):
+        return False
+    cur_time = now if now is not None else int(time.time())
+    with _writer_transaction() as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM peer_invites WHERE token = ? AND expires_at >= ?", (token.strip(), cur_time))
+        return cursor.rowcount > 0
+
+# Which local monitors are disclosed to peers: "admin" (chats the admin is in), "all" or "none"
+PEER_SHARE_SCOPES = ("admin", "all", "none")
+
+def get_peer_share_scope() -> str:
+    scope = (get_config("peer_share_scope") or os.getenv("PEER_SHARE_SCOPE", "admin")).strip().lower()
+    return scope if scope in PEER_SHARE_SCOPES else "admin"
+
+def set_peer_share_scope(scope: str):
+    scope = (scope or "").strip().lower()
+    if scope not in PEER_SHARE_SCOPES:
+        raise ValueError(f"Unknown peer share scope: {scope}")
+    set_config("peer_share_scope", scope)
 
 # Peer measurements (remote probe telemetry)
 def save_peer_measurement(url: str, node_name: str, status: str, latency_ms: int | None = None, error_msg: str = None, last_checked: int = None):
@@ -1342,7 +1398,9 @@ def get_all_peer_measurements() -> list[dict]:
         conn.close()
 
 # Remote probe targets functions
-def save_probe_targets_batch(targets: list[dict], source_peer: str = None):
+MAX_PROBE_TARGETS_PER_PEER = 200
+
+def save_probe_targets_batch(targets: list[dict], source_peer: str = None, max_per_source: int = MAX_PROBE_TARGETS_PER_PEER):
     if not targets:
         return
     with _writer_transaction() as conn:
@@ -1351,6 +1409,16 @@ def save_probe_targets_batch(targets: list[dict], source_peer: str = None):
         ignored_set = set(row[0] for row in cursor.fetchall())
 
         now = int(time.time())
+        # Cap how many active probe targets a single peer can make this node scan
+        known_urls = set()
+        if source_peer and max_per_source:
+            cursor.execute(
+                "SELECT url FROM probe_targets WHERE source_peer = ? AND last_seen >= ?",
+                (source_peer, now - 86400)
+            )
+            known_urls = set(row[0] for row in cursor.fetchall())
+        new_slots = max(0, max_per_source - len(known_urls)) if (source_peer and max_per_source) else None
+
         rows = []
         for item in targets[:200]:
             if not isinstance(item, dict):
@@ -1358,6 +1426,11 @@ def save_probe_targets_batch(targets: list[dict], source_peer: str = None):
             url = str(item.get("url") or "").strip()[:500]
             if not url or url in ignored_set:
                 continue
+            if new_slots is not None and url not in known_urls:
+                if new_slots <= 0:
+                    continue
+                new_slots -= 1
+                known_urls.add(url)
             name = str(item.get("name") or url).strip()[:200]
             chk_type = str(item.get("type") or "http").strip().lower()
             if chk_type not in ("http", "tcp", "ping"):

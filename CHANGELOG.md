@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.12.0] - 2026-10-16
+
+### Security
+- **No More Automatic Peering**: Any Delta Chat user could send a `[UPTIME_PEER_HELLO]` message to the bot, be added as a peer automatically and from then on receive every monitor of every chat every 2 minutes. An unknown bot is now only accepted as a peer if it presents a single-use token from `/invitepeer` (valid 24h); the admin is notified when that happens. `HELLO_ACK` is only accepted from bots the admin added. Without a token, both admins have to run `/addpeer` for each other.
+- **Peer Messages Only From Peers**: `CHECK_REQ`, `CHECK_RESP` and `METRICS` were processed from any sender, so anyone could make the bot probe arbitrary hosts, plant up to 200 probe targets per message and inject fake per-node results into public status pages. They are now accepted only from configured peers, in a 1:1 chat and end-to-end encrypted (padlock). The sender is taken from the Delta Chat contact only; `sender_email` and `node_name` in the payload are no longer trusted.
+- **Cross-Check Responses Bound to Requests**: A response is only accepted for a pending `req_id`, from a peer the request was sent to, once per peer. Request IDs are now 96-bit.
+- **Controlled Disclosure (`/peershare admin|all|none`)**: Telemetry and cross-check requests now include only monitors from chats the administrator is a member of (`admin`, default). `all` restores the previous behaviour, `none` shares no local monitors. Monitor names are no longer sent. `/ping` from non-admin users reaches peers only with `all`.
+- **No Relaying of Mirrored Targets**: Targets one peer asked this node to probe are reported back only to that peer instead of being forwarded to every other peer (and from there further across the mesh). Each peer can make this node probe at most 200 targets; `/rmpeer` removes the targets mirrored from that peer.
+- **SSRF via Redirects**: HTTP checks and `/ping` title fetches followed redirects without re-validating them, so a public URL could redirect the probe to `127.0.0.1` or cloud metadata addresses. Redirects are now followed manually (at most 10) and every hop is checked by the SSRF filter.
+
+### Fixed
+- **SecureJoin Peers With Unknown Address**: A peer stored under the `peer_<chat>@securejoin` placeholder never matched incoming messages. The placeholder is now replaced with the real address on the first message in that chat.
+
+### Upgrade Notes
+- Existing peers keep working. Pairing with a new bot requires the `/addpeer ... token=...` command printed by `/invitepeer` (or `/addpeer` on both sides).
+- Unencrypted peer telemetry is dropped. Bots exchange keys during the HELLO handshake, so this only affects peers on classic email providers without Autocrypt.
+- If you relied on peers seeing monitors of all chats, run `/peershare all`.
+
 ## [2.11.1] - 2026-10-15
 - **User-Agent No Longer Contains "Bot"**: HTTP checks now send `Delta Chat Uptime Monitor/<version> (+https://git.gluek.info/gluek/deltachat_uptime)` instead of `DeltaChat-Uptime-Bot/...`. Hiddify Manager (and other services that block crawlers) answered `400 Bad Request` to any User-Agent containing "bot", so working subscription links showed as down while they opened fine in a browser.
 

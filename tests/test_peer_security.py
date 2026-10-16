@@ -467,6 +467,9 @@ class _FakeSession:
 
 
 class TestSafeRedirects(unittest.TestCase):
+    def setUp(self):
+        bot._dns_cache.clear()
+
     def _run(self, coro):
         return asyncio.run(coro)
 

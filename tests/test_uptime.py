@@ -81,6 +81,11 @@ class TestUptimeBot(unittest.TestCase):
         database.init_db()
         bot._chat_ping_anti_spam.clear()
         database._transport_stats_buffer.clear()
+        # Unit tests mock the network; give probe connections a public address without real DNS
+        bot._dns_cache.clear()
+        dns_patcher = patch('bot.resolve_host_safe', unittest.mock.AsyncMock(return_value=["93.184.216.34"]))
+        dns_patcher.start()
+        self.addCleanup(dns_patcher.stop)
 
     def tearDown(self):
         database.close_db()

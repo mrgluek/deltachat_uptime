@@ -15,7 +15,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **No Relaying of Mirrored Targets**: Targets one peer asked this node to probe are reported back only to that peer instead of being forwarded to every other peer (and from there further across the mesh). Each peer can make this node probe at most 200 targets; `/rmpeer` removes the targets mirrored from that peer.
 - **SSRF via Redirects**: HTTP checks and `/ping` title fetches followed redirects without re-validating them, so a public URL could redirect the probe to `127.0.0.1` or cloud metadata addresses. Redirects are now followed manually (at most 10) and every hop is checked by the SSRF filter.
 
+- **DNS Rebinding Protection**: Targets were validated with one DNS lookup and then connected to after a second, independent lookup, so a hostname could answer with a public address during validation and with `127.0.0.1` or a cloud metadata address at connect time. All probe connections (HTTP checks, redirects, TCP, ping, SSL expiry, `/ping` title fetch) now go through one resolver that checks every address and pins the validated answer for the record's TTL (clamped to 30–300 s, 60 s when the TTL is unknown). After expiry the new answer is validated again. HTTP checks use a custom aiohttp resolver; TCP, ping and SSL checks connect to the validated IP; the title fetch connects to the pinned IP with the original hostname for SNI and no longer uses environment proxies. DNS is now resolved asynchronously (aiodns, falling back to the system resolver for `/etc/hosts`) instead of blocking the event loop on every check.
+
 ### Fixed
+- **TCP Targets With IPv6 Literals**: `[::1]:22` style targets were not recognised as IP literals by the SSRF filter.
 - **SecureJoin Peers With Unknown Address**: A peer stored under the `peer_<chat>@securejoin` placeholder never matched incoming messages. The placeholder is now replaced with the real address on the first message in that chat.
 
 ### Upgrade Notes

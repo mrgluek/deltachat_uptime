@@ -15,6 +15,7 @@ import shlex
 import secrets
 from urllib.parse import urlparse, urljoin
 import aiohttp
+import aiohttp.abc
 from aiohttp import web
 from deltachat2 import events, MsgData
 from deltabot_cli import BotCli
@@ -627,6 +628,171 @@ def _is_blocked_ip(ip) -> bool:
         return True
     return False
 
+# DNS pinning: every hostname is resolved through one cache, and every address is checked against
+# _is_blocked_ip before it is connected to. Validation and the actual connection therefore use the
+# same answer for the record's TTL, and a re-resolution after expiry is validated again, so a DNS
+# rebinding attack (public answer at validation, private answer at connect) cannot reach the probe.
+DNS_CACHE_DEFAULT_TTL = 60   # used when the TTL is unknown (system resolver fallback)
+DNS_CACHE_MIN_TTL = 30       # TTL 0/1 tricks cannot force a fresh lookup between validation and connect
+DNS_CACHE_MAX_TTL = 300      # long TTLs must not keep probing an old address after a migration
+DNS_CACHE_MAX_ENTRIES = 5000
+_dns_cache = {}  # host -> (expires_at, tuple_of_ip_strings)
+_dns_cache_lock = threading.Lock()
+
+
+class BlockedAddressError(OSError):
+    """A hostname resolved to an internal/private/non-routable address."""
+
+
+def _dns_cache_get(host: str):
+    now = time.monotonic()
+    with _dns_cache_lock:
+        entry = _dns_cache.get(host)
+        if entry and entry[0] > now:
+            return entry[1]
+    return None
+
+
+def _dns_cache_put(host: str, ips, ttl) -> tuple:
+    try:
+        ttl = int(ttl)
+    except (TypeError, ValueError):
+        ttl = DNS_CACHE_DEFAULT_TTL
+    ttl = min(DNS_CACHE_MAX_TTL, max(DNS_CACHE_MIN_TTL, ttl))
+    ips = tuple(dict.fromkeys(ips))
+    now = time.monotonic()
+    with _dns_cache_lock:
+        if len(_dns_cache) >= DNS_CACHE_MAX_ENTRIES:
+            for key in [k for k, v in _dns_cache.items() if v[0] <= now]:
+                del _dns_cache[key]
+            if len(_dns_cache) >= DNS_CACHE_MAX_ENTRIES:
+                _dns_cache.clear()
+        _dns_cache[host] = (now + ttl, ips)
+    return ips
+
+
+def _validated_ips(host: str, ips) -> list[str]:
+    """Raises BlockedAddressError unless every resolved address is publicly routable."""
+    import ipaddress
+    if not ips:
+        raise BlockedAddressError(f"No addresses for {host}")
+    for ip_str in ips:
+        try:
+            ip_obj = ipaddress.ip_address(ip_str.split("%", 1)[0])
+        except ValueError:
+            raise BlockedAddressError(f"Invalid address {ip_str!r} for {host}")
+        if _is_blocked_ip(ip_obj):
+            raise BlockedAddressError(f"{host} resolves to internal or private network address {ip_str}")
+    # IPv4 first: ping/TCP fallbacks and most hosts behave best over IPv4
+    return sorted(ips, key=lambda a: ":" in a)
+
+
+def _literal_ip(host: str):
+    import ipaddress
+    try:
+        return str(ipaddress.ip_address(host.strip("[]")))
+    except ValueError:
+        return None
+
+
+def resolve_host_safe_sync(host: str) -> list[str]:
+    """Blocking variant of resolve_host_safe (system resolver, TTL unknown -> DNS_CACHE_DEFAULT_TTL)."""
+    host = (host or "").strip().lower().rstrip(".")
+    literal = _literal_ip(host)
+    if literal:
+        return _validated_ips(host, [literal])
+    cached = _dns_cache_get(host)
+    if cached is None:
+        infos = socket.getaddrinfo(host, None)
+        cached = _dns_cache_put(host, [info[4][0] for info in infos], DNS_CACHE_DEFAULT_TTL)
+    return _validated_ips(host, cached)
+
+
+async def _query_with_ttl(host: str):
+    """Returns (ips, ttl) using aiodns so the record TTL is known; raises if nothing resolves."""
+    resolver = aiodns.DNSResolver(timeout=3.0, tries=2)
+    try:
+        results = await asyncio.gather(resolver.query(host, "A"), resolver.query(host, "AAAA"), return_exceptions=True)
+    finally:
+        try:
+            close = resolver.close()
+            if asyncio.iscoroutine(close):
+                await close
+        except Exception:
+            pass
+    ips, ttls = [], []
+    for res in results:
+        if isinstance(res, BaseException):
+            continue
+        for rec in res:
+            ips.append(rec.host)
+            ttls.append(getattr(rec, "ttl", DNS_CACHE_DEFAULT_TTL))
+    if not ips:
+        raise socket.gaierror(socket.EAI_NONAME, f"DNS lookup failed for {host}")
+    return ips, min(ttls)
+
+
+async def resolve_host_safe(host: str) -> list[str]:
+    """Resolves a hostname for an outgoing probe connection.
+
+    Uses the cached answer while its TTL is valid, otherwise queries DNS (aiodns, which reports the TTL)
+    and falls back to the system resolver (e.g. /etc/hosts). Raises BlockedAddressError if any address
+    is internal, so callers must connect only to the returned IPs."""
+    host = (host or "").strip().lower().rstrip(".")
+    literal = _literal_ip(host)
+    if literal:
+        return _validated_ips(host, [literal])
+    cached = _dns_cache_get(host)
+    if cached is None:
+        ips, ttl = None, DNS_CACHE_DEFAULT_TTL
+        if aiodns is not None:
+            try:
+                ips, ttl = await _query_with_ttl(host)
+            except Exception as e:
+                logger.debug(f"aiodns lookup failed for {host} ({e}), using system resolver")
+        if not ips:
+            loop = asyncio.get_running_loop()
+            infos = await loop.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+            ips = [info[4][0] for info in infos]
+        cached = _dns_cache_put(host, ips, ttl)
+    return _validated_ips(host, cached)
+
+
+class SafeResolver(aiohttp.abc.AbstractResolver):
+    """aiohttp resolver that only hands out validated, cached addresses (DNS rebinding protection)."""
+
+    async def resolve(self, host: str, port: int = 0, family: int = socket.AF_INET):
+        ips = await resolve_host_safe(host)
+        results = []
+        for ip in ips:
+            ip_family = socket.AF_INET6 if ":" in ip else socket.AF_INET
+            if family not in (socket.AF_UNSPEC, 0) and family != ip_family:
+                continue
+            results.append({
+                "hostname": host, "host": ip, "port": port,
+                "family": ip_family, "proto": 0, "flags": socket.AI_NUMERICHOST,
+            })
+        if not results:
+            raise OSError(f"No usable address for {host}")
+        return results
+
+    async def close(self) -> None:
+        return None
+
+
+def _make_safe_connector(**kwargs) -> aiohttp.TCPConnector:
+    # aiohttp's own DNS cache is disabled: it ignores record TTLs, and our cache already pins answers
+    return aiohttp.TCPConnector(resolver=SafeResolver(), use_dns_cache=False, **kwargs)
+
+
+def _target_host(validated: str, check_type: str) -> str:
+    if check_type == "http":
+        return (urlparse(validated).hostname or "").lower().strip()
+    if check_type == "tcp":
+        return validated.rsplit(":", 1)[0].strip("[]").lower().strip()
+    return validated.lower().strip()
+
+
 def is_safe_target_url(url: str, check_type: str = "http") -> bool:
     """Validates target format and blocks dangerous internal/private/metadata IP addresses (SSRF prevention)."""
     try:
@@ -634,16 +800,7 @@ def is_safe_target_url(url: str, check_type: str = "http") -> bool:
         if expected_type != check_type:
             return False
 
-        host = ""
-        if check_type == "http":
-            parsed = urlparse(validated)
-            host = parsed.hostname or ""
-        elif check_type == "tcp":
-            host = validated.rsplit(":", 1)[0]
-        elif check_type == "ping":
-            host = validated
-
-        host = host.lower().strip()
+        host = _target_host(validated, check_type)
         if not host:
             return False
 
@@ -669,19 +826,11 @@ def is_safe_target_url(url: str, check_type: str = "http") -> bool:
         except ValueError:
             pass
 
-        # DNS resolution check (prevent DNS rebinding to internal/private IPs)
+        # DNS resolution check through the shared pinning cache (the connection reuses this answer)
         try:
-            addr_info = socket.getaddrinfo(host, None)
-            if not addr_info:
-                return False
-            for family, _, _, _, sockaddr in addr_info:
-                ip_str = sockaddr[0]
-                try:
-                    ip_obj = ipaddress.ip_address(ip_str)
-                    if _is_blocked_ip(ip_obj):
-                        return False
-                except ValueError:
-                    return False
+            resolve_host_safe_sync(host)
+        except BlockedAddressError:
+            return False
         except socket.gaierror:
             # Domain could not be resolved; allow in offline/test environment if name is syntactically valid
             pass
@@ -840,8 +989,8 @@ async def check_ssl_expiry(url: str, timeout: float = 10.0) -> tuple[int | None,
             return None, "Invalid hostname"
             
         ctx = ssl.create_default_context()
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(host, port, ssl=ctx, server_hostname=host),
+        writer = await asyncio.wait_for(
+            _open_pinned_connection(host, port, ssl=ctx, server_hostname=host),
             timeout=timeout
         )
         ssl_obj = writer.get_extra_info("ssl_object")
@@ -925,6 +1074,31 @@ async def notify_ssl_alert(resource, days_left: float, exp_date_str: str, alert_
         except Exception as e:
             logger.error(f"Failed to send SSL alert to chat {chat_id}: {e}")
 
+async def _prewarm_target_dns(url: str, check_type: str) -> bool:
+    """Resolves the target asynchronously (with the record TTL) before the synchronous SSRF check,
+    so that check hits the cache instead of blocking the event loop. Returns False if blocked."""
+    try:
+        _, validated = parse_target(url)
+        host = _target_host(validated, check_type)
+        if host:
+            await resolve_host_safe(host)
+    except BlockedAddressError:
+        return False
+    except Exception:
+        pass  # unresolvable/invalid: is_safe_target_url decides
+    return True
+
+async def _open_pinned_connection(host: str, port: int, **kwargs):
+    """Opens a TCP connection to one of the validated addresses of host; returns the writer."""
+    last_error = None
+    for ip in await resolve_host_safe(host):
+        try:
+            _, writer = await asyncio.open_connection(ip, port, **kwargs)
+            return writer
+        except OSError as e:
+            last_error = e
+    raise last_error or OSError(f"Could not connect to {host}:{port}")
+
 _REDIRECT_STATUSES = (301, 302, 303, 307, 308)
 _MAX_SAFE_REDIRECTS = 10
 
@@ -942,7 +1116,7 @@ async def _safe_http_request(sess, method: str, url: str, **kwargs):
                 yield resp
                 return
             next_url = urljoin(str(resp.url) if getattr(resp, "url", None) else current_url, location)
-            if not is_safe_target_url(next_url, "http"):
+            if not await _prewarm_target_dns(next_url, "http") or not is_safe_target_url(next_url, "http"):
                 raise aiohttp.ClientError(f"Redirect to blocked address: {next_url[:200]}")
             if resp.status == 303 and method.upper() != "HEAD":
                 method = "GET"
@@ -954,8 +1128,8 @@ async def run_single_check(resource, session=None) -> tuple[bool, str, int | Non
     rtype = resource["type"]
     url = resource["url"]
     timeout = 10
-    
-    if not is_safe_target_url(url, rtype):
+
+    if not await _prewarm_target_dns(url, rtype) or not is_safe_target_url(url, rtype):
         return False, "Target blocked: internal or private network address", None
 
     start_time = time.time()
@@ -1069,15 +1243,12 @@ async def run_single_check(resource, session=None) -> tuple[bool, str, int | Non
             if session is not None and not getattr(session, "closed", False):
                 return await _check_http(session, is_local=False)
             else:
-                async with aiohttp.ClientSession(headers=headers, timeout=req_timeout) as local_session:
+                async with aiohttp.ClientSession(connector=_make_safe_connector(), headers=headers, timeout=req_timeout) as local_session:
                     return await _check_http(local_session, is_local=True)
         elif rtype == "tcp":
             parts = url.rsplit(":", 1)
-            host, port = parts[0], int(parts[1])
-            reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(host, port),
-                timeout=timeout
-            )
+            host, port = parts[0].strip("[]"), int(parts[1])
+            writer = await asyncio.wait_for(_open_pinned_connection(host, port), timeout=timeout)
             writer.close()
             try:
                 await writer.wait_closed()
@@ -1092,6 +1263,8 @@ async def run_single_check(resource, session=None) -> tuple[bool, str, int | Non
 
             ping_success = False
             elapsed_ms = None
+            # Ping the validated address itself so the ping tool cannot resolve to something else
+            host = (await resolve_host_safe(host))[0]
 
             if aioping is not None:
                 try:
@@ -1124,6 +1297,13 @@ async def run_single_check(resource, session=None) -> tuple[bool, str, int | Non
     except asyncio.TimeoutError:
         elapsed_ms = int((time.time() - start_time) * 1000)
         return False, "Timeout", elapsed_ms
+    except BlockedAddressError:
+        return False, "Target blocked: internal or private network address", None
+    except aiohttp.ClientConnectorError as e:
+        if isinstance(getattr(e, "os_error", None), BlockedAddressError):
+            return False, "Target blocked: internal or private network address", None
+        elapsed_ms = int((time.time() - start_time) * 1000)
+        return False, str(e), elapsed_ms
     except Exception as e:
         elapsed_ms = int((time.time() - start_time) * 1000)
         return False, str(e), elapsed_ms
@@ -1667,17 +1847,8 @@ async def monitoring_scheduler_loop():
     _last_incident_audit = 0
     _last_cleanup = 0
     _last_transport_flush = 0
-    connector_kwargs = {
-        "limit": 100,
-        "ttl_dns_cache": 300,
-        "use_dns_cache": True,
-    }
-    if aiodns is not None:
-        try:
-            connector_kwargs["resolver"] = aiohttp.AsyncResolver()
-        except Exception as e:
-            logger.warning(f"Could not initialize aiohttp.AsyncResolver: {e}")
-    connector = aiohttp.TCPConnector(**connector_kwargs)
+    # Validated, TTL-pinned DNS answers (see resolve_host_safe)
+    connector = _make_safe_connector(limit=100)
     async with aiohttp.ClientSession(connector=connector, headers={"User-Agent": USER_AGENT}) as shared_session:
         while True:
             try:
@@ -3065,7 +3236,7 @@ def url_command(bot, accid, event):
     _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=f"✅ Base status URL set to: `{url}`"))
 
 def _safe_url_opener():
-    """urllib opener whose redirects are re-validated against the SSRF filter."""
+    """urllib opener that connects only to validated, pinned addresses and re-validates redirects."""
     import urllib.request
     import urllib.error
 
@@ -3075,7 +3246,31 @@ def _safe_url_opener():
                 raise urllib.error.HTTPError(newurl, code, "Redirect to blocked address", headers, fp)
             return super().redirect_request(req, fp, code, msg, headers, newurl)
 
-    return urllib.request.build_opener(_SafeRedirectHandler)
+    import http.client
+
+    class _PinnedHTTPConnection(http.client.HTTPConnection):
+        def connect(self):
+            ip = resolve_host_safe_sync(self.host)[0]
+            self.sock = socket.create_connection((ip, self.port), self.timeout, self.source_address)
+
+    class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+        def connect(self):
+            ip = resolve_host_safe_sync(self.host)[0]
+            sock = socket.create_connection((ip, self.port), self.timeout, self.source_address)
+            self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
+
+    class _PinnedHTTPHandler(urllib.request.HTTPHandler):
+        def http_open(self, req):
+            return self.do_open(_PinnedHTTPConnection, req)
+
+    class _PinnedHTTPSHandler(urllib.request.HTTPSHandler):
+        def https_open(self, req):
+            return self.do_open(_PinnedHTTPSConnection, req)
+
+    # No environment proxies: a proxy would resolve the name itself and bypass the pinning
+    return urllib.request.build_opener(
+        urllib.request.ProxyHandler({}), _PinnedHTTPHandler, _PinnedHTTPSHandler, _SafeRedirectHandler
+    )
 
 def fetch_html_title(url, timeout=3.0):
     if not is_safe_target_url(url, "http"):

@@ -230,6 +230,11 @@ def init_db():
             cursor.execute("ALTER TABLE peers ADD COLUMN is_offline INTEGER DEFAULT 0")
         if "went_offline_at" not in peer_cols:
             cursor.execute("ALTER TABLE peers ADD COLUMN went_offline_at INTEGER DEFAULT 0")
+        # A peer is identified by its OpenPGP key: bots with several relays send from different
+        # addresses, so the address is only kept for display. NULL until the first encrypted message.
+        if "fingerprint" not in peer_cols:
+            cursor.execute("ALTER TABLE peers ADD COLUMN fingerprint TEXT")
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_peers_fingerprint ON peers(fingerprint)')
 
         # Telemetry metrics reported from remote peer probes
         cursor.execute('''
@@ -1132,8 +1137,18 @@ def get_local_node_name() -> str:
 def set_local_node_name(name: str):
     set_config("node_name", name.strip())
 
-def add_or_update_peer(email: str, node_name: str = None, chat_id: int = None, last_seen: int = None):
+_FINGERPRINT_RE = re.compile(r'[0-9A-F]{40}|[0-9A-F]{64}')
+
+def normalize_fingerprint(fp) -> str | None:
+    """Returns an OpenPGP fingerprint as uppercase hex without separators (v4: 40, v6: 64 chars), or None."""
+    if not isinstance(fp, str):
+        return None
+    cleaned = re.sub(r'[\s:]', '', fp).upper()
+    return cleaned if _FINGERPRINT_RE.fullmatch(cleaned) else None
+
+def add_or_update_peer(email: str, node_name: str = None, chat_id: int = None, last_seen: int = None, fingerprint: str = None):
     email = email.lower().strip()
+    fingerprint = normalize_fingerprint(fingerprint)
     with _writer_transaction() as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT node_name, chat_id, last_seen FROM peers WHERE email = ?", (email,))
@@ -1145,21 +1160,45 @@ def add_or_update_peer(email: str, node_name: str = None, chat_id: int = None, l
             new_node = node_name if node_name is not None else curr_node
             new_chat = chat_id if chat_id is not None else curr_chat
             new_seen = last_seen if last_seen is not None else (curr_seen or now)
+            # A fingerprint is only filled in, never replaced: a different key means a different bot
             cursor.execute(
-                "UPDATE peers SET node_name = ?, chat_id = ?, last_seen = ? WHERE email = ?",
-                (new_node, new_chat, new_seen, email)
+                "UPDATE peers SET node_name = ?, chat_id = ?, last_seen = ?, fingerprint = COALESCE(fingerprint, ?) WHERE email = ?",
+                (new_node, new_chat, new_seen, fingerprint, email)
             )
         else:
             n_name = node_name or "Remote-Node"
             c_id = chat_id
             s_time = last_seen or now
             cursor.execute(
-                "INSERT INTO peers (email, node_name, chat_id, last_seen) VALUES (?, ?, ?, ?)",
-                (email, n_name, c_id, s_time)
+                "INSERT INTO peers (email, node_name, chat_id, last_seen, fingerprint) VALUES (?, ?, ?, ?, ?)",
+                (email, n_name, c_id, s_time, fingerprint)
             )
 
-def remove_peer(email: str) -> bool:
-    email = email.lower().strip()
+def find_peer(identifier: str) -> dict | None:
+    """Looks a peer up by address, full fingerprint or a fingerprint prefix of at least 8 hex chars."""
+    ident = (identifier or "").strip()
+    if not ident:
+        return None
+    peer = get_peer(ident)
+    if peer:
+        return peer
+    fp = re.sub(r'[\s:]', '', ident).upper()
+    if len(fp) < 8 or not re.fullmatch(r'[0-9A-F]+', fp):
+        return None
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute("SELECT * FROM peers WHERE fingerprint LIKE ?", (fp + "%",)).fetchall()
+        # An ambiguous prefix matches nothing rather than an arbitrary peer
+        return dict(rows[0]) if len(rows) == 1 else None
+    finally:
+        conn.close()
+
+def remove_peer(identifier: str) -> bool:
+    peer = find_peer(identifier)
+    if not peer:
+        return False
+    email = peer["email"]
     with _writer_transaction() as conn:
         cursor = conn.cursor()
         cursor.execute("DELETE FROM peers WHERE email = ?", (email,))
@@ -1180,17 +1219,55 @@ def get_peer(email: str) -> dict | None:
     finally:
         conn.close()
 
-def rename_peer(old_email: str, new_email: str) -> bool:
-    """Re-keys a peer row (used to replace a SecureJoin placeholder address with the real one)."""
-    old_email = old_email.lower().strip()
-    new_email = new_email.lower().strip()
+def get_peer_by_fingerprint(fingerprint: str) -> dict | None:
+    fingerprint = normalize_fingerprint(fingerprint)
+    if not fingerprint:
+        return None
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute("SELECT * FROM peers WHERE fingerprint = ?", (fingerprint,)).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+def bind_peer_identity(email: str, fingerprint: str = None, new_email: str = None, chat_id: int = None) -> dict | None:
+    """Updates what is known about a peer row identified by `email` and returns the updated row.
+
+    - `fingerprint` is stored if the row has none yet (a row bound to another key is left alone).
+    - `new_email` (the address the peer currently sends from) replaces the stored address. Mirrored
+      probe targets follow the peer. A stale row of the same bot under `new_email` (no key, or the
+      same key) is dropped; a row under `new_email` that belongs to another key blocks the rename.
+    - `chat_id` replaces the stored 1:1 chat.
+    """
+    email = email.lower().strip()
+    fingerprint = normalize_fingerprint(fingerprint)
+    new_email = (new_email or "").lower().strip() or None
     with _writer_transaction() as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT 1 FROM peers WHERE email = ?", (new_email,))
-        if cursor.fetchone():
-            return False
-        cursor.execute("UPDATE peers SET email = ? WHERE email = ?", (new_email, old_email))
-        return cursor.rowcount > 0
+        # Row access by name on this cursor only: the shared writer connection must keep returning tuples
+        cursor.row_factory = sqlite3.Row
+        row = cursor.execute("SELECT * FROM peers WHERE email = ?", (email,)).fetchone()
+        if not row:
+            return None
+        if fingerprint and not row["fingerprint"]:
+            cursor.execute("UPDATE peers SET fingerprint = ? WHERE email = ?", (fingerprint, email))
+        if chat_id is not None and row["chat_id"] != chat_id:
+            cursor.execute("UPDATE peers SET chat_id = ? WHERE email = ?", (chat_id, email))
+        own_fp = row["fingerprint"] or fingerprint
+        if new_email and new_email != email:
+            other = cursor.execute("SELECT fingerprint FROM peers WHERE email = ?", (new_email,)).fetchone()
+            if other and other["fingerprint"] and other["fingerprint"] != own_fp:
+                new_email = None
+            else:
+                if other:
+                    cursor.execute("DELETE FROM peers WHERE email = ?", (new_email,))
+                    cursor.execute("DELETE FROM probe_targets WHERE source_peer = ?", (new_email,))
+                cursor.execute("UPDATE peers SET email = ? WHERE email = ?", (new_email, email))
+                cursor.execute("UPDATE probe_targets SET source_peer = ? WHERE source_peer = ?", (new_email, email))
+                email = new_email
+        updated = cursor.execute("SELECT * FROM peers WHERE email = ?", (email,)).fetchone()
+        return dict(updated) if updated else None
 
 def get_peer_by_chat_id(chat_id: int) -> dict | None:
     conn = _connect()

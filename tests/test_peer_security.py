@@ -245,12 +245,13 @@ class TestPeerFederationSecurity(unittest.TestCase):
             mock_check.assert_not_called()
         self.assertEqual(mock_bot.rpc.send_msg.call_count, 0)
 
-    def _pending(self, req_id, senders):
+    def _pending(self, req_id, chat_ids):
+        """A cross-check request sent to the peers in these 1:1 chats."""
         loop = asyncio.new_event_loop()
         self.addCleanup(loop.close)
         fut = loop.create_future()
         responses = []
-        bot.pending_peer_checks[req_id] = (fut, len(senders), responses, set(senders))
+        bot.pending_peer_checks[req_id] = (fut, len(chat_ids), responses, set(chat_ids))
         return fut, responses
 
     def _resp(self, req_id, status="up"):
@@ -259,7 +260,7 @@ class TestPeerFederationSecurity(unittest.TestCase):
             "latency_ms": 10, "node_name": "Spoofed"})
 
     def test_check_response_from_non_peer_is_ignored(self):
-        fut, responses = self._pending("req1", ["trusted@example.org"])
+        fut, responses = self._pending("req1", [700])
         mock_bot = self._make_bot("attacker@evil.example")
         bot.on_new_message(mock_bot, 1, self._make_event(self._resp("req1")))
 
@@ -270,7 +271,7 @@ class TestPeerFederationSecurity(unittest.TestCase):
     def test_check_response_from_peer_not_asked_is_ignored(self):
         database.add_or_update_peer("trusted@example.org", "Trusted", 700)
         database.add_or_update_peer("other@example.org", "Other", 701)
-        fut, responses = self._pending("req2", ["trusted@example.org"])
+        fut, responses = self._pending("req2", [700])
 
         mock_bot = self._make_bot("other@example.org")
         bot.on_new_message(mock_bot, 1, self._make_event(self._resp("req2"), chat_id=701))
@@ -288,7 +289,7 @@ class TestPeerFederationSecurity(unittest.TestCase):
     def test_check_response_counted_once_per_peer(self):
         database.add_or_update_peer("trusted@example.org", "Trusted", 700)
         database.add_or_update_peer("other@example.org", "Other", 701)
-        fut, responses = self._pending("req3", ["trusted@example.org", "other@example.org"])
+        fut, responses = self._pending("req3", [700, 701])
 
         mock_bot = self._make_bot("trusted@example.org")
         event = self._make_event(self._resp("req3"), chat_id=700)

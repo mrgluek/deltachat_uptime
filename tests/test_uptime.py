@@ -1945,7 +1945,7 @@ class TestUptimeBot(unittest.TestCase):
         asyncio.set_event_loop(loop)
         fut = loop.create_future()
         responses = []
-        bot.pending_peer_checks["req123"] = (fut, 1, responses, {"probe2@gluek.info"})
+        bot.pending_peer_checks["req123"] = (fut, 1, responses, {888})
 
         mock_event.msg.text = (
             '[UPTIME_PEER_CHECK_RESP]\n'

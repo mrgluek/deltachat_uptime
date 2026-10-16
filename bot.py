@@ -57,7 +57,7 @@ import transports_view
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "2.12.1"
+VERSION = "2.13.0"
 # No "bot" in the name: some services (e.g. Hiddify subscription links) reply 400 to any User-Agent containing "bot".
 USER_AGENT = f"Delta Chat Uptime Monitor/{VERSION} (+https://git.gluek.info/gluek/deltachat_uptime)"
 
@@ -132,7 +132,7 @@ def get_bot_invite_link() -> str:
 async_event_loop = None
 
 # Peering globals
-pending_peer_checks = {} # req_id -> (Future, expected_count, list_of_responses, expected_sender_emails)
+pending_peer_checks = {} # req_id -> (Future, expected_count, list_of_responses, expected_chat_ids)
 last_peer_telemetry_broadcast = 0.0
 _telemetry_rotation_offsets = {}  # peer email -> rotation offset
 
@@ -298,9 +298,10 @@ async def request_peer_cross_checks(target_dict: dict, timeout: float = 8.0) -> 
     if not valid_peers:
         return []
 
-    # Only the peers this request was sent to may answer it, and each of them only once
-    expected_senders = {p["email"].lower() for p, _ in valid_peers}
-    pending_peer_checks[req_id] = (fut, len(valid_peers), responses, expected_senders)
+    # Only the peers this request was sent to may answer it, each once and in its own 1:1 chat.
+    # Chats rather than addresses: a peer may answer from another relay address than it used before.
+    expected_chats = {chat_id for _, chat_id in valid_peers}
+    pending_peer_checks[req_id] = (fut, len(valid_peers), responses, expected_chats)
 
     for p, chat_id in valid_peers:
         try:
@@ -849,11 +850,47 @@ def is_safe_target_url(url: str, check_type: str = "http") -> bool:
     except Exception:
         return False
 
+def _get_peer_fingerprint(bot, accid, contact_id, contact_addr: str = "") -> str | None:
+    """Returns the OpenPGP fingerprint Delta Chat holds for a peer contact, or None.
+
+    get_contact_encryption_info() lists one block per key ("<name> (<addr>):" followed by the
+    fingerprint in groups of four), ours first. The peer's block is the one with its address; if the
+    address does not match any block, a single block that is not ours ("Me (...)") is used."""
+    try:
+        info = bot.rpc.get_contact_encryption_info(accid, contact_id)
+    except Exception:
+        return None
+    if not isinstance(info, str):
+        return None
+    blocks = []
+    for block in info.split("\n\n"):
+        lines = block.strip().splitlines()
+        if len(lines) < 2 or not lines[0].endswith("):"):
+            continue
+        fp = database.normalize_fingerprint("".join(lines[1:]))
+        if fp:
+            blocks.append((lines[0], fp))
+    addr = (contact_addr or "").lower().strip()
+    if addr:
+        for header, fp in blocks:
+            if header.lower().endswith(f"({addr}):"):
+                return fp
+    others = [fp for header, fp in blocks if not header.startswith("Me (")]
+    return others[0] if len(others) == 1 else None
+
 def _get_verified_peer_for_msg(bot, accid, msg, is_private_chat: bool = True) -> tuple[dict | None, str]:
     """Resolves the peer sending a protocol message from Delta Chat contact data.
 
-    The sender address always comes from the Delta Chat contact, never from the message payload.
-    Returns (peer_row_or_None, sender_addr)."""
+    A peer is identified by its key fingerprint: a bot with several relays sends from whichever
+    address is reachable, so the address alone says nothing. The sender address and fingerprint
+    always come from the Delta Chat contact, never from the message payload.
+
+    Peers stored before fingerprints were recorded (or added by address) have none yet. Such a row is
+    matched by its 1:1 chat or its address as before, and the first end-to-end encrypted message
+    binds the sender's key to it. From then on only that key is accepted.
+
+    Returns (peer_row_or_None, sender_addr). When the peer now sends from another address, the row
+    is moved to that address, so peer["email"] is the current one."""
     sender_addr = ""
     try:
         contact = bot.rpc.get_contact(accid, msg.from_id)
@@ -865,14 +902,50 @@ def _get_verified_peer_for_msg(bot, accid, msg, is_private_chat: bool = True) ->
     if not sender_addr:
         return None, ""
 
-    peer = database.get_peer(sender_addr)
-    if not peer and is_private_chat:
-        # A SecureJoin peer whose address could not be resolved at /addpeer time is stored under a
-        # placeholder bound to the 1:1 chat created by the admin; replace it with the real address.
-        placeholder = database.get_peer_by_chat_id(msg.chat_id)
-        if placeholder and str(placeholder.get("email", "")).endswith("@securejoin"):
-            if database.rename_peer(placeholder["email"], sender_addr):
-                peer = database.get_peer(sender_addr)
+    encrypted = bool(getattr(msg, "show_padlock", False))
+    fp = _get_peer_fingerprint(bot, accid, msg.from_id, sender_addr) if encrypted else None
+
+    peer = database.get_peer_by_fingerprint(fp) if fp else None
+    if not peer:
+        candidates = [database.get_peer(sender_addr)]
+        if is_private_chat:
+            candidates.append(database.get_peer_by_chat_id(msg.chat_id))
+        for cand in candidates:
+            if not cand:
+                continue
+            if cand.get("fingerprint"):
+                # A key-bound peer is never accepted by address or chat alone
+                reason = "unencrypted" if not encrypted else f"signed by another key ({fp or 'unknown'})"
+                logger.warning(f"Peer {cand['email']} is bound to key {cand['fingerprint']}; message from {sender_addr} is {reason}")
+                continue
+            # Matched by chat: only for an encrypted message in the peer's 1:1 chat. Without a readable
+            # key that is accepted for SecureJoin placeholders only (that chat exists only after SecureJoin).
+            by_chat = is_private_chat and encrypted and cand.get("chat_id") == msg.chat_id and (
+                fp or cand["email"].endswith("@securejoin"))
+            if cand["email"] == sender_addr or by_chat:
+                peer = cand
+                break
+
+    if peer and not fp and peer["email"].endswith("@securejoin") and peer["email"] != sender_addr:
+        # SecureJoin peer whose address was unknown at /addpeer time: store the real address
+        peer = database.bind_peer_identity(peer["email"], new_email=sender_addr) or peer
+    if peer and fp:
+        # Key-verified peer: record its key, the address it now sends from and its 1:1 chat
+        changes = {}
+        if is_private_chat and not peer.get("fingerprint"):
+            changes["fingerprint"] = fp
+        if peer["email"] != sender_addr:
+            changes["new_email"] = sender_addr
+        if is_private_chat and peer.get("chat_id") != msg.chat_id:
+            changes["chat_id"] = msg.chat_id
+        if changes:
+            updated = database.bind_peer_identity(peer["email"], **changes)
+            if updated:
+                if updated["email"] != peer["email"]:
+                    logger.info(f"Peer {updated.get('node_name')} now sends from {updated['email']} (was {peer['email']})")
+                if "fingerprint" in changes:
+                    logger.info(f"Peer {updated.get('node_name')} bound to key {fp}")
+                peer = updated
     return peer, sender_addr
 
 def _is_trusted_peer_msg(msg, peer: dict | None, is_private_chat: bool) -> bool:
@@ -3167,7 +3240,7 @@ def help_command(bot, accid, event):
             f"/invitepeer — Generate SecureJoin E2EE invite link for pairing with other bots\n"
             f"/peers (or /probes) — List distributed peer bots and their status\n"
             f"/addpeer <email|link> [node_name] — Add remote peer bot (via email or SecureJoin invite)\n"
-            f"/rmpeer <email> — Remove remote peer bot\n"
+            f"/rmpeer <email|key> — Remove remote peer bot\n"
             f"/peershare [admin|all|none] — Choose which local monitors are disclosed to peers\n"
             f"/accounts — List configured bot accounts\n"
             f"/rmaccount <id> — Delete a bot account\n"
@@ -4419,8 +4492,11 @@ def peers_command(bot, accid, event):
             chat_lbl = f"Chat ID: `{p.get('chat_id')}`" if p.get('chat_id') else "Chat: `Pending`"
             p_node = p.get('node_name') or 'Remote'
             node_meas_count = sum(1 for m in all_peer_measurements if m.get("node_name") == p_node)
-            reply += f"• {status_icon} **{p_node}** — `{p['email']}`\n  {chat_lbl} | Last seen: `{seen_str}` | Active metrics: `{node_meas_count}`\n\n"
-        reply += "Commands:\n• `/invitepeer` — Generate E2EE invite link\n• `/addpeer <email|link> [node_name]`\n• `/rmpeer <email>`\n• `/peershare [admin|all|none]`\n• `/nodename <name>`\n• `/probeignore [url]` — Exclude/list ignored targets on this node\n• `/probeunignore <url>` — Resume probing target on this node"
+            fp = p.get("fingerprint")
+            # First 16 hex digits identify the key; the address only shows the relay it last used
+            key_lbl = f"Key: `{' '.join(fp[i:i + 4] for i in range(0, 16, 4))}…`" if fp else "Key: `not bound yet`"
+            reply += f"• {status_icon} **{p_node}** — `{p['email']}`\n  {key_lbl} | {chat_lbl} | Last seen: `{seen_str}` | Active metrics: `{node_meas_count}`\n\n"
+        reply += "Commands:\n• `/invitepeer` — Generate E2EE invite link\n• `/addpeer <email|link> [node_name]`\n• `/rmpeer <email|key>`\n• `/peershare [admin|all|none]`\n• `/nodename <name>`\n• `/probeignore [url]` — Exclude/list ignored targets on this node\n• `/probeunignore <url>` — Resume probing target on this node"
     _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=reply.strip()))
 
 @dc_cli.on(events.NewMessage(command="/invitepeer"))
@@ -4526,8 +4602,20 @@ def addpeer_command(bot, accid, event):
                     
             if not peer_email:
                 peer_email = f"peer_{chat_id}@securejoin"
-                
-            database.add_or_update_peer(peer_email, node_name, chat_id)
+
+            # The invite carries the peer's key fingerprint: bind it now, so the peer is recognised
+            # whichever relay address it later sends from.
+            peer_fp = database.normalize_fingerprint(qr_info.get("fingerprint")) if isinstance(qr_info, dict) else None
+            existing = database.get_peer_by_fingerprint(peer_fp) if peer_fp else None
+            if existing:
+                # Re-adding a known bot: keep its row (and mirrored targets) instead of creating a twin
+                existing = database.bind_peer_identity(
+                    existing["email"],
+                    new_email=None if peer_email.endswith("@securejoin") else peer_email,
+                    chat_id=chat_id,
+                ) or existing
+                peer_email = existing["email"]
+            database.add_or_update_peer(peer_email, node_name, chat_id, fingerprint=peer_fp)
             _dc_send_msg_with_stats(bot, accid, chat_id, MsgData(text=_hello_text()))
 
             _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(
@@ -4590,15 +4678,15 @@ def rmpeer_command(bot, accid, event):
     if not _is_dc_admin(bot, accid, msg.from_id):
         _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text="❌ This command is only for the administrator."))
         return
-    email = (event.payload or "").strip().lower()
-    if not email:
-        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text="Usage: `/rmpeer <email>`"))
+    ident = (event.payload or "").strip().lower()
+    if not ident:
+        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text="Usage: `/rmpeer <email|key>` (key: fingerprint or its first 8+ hex digits, see `/peers`)"))
         return
-    removed = database.remove_peer(email)
-    if removed:
-        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=f"✅ Peer `{email}` removed."))
+    peer = database.find_peer(ident)
+    if peer and database.remove_peer(peer["email"]):
+        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=f"✅ Peer **{peer.get('node_name') or 'Remote'}** (`{peer['email']}`) removed."))
     else:
-        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=f"❌ Peer `{email}` not found in database."))
+        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=f"❌ Peer `{ident}` not found in database (or the key prefix matches several peers)."))
 
 @dc_cli.on(events.NewMessage(command="/probeignore"))
 @dc_cli.on(events.NewMessage(command="/ignoreprobe"))
@@ -4894,7 +4982,10 @@ def on_new_message(bot, accid, event):
                 if not database.consume_peer_invite_token(invite_token):
                     logger.warning(f"Ignoring peer HELLO from unknown sender {sender_addr} without a valid invite token")
                     return
-                database.add_or_update_peer(sender_addr, peer_node, msg.chat_id, int(time.time()))
+                # Bind the key right away if the handshake is encrypted (it is after SecureJoin)
+                fp = _get_peer_fingerprint(bot, accid, msg.from_id, sender_addr) if getattr(msg, "show_padlock", False) else None
+                database.add_or_update_peer(sender_addr, peer_node, msg.chat_id, int(time.time()), fingerprint=fp)
+                peer = database.get_peer(sender_addr)
                 if async_event_loop and async_event_loop.is_running():
                     asyncio.run_coroutine_threadsafe(send_admin_notification(
                         f"🔗 **New Monitoring Peer Linked**\n"
@@ -4902,8 +4993,8 @@ def on_new_message(bot, accid, event):
                         f"Linked using a `/invitepeer` token. Remove it with `/rmpeer {sender_addr}`."
                     ), async_event_loop)
             else:
-                database.add_or_update_peer(sender_addr, peer_node, msg.chat_id, int(time.time()))
-            _record_peer_activity(sender_addr)
+                database.add_or_update_peer(peer["email"], peer_node, msg.chat_id, int(time.time()))
+            _record_peer_activity(peer["email"] if peer else sender_addr)
 
             self_addr = _get_self_addr(bot, accid)
             ack_payload = {
@@ -4930,8 +5021,8 @@ def on_new_message(bot, accid, event):
             if not peer or not is_private_chat:
                 logger.warning(f"Ignoring peer HELLO_ACK from unknown sender {sender_addr or msg.from_id}")
                 return
-            database.add_or_update_peer(sender_addr, peer_node, msg.chat_id, int(time.time()))
-            _record_peer_activity(sender_addr)
+            database.add_or_update_peer(peer["email"], peer_node, msg.chat_id, int(time.time()))
+            _record_peer_activity(peer["email"])
         except Exception as e:
             logger.error(f"Error handling peer hello ack: {e}")
         return
@@ -4951,7 +5042,7 @@ def on_new_message(bot, accid, event):
             if not _is_trusted_peer_msg(msg, peer, is_private_chat):
                 logger.warning(f"Dropping check request from untrusted sender {sender_addr or msg.from_id} in chat {msg.chat_id}")
                 return
-            _record_peer_activity(sender_addr)
+            _record_peer_activity(peer["email"])
 
             # Security: Validate target_url against SSRF (no localhost / private IPs)
             if not is_safe_target_url(target_url, check_type):
@@ -5011,17 +5102,17 @@ def on_new_message(bot, accid, event):
             if not _is_trusted_peer_msg(msg, peer, is_private_chat):
                 logger.warning(f"Dropping check response from untrusted sender {sender_addr or msg.from_id}")
                 return
-            _record_peer_activity(sender_addr)
+            _record_peer_activity(peer["email"])
 
             # Only answers to a request this node sent to this very peer are accepted
             pending = pending_peer_checks.get(req_id) if req_id else None
             if not pending:
                 return
-            fut, expected_count, resp_list, expected_senders = pending
-            if sender_addr not in expected_senders:
-                logger.warning(f"Dropping check response for req_id {req_id} from unexpected peer {sender_addr}")
+            fut, expected_count, resp_list, expected_chats = pending
+            if msg.chat_id not in expected_chats:
+                logger.warning(f"Dropping check response for req_id {req_id} from unexpected peer {sender_addr} in chat {msg.chat_id}")
                 return
-            expected_senders.discard(sender_addr)
+            expected_chats.discard(msg.chat_id)
 
             node_name = peer.get("node_name") or "Remote-Node"
             if status not in ("up", "down"):
@@ -5066,7 +5157,7 @@ def on_new_message(bot, accid, event):
             if not _is_trusted_peer_msg(msg, peer, is_private_chat):
                 logger.warning(f"Dropping telemetry from untrusted sender {sender_addr or msg.from_id}")
                 return
-            _record_peer_activity(sender_addr)
+            _record_peer_activity(peer["email"])
             if not isinstance(metrics_list, list):
                 return
 
@@ -5092,7 +5183,7 @@ def on_new_message(bot, accid, event):
                 ]
                 if safe_metrics:
                     database.save_peer_measurements_batch(peer_node, safe_metrics)
-                    database.save_probe_targets_batch(safe_metrics, sender_addr)
+                    database.save_probe_targets_batch(safe_metrics, peer["email"])
                     _scheduler_cache["probe_targets"] = None
         except Exception as e:
             logger.error(f"Error handling peer metrics: {e}")

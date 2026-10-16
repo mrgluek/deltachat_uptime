@@ -41,6 +41,7 @@ Additionally, it automatically generates a secure, beautiful web status dashboar
 - 🛰️ **Distributed Multi-Node Peering & Cross-Probe Verification:**
   - Link multiple bot instances across different regions/servers as remote probes via private 1:1 Delta Chat DMs. Run `/invitepeer` on the other bot and send the `/addpeer <link> token=<token> [node_name]` command it prints to this bot; both bots then exchange telemetry.
   - **Closed Peering:** A bot only becomes a peer if the admin added it with `/addpeer`, or if it presents a single-use `/invitepeer` token (valid 24h). Telemetry and cross-check messages are only accepted from configured peers, in a 1:1 chat, end-to-end encrypted.
+  - **Peers Identified by Key:** A peer is bound to its OpenPGP key fingerprint (taken from the SecureJoin invite or the first encrypted message), not to its email address. A bot with several relays may send from any of them and stays the same peer; a message from the peer's address signed by another key is rejected.
   - **Controlled Disclosure (`/peershare`):** By default peers only see monitors from chats the administrator is a member of (`admin`); `all` shares every chat, `none` shares no local monitors. Monitor names are never sent, and targets a peer asked this node to probe are only reported back to that peer, never relayed to others.
   - **Zero Group Spam:** All protocol handshakes, background telemetry, and instant cross-checks happen in private DMs between bots.
   - **Cross-Probe Verification:** Outages are verified across remote probes in real-time before alerting, distinguishing global downtime from regional/routing reachability issues.
@@ -99,9 +100,9 @@ These commands are only executable by the configured administrator.
 - `/url <url>` — Update the base external status URL (e.g., `/url https://up.gluek.info`) to generate correct status links.
 - `/nodename [name]` — View or set the local probe node identifier (e.g. `/nodename Frankfurt-DE`).
 - `/invitepeer` — Generate a SecureJoin E2E encrypted invite link (`https://i.delta.chat/#...`) with a single-use pairing token (valid 24h) for linking another bot.
-- `/peers` (or `/probes`) — List distributed monitoring peers, node names, and last seen activity.
+- `/peers` (or `/probes`) — List distributed monitoring peers, node names, key fingerprints, the relay address each one last used, and last seen activity.
 - `/addpeer <email|link> [token=<token>] [node_name]` — Link another Delta Chat Uptime bot as a remote probe using the command printed by its `/invitepeer` (e.g. `/addpeer https://i.delta.chat/#... token=... RU`). Without a token (e.g. `/addpeer ruptimebot@chat.gluek.info RU`) the other bot's admin must add this bot too.
-- `/rmpeer <email>` — Remove a remote peer probe (also stops probing targets it mirrored to this node).
+- `/rmpeer <email|key>` — Remove a remote peer probe by its current address or key fingerprint (the first 8+ hex digits shown by `/peers` are enough). Also stops probing targets it mirrored to this node.
 - `/peershare [admin|all|none]` — Choose which local monitors are disclosed to peers (default `admin`: only chats the administrator is a member of).
 - `/accounts` — List active bot accounts.
 - `/rmaccount <id>` — Delete a bot account.

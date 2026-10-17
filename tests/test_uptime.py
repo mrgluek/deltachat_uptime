@@ -6,7 +6,7 @@ import time
 import datetime
 import asyncio
 import sqlite3
-from unittest.mock import MagicMock, patch, ANY
+from unittest.mock import AsyncMock, MagicMock, patch, ANY
 
 # Setup test environment
 TEST_DB = "test_uptime.db"
@@ -116,7 +116,18 @@ class TestUptimeBot(unittest.TestCase):
         self.assertEqual(bot.parse_target("gluek.info"), ("ping", "gluek.info"))
         self.assertEqual(bot.parse_target("8.8.8.8"), ("ping", "8.8.8.8"))
         
+        # 3b. IPv6: bare / bracketed address = ping, [address]:port = TCP (normalized)
+        self.assertEqual(bot.parse_target("2a00:da00:f443:e900::1"), ("ping", "2a00:da00:f443:e900::1"))
+        self.assertEqual(bot.parse_target("[2A00:DA00:F443:E900:0::1]"), ("ping", "2a00:da00:f443:e900::1"))
+        self.assertEqual(bot.parse_target("[2a00:da00:f443:e900::1]:22"), ("tcp", "[2a00:da00:f443:e900::1]:22"))
+        self.assertEqual(bot.parse_target("http://[2a00::1]:8080/"), ("http", "http://[2a00::1]:8080/"))
+        self.assertEqual(bot.target_type("[2a00::1]:22"), "tcp")
+        self.assertEqual(bot.target_type("2a00::1"), "ping")
+
         # 4. Invalid targets
+        for bad in ("[example.com]:22", "[2a00::1]:0", "[2a00::1]:70000", "-6", "a:b:22", "2a00::1::2"):
+            with self.assertRaises(ValueError, msg=bad):
+                bot.parse_target(bad)
         with self.assertRaises(ValueError):
             bot.parse_target("")
         with self.assertRaises(ValueError):
@@ -2325,7 +2336,7 @@ class TestUptimeBot(unittest.TestCase):
         mock_event.payload = ""
         bot.ping_command(mock_bot, 1, mock_event)
         args, _ = mock_bot.rpc.send_msg.call_args
-        self.assertIn("Usage: `/ping <target> [\"keyword\"]`", args[2].text)
+        self.assertIn("Usage: `/ping [-4|-6] <target> [\"keyword\"]`", args[2].text)
 
         # 2. SSRF blocked target
         mock_event.payload = "http://127.0.0.1:8080"
@@ -2361,6 +2372,76 @@ class TestUptimeBot(unittest.TestCase):
         self.assertIn("Multi-Region Check", sent_text)
         self.assertIn("RU-Moscow", sent_text)
         self.assertIn("65ms", sent_text)
+
+    @patch('bot._is_dc_admin', return_value=True)
+    @patch('bot.run_single_check')
+    @patch('bot.request_peer_cross_checks')
+    def test_ping_command_ipv6_flags_and_skip(self, mock_cross_checks, mock_check, mock_is_admin):
+        mock_bot = MagicMock()
+        mock_event = MagicMock()
+        mock_event.msg.chat_id = 12345
+
+        # -6 reaches run_single_check and the peers; the /add hint is left out (monitors have no -6)
+        mock_check.return_value = (True, "12 ms", 12)
+        mock_cross_checks.return_value = []
+        database.add_or_update_peer("it@probe.org", "IT", 778)
+        mock_event.payload = "-6 example.com"
+        bot.ping_command(mock_bot, 1, mock_event)
+        self.assertEqual(mock_check.call_args.args[0]["family"], 6)
+        self.assertEqual(mock_cross_checks.call_args.args[0]["family"], 6)
+        text = mock_bot.rpc.send_msg.call_args.args[2].text
+        self.assertIn("`PING · IPv6`", text)
+        self.assertNotIn("/add", text)
+
+        # The flag must fit an address given literally
+        mock_event.payload = "-6 1.1.1.1"
+        bot.ping_command(mock_bot, 1, mock_event)
+        self.assertIn("does not fit `1.1.1.1`", mock_bot.rpc.send_msg.call_args.args[2].text)
+
+        # No IPv6 here: ⚪ locally, verdict from the peers
+        mock_check.return_value = (None, bot.NO_IPV6_MSG, None)
+        mock_cross_checks.return_value = [{"node_name": "IT", "status": "up", "latency_ms": 30, "error_msg": None},
+                                          {"node_name": "RU2", "status": "unknown", "latency_ms": None,
+                                           "error_msg": bot.NO_IPV6_MSG}]
+        mock_event.payload = "2a00:da00:f443:e900::1"
+        bot.ping_command(mock_bot, 1, mock_event)
+        text = mock_bot.rpc.send_msg.call_args.args[2].text
+        self.assertIn("🟢 **Target is UP** (from other regions)", text)
+        self.assertIn("(Local): ⚪ N/A", text)
+        self.assertIn("**RU2**: ⚪", text)
+        self.assertIn("`PING`", text)
+        self.assertEqual(mock_bot.rpc.send_reaction.call_args_list[-1].args[2], ["☑️"])
+
+        mock_cross_checks.return_value = []
+        bot.ping_command(mock_bot, 1, mock_event)
+        self.assertIn("⚪ **Not checked**", mock_bot.rpc.send_msg.call_args.args[2].text)
+
+    def test_add_command_ipv6(self):
+        mock_bot = MagicMock()
+        mock_event = MagicMock()
+        mock_event.msg.chat_id = 4242
+        mock_event.payload = "-6 example.com"
+        bot.add_command(mock_bot, 1, mock_event)
+        self.assertIn("works with `/ping` only", mock_bot.rpc.send_msg.call_args.args[2].text)
+
+        mock_event.payload = "[2a00:da00:f443:e900::1]:22 uk2"
+        with patch('bot.has_route_to', return_value=False):
+            bot.add_command(mock_bot, 1, mock_event)
+        text = mock_bot.rpc.send_msg.call_args.args[2].text
+        self.assertIn("`[2a00:da00:f443:e900::1]:22`", text)
+        self.assertIn("`TCP`", text)
+        self.assertIn("no IPv6 connectivity", text)
+
+    def test_check_group_task_skips_without_ipv6(self):
+        group = [{"id": 1, "dc_chat_id": 100, "url": "2a00::1", "type": "ping", "name": "v6", "status": "up"}]
+        with patch('bot.run_single_check', AsyncMock(return_value=(None, bot.NO_IPV6_MSG, None))), \
+             patch('asyncio.sleep', AsyncMock()) as mock_sleep, \
+             patch('bot.request_peer_cross_checks', AsyncMock()) as mock_peers, \
+             patch('bot.handle_check_result', AsyncMock()) as mock_handle:
+            asyncio.run(bot.check_group_task(group, asyncio.Semaphore(1)))
+        mock_handle.assert_not_called()  # status stays as it was: no DOWN, no alert
+        mock_sleep.assert_not_called()   # and no retries
+        mock_peers.assert_not_called()
 
     def test_web_qr_endpoints(self):
         import asyncio

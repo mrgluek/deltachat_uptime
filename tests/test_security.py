@@ -250,7 +250,9 @@ class TestDnsPinning(unittest.TestCase):
 
     def test_safe_resolver_filters_by_family_and_blocks_private(self):
         resolver = bot.SafeResolver()
-        with patch('bot._query_with_ttl', AsyncMock(return_value=(["93.184.216.34", "2606:2800:220:1::1"], 60))):
+        # has_route_to is pinned: the result must not depend on whether the test machine has IPv6
+        with patch('bot._query_with_ttl', AsyncMock(return_value=(["93.184.216.34", "2606:2800:220:1::1"], 60))), \
+             patch('bot.has_route_to', return_value=True):
             v4 = asyncio.run(resolver.resolve("dual.example.org", 443, socket.AF_INET))
             both = asyncio.run(resolver.resolve("dual.example.org", 443, socket.AF_UNSPEC))
         self.assertEqual([r["host"] for r in v4], ["93.184.216.34"])
@@ -260,6 +262,86 @@ class TestDnsPinning(unittest.TestCase):
         with patch('bot._query_with_ttl', AsyncMock(return_value=(["127.0.0.1"], 60))):
             with self.assertRaises(bot.BlockedAddressError):
                 asyncio.run(resolver.resolve("evil.example.org", 80, socket.AF_INET))
+
+    def test_safe_resolver_skips_ipv6_without_route(self):
+        resolver = bot.SafeResolver()
+        with patch('bot._query_with_ttl', AsyncMock(return_value=(["93.184.216.34", "2606:2800:220:1::1"], 60))), \
+             patch('bot.has_route_to', return_value=False):
+            both = asyncio.run(resolver.resolve("dual2.example.org", 443, socket.AF_UNSPEC))
+            self.assertEqual([r["host"] for r in both], ["93.184.216.34"])
+            with self.assertRaises(bot.NoIPv6Error):
+                asyncio.run(resolver.resolve("dual2.example.org", 443, socket.AF_INET6))
+
+    def test_pick_probe_addresses(self):
+        ips = ["93.184.216.34", "2606:2800:220:1::1"]
+        with patch('bot.has_route_to', return_value=True):
+            self.assertEqual(bot.pick_probe_addresses("h", ips), ips)
+            self.assertEqual(bot.pick_probe_addresses("h", ips, 6), ["2606:2800:220:1::1"])
+            self.assertEqual(bot.pick_probe_addresses("h", ips, 4), ["93.184.216.34"])
+            with self.assertRaises(bot.NoAddressForFamilyError):
+                bot.pick_probe_addresses("h", ["93.184.216.34"], 6)
+        with patch('bot.has_route_to', return_value=False):
+            # A dual-stack host is checked over IPv4; an IPv6-only one cannot be checked here
+            self.assertEqual(bot.pick_probe_addresses("h", ips), ["93.184.216.34"])
+            with self.assertRaises(bot.NoIPv6Error):
+                bot.pick_probe_addresses("h", ["2606:2800:220:1::1"])
+
+    def test_has_route_to(self):
+        self.assertTrue(bot.has_route_to("127.0.0.1"))
+        with patch('socket.socket.connect', side_effect=OSError(101, "Network is unreachable")):
+            self.assertFalse(bot.has_route_to("2606:2800:220:1::1"))
+
+    def test_tcp_error_of_preferred_address_is_kept(self):
+        """The IPv4 error is reported, not the error of the IPv6 address tried after it."""
+        async def fail(ip, port, **kw):
+            raise OSError(111 if ":" not in ip else 101, f"failed {ip}")
+        with patch('bot._query_with_ttl', AsyncMock(return_value=(["93.184.216.34", "2606:2800:220:1::1"], 60))), \
+             patch('bot.has_route_to', return_value=True), \
+             patch('socket.getaddrinfo', return_value=self.PUBLIC), \
+             patch('asyncio.open_connection', side_effect=fail):
+            is_up, details, _ = asyncio.run(bot.run_single_check({"type": "tcp", "url": "dual3.example.org:22"}))
+        self.assertFalse(is_up)
+        self.assertIn("93.184.216.34", details)
+
+    def test_ipv6_only_target_is_skipped_without_ipv6(self):
+        with patch('bot.has_route_to', return_value=False), patch('asyncio.open_connection', AsyncMock()) as mock_open:
+            is_up, details, _ = asyncio.run(bot.run_single_check({"type": "tcp", "url": "[2606:2800:220:1::1]:443"}))
+            self.assertIsNone(is_up)
+            self.assertEqual(details, bot.NO_IPV6_MSG)
+            mock_open.assert_not_called()
+            is_up, _, _ = asyncio.run(bot.run_single_check({"type": "ping", "url": "2606:2800:220:1::1"}))
+            self.assertIsNone(is_up)
+
+    def test_ipv6_ping_and_tcp(self):
+        mock_aioping = MagicMock()
+        mock_aioping.ping = AsyncMock(return_value=0.01)
+        writer = MagicMock()
+        writer.wait_closed = AsyncMock()
+        with patch('bot.has_route_to', return_value=True), patch.object(bot, 'aioping', mock_aioping), \
+             patch('asyncio.open_connection', AsyncMock(return_value=(MagicMock(), writer))) as mock_open:
+            self.assertTrue(asyncio.run(bot.run_single_check({"type": "ping", "url": "2606:2800:220:1::1"}))[0])
+            self.assertEqual(mock_aioping.ping.call_args.args[0], "2606:2800:220:1::1")
+            self.assertTrue(asyncio.run(bot.run_single_check({"type": "tcp", "url": "[2606:2800:220:1::1]:443"}))[0])
+            self.assertEqual(mock_open.call_args.args[:2], ("2606:2800:220:1::1", 443))
+
+    def test_family_restricted_ping(self):
+        mock_aioping = MagicMock()
+        mock_aioping.ping = AsyncMock(return_value=0.01)
+        with patch('bot._query_with_ttl', AsyncMock(return_value=(["93.184.216.34", "2606:2800:220:1::1"], 60))), \
+             patch('bot.has_route_to', return_value=True), patch('socket.getaddrinfo', return_value=self.PUBLIC), \
+             patch.object(bot, 'aioping', mock_aioping):
+            asyncio.run(bot.run_single_check({"type": "ping", "url": "dual4.example.org", "family": 6}))
+        self.assertEqual(mock_aioping.ping.call_args.args[0], "2606:2800:220:1::1")
+        with patch('bot._query_with_ttl', AsyncMock(return_value=(["93.184.216.34"], 60))), \
+             patch('socket.getaddrinfo', return_value=self.PUBLIC):
+            is_up, details, _ = asyncio.run(bot.run_single_check({"type": "ping", "url": "v4only.example.org", "family": 6}))
+        self.assertFalse(is_up)
+        self.assertIn("has no IPv6 address", details)
+
+    def test_private_ipv6_blocked(self):
+        for target, kind in (("fd42:42:42::1", "ping"), ("[fe80::1]:22", "tcp"), ("[::1]", "ping")):
+            self.assertFalse(bot.is_safe_target_url(target, kind), target)
+        self.assertTrue(bot.is_safe_target_url("[2606:2800:220:1::1]:443", "tcp"))
 
     def test_http_probe_never_connects_to_rebound_private_address(self):
         """End-to-end through aiohttp: a hostname answering 127.0.0.1 at connect time is not reached."""

@@ -29,6 +29,7 @@ Additionally, it automatically generates a secure, beautiful web status dashboar
 - 🌐 **Host Outage Protection & Circuit Breaker:**
   - Automatically verifies host internet connectivity via high-speed canary checks (`1.1.1.1`, `8.8.8.8`, `9.9.9.9`, `1.0.0.1`) before declaring any resource DOWN.
   - If the bot host itself loses internet access, false mass-downtime alerts and false downtime logs are suppressed, keeping 30-day uptime metrics accurate.
+- 🌍 **IPv6:** IPv6 addresses work as targets (`2a00::1`, `[2a00::1]:443`, `https://[2a00::1]/`). A node without IPv6 (no route, or Docker without `enable_ipv6`) does not report IPv6 targets as DOWN: its checks are skipped (⚪ in `/ping`, no alert, status unchanged) and other regions answer instead. Names with both A and AAAA records are checked over IPv4 there, so an unreachable IPv6 address no longer hides the real error.
 - 🔒 **SSL Certificate Expiration Monitoring:** Automatically tracks SSL/TLS certificate expiration for HTTPS targets:
   - Periodic checks cached to run at most once per hour.
   - Staged proactive alerts sent to chat at **7 days**, **3 days**, and **24 hours (1 day)** before expiration, as well as upon expiration.
@@ -75,12 +76,13 @@ These commands are available to any member of a chat. They support suffixes (e.g
 
 A plain `/help` sent in a group chat is answered in a private 1:1 chat with the sender, so several bots don't flood the group with help texts. Use `/help@uptime` to show the help in the group itself.
 
-- `/ping <target> ["keyword"]` (or `/check`, `/test`) — Perform an immediate on-demand reachability and diagnostics test without adding to monitoring (rate-limited to 1 request per 15s per chat for non-admins; supports HTTP/HTTPS, SSL certificate inspection, keyword assertions, TCP port, ICMP Ping, and multi-region cross-checks).
+- `/ping [-4|-6] <target> ["keyword"]` (or `/check`, `/test`) — Perform an immediate on-demand reachability and diagnostics test without adding to monitoring (rate-limited to 1 request per 15s per chat for non-admins; supports HTTP/HTTPS, SSL certificate inspection, keyword assertions, TCP port, ICMP Ping, and multi-region cross-checks). `-6` / `-4` check a name only over IPv6 / IPv4 (also on the other regions), e.g. `/ping -6 chatmail.uk`.
 - `/add <target> [name] ["keyword"]` — Add a monitor. Target formats:
   • `https://google.com Google` (HTTP/HTTPS check)
   • `https://api.site.com Health "status:ok"` (HTTP with keyword assertion)
   • `google.com:443 Google TCP` (TCP port check)
   • `google.com Google Ping` (ICMP Ping check)
+  • `2a00::1 Server` / `[2a00::1]:22 SSH` (IPv6 ping / TCP port; with a port the address goes in brackets, as in URLs)
 - `/remove <id|url>` (or `/delete`, `/rm`, `/del`) — Stop monitoring a resource by ID or target URL. You can also reply `/remove` directly to any incident or outage alert message to remove the affected monitor without knowing its ID.
 - `/pause <id|url> [dur]` (or `/mute`, `/maintenance`) — Mute outage alerts during maintenance (e.g. `/pause 1 30m`, `/pause https://example.com 2h`, or reply `/pause` to an alert).
 - `/resume <id|url>` (or `/unpause`) — Resume active monitoring after maintenance.

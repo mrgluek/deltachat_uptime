@@ -57,7 +57,7 @@ import transports_view
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "2.13.0"
+VERSION = "2.14.0"
 # No "bot" in the name: some services (e.g. Hiddify subscription links) reply 400 to any User-Agent containing "bot".
 USER_AGENT = f"Delta Chat Uptime Monitor/{VERSION} (+https://git.gluek.info/gluek/deltachat_uptime)"
 
@@ -279,6 +279,8 @@ async def request_peer_cross_checks(target_dict: dict, timeout: float = 8.0) -> 
         "expected_keyword": target_dict.get("expected_keyword"),
         "node_name": database.get_local_node_name()
     }
+    if target_dict.get("family") in (4, 6):
+        req_payload["family"] = target_dict["family"]  # older peers ignore it and check any family
     msg_text = f"[UPTIME_PEER_CHECK_REQ]\n{json.dumps(req_payload)}\n[/UPTIME_PEER_CHECK_REQ]"
 
     try:
@@ -587,26 +589,68 @@ def format_duration(seconds: int) -> str:
         mins = (seconds % 3600) // 60
         return f"{hours}h {mins}m"
 
+_HOSTNAME_RE = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9.-]*$')  # no leading "-": it would read like a flag
+
+
+def _ipv6_literal(text: str) -> str | None:
+    """Normalized IPv6 address (compressed, lowercase) if text is one, else None."""
+    import ipaddress
+    try:
+        return ipaddress.IPv6Address(text).compressed
+    except ValueError:
+        return None
+
+
 # Helper: parse add targets
 def parse_target(target: str) -> tuple[str, str]:
+    """-> (check_type, target). IPv6 needs brackets with a port, as in URLs: an address like
+    2a00::1 ends in hex digits, so "2a00::1:22" cannot tell address from port.
+
+    • http(s)://...        -> http
+    • host:port, [v6]:port -> tcp ("[2a00::1]:443")
+    • host, IPv4, IPv6     -> ping ("2a00::1" or "[2a00::1]")"""
     target = target.strip()
     if not target:
         raise ValueError("Target is empty")
         
     if target.startswith("http://") or target.startswith("https://"):
         return "http", target
+
+    bracketed = re.match(r'^\[([^\]]+)\](?::(\d+))?$', target)
+    if bracketed:
+        ip6 = _ipv6_literal(bracketed.group(1))
+        if ip6 is None:
+            raise ValueError("Only IPv6 addresses go in brackets, e.g. `[2a00::1]:443`.")
+        if bracketed.group(2) is None:
+            return "ping", ip6
+        port = int(bracketed.group(2))
+        if not 1 <= port <= 65535:
+            raise ValueError("Port must be between 1 and 65535.")
+        return "tcp", f"[{ip6}]:{port}"
+
+    ip6 = _ipv6_literal(target)
+    if ip6:
+        return "ping", ip6
         
     if ":" in target:
         parts = target.rsplit(":", 1)
-        if len(parts) == 2 and parts[1].isdigit():
+        if len(parts) == 2 and parts[1].isdigit() and _HOSTNAME_RE.match(parts[0]):
             port = int(parts[1])
             if 1 <= port <= 65535:
                 return "tcp", target
                 
     host = target
-    if not re.match(r'^[a-zA-Z0-9.-]+$', host):
-        raise ValueError("Invalid target format. Provide an HTTP/HTTPS URL, a host:port, or a hostname/IP.")
+    if not _HOSTNAME_RE.match(host):
+        raise ValueError("Invalid target format. Provide an HTTP/HTTPS URL, a host:port ([IPv6]:port), or a hostname/IP.")
     return "ping", host
+
+
+def target_type(target: str) -> str:
+    """Check type of a stored or received target (http / tcp / ping), "http" if it does not parse."""
+    try:
+        return parse_target(target)[0]
+    except ValueError:
+        return "http"
 
 _YGGDRASIL_NET = None
 
@@ -697,6 +741,57 @@ def _literal_ip(host: str):
         return None
 
 
+class NoIPv6Error(OSError):
+    """The target is IPv6-only (or IPv6 was asked for), but this node has no route to IPv6 at all.
+
+    Not a failure of the target: such a check is skipped instead of reported as DOWN."""
+
+
+class NoAddressForFamilyError(OSError):
+    """-4 / -6 was asked for, but the name has no address of that family."""
+
+
+NO_IPV6_MSG = "No IPv6 connectivity on this node"
+
+
+def has_route_to(ip: str) -> bool:
+    """True if the kernel has a route (and a source address) for ip.
+
+    connect() on a UDP socket sends nothing: it only picks the route and source address, so this
+    is free and instant. Without IPv6 (no global address, or Docker without enable_ipv6) it fails
+    with ENETUNREACH (101) or EADDRNOTAVAIL (99) - the "[Errno 101] Connect call failed" seen
+    when a TCP check tried the AAAA address of a host on a node without IPv6."""
+    family = socket.AF_INET6 if ":" in ip else socket.AF_INET
+    try:
+        with socket.socket(family, socket.SOCK_DGRAM) as s:
+            s.connect((ip, 53))
+        return True
+    except OSError:
+        return False
+
+
+def pick_probe_addresses(host: str, ips: list[str], family: int | None = None) -> list[str]:
+    """The validated addresses a check should try, in order.
+
+    family 4 / 6 keeps only that family (raises NoAddressForFamilyError if there is none).
+    IPv6 addresses this node cannot route to are dropped, so a host with A and AAAA records is
+    checked over IPv4 and its result is not replaced by a meaningless IPv6 "network unreachable".
+    Raises NoIPv6Error if nothing is left only because IPv6 is missing here."""
+    if family in (4, 6):
+        ips = [ip for ip in ips if (":" in ip) == (family == 6)]
+        if not ips:
+            raise NoAddressForFamilyError(f"{host} has no IPv{family} address")
+    usable = [ip for ip in ips if ":" not in ip or has_route_to(ip)]
+    if not usable:
+        raise NoIPv6Error(NO_IPV6_MSG)
+    return usable
+
+
+async def probe_addresses(host: str, family: int | None = None) -> list[str]:
+    """resolve_host_safe + pick_probe_addresses: validated, reachable addresses of host."""
+    return pick_probe_addresses(host, await resolve_host_safe(host), family)
+
+
 def resolve_host_safe_sync(host: str) -> list[str]:
     """Blocking variant of resolve_host_safe (system resolver, TTL unknown -> DNS_CACHE_DEFAULT_TTL)."""
     host = (host or "").strip().lower().rstrip(".")
@@ -773,7 +868,8 @@ class SafeResolver(aiohttp.abc.AbstractResolver):
     """aiohttp resolver that only hands out validated, cached addresses (DNS rebinding protection)."""
 
     async def resolve(self, host: str, port: int = 0, family: int = socket.AF_INET):
-        ips = await resolve_host_safe(host)
+        want = {socket.AF_INET: 4, socket.AF_INET6: 6}.get(family)
+        ips = await probe_addresses(host, want)
         results = []
         for ip in ips:
             ip_family = socket.AF_INET6 if ":" in ip else socket.AF_INET
@@ -802,6 +898,15 @@ def _target_host(validated: str, check_type: str) -> str:
     if check_type == "tcp":
         return validated.rsplit(":", 1)[0].strip("[]").lower().strip()
     return validated.lower().strip()
+
+
+def _no_ipv6_note(url: str, check_type: str) -> str:
+    """Warning for /add when the target is an IPv6 address this node cannot reach."""
+    ip = _literal_ip(_target_host(url, check_type))
+    if ip and ":" in ip and not has_route_to(ip):
+        return ("\n⚠️ This node has no IPv6 connectivity: its checks of this target are skipped "
+                "(not counted as DOWN) until IPv6 works here.")
+    return ""
 
 
 def is_safe_target_url(url: str, check_type: str = "http") -> bool:
@@ -1171,16 +1276,17 @@ async def _prewarm_target_dns(url: str, check_type: str) -> bool:
         pass  # unresolvable/invalid: is_safe_target_url decides
     return True
 
-async def _open_pinned_connection(host: str, port: int, **kwargs):
+async def _open_pinned_connection(host: str, port: int, family: int | None = None, **kwargs):
     """Opens a TCP connection to one of the validated addresses of host; returns the writer."""
-    last_error = None
-    for ip in await resolve_host_safe(host):
+    first_error = None
+    for ip in await probe_addresses(host, family):
         try:
             _, writer = await asyncio.open_connection(ip, port, **kwargs)
             return writer
         except OSError as e:
-            last_error = e
-    raise last_error or OSError(f"Could not connect to {host}:{port}")
+            # The first address is the preferred one (IPv4 first): its error explains the outage best
+            first_error = first_error or e
+    raise first_error or OSError(f"Could not connect to {host}:{port}")
 
 _REDIRECT_STATUSES = (301, 302, 303, 307, 308)
 _MAX_SAFE_REDIRECTS = 10
@@ -1211,6 +1317,8 @@ async def run_single_check(resource, session=None) -> tuple[bool, str, int | Non
     rtype = resource["type"]
     url = resource["url"]
     timeout = 10
+    # 4 / 6 = only that address family (/ping -4 / -6); None = any, IPv4 first
+    family = resource.get("family") if resource.get("family") in (4, 6) else None
 
     if not await _prewarm_target_dns(url, rtype) or not is_safe_target_url(url, rtype):
         return False, "Target blocked: internal or private network address", None
@@ -1323,15 +1431,17 @@ async def run_single_check(resource, session=None) -> tuple[bool, str, int | Non
                     # Keyword check requires body reading (max 128KB)
                     return await _do_get(sess, 131072, is_local)
 
-            if session is not None and not getattr(session, "closed", False):
+            if session is not None and not getattr(session, "closed", False) and family is None:
                 return await _check_http(session, is_local=False)
             else:
-                async with aiohttp.ClientSession(connector=_make_safe_connector(), headers=headers, timeout=req_timeout) as local_session:
+                # aiohttp passes the connector's family to SafeResolver, which keeps only those addresses
+                conn_family = {4: socket.AF_INET, 6: socket.AF_INET6}.get(family, 0)
+                async with aiohttp.ClientSession(connector=_make_safe_connector(family=conn_family), headers=headers, timeout=req_timeout) as local_session:
                     return await _check_http(local_session, is_local=True)
         elif rtype == "tcp":
             parts = url.rsplit(":", 1)
             host, port = parts[0].strip("[]"), int(parts[1])
-            writer = await asyncio.wait_for(_open_pinned_connection(host, port), timeout=timeout)
+            writer = await asyncio.wait_for(_open_pinned_connection(host, port, family), timeout=timeout)
             writer.close()
             try:
                 await writer.wait_closed()
@@ -1340,14 +1450,14 @@ async def run_single_check(resource, session=None) -> tuple[bool, str, int | Non
             elapsed_ms = int((time.time() - start_time) * 1000)
             return True, f"{elapsed_ms} ms", elapsed_ms
         elif rtype == "ping":
-            host = url.strip()
-            if not re.match(r'^[a-zA-Z0-9.-]+$', host):
+            host = url.strip().strip("[]")
+            if not (_HOSTNAME_RE.match(host) or _ipv6_literal(host)):
                 return False, "Invalid hostname format", None
 
             ping_success = False
             elapsed_ms = None
             # Ping the validated address itself so the ping tool cannot resolve to something else
-            host = (await resolve_host_safe(host))[0]
+            host = (await probe_addresses(host, family))[0]
 
             if aioping is not None:
                 try:
@@ -1382,9 +1492,18 @@ async def run_single_check(resource, session=None) -> tuple[bool, str, int | Non
         return False, "Timeout", elapsed_ms
     except BlockedAddressError:
         return False, "Target blocked: internal or private network address", None
+    except NoIPv6Error:
+        return None, NO_IPV6_MSG, None  # None = not checked here: neither UP nor DOWN
+    except NoAddressForFamilyError as e:
+        return False, str(e), None
     except aiohttp.ClientConnectorError as e:
-        if isinstance(getattr(e, "os_error", None), BlockedAddressError):
+        os_error = getattr(e, "os_error", None)
+        if isinstance(os_error, BlockedAddressError):
             return False, "Target blocked: internal or private network address", None
+        if isinstance(os_error, NoIPv6Error):
+            return None, NO_IPV6_MSG, None
+        if isinstance(os_error, NoAddressForFamilyError):
+            return False, str(os_error), None
         elapsed_ms = int((time.time() - start_time) * 1000)
         return False, str(e), elapsed_ms
     except Exception as e:
@@ -1407,6 +1526,8 @@ async def check_group_task(group, semaphore, session=None):
         else:
             is_up, error_msg = res
             latency_ms = None
+        if is_up is None:  # this node cannot check it (no IPv6): keep the last result
+            return
         status_str = "up" if is_up else "down"
         local_node = database.get_local_node_name()
         await run_db(database.update_probe_target_result, rep["url"], status_str, latency_ms, error_msg)
@@ -1419,6 +1540,11 @@ async def check_group_task(group, semaphore, session=None):
     else:
         is_up, error_msg = res
         latency_ms = None
+
+    if is_up is None:
+        # IPv6-only target on a node without IPv6: not an outage, so no retries, alerts or status change
+        logger.info(f"Check skipped: {rep['name'] or rep['url']} (id: {rep['id']}) in chat {rep['dc_chat_id']} ({error_msg})")
+        return
 
     # Retry logic: retry if check failed and at least one resource in the group was not already DOWN.
     # Note: sleep(30) is executed OUTSIDE the semaphore so failing targets do not starve healthy checks!
@@ -3205,12 +3331,13 @@ def help_command(bot, accid, event):
         f"👋 Welcome to Delta Chat Uptime Bot {VERSION}!\n\n"
         f"I monitor resource availability (HTTP, TCP, Ping) and alert this chat if they go offline.\n\n"
         f"**Public Commands:**\n"
-        f"/ping <target> [\"keyword\"] — Quick on-demand test & diagnostics without adding\n"
+        f"/ping [-4|-6] <target> [\"keyword\"] — Quick on-demand test & diagnostics without adding (`-6`: only over IPv6)\n"
         f"/add <target> [name] [\"keyword\"] — Monitor a resource. Target formats:\n"
         f"  • `https://example.com` (HTTP/HTTPS)\n"
         f"  • `https://api.site.com Health \"status:ok\"` (Keyword assertion)\n"
         f"  • `example.com:22` (TCP Port)\n"
         f"  • `example.com` (ICMP Ping)\n"
+        f"  • `2a00::1`, `[2a00::1]:443` (IPv6: ping, TCP port)\n"
         f"/remove <id|url> (or reply /remove) — Stop monitoring a resource\n"
         f"/pause <id|url> [dur] (or reply /pause) — Pause/mute alerts (e.g. `30m`, `2h`)\n"
         f"/resume <id|url> (or reply /resume) — Resume monitoring after maintenance\n"
@@ -3418,16 +3545,26 @@ def ping_command(bot, accid, event):
         tokens = shlex.split(payload) if payload else []
     except Exception:
         tokens = payload.split() if payload else []
+
+    # -4 / -6 (like ping -4 / -6): check only over that address family
+    family = None
+    for flag in ("-4", "-6"):
+        while flag in tokens:
+            tokens.remove(flag)
+            family = int(flag[1])
         
     if not tokens:
         _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(
-            text="Usage: `/ping <target> [\"keyword\"]`\n\n"
+            text="Usage: `/ping [-4|-6] <target> [\"keyword\"]`\n\n"
                  "Quickly tests target reachability and diagnostics on-demand without adding to monitoring.\n\n"
                  "Examples:\n"
                  "• `/ping https://gluek.info` (HTTP)\n"
                  "• `/ping https://gluek.info \"and enjoy\"` (HTTP + Keyword assertion)\n"
                  "• `/ping 1.1.1.1` (ICMP Ping)\n"
-                 "• `/ping example.com:443` (TCP Port)"
+                 "• `/ping 2606:4700:4700::1111` (ICMP Ping, IPv6)\n"
+                 "• `/ping example.com:443` (TCP Port)\n"
+                 "• `/ping [2606:4700:4700::1111]:443` (TCP Port, IPv6)\n"
+                 "• `/ping -6 example.com` (only over IPv6; `-4` only over IPv4)"
         ))
         return
         
@@ -3442,9 +3579,18 @@ def ping_command(bot, accid, event):
                  "Examples:\n"
                  "• `/ping https://example.com`\n"
                  "• `/ping example.com:443`\n"
-                 "• `/ping 1.1.1.1`"
+                 "• `/ping 1.1.1.1`\n"
+                 "• `/ping [2a00::1]:443`"
         ))
         return
+
+    if family is not None:
+        literal = _literal_ip(_target_host(validated_url, check_type))
+        if literal and (":" in literal) != (family == 6):
+            _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(
+                text=f"❌ `-{family}` does not fit `{literal}`: it is an IPv{6 if ':' in literal else 4} address."
+            ))
+            return
 
     if not is_safe_target_url(validated_url, check_type):
         _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(
@@ -3483,7 +3629,8 @@ def ping_command(bot, accid, event):
                 "id": 0,
                 "url": validated_url,
                 "type": check_type,
-                "expected_keyword": keyword
+                "expected_keyword": keyword,
+                "family": family,
             }
             
             # Start multi-region peer cross-checks immediately in parallel
@@ -3501,7 +3648,7 @@ def ping_command(bot, accid, event):
                 is_up, details = res
                 latency_ms = None
 
-            final_reaction = "☑️" if is_up else "❌"
+            final_reaction = "☑️" if is_up else ("⚪" if is_up is None else "❌")
 
             # 2. SSL certificate check if HTTPS
             ssl_info = None
@@ -3538,13 +3685,24 @@ def ping_command(bot, accid, event):
                     pass
 
             local_node = database.get_local_node_name()
-            status_icon = "🟢" if is_up else "🔴"
-            status_word = "UP" if is_up else "DOWN"
+            status_icon = "🟢" if is_up else ("⚪" if is_up is None else "🔴")
+            if is_up is None:
+                # Not checked here (no IPv6): the verdict comes from the peers, if any could check
+                peer_states = {pr.get("status") for pr in peer_responses}
+                if "up" in peer_states:
+                    headline, final_reaction = "🟢 **Target is UP** (from other regions)", "☑️"
+                elif "down" in peer_states:
+                    headline, final_reaction = "🔴 **Target is DOWN** (from other regions)", "❌"
+                else:
+                    headline = "⚪ **Not checked**: no IPv6 connectivity here"
+            else:
+                headline = f"{status_icon} **Target is {'UP' if is_up else 'DOWN'}**"
 
+            type_label = check_type.upper() + (f" · IPv{family}" if family else "")
             lines = [
-                f"{status_icon} **Target is {status_word}**\n",
+                f"{headline}\n",
                 f"🔗 Target: `{validated_url}`",
-                f"⚙️ Type: `{check_type.upper()}`",
+                f"⚙️ Type: `{type_label}`",
             ]
             if page_title:
                 lines.append(f"🖥️ Title: **{page_title}**")
@@ -3565,14 +3723,15 @@ def ping_command(bot, accid, event):
                 for pr in peer_responses:
                     pr_node = pr.get("node_name") or "Remote"
                     pr_status = pr.get("status")
-                    pr_icon = "🟢" if pr_status == "up" else "🔴"
+                    pr_icon = {"up": "🟢", "down": "🔴"}.get(pr_status, "⚪")  # ⚪: peer could not check
                     pr_lat = f"`{pr['latency_ms']}ms`" if pr.get("latency_ms") is not None else "N/A"
                     pr_err = f" - {pr['error_msg']}" if pr.get("error_msg") else ""
                     lines.append(f"• 🛰️ **{pr_node}**: {pr_icon} {pr_lat}{pr_err}")
 
-            # Add command hint
-            kw_arg = f' "{keyword}"' if keyword else ""
-            lines.append(f"\n💡 _To monitor 24/7, run:_ `/add {validated_url}{kw_arg}`")
+            # Add command hint (monitors have no -4/-6, so none for a family-restricted check)
+            if family is None:
+                kw_arg = f' "{keyword}"' if keyword else ""
+                lines.append(f"\n💡 _To monitor 24/7, run:_ `/add {validated_url}{kw_arg}`")
 
             out_text = "\n".join(lines)
             _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=out_text))
@@ -3599,7 +3758,8 @@ def add_command(bot, accid, event):
                  "• `/add https://google.com Google` (HTTP)\n"
                  "• `/add https://api.site.com Health \"status:ok\"` (Keyword assertion)\n"
                  "• `/add google.com:443 Google TCP` (TCP)\n"
-                 "• `/add google.com Google Ping` (Ping)"
+                 "• `/add google.com Google Ping` (Ping)\n"
+                 "• `/add 2a00::1 Server` / `/add [2a00::1]:22 SSH` (IPv6 ping / TCP)"
         ))
         return
         
@@ -3612,6 +3772,11 @@ def add_command(bot, accid, event):
         return
         
     target = tokens[0]
+    if target in ("-4", "-6"):
+        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(
+            text=f"❌ `{target}` works with `/ping` only. To monitor over IPv6, add the address itself, "
+                 "e.g. `/add 2a00::1` or `/add [2a00::1]:443`."))
+        return
     
     try:
         check_type, url = parse_target(target)
@@ -3650,7 +3815,7 @@ def add_command(bot, accid, event):
              f"🖥️ Name: **{name}**\n"
              f"🔗 Target: `{url}`\n"
              f"⚙️ Type: `{check_type.upper()}`{kw_line}\n"
-             f"🕒 Checking once a minute."
+             f"🕒 Checking once a minute.{_no_ipv6_note(url, check_type)}"
     ))
 
 @dc_cli.on(events.NewMessage(command="/rm"))
@@ -5037,6 +5202,7 @@ def on_new_message(bot, accid, event):
             target_url = req_data.get("url")
             check_type = req_data.get("type", "http")
             keyword = req_data.get("expected_keyword")
+            family = req_data.get("family") if req_data.get("family") in (4, 6) else None
 
             peer, sender_addr = _get_verified_peer_for_msg(bot, accid, msg, is_private_chat)
             if not _is_trusted_peer_msg(msg, peer, is_private_chat):
@@ -5054,7 +5220,8 @@ def on_new_message(bot, accid, event):
                     "id": 0,
                     "url": target_url,
                     "type": check_type,
-                    "expected_keyword": keyword
+                    "expected_keyword": keyword,
+                    "family": family,
                 }
                 async def _do_cross_check_reply():
                     res = await run_single_check(synth_r)
@@ -5066,7 +5233,8 @@ def on_new_message(bot, accid, event):
                     resp_payload = {
                         "req_id": req_id,
                         "url": target_url,
-                        "status": "up" if is_up else "down",
+                        # "skip": not checked (no IPv6 here); the receiver files it as "unknown"
+                        "status": "skip" if is_up is None else ("up" if is_up else "down"),
                         "latency_ms": latency_ms,
                         "error_msg": error_msg,
                         "node_name": database.get_local_node_name()
@@ -5121,7 +5289,7 @@ def on_new_message(bot, accid, event):
                 latency_ms = None
             error_msg = str(error_msg)[:500] if error_msg else None
 
-            if target_url and is_safe_target_url(target_url, "http" if target_url.startswith("http") else ("tcp" if ":" in target_url else "ping")):
+            if target_url and is_safe_target_url(target_url, target_type(target_url)):
                 database.save_peer_measurement(target_url, node_name, status, latency_ms, error_msg, int(time.time()))
 
             resp_list.append({

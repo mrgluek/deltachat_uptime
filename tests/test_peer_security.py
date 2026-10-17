@@ -197,14 +197,18 @@ class TestPeerFederationSecurity(unittest.TestCase):
 
         self.assertEqual(database.get_peer_measurements_for_url("https://peer-target.example.org"), [])
 
-    def test_metrics_from_peer_use_stored_node_name(self):
+    def test_metrics_from_peer_cannot_take_another_nodes_name(self):
+        database.set_local_node_name("Local-DE")
         database.add_or_update_peer("trusted@example.org", "Trusted", 700)
+        database.add_or_update_peer("other@example.org", "Other", 701)
         mock_bot = self._make_bot("trusted@example.org")
-        bot.on_new_message(mock_bot, 1, self._make_event(self._metrics(node="Spoofed-Name"), chat_id=700))
+        for taken in ("Other", "local-de"):  # another peer's name, this node's name (any case)
+            bot.on_new_message(mock_bot, 1, self._make_event(self._metrics(node=taken), chat_id=700))
 
         measurements = database.get_peer_measurements_for_url("https://peer-target.example.org")
         self.assertEqual(len(measurements), 1)
         self.assertEqual(measurements[0]["node_name"], "Trusted")
+        self.assertEqual(database.get_peer("trusted@example.org")["node_name"], "Trusted")
         targets = database.get_active_probe_targets()
         self.assertEqual(targets[0]["source_peer"], "trusted@example.org")
 
@@ -298,7 +302,8 @@ class TestPeerFederationSecurity(unittest.TestCase):
 
         self.assertEqual(len(responses), 1)
         self.assertFalse(fut.done())
-        self.assertEqual(responses[0]["node_name"], "Trusted")
+        # The verified peer renamed itself (/nodename there); a free name is taken over
+        self.assertEqual(responses[0]["node_name"], "Spoofed")
 
     # ---- Outbound disclosure ---------------------------------------------------
 

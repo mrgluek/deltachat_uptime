@@ -81,7 +81,6 @@ class TestPeerFingerprintBinding(unittest.TestCase):
 
     def _metrics(self, url="https://peer-target.example.org"):
         return _wrap("UPTIME_PEER_METRICS", {
-            "node_name": "Spoofed",
             "metrics": [{"url": url, "type": "http", "status": "up", "latency_ms": 7}],
         })
 
@@ -304,6 +303,36 @@ class TestPeerFingerprintBinding(unittest.TestCase):
         text = mock_bot.rpc.send_msg.call_args.args[2].text
         self.assertIn("DEC0 E8D1 1FC4 686F", text)
         self.assertIn("not bound yet", text)
+
+
+    # ---- node names ----------------------------------------------------------
+
+    def test_renamed_peer_node_is_picked_up_with_measurements(self):
+        database.add_or_update_peer("ru@relay-a.example", "RU", 27, fingerprint=RU_FP)
+        database.save_peer_measurement("https://old.example.org", "RU", "up", 5)
+        mock_bot = self._make_bot("ru@relay-a.example", RU_FP)
+        text = _wrap("UPTIME_PEER_METRICS", {"node_name": "RU 🏠", "metrics": [
+            {"url": "https://peer-target.example.org", "type": "http", "status": "up", "latency_ms": 7}]})
+        bot.on_new_message(mock_bot, 1, self._event(text, chat_id=27))
+
+        self.assertEqual(database.get_peer("ru@relay-a.example")["node_name"], "RU 🏠")
+        self.assertEqual(self._measured_by(), ["RU 🏠"])
+        self.assertEqual([m["node_name"] for m in database.get_peer_measurements_for_url("https://old.example.org")], ["RU 🏠"])
+
+    @patch("bot._is_dc_admin", return_value=True)
+    def test_nodename_moves_local_measurements_and_announces(self, mock_is_admin):
+        database.set_local_node_name("DE")
+        database.save_peer_measurement("https://site.example.org", "DE", "up", 5)
+        bot.last_peer_telemetry_broadcast = 12345.0
+        mock_bot = MagicMock()
+        event = MagicMock()
+        event.msg.chat_id = 1
+        event.payload = "🇩🇪 DE"
+        bot.nodename_command(mock_bot, 1, event)
+
+        self.assertEqual(database.get_local_node_name(), "🇩🇪 DE")
+        self.assertEqual([m["node_name"] for m in database.get_peer_measurements_for_url("https://site.example.org")], ["🇩🇪 DE"])
+        self.assertEqual(bot.last_peer_telemetry_broadcast, 0.0)
 
 
 if __name__ == "__main__":

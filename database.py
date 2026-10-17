@@ -1670,7 +1670,9 @@ def start_partial_outage(resource_id: int, started_at: int, nodes_down: str):
         cursor.execute("SELECT id FROM partial_outages WHERE resource_id = ? AND ended_at IS NULL", (resource_id,))
         row = cursor.fetchone()
         if row:
-            cursor.execute("UPDATE partial_outages SET nodes_down = ? WHERE id = ?", (nodes_down, row[0]))
+            # "[]": the nodes that could not reach it abstained this time; keep the last known ones
+            if nodes_down and nodes_down != "[]":
+                cursor.execute("UPDATE partial_outages SET nodes_down = ? WHERE id = ?", (nodes_down, row[0]))
         else:
             cursor.execute(
                 "INSERT INTO partial_outages (resource_id, started_at, nodes_down) VALUES (?, ?, ?)",
@@ -1731,3 +1733,26 @@ def get_resources_by_urls(urls) -> list[dict]:
         return [dict(r) for r in rows]
     finally:
         conn.close()
+
+
+def rename_measurement_node(old_name: str, new_name: str):
+    """Moves cached per-node measurements to a node's new name (a newer row under the new name wins)."""
+    if not old_name or not new_name or old_name == new_name:
+        return
+    with _writer_transaction() as conn:
+        conn.execute("UPDATE OR IGNORE peer_measurements SET node_name = ? WHERE node_name = ?", (new_name, old_name))
+        conn.execute("DELETE FROM peer_measurements WHERE node_name = ?", (old_name,))
+
+def rename_peer_node(email: str, new_name: str) -> bool:
+    """Sets a peer's node name and moves its cached measurements to it."""
+    email = email.lower().strip()
+    with _writer_transaction() as conn:
+        row = conn.execute("SELECT node_name FROM peers WHERE email = ?", (email,)).fetchone()
+        if not row:
+            return False
+        old_name = row[0]
+        conn.execute("UPDATE peers SET node_name = ? WHERE email = ?", (new_name, email))
+        if old_name and old_name != new_name:
+            conn.execute("UPDATE OR IGNORE peer_measurements SET node_name = ? WHERE node_name = ?", (new_name, old_name))
+            conn.execute("DELETE FROM peer_measurements WHERE node_name = ?", (old_name,))
+        return True

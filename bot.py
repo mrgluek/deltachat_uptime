@@ -57,7 +57,7 @@ import transports_view
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "2.17.1"
+VERSION = "2.17.2"
 # No "bot" in the name: some services (e.g. Hiddify subscription links) reply 400 to any User-Agent containing "bot".
 USER_AGENT = f"Delta Chat Uptime Monitor/{VERSION} (+https://git.gluek.info/gluek/deltachat_uptime)"
 
@@ -368,6 +368,31 @@ def _peer_supports(peer: dict, cap: str) -> bool:
 def _note_peer_caps(email: str, caps) -> None:
     if email and isinstance(caps, list):
         _peer_caps[email.lower()] = {str(c)[:40] for c in caps[:20]}
+
+
+def _note_peer_announcement(peer: dict, data) -> dict:
+    """What a key-verified peer says about itself in protocol messages: its capabilities and its
+    node name (changed with /nodename there). Returns the peer row, renamed if the name changed.
+
+    The name is trusted because the peer is bound to its key; it may still not take the name of this
+    node or of another peer, so it cannot pose as a different node in votes and measurements."""
+    if not isinstance(data, dict):
+        return peer
+    _note_peer_caps(peer["email"], data.get("caps"))
+    claimed = data.get("node_name")
+    claimed = claimed.strip()[:64] if isinstance(claimed, str) else ""
+    current = peer.get("node_name") or ""
+    if not claimed or claimed == current:
+        return peer
+    taken = {database.get_local_node_name().casefold()} | {
+        (p.get("node_name") or "").casefold() for p in database.get_all_peers() if p["email"] != peer["email"]}
+    if claimed.casefold() in taken:
+        logger.warning(f"Peer {peer['email']} announces node name {claimed!r}, already used by another node; keeping {current!r}")
+        return peer
+    if database.rename_peer_node(peer["email"], claimed):
+        logger.info(f"Peer {peer['email']} renamed its node: {current!r} -> {claimed!r}")
+        peer = dict(peer, node_name=claimed)
+    return peer
 
 
 async def request_peer_cross_checks_batched(target_dict: dict) -> list[dict]:
@@ -5342,8 +5367,14 @@ def nodename_command(bot, accid, event):
         return
     payload = (event.payload or "").strip()
     if payload:
+        global last_peer_telemetry_broadcast
+        old_name = database.get_local_node_name()
         database.set_local_node_name(payload)
-        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=f"✅ Local probe node name set to: `{payload}`"))
+        database.rename_measurement_node(old_name, payload.strip())
+        # Peers learn the new name from the next telemetry message: send it on the next scheduler tick
+        last_peer_telemetry_broadcast = 0.0
+        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(
+            text=f"✅ Local probe node name set to: `{payload}`\nPeers on 2.17.2+ pick it up with the next telemetry message."))
     else:
         current_name = database.get_local_node_name()
         _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=f"📍 Current local probe node name: `{current_name}`\n\nTo change it: `/nodename <name>` (e.g. `/nodename Frankfurt-DE`, `/nodename RU-Moscow`)."))
@@ -5952,7 +5983,7 @@ def on_new_message(bot, accid, event):
                 logger.warning(f"Dropping check request from untrusted sender {sender_addr or msg.from_id} in chat {msg.chat_id}")
                 return
             _record_peer_activity(peer["email"])
-            _note_peer_caps(peer["email"], req_data.get("caps"))
+            peer = _note_peer_announcement(peer, req_data)
 
             # Security: Validate target_url against SSRF (no localhost / private IPs)
             if not is_safe_target_url(target_url, check_type):
@@ -6014,7 +6045,7 @@ def on_new_message(bot, accid, event):
                 logger.warning(f"Dropping batch check request from untrusted sender {sender_addr or msg.from_id} in chat {msg.chat_id}")
                 return
             _record_peer_activity(peer["email"])
-            _note_peer_caps(peer["email"], req_data.get("caps"))
+            peer = _note_peer_announcement(peer, req_data)
             req_id = req_data.get("req_id")
             targets = _parse_batch_targets(req_data.get("targets"))
             if req_id and targets:
@@ -6038,7 +6069,7 @@ def on_new_message(bot, accid, event):
                 logger.warning(f"Dropping batch check response from untrusted sender {sender_addr or msg.from_id}")
                 return
             _record_peer_activity(peer["email"])
-            _note_peer_caps(peer["email"], resp_data.get("caps"))
+            peer = _note_peer_announcement(peer, resp_data)
             # Only an answer to a batch this node sent, from the chat it was sent to
             pending = pending_batch_checks.get(resp_data.get("req_id"))
             if not pending:
@@ -6077,7 +6108,7 @@ def on_new_message(bot, accid, event):
                 logger.warning(f"Dropping check response from untrusted sender {sender_addr or msg.from_id}")
                 return
             _record_peer_activity(peer["email"])
-            _note_peer_caps(peer["email"], resp_data.get("caps"))
+            peer = _note_peer_announcement(peer, resp_data)
 
             # Only answers to a request this node sent to this very peer are accepted
             pending = pending_peer_checks.get(req_id) if req_id else None
@@ -6133,7 +6164,7 @@ def on_new_message(bot, accid, event):
                 logger.warning(f"Dropping telemetry from untrusted sender {sender_addr or msg.from_id}")
                 return
             _record_peer_activity(peer["email"])
-            _note_peer_caps(peer["email"], metrics_data.get("caps"))
+            peer = _note_peer_announcement(peer, metrics_data)
             if not isinstance(metrics_list, list):
                 return
 

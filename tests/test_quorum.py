@@ -611,5 +611,28 @@ class TestCheckCompletionTracking(unittest.TestCase):
         self.assertNotIn("probe_x", bot._check_finished_at)
 
 
+class TestPartialOutageNodes(unittest.TestCase):
+    def setUp(self):
+        self.orig_db = database.DB_PATH
+        database.close_db()
+        database.DB_PATH = TEST_DB
+        database.init_db()
+
+    def tearDown(self):
+        database.close_db()
+        database.DB_PATH = self.orig_db
+        for suffix in ["", "-wal", "-shm"]:
+            if os.path.exists(TEST_DB + suffix):
+                os.remove(TEST_DB + suffix)
+
+    def test_abstaining_nodes_do_not_clear_the_list(self):
+        rid = database.add_resource(CHAT, URL, "Target", "http")
+        database.start_partial_outage(rid, 1700000000, json.dumps(["IT"]))
+        database.start_partial_outage(rid, 1700000000, "[]")
+        self.assertEqual(json.loads(database.get_partial_outages(rid)[0]["nodes_down"]), ["IT"])
+        database.start_partial_outage(rid, 1700000000, json.dumps(["IT", "RU"]))
+        self.assertEqual(json.loads(database.get_partial_outages(rid)[0]["nodes_down"]), ["IT", "RU"])
+
+
 if __name__ == "__main__":
     unittest.main()

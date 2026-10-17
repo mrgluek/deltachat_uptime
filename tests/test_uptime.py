@@ -1998,6 +1998,8 @@ class TestUptimeBot(unittest.TestCase):
         database.add_or_update_peer("peer@example.com", "Helsinki-DO", 101)
         # Monitor lives in the admin's chat, so it is within the default "admin" peer share scope
         database.set_config("admin_chat_id", "100")
+        # Local alert mode: this node decides, peers' answers annotate the error (quorum: test_quorum.py)
+        database.set_chat_alert_mode(100, "local")
 
         rep = {"id": 1, "url": "https://cross-check-test.org", "type": "http", "name": "Cross Check"}
         group = [{"id": 1, "dc_chat_id": 100, "url": "https://cross-check-test.org", "type": "http", "name": "Cross Check", "status": "up"}]
@@ -2015,7 +2017,8 @@ class TestUptimeBot(unittest.TestCase):
             # Verify error message contains confirmed node
             self.assertIn("Confirmed by Helsinki-DO", args[2])
 
-        # 2. Simulate peer reports UP (Regional issue)
+        # 2. Simulate peer reports UP (Regional issue) - a fresh UP monitor, as the scheduler reloads it
+        group = [{"id": 1, "dc_chat_id": 100, "url": "https://cross-check-test.org", "type": "http", "name": "Cross Check", "status": "up"}]
         with patch('asyncio.sleep', unittest.mock.AsyncMock()), \
              patch('bot.run_single_check', unittest.mock.AsyncMock(return_value=(False, "502 Bad Gateway", 100))), \
              patch('bot.check_host_internet_connectivity', unittest.mock.AsyncMock(return_value=True)), \

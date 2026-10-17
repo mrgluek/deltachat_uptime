@@ -46,6 +46,7 @@ Additionally, it automatically generates a secure, beautiful web status dashboar
   - **Controlled Disclosure (`/peershare`):** By default peers only see monitors from chats the administrator is a member of (`admin`); `all` shares every chat, `none` shares no local monitors. Monitor names are never sent, and targets a peer asked this node to probe are only reported back to that peer, never relayed to others.
   - **Zero Group Spam:** All protocol handshakes, background telemetry, and instant cross-checks happen in private DMs between bots.
   - **Cross-Probe Verification:** Outages are verified across remote probes in real-time before alerting, distinguishing global downtime from regional/routing reachability issues.
+  - **Quorum Alerting (`/alertmode quorum`, default):** When a target fails, this node and its live peers vote. If most nodes cannot reach it, it is 🔴 DOWN (incident). If only some cannot (e.g. 1–2 of 4, or only this node), it is 🟠 DEGRADED: one grouped notice in the chat, no incident and no downtime. Alerts show which nodes can and cannot reach the target (`🔴 DE, RU · 🟢 IT (196ms)`). Nodes that are offline, cannot check the target (IPv6) or ignore it (`/probeignore`) abstain; with fewer than two voters this node decides alone. DEGRADED is entered and left after two consecutive votes. `/alertmode local` keeps the previous behaviour (this node decides).
   - **Batched Cross-Checks:** Monitors that fail within the same 5 seconds go to each peer in one message (up to 100 targets) and come back in one, instead of a message per target and peer. In a mass outage this keeps the bots far below the chatmail relays' send limit (60 messages a minute). Bots announce the feature (`caps` in telemetry and check messages); peers that have not announced it yet get the classic one-target requests, so nodes can be updated one at a time.
   - **Telemetry Changes First:** Telemetry carries up to 200 targets every 2 minutes. With more targets, the ones whose status changed go first and the rest are refreshed in turn, so peers learn about an outage within 2 minutes even with 1000+ monitors.
   - **Aggregated Web Dashboard:** Web status pages show latency and status badges for all active probe locations (`[📍 Frankfurt-DE: 18ms] [🛰️ RU-Moscow: 45ms]`).
@@ -93,7 +94,8 @@ A plain `/help` sent in a group chat is answered in a private 1:1 chat with the 
 - `/resume <id|url>` (or `/unpause`) — Resume active monitoring after maintenance.
 - `/keyword <id|url> [keyword|none]` — Configure or remove expected keyword assertion.
 - `/list` — List monitored resources, status, latency, and SSL expiration in this chat.
-- `/status` — View monthly uptime statistics and get the link to the chat's secure Web Status Page.
+- `/status` — View monthly uptime statistics (online / degraded / offline, alert mode) and get the link to the chat's secure Web Status Page.
+- `/alertmode [quorum|local]` — How this chat is alerted: `quorum` (default) — DOWN when most nodes cannot reach a target, DEGRADED notice when some cannot; `local` — this node's checks only.
 - `/events` — View recent incidents and active outages for this chat.
 - `/history [id]` — View downtime history for monitors.
 - `/sync` — Synchronize monitored resources with other bots in the same chat (rate-limited to 1/minute for non-admins).

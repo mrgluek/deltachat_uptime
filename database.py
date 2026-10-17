@@ -138,7 +138,28 @@ def init_db():
             cursor.execute("ALTER TABLE resources ADD COLUMN last_latency_ms INTEGER")
         if "http_method" not in columns:
             cursor.execute("ALTER TABLE resources ADD COLUMN http_method TEXT")
-        
+        # Quorum alerting: up / degraded (unreachable from a minority of nodes) / down. `status`
+        # stays up/down only, so uptime and incidents are unchanged by a degraded target.
+        if "alert_state" not in columns:
+            cursor.execute("ALTER TABLE resources ADD COLUMN alert_state TEXT DEFAULT 'up'")
+        if "last_votes" not in columns:
+            cursor.execute("ALTER TABLE resources ADD COLUMN last_votes TEXT")  # JSON: per-node results
+        if "degraded_since" not in columns:
+            cursor.execute("ALTER TABLE resources ADD COLUMN degraded_since INTEGER DEFAULT 0")
+
+        # Partial outages: periods a target was unreachable from a minority of nodes (not downtime)
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS partial_outages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                resource_id INTEGER,
+                started_at INTEGER,
+                ended_at INTEGER,
+                nodes_down TEXT,
+                FOREIGN KEY(resource_id) REFERENCES resources(id) ON DELETE CASCADE
+            )
+        ''')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_partial_outages_resource ON partial_outages(resource_id, ended_at)')
+
         # Downtime events for uptime calculations
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS downtime_events (
@@ -450,6 +471,7 @@ def delete_resource(dc_chat_id: int, resource_id: int) -> bool:
         deleted = cursor.rowcount > 0
         if deleted:
             invalidate_uptime_cache(resource_id)
+            cursor.execute("DELETE FROM partial_outages WHERE resource_id = ?", (resource_id,))
         return deleted
 
 def get_resources(dc_chat_id: int) -> list[dict]:
@@ -1140,6 +1162,9 @@ def cleanup_old_records(retention_days: int = 90) -> dict[str, int]:
         meas_cutoff = now - (7 * 86400)
         cursor.execute("DELETE FROM peer_measurements WHERE last_checked < ?", (meas_cutoff,))
         cleaned["peer_measurements"] = cursor.rowcount
+
+        cursor.execute("DELETE FROM partial_outages WHERE ended_at IS NOT NULL AND ended_at < ?", (cutoff,))
+        cleaned["partial_outages"] = cursor.rowcount
     return cleaned
 
 # Peer management functions
@@ -1611,3 +1636,66 @@ def get_all_ignored_probe_targets() -> list[dict]:
 
 # Initialize DB on module import
 init_db()
+
+
+# ---- Quorum alerting -----------------------------------------------------------
+
+ALERT_MODES = ("quorum", "local")
+
+def get_chat_alert_mode(dc_chat_id: int) -> str:
+    """quorum (default): a target is down when most nodes cannot reach it. local: this node decides."""
+    mode = get_config(f"alert_mode:{dc_chat_id}")
+    return mode if mode in ALERT_MODES else "quorum"
+
+def set_chat_alert_mode(dc_chat_id: int, mode: str):
+    if mode not in ALERT_MODES:
+        raise ValueError(f"alert mode must be one of {ALERT_MODES}")
+    set_config(f"alert_mode:{dc_chat_id}", mode)
+
+def update_resource_alert_state(resource_id: int, alert_state: str, last_votes: str | None, degraded_since: int = 0):
+    with _writer_transaction() as conn:
+        conn.execute(
+            "UPDATE resources SET alert_state = ?, last_votes = ?, degraded_since = ? WHERE id = ?",
+            (alert_state, last_votes, degraded_since, resource_id)
+        )
+
+def update_resource_votes(resource_id: int, last_votes: str | None):
+    with _writer_transaction() as conn:
+        conn.execute("UPDATE resources SET last_votes = ? WHERE id = ?", (last_votes, resource_id))
+
+def start_partial_outage(resource_id: int, started_at: int, nodes_down: str):
+    """Opens a partial outage, or updates the unreachable nodes of the one already open."""
+    with _writer_transaction() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id FROM partial_outages WHERE resource_id = ? AND ended_at IS NULL", (resource_id,))
+        row = cursor.fetchone()
+        if row:
+            cursor.execute("UPDATE partial_outages SET nodes_down = ? WHERE id = ?", (nodes_down, row[0]))
+        else:
+            cursor.execute(
+                "INSERT INTO partial_outages (resource_id, started_at, nodes_down) VALUES (?, ?, ?)",
+                (resource_id, started_at, nodes_down)
+            )
+
+def end_partial_outage(resource_id: int, ended_at: int) -> int | None:
+    """Closes the open partial outage; returns when it started (None if none was open)."""
+    with _writer_transaction() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, started_at FROM partial_outages WHERE resource_id = ? AND ended_at IS NULL", (resource_id,))
+        row = cursor.fetchone()
+        if not row:
+            return None
+        cursor.execute("UPDATE partial_outages SET ended_at = ? WHERE id = ?", (ended_at, row[0]))
+        return row[1]
+
+def get_partial_outages(resource_id: int, limit: int = 20) -> list[dict]:
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            "SELECT * FROM partial_outages WHERE resource_id = ? ORDER BY started_at DESC LIMIT ?",
+            (resource_id, limit)
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()

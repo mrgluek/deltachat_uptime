@@ -57,7 +57,7 @@ import transports_view
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "2.15.0"
+VERSION = "2.16.0"
 # No "bot" in the name: some services (e.g. Hiddify subscription links) reply 400 to any User-Agent containing "bot".
 USER_AGENT = f"Delta Chat Uptime Monitor/{VERSION} (+https://git.gluek.info/gluek/deltachat_uptime)"
 
@@ -151,6 +151,18 @@ _cross_check_queue = []  # (target_dict, future) waiting for the next batch
 _cross_check_flush_task = None
 pending_batch_checks = {}  # req_id -> (Future, chat_id, number of targets)
 _peer_batch_semaphore = None
+
+# Quorum alerting (/alertmode quorum, the default): this node and its live peers vote on whether a
+# failing target is reachable. Most nodes cannot reach it -> DOWN (incident). Some can't -> DEGRADED:
+# a notice in the chat, no incident and no downtime. With fewer than 2 voters this node decides alone.
+QUORUM_REVOTE_INTERVAL = 120          # peers are asked again at most this often while nothing changed locally
+QUORUM_REVOTE_INTERVAL_LONG = 600     # ...and this often for targets down/degraded for over an hour
+DEGRADED_CONFIRMATIONS = 2            # consecutive votes needed to enter or leave DEGRADED
+DEGRADED_NOTIFY_WINDOW = 10.0         # seconds to collect DEGRADED changes of a chat into one message
+_vote_cache = {}          # cross-check key -> (monotonic time, local_up, peer results)
+_alert_streaks = {}       # resource id -> (candidate alert state, consecutive votes for it)
+_degraded_notify_queue = {}  # chat id -> list of ("start" | "end", resource, votes, started_at)
+_degraded_flush_task = None
 
 # Protocol message deduplication cache (bounded set of recent msg_ids)
 _processed_msg_ids = set()
@@ -396,6 +408,8 @@ async def _flush_cross_checks(batch: list) -> None:
     results = {key: [] for key in by_key}
     try:
         peers = await asyncio.to_thread(database.get_all_peers) or []
+        # Peers known to be offline would only make everyone wait for the timeout
+        peers = [p for p in peers if not p.get("is_offline")]
         batch_peers = [p for p in peers if _peer_supports(p, PEER_CAP_BATCH_CHECK)]
         legacy_peers = [p for p in peers if not _peer_supports(p, PEER_CAP_BATCH_CHECK)]
         items = [(key, target) for key, (target, _) in by_key.items()]
@@ -475,6 +489,9 @@ async def _answer_batch_cross_check(bot, accid, chat_id: int, req_id: str, targe
     async def one(t):
         if t is None:
             return {"status": "skip", "latency_ms": None, "error_msg": "Target refused"}
+        if await asyncio.to_thread(database.is_probe_target_ignored, t["url"]):
+            # /probeignore: e.g. blocked in this node's region. Abstain instead of voting "down".
+            return {"status": "skip", "latency_ms": None, "error_msg": "Ignored on this node (/probeignore)"}
         async with _peer_batch_semaphore:
             is_up, error_msg, latency_ms = await run_single_check(t)
         return {"status": "skip" if is_up is None else ("up" if is_up else "down"),
@@ -1751,6 +1768,197 @@ def log_check_summary(running: int) -> None:
     st.update(up=0, down=0, skipped=0, lat_sum=0, lat_n=0, slowest=(0, ""))
 
 
+def decide_quorum(votes: list[dict]) -> str:
+    """up / degraded / down from per-node results. Only "up" and "down" votes count; others abstain.
+
+    down: more than half of the voting nodes cannot reach the target. degraded: some can't.
+    With fewer than two voters the local result decides (as without peers)."""
+    voters = [v for v in votes if v.get("status") in ("up", "down")]
+    if len(voters) < 2:
+        local = next((v for v in votes if v.get("local")), None)
+        return "down" if local and local.get("status") == "down" else "up"
+    down = sum(1 for v in voters if v["status"] == "down")
+    if down == 0:
+        return "up"
+    return "down" if down * 2 > len(voters) else "degraded"
+
+
+def next_alert_state(resource_id: int, prev: str, raw: str) -> str:
+    """Applies the hysteresis: DEGRADED is entered from UP, and left for UP, only after
+    DEGRADED_CONFIRMATIONS consecutive votes. DOWN is entered at once (after this node's retries) and
+    left at once, like before quorum alerting."""
+    if raw == prev or raw == "down" or prev == "down":
+        _alert_streaks.pop(resource_id, None)
+        return raw
+    cand, count = _alert_streaks.get(resource_id, (None, 0))
+    count = count + 1 if cand == raw else 1
+    if count >= DEGRADED_CONFIRMATIONS:
+        _alert_streaks.pop(resource_id, None)
+        return raw
+    _alert_streaks[resource_id] = (raw, count)
+    return prev
+
+
+def _vote_entry(node: str, status: str, latency_ms=None, error_msg=None, local: bool = False) -> dict:
+    v = {"node": str(node or "Peer")[:64], "status": status if status in ("up", "down") else "unknown",
+         "latency_ms": latency_ms if isinstance(latency_ms, int) and not isinstance(latency_ms, bool) else None,
+         "error": str(error_msg)[:200] if error_msg and status != "up" else None}
+    if local:
+        v["local"] = True
+    return v
+
+
+def build_votes(local_node: str, is_up: bool, latency_ms, error_msg, peer_results) -> list[dict]:
+    votes = [_vote_entry(local_node, "up" if is_up else "down", latency_ms, error_msg, local=True)]
+    seen = {local_node}
+    for pr in peer_results or []:
+        node = pr.get("node_name") or "Peer"
+        if node in seen:
+            continue  # one vote per node
+        seen.add(node)
+        votes.append(_vote_entry(node, pr.get("status"), pr.get("latency_ms"), pr.get("error_msg")))
+    return votes
+
+
+def format_votes(votes: list[dict]) -> str:
+    """🔴 DE · 🟢 IT (196ms), RU (188ms) · ⚪ RU2 (no answer)"""
+    down = [v["node"] for v in votes if v.get("status") == "down"]
+    up = [f"{v['node']} ({v['latency_ms']}ms)" if v.get("latency_ms") is not None else v["node"]
+          for v in votes if v.get("status") == "up"]
+    other = [v["node"] for v in votes if v.get("status") not in ("up", "down")]
+    parts = []
+    if down:
+        parts.append("🔴 " + ", ".join(down))
+    if up:
+        parts.append("🟢 " + ", ".join(up))
+    if other:
+        parts.append("⚪ " + ", ".join(other) + " (no result)")
+    return " · ".join(parts)
+
+
+def _votes_from_json(raw) -> list[dict]:
+    try:
+        votes = json.loads(raw) if raw else []
+        return votes if isinstance(votes, list) else []
+    except (TypeError, ValueError):
+        return []
+
+
+def _votes_summary(votes: list[dict]) -> str:
+    down = [v["node"] for v in votes if v.get("status") == "down"]
+    up = [v["node"] for v in votes if v.get("status") == "up"]
+    text = f"Unreachable from {', '.join(down)}" if down else "Reachable from all nodes"
+    if down and up:
+        text += f"; reachable from {', '.join(up)}"
+    return text
+
+
+async def _quorum_resource_ids(group: list[dict]) -> set:
+    """Monitors of this target decided by quorum: chat mode quorum, live peers exist and the monitor
+    may be sent to peers (/peershare) - otherwise there is nobody to vote, and this node decides."""
+    peers = await asyncio.to_thread(database.get_all_peers)
+    if not any(not p.get("is_offline") for p in peers or []):
+        return set()
+    candidates = [r for r in group
+                  if await asyncio.to_thread(database.get_chat_alert_mode, r["dc_chat_id"]) == "quorum"]
+    if not candidates:
+        return set()
+    shareable = await asyncio.to_thread(_filter_peer_shareable_resources, dc_bot_instance, dc_accid, candidates)
+    return {r["id"] for r in shareable}
+
+
+async def collect_peer_votes(rep: dict, local_up: bool, fresh: bool = False, revote_interval: float = QUORUM_REVOTE_INTERVAL) -> list[dict]:
+    """The peers' results for this target. Re-used for revote_interval while this node's own
+    result is unchanged, so targets that stay down or degraded do not ask peers every minute."""
+    key = _cross_check_key(rep)
+    now = time.monotonic()
+    cached = _vote_cache.get(key)
+    if cached and not fresh and cached[1] == local_up and now - cached[0] < revote_interval:
+        return cached[2]
+    results = await request_peer_cross_checks_batched(rep)
+    if len(_vote_cache) > 5000:
+        _vote_cache.clear()
+    _vote_cache[key] = (now, local_up, results)
+    return results
+
+
+def _queue_degraded_notice(kind: str, resource: dict, votes: list[dict], started_at: int = None):
+    """Collects DEGRADED starts/ends of a chat for DEGRADED_NOTIFY_WINDOW and sends them as one message."""
+    global _degraded_flush_task
+    _degraded_notify_queue.setdefault(resource["dc_chat_id"], []).append((kind, resource, votes, started_at))
+    if _degraded_flush_task is None or _degraded_flush_task.done():
+        _degraded_flush_task = asyncio.create_task(_flush_degraded_notices())
+
+
+def format_degraded_notice(items: list) -> str:
+    starts = [i for i in items if i[0] == "start"]
+    ends = [i for i in items if i[0] == "end"]
+    now = int(time.time())
+    lines = []
+    if starts:
+        lines.append(f"🟠 **Partial Outage** — {len(starts)} monitor(s) unreachable from some nodes\n")
+        for _, r, votes, _ in starts:
+            lines.append(f"• 🟠 `ID: {r['id']}` **{r.get('name') or r['url']}**\n  Target: `{r['url']}`\n  {format_votes(votes)}")
+        lines.append("\n_Not counted as downtime: most nodes still reach these targets._")
+    if ends:
+        if lines:
+            lines.append("")
+        lines.append(f"✅ **Partial Outage Resolved** — {len(ends)} monitor(s) reachable from all nodes again\n")
+        for _, r, votes, started_at in ends:
+            dur = f" after `{format_duration(max(1, now - started_at))}`" if started_at else ""
+            lines.append(f"• 🟢 `ID: {r['id']}` **{r.get('name') or r['url']}**{dur}\n  {format_votes(votes)}")
+    return "\n".join(lines)
+
+
+async def _flush_degraded_notices():
+    await asyncio.sleep(DEGRADED_NOTIFY_WINDOW)
+    queued = dict(_degraded_notify_queue)
+    _degraded_notify_queue.clear()
+    for chat_id, items in queued.items():
+        # A monitor that started and ended within the window only needs its latest change
+        latest = {}
+        for item in items:
+            latest[item[1]["id"]] = item
+        text = format_degraded_notice(list(latest.values()))
+        if not text or not dc_bot_instance or dc_accid is None:
+            continue
+        try:
+            await asyncio.to_thread(_dc_send_msg_with_stats, dc_bot_instance, dc_accid, chat_id, MsgData(text=text))
+        except Exception as e:
+            logger.warning(f"Failed to send partial outage notice to chat {chat_id}: {e}")
+
+
+async def apply_quorum_state(r: dict, votes: list[dict], votes_json: str) -> str:
+    """Moves a monitor to its next alert state, records partial outages and queues notices.
+    Returns the new state; the caller stores status DOWN only for "down"."""
+    # status DOWN is alert state DOWN (also for monitors that were down before quorum alerting existed)
+    prev = "down" if r.get("status") == "down" else r.get("alert_state")
+    if prev not in ("up", "degraded"):
+        prev = "down" if prev == "down" and r.get("status") == "down" else "up"
+    now = int(time.time())
+    if now < (r.get("maintenance_until") or 0):
+        await run_db(database.update_resource_votes, r["id"], votes_json)
+        return prev
+    new = next_alert_state(r["id"], prev, decide_quorum(votes))
+    nodes_down = json.dumps([v["node"] for v in votes if v.get("status") == "down"])
+    degraded_since = r.get("degraded_since") or 0
+    if new == "degraded":
+        if prev != "degraded":
+            degraded_since = now
+            _queue_degraded_notice("start", r, votes)
+        await run_db(database.start_partial_outage, r["id"], degraded_since, nodes_down)
+    elif prev == "degraded":
+        started_at = await run_db(database.end_partial_outage, r["id"], now)
+        if new == "up":
+            _queue_degraded_notice("end", r, votes, started_at or degraded_since or None)
+        degraded_since = 0  # to DOWN: the incident message takes over
+    if new != prev:
+        logger.info(f"Quorum: {r.get('name') or r['url']} (id: {r['id']}) {prev.upper()} -> {new.upper()} ({format_votes(votes)})")
+    await run_db(database.update_resource_alert_state, r["id"], new, votes_json, degraded_since)
+    r["alert_state"], r["last_votes"], r["degraded_since"] = new, votes_json, degraded_since
+    return new
+
+
 async def check_network_probe(target, semaphore, session=None):
     """Executes a network check acquiring the concurrency semaphore ONLY for the duration of the network probe."""
     async with semaphore:
@@ -1788,12 +1996,16 @@ async def check_group_task(group, semaphore, session=None):
         logger.debug(f"Check skipped: {rep['name'] or rep['url']} (id: {rep['id']}) in chat {rep['dc_chat_id']} ({error_msg})")
         return
 
-    # Retry logic: retry if check failed and at least one resource in the group was not already DOWN.
+    def _in_alert(r):
+        return r["status"] == "down" or r.get("alert_state") in ("degraded", "down")
+
+    # Retry logic: retry if check failed and at least one resource in the group was not already
+    # DOWN or DEGRADED (those are re-checked every interval anyway).
     # Note: sleep(30) is executed OUTSIDE the semaphore so failing targets do not starve healthy checks!
-    if not is_up and any(r["status"] != "down" for r in group):
+    if not is_up and any(not _in_alert(r) for r in group):
         for retry in range(1, 3):
             for r in group:
-                if r["status"] != "down":
+                if not _in_alert(r):
                     logger.info(f"Retry {retry}/2 for resource {r['id']} ({r['name'] or r['url']}) in chat {r['dc_chat_id']}")
             await asyncio.sleep(30)
             res = await check_network_probe(rep, semaphore, session=session)
@@ -1814,29 +2026,75 @@ async def check_group_task(group, semaphore, session=None):
             )
             return
 
-    # Peer Cross-Check: verify failing target with remote probes before marking DOWN
-    if not is_up and any(r["status"] != "down" for r in group) and await _peer_cross_check_allowed(group):
-        try:
-            peer_results = await request_peer_cross_checks_batched(rep)
-            if peer_results:
-                up_peers = [pr for pr in peer_results if pr.get("status") == "up"]
-                down_peers = [pr for pr in peer_results if pr.get("status") == "down"]
-                if up_peers:
-                    reach_details = ", ".join(f"{pr.get('node_name', 'Peer')}: {pr.get('latency_ms', '?')}ms" for pr in up_peers)
-                    error_msg = f"{error_msg} (Reachable from {reach_details})"
-                elif down_peers:
-                    nodes_confirmed = [pr.get('node_name', 'Peer') for pr in down_peers]
-                    error_msg = f"{error_msg} [Confirmed by {', '.join(nodes_confirmed)}]"
-        except Exception as ex:
-            logger.warning(f"Error during peer cross-check: {ex}")
+    local_node = database.get_local_node_name()
+    quorum_ids = await _quorum_resource_ids(group) if (not is_up or any(_in_alert(r) for r in group)) else set()
+    quorum_group = [r for r in group if r["id"] in quorum_ids]
+
+    # Peers are asked when this node newly sees the target failing (fresh answers), and, for quorum
+    # monitors that are DOWN/DEGRADED, again to notice recovery or a change between the two
+    # (answers re-used for QUORUM_REVOTE_INTERVAL while this node's own result is unchanged).
+    newly_failing = not is_up and any(not _in_alert(r) for r in group)
+    peer_results = None
+    try:
+        if newly_failing and await _peer_cross_check_allowed(group):
+            peer_results = await collect_peer_votes(rep, is_up, fresh=True)
+        elif quorum_group and (not is_up or any(r.get("alert_state") in ("degraded", "down") for r in quorum_group)):
+            # Since when it is in this state: DEGRADED keeps status UP, so last_changed says nothing
+            oldest_change = min(((r.get("degraded_since") if r.get("alert_state") == "degraded" else r.get("last_changed")) or 0)
+                                for r in quorum_group)
+            long_running = oldest_change and time.time() - oldest_change > 3600
+            peer_results = await collect_peer_votes(
+                rep, is_up, revote_interval=QUORUM_REVOTE_INTERVAL_LONG if long_running else QUORUM_REVOTE_INTERVAL)
+    except Exception as ex:
+        logger.warning(f"Error during peer cross-check: {ex}")
+
+    votes = build_votes(local_node, is_up, latency_ms, error_msg, peer_results) if peer_results is not None else None
+    votes_json = json.dumps(votes) if votes and len(votes) > 1 else None
+
+    # Local-mode monitors: this node decides; peers' answers are added to the error text
+    local_error_msg = error_msg
+    if not is_up and peer_results:
+        up_peers = [pr for pr in peer_results if pr.get("status") == "up"]
+        down_peers = [pr for pr in peer_results if pr.get("status") == "down"]
+        if up_peers:
+            reach_details = ", ".join(f"{pr.get('node_name', 'Peer')}: {pr.get('latency_ms', '?')}ms" for pr in up_peers)
+            local_error_msg = f"{error_msg} (Reachable from {reach_details})"
+        elif down_peers:
+            nodes_confirmed = [pr.get('node_name', 'Peer') for pr in down_peers]
+            local_error_msg = f"{error_msg} [Confirmed by {', '.join(nodes_confirmed)}]"
+
+    # Each monitor's result: (is_up, error_msg) as stored and alerted on
+    outcomes = {}
+    for r in group:
+        if r["id"] in quorum_ids and votes is not None:
+            state = await apply_quorum_state(r, votes, votes_json)
+            r_up = state != "down"
+            r_err = None if is_up and state == "up" else _votes_summary(votes)
+            if not is_up and error_msg:
+                r_err = f"{error_msg} ({r_err})" if r_err else error_msg
+            outcomes[r["id"]] = (r_up, r_err)
+            continue
+        if r.get("alert_state") == "degraded":
+            # Switched to local mode (or no peers left) while degraded: close it quietly
+            await run_db(database.end_partial_outage, r["id"], int(time.time()))
+            await run_db(database.update_resource_alert_state, r["id"], "up", r.get("last_votes"), 0)
+            r["alert_state"] = "up"
+        if votes_json:
+            await run_db(database.update_resource_votes, r["id"], votes_json)
+            r["last_votes"] = votes_json
+        if r.get("alert_state") != ("up" if is_up else "down"):
+            # Keep alert_state in step with status, so a later switch to quorum starts from it
+            await run_db(database.update_resource_alert_state, r["id"], "up" if is_up else "down",
+                         r.get("last_votes"), 0)
+            r["alert_state"] = "up" if is_up else "down"
+        outcomes[r["id"]] = (is_up, local_error_msg)
 
     _count_check(is_up, latency_ms, rep.get("name") or rep["url"])  # the result after retries
 
     # One transaction for the whole check: every monitor of this target + the local measurement
-    local_node = database.get_local_node_name()
     status_str = "up" if is_up else "down"
     await run_db(database.record_check_results,
-                 [_status_update_for(r, is_up, error_msg, latency_ms) for r in group],
+                 [_status_update_for(r, outcomes[r["id"]][0], outcomes[r["id"]][1], latency_ms) for r in group],
                  (rep["url"], local_node, status_str, latency_ms, error_msg))
 
     for r in group:
@@ -1844,12 +2102,14 @@ async def check_group_task(group, semaphore, session=None):
             r["last_latency_ms"] = latency_ms
         if rep.get("http_method"):
             r["http_method"] = rep["http_method"]
+        r_up, r_err = outcomes[r["id"]]
 
         # INFO only for what needs attention (DOWN or a change); routine UPs are in the minute summary
-        changed = r.get("status") != ("up" if is_up else "down")
-        logger.log(logging.INFO if (changed or not is_up) else logging.DEBUG,
-                   f"Check result: {r['name'] or r['url']} (id: {r['id']}) in chat {r['dc_chat_id']} -> {'UP' if is_up else 'DOWN'} ({error_msg})")
-        await handle_check_result(r, is_up, error_msg, latency_ms=latency_ms, status_written=True)
+        changed = r.get("status") != ("up" if r_up else "down")
+        logger.log(logging.INFO if (changed or not r_up or not is_up) else logging.DEBUG,
+                   f"Check result: {r['name'] or r['url']} (id: {r['id']}) in chat {r['dc_chat_id']} -> {'UP' if r_up else 'DOWN'}"
+                   f"{'' if r_up == is_up else ' by quorum, locally ' + ('UP' if is_up else 'DOWN')} ({r_err})")
+        await handle_check_result(r, r_up, r_err, latency_ms=latency_ms, status_written=True)
 
     # Check SSL Certificate Expiry for HTTPS targets (at most once per hour)
     if rep.get("type") == "http" and rep.get("url", "").startswith("https://"):
@@ -1918,6 +2178,9 @@ def format_incident_message(incident_id: int, started_at: int, resources: list[d
                     r_type = (r.get("type") or "HTTP").upper()
                     uptime_val = database.get_resource_uptime_30d(r["id"])
                     lines.append(f"• 🟢 `ID: {r['id']}` **{r_name}** ({r_type}) — Uptime 30d: `{uptime_val:.2f}%`")
+                    votes = _votes_from_json(r.get("last_votes"))
+                    if len(votes) > 1 and r.get("alert_state") == "degraded":
+                        lines.append(f"  🟠 Still unreachable from some nodes: {format_votes(votes)}")
         else:
             lines = [
                 f"✅ **Incident #{incident_id}** — `Resolved`",
@@ -1955,6 +2218,9 @@ def format_incident_message(incident_id: int, started_at: int, resources: list[d
             d_str = format_duration(d_time)
             uptime_val = database.get_resource_uptime_30d(r["id"])
             lines.append(f"• 🔴 `ID: {r['id']}` **{r_name}**\n  Target: `{r['url']}` ({r_type})\n  Status: `DOWN` (down for `{d_str}`) | Uptime 30d: `{uptime_val:.2f}%`")
+            votes = _votes_from_json(r.get("last_votes"))
+            if len(votes) > 1:
+                lines.append(f"  🛰️ {format_votes(votes)}")
             
         for r in up_resources:
             r_name = r.get("name") or r.get("url")
@@ -2064,7 +2330,8 @@ async def sync_chat_incident_state(dc_chat_id: int, force_update: bool = False):
                             "status": "down" if is_currently_down else "up",
                             "last_changed": r.get("last_changed") or ev.get("went_up_at") or ev.get("went_down_at"),
                             "went_down_at": ev.get("went_down_at"),
-                            "went_up_at": ev.get("went_up_at")
+                            "went_up_at": ev.get("went_up_at"),
+                            "last_votes": r.get("last_votes"),
                         })
                 
                 msg_text = format_incident_message(
@@ -3617,6 +3884,7 @@ def help_command(bot, accid, event):
         f"/keyword <id|url> [keyword|none] — Set or remove required keyword assertion\n"
         f"/list — List all monitors in this chat with uptime, latency & SSL\n"
         f"/status — Show monthly uptime statistics & web link\n"
+        f"/alertmode [quorum|local] — Alert when most nodes cannot reach a target (default), or on this node's checks only\n"
         f"/events — View incident history and active outages\n"
         f"/history [id] — View downtime history for monitors\n"
         f"/sync — Synchronize monitors with other bots in the chat\n"
@@ -4463,6 +4731,9 @@ def list_command(bot, accid, event):
             m_left_secs = m_until - now_ts
             m_left_str = format_duration(m_left_secs)
             status_text = f"PAUSED ({m_left_str} left)"
+        elif r["status"] == "up" and r.get("alert_state") == "degraded":
+            emoji_status = "🟠"
+            status_text = "DEGRADED"
         elif r["status"] == "up":
             emoji_status = "🟢"
             status_text = "UP"
@@ -4474,6 +4745,8 @@ def list_command(bot, accid, event):
             status_text = "UNKNOWN"
             
         uptime = uptimes_map.get(r["id"], 100.0)
+        votes = _votes_from_json(r.get("last_votes"))
+        votes_line = f"  🛰️ {format_votes(votes)}\n" if len(votes) > 1 and status_text in ("DEGRADED", "DOWN") else ""
         
         extra_info = ""
         if r.get("last_latency_ms") is not None:
@@ -4499,8 +4772,47 @@ def list_command(bot, accid, event):
         reply += (
             f"{emoji_status} `ID: {r['id']}` **{r['name']}**\n"
             f"  Target: `{r['url']}` ({r['type'].upper()})\n"
-            f"  Uptime 30d: `{uptime:.2f}%` | Status: `{status_text}`{extra_info}{ssl_info}\n\n"
+            f"  Uptime 30d: `{uptime:.2f}%` | Status: `{status_text}`{extra_info}{ssl_info}\n"
+            f"{votes_line}\n"
         )
+    _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=reply))
+
+@dc_cli.on(events.NewMessage(command="/alertmode"))
+def alertmode_command(bot, accid, event):
+    """Per-chat alerting: quorum (default) or local. Any chat member may change it, like /pause."""
+    msg = event.msg
+    payload = (event.payload or "").strip().lower()
+    if payload:
+        try:
+            database.set_chat_alert_mode(msg.chat_id, payload)
+        except ValueError:
+            _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text="❌ Usage: `/alertmode quorum|local`"))
+            return
+    mode = database.get_chat_alert_mode(msg.chat_id)
+
+    live_peers = [p for p in database.get_all_peers() if not p.get("is_offline")]
+    resources = database.get_resources(msg.chat_id)
+    shared = _filter_peer_shareable_resources(bot, accid, resources) if resources else [{"dc_chat_id": msg.chat_id}]
+    node_count = len(live_peers) + 1
+    majority = node_count // 2 + 1
+
+    reply = ("✅ " if payload else "") + f"🛰️ **Alert mode:** `{mode}`\n\n"
+    if mode == "quorum":
+        reply += (
+            f"This node and its live peers check a failing target together ({node_count} node(s) now):\n"
+            f"• 🔴 **DOWN** (incident) when at least {majority} of {node_count} cannot reach it\n"
+            f"• 🟠 **DEGRADED** (a notice, not downtime) when fewer cannot reach it\n"
+            f"Alerts show which nodes can and cannot reach the target.\n\n"
+        )
+        if node_count < 2:
+            reply += "⚠️ _No live peers right now: this node decides alone until a peer is back._\n\n"
+        elif resources and not shared:
+            reply += ("⚠️ _This chat's monitors are not shared with peers (`/peershare`), "
+                      "so this node decides alone for them._\n\n")
+    else:
+        reply += ("Only this node's checks decide whether a target is down. Peers' results are still "
+                  "shown in alerts when they were asked.\n\n")
+    reply += "Change with `/alertmode quorum` or `/alertmode local`."
     _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=reply))
 
 @dc_cli.on(events.NewMessage(command="/status"))
@@ -4512,7 +4824,8 @@ def status_command(bot, accid, event):
         return
         
     total_monitors = len(resources)
-    up_monitors = sum(1 for r in resources if r["status"] == "up")
+    degraded_monitors = sum(1 for r in resources if r["status"] == "up" and r.get("alert_state") == "degraded")
+    up_monitors = sum(1 for r in resources if r["status"] == "up") - degraded_monitors
     down_monitors = sum(1 for r in resources if r["status"] == "down")
     
     avg_uptime = database.get_chat_uptime_30d(msg.chat_id)
@@ -4525,7 +4838,8 @@ def status_command(bot, accid, event):
         f"📊 **Uptime Status Report (Last 30 days):**\n\n"
         f"📈 Overall Uptime: `{avg_uptime:.2f}%`\n"
         f"🖥️ Total Monitors: `{total_monitors}`\n"
-        f"🟢 Online: `{up_monitors}` | 🔴 Offline: `{down_monitors}`\n\n"
+        f"🟢 Online: `{up_monitors}` | 🟠 Degraded: `{degraded_monitors}` | 🔴 Offline: `{down_monitors}`\n"
+        f"🛰️ Alert mode: `{database.get_chat_alert_mode(msg.chat_id)}` (`/alertmode`)\n\n"
         f"🔗 **Web Status Dashboard:**\n"
         f"{status_page_url}"
     )
@@ -5498,7 +5812,10 @@ def on_new_message(bot, accid, event):
                     "family": family,
                 }
                 async def _do_cross_check_reply():
-                    res = await run_single_check(synth_r)
+                    if await asyncio.to_thread(database.is_probe_target_ignored, target_url):
+                        res = (None, "Ignored on this node (/probeignore)", None)  # abstain, see batch answers
+                    else:
+                        res = await run_single_check(synth_r)
                     if len(res) == 3:
                         is_up, error_msg, latency_ms = res
                     else:

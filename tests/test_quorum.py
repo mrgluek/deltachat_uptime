@@ -600,5 +600,16 @@ class TestPartialOutageDisplay(unittest.TestCase):
         self.assertIn("unreachable from RU", text)
 
 
+class TestCheckCompletionTracking(unittest.TestCase):
+    def test_finished_check_is_remembered(self):
+        bot._check_finished_at.clear()
+        bot.running_resource_ids.update({77, "probe_x"})
+        with patch("bot.check_group_task", AsyncMock()):
+            asyncio.run(bot.run_and_track_group([{"id": 77}, {"id": "probe_x"}], asyncio.Semaphore(1)))
+        self.assertNotIn(77, bot.running_resource_ids)
+        self.assertIn(77, bot._check_finished_at)
+        self.assertNotIn("probe_x", bot._check_finished_at)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.17.1] - 2026-10-17
+
+### Fixed
+- **Same Monitor Checked Twice in a Row**: The scheduler's cached monitor rows (refreshed every 10 s) could be re-read from the database while a long check was still running (retries, peer votes: up to a minute) and still carry the previous `last_checked`, so the same check started again seconds after it finished, with the old status. Seen on de2 as two "DOWN -> UP" transitions 3 s apart. The scheduler now also remembers when each check finished.
+
 ## [2.17.0] - 2026-10-17
 
 ### Added

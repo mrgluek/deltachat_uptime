@@ -57,7 +57,7 @@ import transports_view
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "2.17.0"
+VERSION = "2.17.1"
 # No "bot" in the name: some services (e.g. Hiddify subscription links) reply 400 to any User-Agent containing "bot".
 USER_AGENT = f"Delta Chat Uptime Monitor/{VERSION} (+https://git.gluek.info/gluek/deltachat_uptime)"
 
@@ -2624,13 +2624,22 @@ async def handle_check_result(resource, is_up, error_msg, latency_ms=None, statu
     if not is_up:
         await check_stale_downtime_notifications(resource, now)
 
+# resource id -> when its last check finished. The scheduler's cached rows can be read from the DB
+# while a long check (retries, peer votes: up to a minute) is running, so they still carry the
+# previous last_checked and would start the same check again right after it ends.
+_check_finished_at = {}
+
+
 async def run_and_track_group(group, semaphore, session=None):
     try:
         await check_group_task(group, semaphore, session=session)
     finally:
         async with running_lock:
+            now = int(time.time())
             for r in group:
                 running_resource_ids.discard(r["id"])
+                if isinstance(r.get("id"), int):
+                    _check_finished_at[r["id"]] = now
 
 async def run_checks_parallel(tasks_list):
     await asyncio.gather(*tasks_list, return_exceptions=True)
@@ -2687,7 +2696,7 @@ async def monitoring_scheduler_loop():
                         if r_id in running_resource_ids:
                             continue
                             
-                        last_checked = r["last_checked"] or 0
+                        last_checked = max(r["last_checked"] or 0, _check_finished_at.get(r_id, 0))
                         interval = max(10, r["interval"] or 60)
                         
                         slot_offset = (r_id * 11) % interval if isinstance(r_id, int) else (sum(str(r_id).encode()) * 11) % interval

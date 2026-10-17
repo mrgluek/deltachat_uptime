@@ -109,6 +109,7 @@ These commands are only executable by the configured administrator.
 
 - `/url` — View current base external status URL.
 - `/url <url>` — Update the base external status URL (e.g., `/url https://up.gluek.info`) to generate correct status links.
+- `/probeignore [url|host|pattern]` — On this node, stop probing targets it cannot reach (e.g. blocked in its region or by its ISP) and abstain when peers vote on them. Accepts a target as shown in alerts (`https://nine.testrun.org/`, `dnd.wb.ru:25`), a host (`nine.testrun.org`: all its targets) or a pattern with `*` matched against the target, its host and host:port (`*:25` — all SMTP port checks, `*.testrun.org`). Without arguments lists the entries; `/probeunignore <entry>` removes one.
 - `/nodename [name]` — View or set the local probe node identifier (e.g. `/nodename Frankfurt-DE`). Peers (2.17.2+) pick up a new name from the next telemetry message; a name already used by another node is refused.
 - `/invitepeer` — Generate a SecureJoin E2E encrypted invite link (`https://i.delta.chat/#...`) with a single-use pairing token (valid 24h) for linking another bot.
 - `/peers` (or `/probes`) — List distributed monitoring peers, node names, key fingerprints, the relay address each one last used, and last seen activity.

@@ -57,7 +57,7 @@ import transports_view
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "2.17.2"
+VERSION = "2.18.0"
 # No "bot" in the name: some services (e.g. Hiddify subscription links) reply 400 to any User-Agent containing "bot".
 USER_AGENT = f"Delta Chat Uptime Monitor/{VERSION} (+https://git.gluek.info/gluek/deltachat_uptime)"
 
@@ -5435,7 +5435,7 @@ def peers_command(bot, accid, event):
             # First 16 hex digits identify the key; the address only shows the relay it last used
             key_lbl = f"Key: `{' '.join(fp[i:i + 4] for i in range(0, 16, 4))}…`" if fp else "Key: `not bound yet`"
             reply += f"• {status_icon} **{p_node}** — `{p['email']}`\n  {key_lbl} | {chat_lbl} | Last seen: `{seen_str}` | Active metrics: `{node_meas_count}`\n\n"
-        reply += "Commands:\n• `/invitepeer` — Generate E2EE invite link\n• `/addpeer <email|link> [node_name]`\n• `/rmpeer <email|key>`\n• `/peershare [admin|all|none]`\n• `/nodename <name>`\n• `/probeignore [url]` — Exclude/list ignored targets on this node\n• `/probeunignore <url>` — Resume probing target on this node"
+        reply += "Commands:\n• `/invitepeer` — Generate E2EE invite link\n• `/addpeer <email|link> [node_name]`\n• `/rmpeer <email|key>`\n• `/peershare [admin|all|none]`\n• `/nodename <name>`\n• `/probeignore [url|host|pattern]` — Exclude targets on this node (e.g. `*:25`), or list them\n• `/probeunignore <entry>` — Resume probing on this node"
     _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=reply.strip()))
 
 @dc_cli.on(events.NewMessage(command="/invitepeer"))
@@ -5640,22 +5640,27 @@ def probeignore_command(bot, accid, event):
         ignored = database.get_all_ignored_probe_targets()
         if not ignored:
             _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(
-                text=f"ℹ️ No ignored probe targets configured on `{local_node}`.\n\nTo ignore an inaccessible or region-blocked target on this probe:\n`/probeignore <url>`"
+                text=f"ℹ️ No ignored probe targets configured on `{local_node}`.\n\nTo ignore an inaccessible or region-blocked target on this probe:\n"
+                     f"`/probeignore <url>` — one target, as shown in alerts (`https://site.org/`, `host.org:25`)\n"
+                     f"`/probeignore host.org` — every target on that host\n"
+                     f"`/probeignore *:25` or `/probeignore *.testrun.org` — patterns (`*` = anything)"
             ))
             return
         reply = f"🚫 **Ignored Probe Targets on `{local_node}` ({len(ignored)}):**\n\n"
         for item in ignored:
             reply += f"• `{item['url']}`\n"
-        reply += "\nTo unignore and resume monitoring on this probe: `/probeunignore <url>`"
+        reply += "\nTo unignore and resume monitoring on this probe: `/probeunignore <entry>` (exactly as listed)"
         _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=reply))
         return
 
-    if not url.startswith(("http://", "https://", "tcp://", "ping://")) and ":" not in url:
-        if "." in url:
-            url = f"https://{url}"
-    database.add_ignored_probe_target(url)
+    # Stored as written: a target (`https://site/`, `host:25`), a host (all its targets) or a `*` pattern
+    url = url.lower()
+    matched = database.add_ignored_probe_target(url)
+    kind = "Pattern" if "*" in url else ("Host" if "://" not in url and ":" not in url else "Target")
     _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(
-        text=f"✅ Target `{url}` is now **ignored** on `{local_node}`.\nIt will not be scanned by this probe or synced to peer dashboards."
+        text=f"✅ {kind} `{url}` is now **ignored** on `{local_node}` ({matched} mirrored target(s) matched now).\n"
+             f"This probe does not scan matching targets, does not report them to peers and abstains when peers "
+             f"vote on them (`skip`)."
     ))
 
 @dc_cli.on(events.NewMessage(command="/probeunignore"))
@@ -5670,7 +5675,7 @@ def probeunignore_command(bot, accid, event):
         _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text="Usage: `/probeunignore <url>`"))
         return
 
-    removed = database.remove_ignored_probe_target(url)
+    removed = database.remove_ignored_probe_target(url) or database.remove_ignored_probe_target(url.lower())
     if not removed and not url.startswith(("http://", "https://")):
         removed = database.remove_ignored_probe_target(f"https://{url}")
         if removed:

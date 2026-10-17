@@ -6,6 +6,7 @@ import threading
 import time
 import secrets
 import string
+from urllib.parse import urlparse
 
 DB_PATH = os.getenv("DB_PATH", "uptime.db")
 _write_lock = threading.RLock()
@@ -1526,7 +1527,7 @@ def save_probe_targets_batch(targets: list[dict], source_peer: str = None, max_p
     with _writer_transaction() as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT url FROM ignored_probe_targets")
-        ignored_set = set(row[0] for row in cursor.fetchall())
+        ignore_patterns = [row[0] for row in cursor.fetchall()]
 
         now = int(time.time())
         # Cap how many active probe targets a single peer can make this node scan
@@ -1544,7 +1545,7 @@ def save_probe_targets_batch(targets: list[dict], source_peer: str = None, max_p
             if not isinstance(item, dict):
                 continue
             url = str(item.get("url") or "").strip()[:500]
-            if not url or url in ignored_set:
+            if not url or target_matches_ignore(url, ignore_patterns):
                 continue
             if new_slots is not None and url not in known_urls:
                 if new_slots <= 0:
@@ -1596,16 +1597,70 @@ def update_probe_target_result(url: str, status: str, latency_ms: int = None, er
             WHERE url = ?
         ''', (now, status, latency_ms, error_msg, url))
 
-# Ignored probe targets (excluded from remote scanning on this probe node)
-def add_ignored_probe_target(url: str, reason: str = "") -> bool:
+# Ignored probe targets (excluded from remote scanning on this probe node).
+# An entry is a target as written (`https://site/`, `host:25`), a host (`site.example`: every
+# target on it) or a pattern with `*` (`*:25`, `*.testrun.org`). Each is compared with the
+# target's address, its host and its host:port (http/https with their default port).
+_TCP_TARGET_RE = re.compile(r'^\[([^\]]+)\]:(\d+)$|^([^:\[\]/]+):(\d+)$')
+
+def _target_match_keys(url: str) -> set:
+    u = (url or "").strip().lower()
+    keys = {u, u.rstrip("/")}
+    host, port = None, None
+    if "://" in u:
+        try:
+            parsed = urlparse(u)
+            host = parsed.hostname
+            port = parsed.port or {"https": 443, "http": 80}.get(parsed.scheme)
+        except ValueError:
+            pass
+    else:
+        m = _TCP_TARGET_RE.match(u)
+        if m:
+            host, port = (m.group(1), m.group(2)) if m.group(1) else (m.group(3), m.group(4))
+        else:
+            host = u  # ping target (host name or IP)
+    if host:
+        keys.add(host)
+        if port:
+            keys.add(f"{host}:{port}")
+    keys.discard("")
+    return keys
+
+def _ignore_pattern_regex(pattern: str):
+    # Only "*" is special (any characters); everything else, IPv6 brackets included, is literal
+    return re.compile("^" + ".*".join(re.escape(part) for part in pattern.split("*")) + "$")
+
+def target_matches_ignore(url: str, patterns) -> bool:
+    keys = _target_match_keys(url)
+    for pattern in patterns or []:
+        p = (pattern or "").strip().lower()
+        if not p:
+            continue
+        if "*" in p:
+            rx = _ignore_pattern_regex(p)
+            if any(rx.match(k) for k in keys):
+                return True
+        elif p in keys or p.rstrip("/") in keys:
+            return True
+    return False
+
+def add_ignored_probe_target(url: str, reason: str = "") -> int:
+    """Adds an ignore entry; returns how many mirrored probe targets it matched (and removed)."""
     with _writer_transaction() as conn:
         cursor = conn.cursor()
         cursor.execute("INSERT OR REPLACE INTO ignored_probe_targets (url, reason) VALUES (?, ?)", (url, reason))
-        # Immediately remove from active probe targets
-        cursor.execute("DELETE FROM probe_targets WHERE url = ?", (url,))
+        # Immediately remove matching active probe targets and this node's results for them
+        cursor.execute("SELECT url FROM probe_targets")
+        matched = [row[0] for row in cursor.fetchall() if target_matches_ignore(row[0], [url])]
         local_node = get_local_node_name()
-        cursor.execute("DELETE FROM peer_measurements WHERE url = ? AND node_name = ?", (url, local_node))
-        return True
+        cursor.execute("SELECT DISTINCT url FROM peer_measurements WHERE node_name = ?", (local_node,))
+        measured = [row[0] for row in cursor.fetchall() if target_matches_ignore(row[0], [url])]
+        for target in matched:
+            cursor.execute("DELETE FROM probe_targets WHERE url = ?", (target,))
+        for target in measured:
+            cursor.execute("DELETE FROM peer_measurements WHERE url = ? AND node_name = ?", (target, local_node))
+        return len(matched)
 
 def remove_ignored_probe_target(url: str) -> bool:
     with _writer_transaction() as conn:
@@ -1617,9 +1672,8 @@ def is_probe_target_ignored(url: str) -> bool:
     conn = _connect()
     try:
         cursor = conn.cursor()
-        cursor.execute("SELECT 1 FROM ignored_probe_targets WHERE url = ?", (url,))
-        row = cursor.fetchone()
-        return row is not None
+        cursor.execute("SELECT url FROM ignored_probe_targets")
+        return target_matches_ignore(url, [row[0] for row in cursor.fetchall()])
     finally:
         conn.close()
 

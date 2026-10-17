@@ -57,7 +57,7 @@ import transports_view
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "2.16.0"
+VERSION = "2.17.0"
 # No "bot" in the name: some services (e.g. Hiddify subscription links) reply 400 to any User-Agent containing "bot".
 USER_AGENT = f"Delta Chat Uptime Monitor/{VERSION} (+https://git.gluek.info/gluek/deltachat_uptime)"
 
@@ -163,6 +163,10 @@ _vote_cache = {}          # cross-check key -> (monotonic time, local_up, peer r
 _alert_streaks = {}       # resource id -> (candidate alert state, consecutive votes for it)
 _degraded_notify_queue = {}  # chat id -> list of ("start" | "end", resource, votes, started_at)
 _degraded_flush_task = None
+# A peer reporting a target DOWN in its telemetry while this node sees it UP: the target's next
+# regular check asks all peers and votes (the case "this node reaches it, most others don't").
+PEER_SUSPECT_MAX_AGE = 300  # seconds a report stays valid, and how old the peer's result may be
+_peer_suspects = {}  # url -> (monotonic time, reporting node)
 
 # Protocol message deduplication cache (bounded set of recent msg_ids)
 _processed_msg_ids = set()
@@ -1853,6 +1857,55 @@ def _votes_summary(votes: list[dict]) -> str:
     return text
 
 
+def note_peer_reported_down(peer_node: str, metrics: list[dict]) -> int:
+    """Marks targets a peer reports DOWN that are UP here, in a quorum chat. Returns how many."""
+    now = int(time.time())
+    down_urls = set()
+    for m in metrics or []:
+        if not isinstance(m, dict) or m.get("status") != "down":
+            continue
+        checked = m.get("last_checked")
+        if isinstance(checked, (int, float)) and not isinstance(checked, bool) and now - checked > PEER_SUSPECT_MAX_AGE:
+            continue  # an old result (e.g. late in a >200 target rotation) is not evidence
+        down_urls.add(str(m.get("url") or ""))
+    if not down_urls:
+        return 0
+    marked = set()
+    modes = {}
+    for r in database.get_resources_by_urls(down_urls):
+        if r["url"] in marked or r.get("status") != "up" or r.get("alert_state") not in (None, "up"):
+            continue  # DOWN/DEGRADED targets are re-voted by their regular checks anyway
+        if now < (r.get("maintenance_until") or 0):
+            continue
+        chat = r["dc_chat_id"]
+        if chat not in modes:
+            modes[chat] = database.get_chat_alert_mode(chat)
+        if modes[chat] != "quorum":
+            continue
+        _peer_suspects[r["url"]] = (time.monotonic(), peer_node)
+        marked.add(r["url"])
+    if marked:
+        logger.info(f"Peer {peer_node} reports DOWN for {len(marked)} target(s) that are UP here; voting on their next check")
+    return len(marked)
+
+
+def _take_peer_suspect(rep: dict) -> str | None:
+    """The node that reported this target DOWN, if its report is current and peers were not asked
+    about it within QUORUM_REVOTE_INTERVAL (then the report waits for a later check)."""
+    entry = _peer_suspects.get(rep["url"])
+    if not entry:
+        return None
+    now = time.monotonic()
+    if now - entry[0] > PEER_SUSPECT_MAX_AGE:
+        _peer_suspects.pop(rep["url"], None)
+        return None
+    cached = _vote_cache.get(_cross_check_key(rep))
+    if cached and now - cached[0] < QUORUM_REVOTE_INTERVAL - 10:
+        return None
+    _peer_suspects.pop(rep["url"], None)
+    return entry[1]
+
+
 async def _quorum_resource_ids(group: list[dict]) -> set:
     """Monitors of this target decided by quorum: chat mode quorum, live peers exist and the monitor
     may be sent to peers (/peershare) - otherwise there is nobody to vote, and this node decides."""
@@ -2027,7 +2080,9 @@ async def check_group_task(group, semaphore, session=None):
             return
 
     local_node = database.get_local_node_name()
-    quorum_ids = await _quorum_resource_ids(group) if (not is_up or any(_in_alert(r) for r in group)) else set()
+    in_alert = any(_in_alert(r) for r in group)
+    reported_by = _take_peer_suspect(rep) if is_up and not in_alert else None
+    quorum_ids = await _quorum_resource_ids(group) if (not is_up or in_alert or reported_by) else set()
     quorum_group = [r for r in group if r["id"] in quorum_ids]
 
     # Peers are asked when this node newly sees the target failing (fresh answers), and, for quorum
@@ -2045,6 +2100,9 @@ async def check_group_task(group, semaphore, session=None):
             long_running = oldest_change and time.time() - oldest_change > 3600
             peer_results = await collect_peer_votes(
                 rep, is_up, revote_interval=QUORUM_REVOTE_INTERVAL_LONG if long_running else QUORUM_REVOTE_INTERVAL)
+        elif reported_by and quorum_group:
+            logger.info(f"{rep.get('name') or rep['url']}: UP here but {reported_by} reports it DOWN; asking all peers")
+            peer_results = await collect_peer_votes(rep, is_up, fresh=True)
     except Exception as ex:
         logger.warning(f"Error during peer cross-check: {ex}")
 
@@ -2071,7 +2129,8 @@ async def check_group_task(group, semaphore, session=None):
             r_up = state != "down"
             r_err = None if is_up and state == "up" else _votes_summary(votes)
             if not is_up and error_msg:
-                r_err = f"{error_msg} ({r_err})" if r_err else error_msg
+                # " — " rather than parentheses: the log line wraps this in its own "(...)"
+                r_err = f"{error_msg} — {r_err}" if r_err else error_msg
             outcomes[r["id"]] = (r_up, r_err)
             continue
         if r.get("alert_state") == "degraded":
@@ -2735,14 +2794,30 @@ async def monitoring_scheduler_loop():
             await asyncio.sleep(5)
 
 # Web Server handling and dashboard HTML templates
-def get_dashboard_html(chat_name, resources, overall_uptime, incidents=None, uptimes_map=None) -> str:
+def _votes_html(r: dict) -> str:
+    """The last vote of a DOWN/DEGRADED monitor as one small line on the status page."""
+    votes = _votes_from_json(r.get("last_votes"))
+    if len(votes) < 2:
+        return ""
+    return (f'<div style="margin-top: 0.35rem; font-size: 0.75rem; color: var(--text-muted);">'
+            f'🛰️ Last vote: {html.escape(format_votes(votes))}</div>')
+
+
+def get_dashboard_html(chat_name, resources, overall_uptime, incidents=None, uptimes_map=None, partial_outages=None) -> str:
     total_monitors = len(resources)
     up_monitors = sum(1 for r in resources if r["status"] == "up")
     down_monitors = sum(1 for r in resources if r["status"] == "down")
+    degraded_monitors = sum(1 for r in resources if r["status"] == "up" and r.get("alert_state") == "degraded")
     
-    status_badge_class = "all-up" if down_monitors == 0 else "some-down"
-    status_text = "All Systems Operational" if down_monitors == 0 else f"{down_monitors} Service(s) Offline"
-    status_indicator = "up" if down_monitors == 0 else "down"
+    if down_monitors:
+        status_badge_class, status_indicator = "some-down", "down"
+        status_text = f"{down_monitors} Service(s) Offline"
+    elif degraded_monitors:
+        status_badge_class, status_indicator = "some-degraded", "degraded"
+        status_text = f"{degraded_monitors} Service(s) Unreachable From Some Regions"
+    else:
+        status_badge_class, status_indicator = "all-up", "up"
+        status_text = "All Systems Operational"
     
     monitors_html = ""
     if total_monitors == 0:
@@ -2765,6 +2840,10 @@ def get_dashboard_html(chat_name, resources, overall_uptime, incidents=None, upt
             if is_maintenance:
                 indicator_class = "unknown"
                 status_lbl = "PAUSED"
+                status_color = "var(--color-warn)"
+            elif r["status"] == "up" and r.get("alert_state") == "degraded":
+                indicator_class = "degraded"
+                status_lbl = "DEGRADED"
                 status_color = "var(--color-warn)"
             elif r["status"] == "up":
                 indicator_class = "up"
@@ -2859,7 +2938,7 @@ def get_dashboard_html(chat_name, resources, overall_uptime, incidents=None, upt
                         <span class="monitor-name">{html.escape(r["name"] or r["url"])}</span>
                         <span class="monitor-url">{html.escape(r["url"])}</span>
                         <div style="display: flex; gap: 0.35rem; flex-wrap: wrap; margin-top: 0.25rem;">{badges_html}</div>
-                        {probe_badges_html}
+                        {probe_badges_html}{_votes_html(r) if status_lbl in ("DEGRADED", "DOWN") else ""}
                     </div>
                 </div>
                 <div class="monitor-stats">
@@ -2954,7 +3033,39 @@ def get_dashboard_html(chat_name, resources, overall_uptime, incidents=None, upt
             {inc_items}
         </div>
         """
-            
+
+    partial_html = ""
+    if partial_outages:
+        items = ""
+        for po in partial_outages:
+            start_str = datetime.datetime.fromtimestamp(po["started_at"], tz=datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+            nodes = ", ".join(_votes_from_json(po.get("nodes_down")) if po.get("nodes_down") else []) or "some nodes"
+            if po.get("ended_at"):
+                end_str = datetime.datetime.fromtimestamp(po["ended_at"], tz=datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+                when = f"{start_str} → {end_str} UTC ({format_duration(max(1, po['ended_at'] - po['started_at']))})"
+                indicator, title_style = "up", ""
+            else:
+                when = f"Since {start_str} UTC (for {format_duration(max(1, int(time.time()) - po['started_at']))})"
+                indicator, title_style = "degraded", ' style="color: var(--color-warn);"'
+            items += f"""
+                <div class="monitor-card" style="border-left: 4px solid var(--color-warn);">
+                    <div class="monitor-info" style="display: flex; align-items: flex-start;">
+                        <span class="indicator {indicator}" style="margin-top: 4px;"></span>
+                        <div class="monitor-meta" style="flex: 1;">
+                            <span class="monitor-name"{title_style}>{html.escape(po.get("name") or po.get("url") or "")}</span>
+                            <span class="monitor-url">{when} — unreachable from {html.escape(nodes)}</span>
+                        </div>
+                    </div>
+                </div>
+                """
+        partial_html = f"""
+        <h3 class="monitors-title" style="margin-top: 2rem;">🟠 Partial Outages <span style="font-size: 0.8rem; color: var(--text-muted); font-weight: 400;">(unreachable from some nodes, not counted as downtime)</span></h3>
+        <div class="monitors-grid">
+            {items}
+        </div>
+        """
+    incidents_html += partial_html
+
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -3094,6 +3205,17 @@ def get_dashboard_html(chat_name, resources, overall_uptime, incidents=None, upt
         .indicator.down {{
             background-color: var(--color-down);
             box-shadow: 0 0 8px var(--color-down);
+        }}
+        
+        .indicator.degraded {{
+            background-color: var(--color-warn);
+            box-shadow: 0 0 8px var(--color-warn);
+        }}
+        
+        .status-badge.some-degraded {{
+            background: rgba(245, 158, 11, 0.1);
+            color: var(--color-warn);
+            border: 1px solid rgba(245, 158, 11, 0.2);
         }}
         
         .indicator.unknown {{
@@ -3325,7 +3447,9 @@ async def handle_status_page(request):
         uptimes = [uptimes_map.get(rid, 100.0) for rid in r_ids]
         overall_uptime = sum(uptimes) / len(uptimes)
         
-    html_content = get_dashboard_html(chat_name, resources, overall_uptime, incidents, uptimes_map=uptimes_map)
+    partial_outages = await run_db(database.get_chat_partial_outages, chat_id, 10)
+    html_content = get_dashboard_html(chat_name, resources, overall_uptime, incidents, uptimes_map=uptimes_map,
+                                      partial_outages=partial_outages)
     return web.Response(text=html_content, content_type="text/html")
 
 async def handle_index(request):
@@ -4848,6 +4972,18 @@ def status_command(bot, accid, event):
         
     _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=reply))
 
+def _format_partial_outage_line(po: dict, with_name: bool = False) -> str:
+    start_str = datetime.datetime.fromtimestamp(po["started_at"], tz=datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+    nodes = ", ".join(_votes_from_json(po.get("nodes_down"))) or "some nodes"
+    name = f"`ID: {po['resource_id']}` **{po.get('name') or po.get('url')}** — " if with_name else ""
+    if po.get("ended_at"):
+        end_str = datetime.datetime.fromtimestamp(po["ended_at"], tz=datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+        dur = format_duration(max(1, po["ended_at"] - po["started_at"]))
+        return f"• {name}`{start_str}` → `{end_str} UTC` (`{dur}`) — unreachable from {nodes}"
+    dur = format_duration(max(1, int(time.time()) - po["started_at"]))
+    return f"• 🟠 {name}`{start_str} UTC` → `Ongoing` (`{dur}`) — unreachable from {nodes}"
+
+
 @dc_cli.on(events.NewMessage(command="/events"))
 @dc_cli.on(events.NewMessage(command="/incidents"))
 def events_command(bot, accid, event):
@@ -4855,14 +4991,16 @@ def events_command(bot, accid, event):
     chat_id = msg.chat_id
     
     recent_incs = database.get_recent_incidents(chat_id, limit=10)
+    partials = database.get_chat_partial_outages(chat_id, limit=10)
     
-    if not recent_incs:
+    if not recent_incs and not partials:
         _dc_send_msg_with_stats(bot, accid, chat_id, MsgData(
             text="✨ **No incidents recorded in this chat!**\nAll monitored resources have been running smoothly."
         ))
         return
         
-    lines = [f"📋 **Incident Log for this Chat ({len(recent_incs)} most recent):**\n"]
+    lines = [f"📋 **Incident Log for this Chat ({len(recent_incs)} most recent):**\n" if recent_incs
+             else "📋 **No incidents recorded in this chat.**\n"]
     
     for inc in recent_incs:
         inc_id = inc["id"]
@@ -4886,6 +5024,10 @@ def events_command(bot, accid, event):
                 f"• ✅ **Incident #{inc_id}** — `Resolved`\n"
                 f"  Duration: `{duration_str}` (`{start_str}` → `{resolved_str} UTC`)"
             )
+
+    if partials:
+        lines.append(f"\n🟠 **Partial Outages ({len(partials)} most recent, not downtime):**")
+        lines += [_format_partial_outage_line(po, with_name=True) for po in partials]
             
     _dc_send_msg_with_stats(bot, accid, chat_id, MsgData(text="\n".join(lines)))
 
@@ -4958,6 +5100,11 @@ def history_command(bot, accid, event):
             else:
                 duration_str = format_duration(max(1, int(time.time()) - went_down))
                 lines.append(f"• 🔴 `{down_str} UTC` → `Ongoing` (`{duration_str}`) — `{error_reason}`")
+
+    partials = database.get_partial_outages(res_id, limit=5)
+    if partials:
+        lines.append(f"\n**Partial Outages ({len(partials)} most recent, not downtime):**")
+        lines += [_format_partial_outage_line(po) for po in partials]
                 
     _dc_send_msg_with_stats(bot, accid, chat_id, MsgData(text="\n".join(lines)))
 
@@ -6005,6 +6152,7 @@ def on_new_message(bot, accid, event):
                     database.save_peer_measurements_batch(peer_node, safe_metrics)
                     database.save_probe_targets_batch(safe_metrics, peer["email"])
                     _scheduler_cache["probe_targets"] = None
+                    note_peer_reported_down(peer_node, safe_metrics)
         except Exception as e:
             logger.error(f"Error handling peer metrics: {e}")
         return

@@ -1699,3 +1699,35 @@ def get_partial_outages(resource_id: int, limit: int = 20) -> list[dict]:
         return [dict(r) for r in rows]
     finally:
         conn.close()
+
+def get_chat_partial_outages(dc_chat_id: int, limit: int = 10) -> list[dict]:
+    """Recent partial outages of a chat's monitors, newest first, with the monitor's name and URL."""
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute('''
+            SELECT po.*, r.name, r.url FROM partial_outages po
+            JOIN resources r ON r.id = po.resource_id
+            WHERE r.dc_chat_id = ?
+            ORDER BY po.started_at DESC LIMIT ?
+        ''', (dc_chat_id, limit)).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+def get_resources_by_urls(urls) -> list[dict]:
+    urls = [u for u in set(urls or []) if u]
+    if not urls:
+        return []
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = []
+        for i in range(0, len(urls), 500):  # stay below SQLite's variable limit
+            chunk = urls[i:i + 500]
+            rows += conn.execute(
+                f"SELECT * FROM resources WHERE url IN ({','.join('?' * len(chunk))})", chunk
+            ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()

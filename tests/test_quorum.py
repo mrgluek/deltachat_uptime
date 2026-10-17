@@ -410,5 +410,195 @@ class TestQuorumTexts(unittest.TestCase):
         self.assertEqual(asked, ["it@example.org"])
 
 
+class TestPeerReportedDown(unittest.TestCase):
+    """Stage 2: this node reaches a target, peers report it DOWN in their telemetry."""
+
+    def setUp(self):
+        self.orig_db = database.DB_PATH
+        database.close_db()
+        database.DB_PATH = TEST_DB
+        database.init_db()
+        bot._alert_streaks.clear()
+        bot._vote_cache.clear()
+        bot._peer_suspects.clear()
+        bot._admin_chat_membership_cache.clear()
+        self.orig_dc_bot, self.orig_accid = bot.dc_bot_instance, bot.dc_accid
+        bot.dc_bot_instance, bot.dc_accid = None, None
+        database.set_local_node_name("DE")
+        database.set_config("admin_chat_id", str(CHAT))
+        for i, node in enumerate(["IT", "RU", "RU2"]):
+            database.add_or_update_peer(f"{node.lower()}@example.org", node, 200 + i)
+        self.rid = database.add_resource(CHAT, URL, "Target", "http")
+        self._set(status="up")
+
+    def tearDown(self):
+        bot.dc_bot_instance, bot.dc_accid = self.orig_dc_bot, self.orig_accid
+        bot._peer_suspects.clear()
+        database.close_db()
+        database.DB_PATH = self.orig_db
+        for suffix in ["", "-wal", "-shm"]:
+            if os.path.exists(TEST_DB + suffix):
+                os.remove(TEST_DB + suffix)
+
+    def _set(self, **fields):
+        conn = sqlite3.connect(TEST_DB)
+        for k, v in fields.items():
+            conn.execute(f"UPDATE resources SET {k} = ? WHERE id = ?", (v, self.rid))
+        conn.commit()
+        conn.close()
+
+    def _report(self, node="RU", url=URL, age=10):
+        import time
+        return bot.note_peer_reported_down(node, [{"url": url, "status": "down", "last_checked": int(time.time()) - age}])
+
+    def _run(self, peers):
+        group = database.get_resources(CHAT)
+        notices = MagicMock()
+        cross = AsyncMock(return_value=peers)
+        with patch("bot.asyncio.sleep", AsyncMock()), \
+             patch("bot.run_single_check", AsyncMock(return_value=(True, None, 40))), \
+             patch("bot.check_host_internet_connectivity", AsyncMock(return_value=True)), \
+             patch("bot.request_peer_cross_checks_batched", cross), \
+             patch("bot._queue_degraded_notice", notices), \
+             patch("bot.handle_check_result", AsyncMock()) as handle:
+            asyncio.run(bot.check_group_task(group, asyncio.Semaphore(1)))
+        return handle, notices, cross
+
+    def test_report_marks_up_quorum_monitor(self):
+        self.assertEqual(self._report(), 1)
+        self.assertIn(URL, bot._peer_suspects)
+
+    def test_report_ignored_when_not_applicable(self):
+        cases = [
+            ("old result", {}, {"age": 3600}),
+            ("unknown url", {}, {"url": "http://other.example.org"}),
+            ("already down", {"status": "down"}, {}),
+            ("degraded", {"alert_state": "degraded"}, {}),
+            ("maintenance", {"maintenance_until": 4102444800}, {}),
+        ]
+        for label, fields, kwargs in cases:
+            with self.subTest(label):
+                bot._peer_suspects.clear()
+                self._set(status="up", alert_state="up", maintenance_until=0)
+                self._set(**fields)
+                self.assertEqual(self._report(**kwargs), 0)
+        bot._peer_suspects.clear()
+        self._set(status="up", alert_state="up", maintenance_until=0)
+        database.set_chat_alert_mode(CHAT, "local")
+        self.assertEqual(self._report(), 0)
+
+    def test_up_here_but_most_nodes_down_is_down(self):
+        self._report()
+        handle, notices, cross = self._run([_peer("IT", "down"), _peer("RU", "down"), _peer("RU2", "down")])
+        cross.assert_called_once()
+        self.assertFalse(handle.call_args.args[1])
+        r = database.get_resource_by_id(self.rid)
+        self.assertEqual(r["status"], "down")
+        self.assertIn("Unreachable from IT, RU, RU2; reachable from DE", handle.call_args.args[2])
+        self.assertNotIn(URL, bot._peer_suspects)
+
+    def test_up_here_minority_down_is_degraded_after_two_reports(self):
+        peers = [_peer("IT", "up", 1), _peer("RU", "down"), _peer("RU2", "down")]
+        self._report()
+        self._run(peers)
+        self.assertEqual(database.get_resource_by_id(self.rid)["alert_state"], "up")
+
+        bot._vote_cache.clear()  # next telemetry round, two minutes later
+        self._report()
+        _, notices, _ = self._run(peers)
+        r = database.get_resource_by_id(self.rid)
+        self.assertEqual(r["alert_state"], "degraded")
+        self.assertEqual(r["status"], "up")
+        self.assertEqual(notices.call_args.args[0], "start")
+
+    def test_report_without_fresh_cross_check_waits(self):
+        self._report()
+        self._run([_peer("IT", "up", 1), _peer("RU", "down"), _peer("RU2", "up", 1)])
+        self._report()  # a second peer reports right away: peers were just asked
+        _, _, cross = self._run([])
+        cross.assert_not_called()
+        self.assertIn(URL, bot._peer_suspects)  # kept for a later check
+
+    def test_no_report_no_vote(self):
+        _, _, cross = self._run([])
+        cross.assert_not_called()
+
+    def test_telemetry_message_marks_target(self):
+        mock_bot = MagicMock()
+        contact = MagicMock()
+        contact.address = "ru@example.org"
+        mock_bot.rpc.get_contact.return_value = contact
+        mock_bot.rpc.get_basic_chat_info.return_value = {"chat_type": "Single"}
+        event = MagicMock()
+        event.msg.is_info = False
+        event.msg.from_id = 42
+        event.msg.chat_id = 201
+        event.msg.show_padlock = True
+        import time
+        event.msg.text = "[UPTIME_PEER_METRICS]\n" + json.dumps({"metrics": [
+            {"url": URL, "type": "http", "status": "down", "last_checked": int(time.time())}]}) + "\n[/UPTIME_PEER_METRICS]"
+        with patch("bot.is_safe_target_url", return_value=True):
+            bot.on_new_message(mock_bot, 1, event)
+        self.assertEqual(bot._peer_suspects[URL][1], "RU")
+
+
+class TestPartialOutageDisplay(unittest.TestCase):
+
+    def setUp(self):
+        self.orig_db = database.DB_PATH
+        database.close_db()
+        database.DB_PATH = TEST_DB
+        database.init_db()
+        self.rid = database.add_resource(CHAT, URL, "Target", "http")
+        conn = sqlite3.connect(TEST_DB)
+        votes = json.dumps(bot.build_votes("DE", True, 40, None, [_peer("RU", "down"), _peer("IT", "up", 9)]))
+        conn.execute("UPDATE resources SET status = 'up', alert_state = 'degraded', last_votes = ? WHERE id = ?",
+                     (votes, self.rid))
+        conn.commit()
+        conn.close()
+        database.start_partial_outage(self.rid, 1700000000, json.dumps(["RU"]))
+        database.end_partial_outage(self.rid, 1700000600)
+        database.start_partial_outage(self.rid, 1700001000, json.dumps(["RU", "RU2"]))
+
+    def tearDown(self):
+        database.close_db()
+        database.DB_PATH = self.orig_db
+        for suffix in ["", "-wal", "-shm"]:
+            if os.path.exists(TEST_DB + suffix):
+                os.remove(TEST_DB + suffix)
+
+    def test_status_page(self):
+        html_out = bot.get_dashboard_html("Chat", database.get_resources(CHAT), 100.0, [],
+                                          partial_outages=database.get_chat_partial_outages(CHAT))
+        self.assertIn("1 Service(s) Unreachable From Some Regions", html_out)
+        self.assertIn('class="indicator degraded"', html_out)
+        self.assertIn("DEGRADED", html_out)
+        self.assertIn("Last vote: 🔴 RU · 🟢 DE (40ms), IT (9ms)", html_out)
+        self.assertIn("🟠 Partial Outages", html_out)
+        self.assertIn("unreachable from RU, RU2", html_out)
+        self.assertIn("(10m", html_out)  # the ended one lasted 10 minutes
+
+    def test_events_without_incidents_lists_partial_outages(self):
+        mock_bot = MagicMock()
+        event = MagicMock()
+        event.msg.chat_id = CHAT
+        bot.events_command(mock_bot, 1, event)
+        text = mock_bot.rpc.send_msg.call_args.args[2].text
+        self.assertIn("No incidents recorded", text)
+        self.assertIn("🟠 **Partial Outages (2", text)
+        self.assertIn("`Ongoing`", text)
+        self.assertIn("**Target**", text)
+
+    def test_history_lists_partial_outages(self):
+        mock_bot = MagicMock()
+        event = MagicMock()
+        event.msg.chat_id = CHAT
+        event.payload = str(self.rid)
+        bot.history_command(mock_bot, 1, event)
+        text = mock_bot.rpc.send_msg.call_args.args[2].text
+        self.assertIn("Partial Outages (2 most recent, not downtime)", text)
+        self.assertIn("unreachable from RU", text)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -493,81 +493,96 @@ def batch_update_resource_status(updates: list[dict]):
     """
     if not updates:
         return
+    with _writer_transaction() as conn:
+        _apply_status_updates(conn.cursor(), updates, int(time.time()))
 
+
+def record_check_results(updates: list[dict], measurement: tuple | None = None):
+    """Everything one check writes, in one transaction: the status of each monitor of the target
+    (as batch_update_resource_status) and, if given, the local peer measurement
+    (url, node_name, status, latency_ms, error_msg) - one commit per check instead of 2+."""
     now = int(time.time())
     with _writer_transaction() as conn:
         cursor = conn.cursor()
-        for item in updates:
-            resource_id = item["id"]
-            status = item["status"]
-            consecutive_failures = item.get("consecutive_failures", 0)
-            error_msg = item.get("error_msg")
-            latency_ms = item.get("latency_ms")
+        if updates:
+            _apply_status_updates(cursor, updates, now)
+        if measurement:
+            _upsert_peer_measurement(cursor, *measurement, now)
 
-            cursor.execute("SELECT status, last_changed FROM resources WHERE id = ?", (resource_id,))
-            row = cursor.fetchone()
-            if not row:
-                continue
 
-            old_status = row[0]
-            if old_status != status:
-                invalidate_uptime_cache(resource_id)
+def _apply_status_updates(cursor, updates: list[dict], now: int):
+    """batch_update_resource_status inside an open transaction."""
+    for item in updates:
+        resource_id = item["id"]
+        status = item["status"]
+        consecutive_failures = item.get("consecutive_failures", 0)
+        error_msg = item.get("error_msg")
+        latency_ms = item.get("latency_ms")
+
+        cursor.execute("SELECT status, last_changed FROM resources WHERE id = ?", (resource_id,))
+        row = cursor.fetchone()
+        if not row:
+            continue
+
+        old_status = row[0]
+        if old_status != status:
+            invalidate_uptime_cache(resource_id)
+            cursor.execute('''
+                UPDATE resources 
+                SET status = ?, last_checked = ?, last_changed = ?, consecutive_failures = ?,
+                    last_latency_ms = COALESCE(?, last_latency_ms)
+                WHERE id = ?
+            ''', (status, now, now, consecutive_failures, latency_ms, resource_id))
+
+            if status == "down":
+                cursor.execute("SELECT dc_chat_id FROM resources WHERE id = ?", (resource_id,))
+                chat_row = cursor.fetchone()
+                inc_id = None
+                if chat_row:
+                    chat_id = chat_row[0]
+                    cursor.execute('''
+                        SELECT i.id, i.status,
+                               MAX(COALESCE(de.went_down_at, i.started_at)) as last_down_at,
+                               COALESCE(i.resolved_at, MAX(COALESCE(de.went_up_at, de.went_down_at, i.started_at))) as last_event_at
+                        FROM incidents i
+                        LEFT JOIN downtime_events de ON de.incident_id = i.id
+                        WHERE i.dc_chat_id = ?
+                        GROUP BY i.id
+                        HAVING (? - last_event_at) <= 3600 AND (? >= last_event_at)
+                        ORDER BY (CASE WHEN i.status = 'ongoing' THEN 0 ELSE 1 END), i.id DESC LIMIT 1
+                    ''', (chat_id, now, now))
+                    inc_row = cursor.fetchone()
+                    if inc_row:
+                        inc_id = inc_row[0]
+                        inc_status = inc_row[1]
+                        if inc_status == 'resolved':
+                            cursor.execute("UPDATE incidents SET status = 'ongoing', resolved_at = NULL, summary = NULL WHERE id = ?", (inc_id,))
+                    else:
+                        cursor.execute("INSERT INTO incidents (dc_chat_id, status, started_at) VALUES (?, 'ongoing', ?)", (chat_id, now))
+                        inc_id = cursor.lastrowid
+
+                cursor.execute('''
+                    INSERT INTO downtime_events (resource_id, went_down_at, went_up_at, error_msg, incident_id)
+                    VALUES (?, ?, NULL, ?, ?)
+                ''', (resource_id, now, error_msg, inc_id))
+            elif status == "up" and old_status == "down":
+                cursor.execute('''
+                    UPDATE downtime_events 
+                    SET went_up_at = ? 
+                    WHERE resource_id = ? AND went_up_at IS NULL
+                ''', (now, resource_id))
                 cursor.execute('''
                     UPDATE resources 
-                    SET status = ?, last_checked = ?, last_changed = ?, consecutive_failures = ?,
-                        last_latency_ms = COALESCE(?, last_latency_ms)
+                    SET stale_warning_level = 0 
                     WHERE id = ?
-                ''', (status, now, now, consecutive_failures, latency_ms, resource_id))
-
-                if status == "down":
-                    cursor.execute("SELECT dc_chat_id FROM resources WHERE id = ?", (resource_id,))
-                    chat_row = cursor.fetchone()
-                    inc_id = None
-                    if chat_row:
-                        chat_id = chat_row[0]
-                        cursor.execute('''
-                            SELECT i.id, i.status,
-                                   MAX(COALESCE(de.went_down_at, i.started_at)) as last_down_at,
-                                   COALESCE(i.resolved_at, MAX(COALESCE(de.went_up_at, de.went_down_at, i.started_at))) as last_event_at
-                            FROM incidents i
-                            LEFT JOIN downtime_events de ON de.incident_id = i.id
-                            WHERE i.dc_chat_id = ?
-                            GROUP BY i.id
-                            HAVING (? - last_event_at) <= 3600 AND (? >= last_event_at)
-                            ORDER BY (CASE WHEN i.status = 'ongoing' THEN 0 ELSE 1 END), i.id DESC LIMIT 1
-                        ''', (chat_id, now, now))
-                        inc_row = cursor.fetchone()
-                        if inc_row:
-                            inc_id = inc_row[0]
-                            inc_status = inc_row[1]
-                            if inc_status == 'resolved':
-                                cursor.execute("UPDATE incidents SET status = 'ongoing', resolved_at = NULL, summary = NULL WHERE id = ?", (inc_id,))
-                        else:
-                            cursor.execute("INSERT INTO incidents (dc_chat_id, status, started_at) VALUES (?, 'ongoing', ?)", (chat_id, now))
-                            inc_id = cursor.lastrowid
-
-                    cursor.execute('''
-                        INSERT INTO downtime_events (resource_id, went_down_at, went_up_at, error_msg, incident_id)
-                        VALUES (?, ?, NULL, ?, ?)
-                    ''', (resource_id, now, error_msg, inc_id))
-                elif status == "up" and old_status == "down":
-                    cursor.execute('''
-                        UPDATE downtime_events 
-                        SET went_up_at = ? 
-                        WHERE resource_id = ? AND went_up_at IS NULL
-                    ''', (now, resource_id))
-                    cursor.execute('''
-                        UPDATE resources 
-                        SET stale_warning_level = 0 
-                        WHERE id = ?
-                    ''', (resource_id,))
-            else:
-                cursor.execute('''
-                    UPDATE resources 
-                    SET last_checked = ?, consecutive_failures = ?,
-                        last_latency_ms = COALESCE(?, last_latency_ms)
-                    WHERE id = ?
-                ''', (now, consecutive_failures, latency_ms, resource_id))
+                ''', (resource_id,))
+        else:
+            cursor.execute('''
+                UPDATE resources 
+                SET last_checked = ?, consecutive_failures = ?,
+                    last_latency_ms = COALESCE(?, last_latency_ms)
+                WHERE id = ?
+            ''', (now, consecutive_failures, latency_ms, resource_id))
 
 
 def update_resource_status(resource_id: int, status: str, consecutive_failures: int, error_msg: str = None, latency_ms: int = None):
@@ -1392,16 +1407,19 @@ def set_peer_share_scope(scope: str):
 def save_peer_measurement(url: str, node_name: str, status: str, latency_ms: int | None = None, error_msg: str = None, last_checked: int = None):
     now = last_checked if last_checked is not None else int(time.time())
     with _writer_transaction() as conn:
-        cursor = conn.cursor()
-        cursor.execute('''
-            INSERT INTO peer_measurements (url, node_name, status, latency_ms, error_msg, last_checked)
-            VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(url, node_name) DO UPDATE SET
-                status = excluded.status,
-                latency_ms = excluded.latency_ms,
-                error_msg = excluded.error_msg,
-                last_checked = excluded.last_checked
-        ''', (url, node_name, status, latency_ms, error_msg, now))
+        _upsert_peer_measurement(conn.cursor(), url, node_name, status, latency_ms, error_msg, now)
+
+
+def _upsert_peer_measurement(cursor, url, node_name, status, latency_ms, error_msg, now):
+    cursor.execute('''
+        INSERT INTO peer_measurements (url, node_name, status, latency_ms, error_msg, last_checked)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(url, node_name) DO UPDATE SET
+            status = excluded.status,
+            latency_ms = excluded.latency_ms,
+            error_msg = excluded.error_msg,
+            last_checked = excluded.last_checked
+    ''', (url, node_name, status, latency_ms, error_msg, now))
 
 def save_peer_measurements_batch(node_name: str, metrics_list: list[dict]):
     if not metrics_list:

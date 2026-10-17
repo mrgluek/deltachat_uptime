@@ -57,7 +57,7 @@ import transports_view
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "2.14.0"
+VERSION = "2.15.0"
 # No "bot" in the name: some services (e.g. Hiddify subscription links) reply 400 to any User-Agent containing "bot".
 USER_AGENT = f"Delta Chat Uptime Monitor/{VERSION} (+https://git.gluek.info/gluek/deltachat_uptime)"
 
@@ -135,6 +135,22 @@ async_event_loop = None
 pending_peer_checks = {} # req_id -> (Future, expected_count, list_of_responses, expected_chat_ids)
 last_peer_telemetry_broadcast = 0.0
 _telemetry_rotation_offsets = {}  # peer email -> rotation offset
+_telemetry_last_sent = {}  # peer email -> {url: status last sent}, so changes go out first
+
+# Batched cross-checks: failing monitors found within CROSS_CHECK_BATCH_WINDOW go to each peer in
+# one message (and come back in one), instead of a message per target and peer. In a mass outage
+# (300 targets) that was 600 mails per peer a minute, far over the relays' 60/min send limit.
+PEER_CAP_BATCH_CHECK = "batch_check"
+OWN_PEER_CAPS = [PEER_CAP_BATCH_CHECK]
+CROSS_CHECK_BATCH_WINDOW = 5.0    # seconds to collect failing targets before sending
+CROSS_CHECK_BATCH_MAX = 100       # targets per batch message
+CROSS_CHECK_BATCH_TIMEOUT = 25.0  # a peer checks up to 100 targets (10 s timeouts) and mails back
+PEER_BATCH_CHECK_CONCURRENCY = 20
+_peer_caps = {}  # peer email (lower) -> set of capabilities it announced (in memory, re-sent every 2 min)
+_cross_check_queue = []  # (target_dict, future) waiting for the next batch
+_cross_check_flush_task = None
+pending_batch_checks = {}  # req_id -> (Future, chat_id, number of targets)
+_peer_batch_semaphore = None
 
 # Protocol message deduplication cache (bounded set of recent msg_ids)
 _processed_msg_ids = set()
@@ -265,9 +281,11 @@ async def _resolve_peer_chat_id(p: dict):
             return None
     return chat_id
 
-async def request_peer_cross_checks(target_dict: dict, timeout: float = 8.0) -> list[dict]:
-    """Broadcasts a cross-check request to all configured remote peers in 1:1 DMs and waits for responses."""
-    peers = await asyncio.to_thread(database.get_all_peers)
+async def request_peer_cross_checks(target_dict: dict, timeout: float = 8.0, peers: list[dict] | None = None) -> list[dict]:
+    """Broadcasts a cross-check request for one target to the peers (default: all) in 1:1 DMs
+    and waits for responses. /ping uses it directly; monitors go through the batched variant."""
+    if peers is None:
+        peers = await asyncio.to_thread(database.get_all_peers)
     if not peers or not dc_bot_instance or dc_accid is None:
         return []
 
@@ -277,7 +295,8 @@ async def request_peer_cross_checks(target_dict: dict, timeout: float = 8.0) -> 
         "url": target_dict["url"],
         "type": target_dict.get("type", "http"),
         "expected_keyword": target_dict.get("expected_keyword"),
-        "node_name": database.get_local_node_name()
+        "node_name": database.get_local_node_name(),
+        "caps": OWN_PEER_CAPS,
     }
     if target_dict.get("family") in (4, 6):
         req_payload["family"] = target_dict["family"]  # older peers ignore it and check any family
@@ -322,6 +341,171 @@ async def request_peer_cross_checks(target_dict: dict, timeout: float = 8.0) -> 
 
     return responses
 
+def _cross_check_key(t: dict) -> tuple:
+    return (t.get("type") or "http", t.get("url"), t.get("expected_keyword") or "", t.get("family") or 0)
+
+
+def _peer_supports(peer: dict, cap: str) -> bool:
+    return cap in _peer_caps.get((peer.get("email") or "").lower(), ())
+
+
+def _note_peer_caps(email: str, caps) -> None:
+    if email and isinstance(caps, list):
+        _peer_caps[email.lower()] = {str(c)[:40] for c in caps[:20]}
+
+
+async def request_peer_cross_checks_batched(target_dict: dict) -> list[dict]:
+    """Cross-check of a failing monitor, sent together with the others failing at the same time.
+
+    Waits up to CROSS_CHECK_BATCH_WINDOW for more targets, then sends one request per peer (peers
+    that did not announce batch support get the old one-target requests). Returns the peers'
+    answers for this target, like request_peer_cross_checks."""
+    global _cross_check_flush_task
+    fut = asyncio.get_running_loop().create_future()
+    _cross_check_queue.append((target_dict, fut))
+    if len(_cross_check_queue) >= CROSS_CHECK_BATCH_MAX:
+        batch = _cross_check_queue[:]
+        _cross_check_queue.clear()
+        asyncio.create_task(_flush_cross_checks(batch))
+    elif _cross_check_flush_task is None:
+        _cross_check_flush_task = asyncio.create_task(_delayed_cross_check_flush())
+    try:
+        return await asyncio.wait_for(asyncio.shield(fut), CROSS_CHECK_BATCH_WINDOW + CROSS_CHECK_BATCH_TIMEOUT + 5)
+    except asyncio.TimeoutError:
+        return []
+
+
+async def _delayed_cross_check_flush():
+    global _cross_check_flush_task
+    try:
+        await asyncio.sleep(CROSS_CHECK_BATCH_WINDOW)
+    finally:
+        _cross_check_flush_task = None
+    batch = _cross_check_queue[:]
+    _cross_check_queue.clear()
+    await _flush_cross_checks(batch)
+
+
+async def _flush_cross_checks(batch: list) -> None:
+    """Sends one batch: identical targets once, a batch message per capable peer, old requests to the rest."""
+    if not batch:
+        return
+    by_key = {}
+    for target, fut in batch:
+        by_key.setdefault(_cross_check_key(target), (target, []))[1].append(fut)
+    results = {key: [] for key in by_key}
+    try:
+        peers = await asyncio.to_thread(database.get_all_peers) or []
+        batch_peers = [p for p in peers if _peer_supports(p, PEER_CAP_BATCH_CHECK)]
+        legacy_peers = [p for p in peers if not _peer_supports(p, PEER_CAP_BATCH_CHECK)]
+        items = [(key, target) for key, (target, _) in by_key.items()]
+        jobs = []
+        for p in batch_peers:
+            for i in range(0, len(items), CROSS_CHECK_BATCH_MAX):
+                jobs.append(_batch_cross_check_peer(p, items[i:i + CROSS_CHECK_BATCH_MAX], results))
+        if legacy_peers:
+            async def _legacy(key, target):
+                results[key].extend(await request_peer_cross_checks(target, timeout=8.0, peers=legacy_peers))
+            jobs += [_legacy(key, target) for key, target in items]
+        await asyncio.gather(*jobs, return_exceptions=True)
+    except Exception as e:
+        logger.warning(f"Batched peer cross-check failed: {e}")
+    finally:
+        for key, (_, futs) in by_key.items():
+            for f in futs:
+                if not f.done():
+                    f.set_result(list(results[key]))
+
+
+async def _batch_cross_check_peer(peer: dict, items: list, results: dict) -> None:
+    """One [UPTIME_PEER_CHECK_BATCH_REQ] to one peer; its answers are added to results[key]."""
+    chat_id = await _resolve_peer_chat_id(peer)
+    if not chat_id or not dc_bot_instance or dc_accid is None:
+        return
+    req_id = secrets.token_hex(12)
+    payload = {
+        "req_id": req_id,
+        "node_name": database.get_local_node_name(),
+        "caps": OWN_PEER_CAPS,
+        "targets": [{k: t.get(k) for k in ("url", "type", "expected_keyword", "family")} for _, t in items],
+    }
+    fut = asyncio.get_running_loop().create_future()
+    pending_batch_checks[req_id] = (fut, chat_id, len(items))
+    try:
+        msg_text = f"[UPTIME_PEER_CHECK_BATCH_REQ]\n{json.dumps(payload)}\n[/UPTIME_PEER_CHECK_BATCH_REQ]"
+        await asyncio.to_thread(_dc_send_msg_with_stats, dc_bot_instance, dc_accid, chat_id, MsgData(text=msg_text))
+        answers = await asyncio.wait_for(fut, CROSS_CHECK_BATCH_TIMEOUT)
+    except asyncio.TimeoutError:
+        logger.info(f"Batch cross-check {req_id} ({len(items)} targets) got no answer from {peer.get('email')} in time")
+        return
+    except Exception as e:
+        logger.warning(f"Batch cross-check to {peer.get('email')} failed: {e}")
+        return
+    finally:
+        pending_batch_checks.pop(req_id, None)
+    answered = []
+    for (key, target), answer in zip(items, answers):
+        answer["url"] = target.get("url")  # positions are what the peer answers; URLs are ours
+        results[key].append(answer)
+        answered.append(answer)
+    if answered:
+        await run_db(database.save_peer_measurements_batch, answered[0]["node_name"], answered)
+
+
+def _clean_peer_result(item, node_name: str, url: str) -> dict:
+    """A peer's answer for one target, with the same limits as single responses."""
+    item = item if isinstance(item, dict) else {}
+    status = item.get("status")
+    if status not in ("up", "down"):
+        status = "unknown"  # also "skip": the peer could not check it (no IPv6 there)
+    latency_ms = item.get("latency_ms")
+    if not isinstance(latency_ms, int) or isinstance(latency_ms, bool) or not 0 <= latency_ms <= 600000:
+        latency_ms = None
+    error_msg = item.get("error_msg")
+    return {"url": url, "status": status, "latency_ms": latency_ms,
+            "error_msg": str(error_msg)[:500] if error_msg else None, "node_name": node_name}
+
+
+async def _answer_batch_cross_check(bot, accid, chat_id: int, req_id: str, targets: list) -> None:
+    """Runs the checks a peer asked for (PEER_BATCH_CHECK_CONCURRENCY at a time) and answers once."""
+    global _peer_batch_semaphore
+    if _peer_batch_semaphore is None:
+        _peer_batch_semaphore = asyncio.Semaphore(PEER_BATCH_CHECK_CONCURRENCY)
+
+    async def one(t):
+        if t is None:
+            return {"status": "skip", "latency_ms": None, "error_msg": "Target refused"}
+        async with _peer_batch_semaphore:
+            is_up, error_msg, latency_ms = await run_single_check(t)
+        return {"status": "skip" if is_up is None else ("up" if is_up else "down"),
+                "latency_ms": latency_ms, "error_msg": error_msg}
+
+    answers = await asyncio.gather(*[one(t) for t in targets], return_exceptions=True)
+    answers = [a if isinstance(a, dict) else {"status": "unknown", "latency_ms": None, "error_msg": str(a)[:200]}
+               for a in answers]
+    payload = {"req_id": req_id, "node_name": database.get_local_node_name(), "caps": OWN_PEER_CAPS, "results": answers}
+    resp_msg = f"[UPTIME_PEER_CHECK_BATCH_RESP]\n{json.dumps(payload)}\n[/UPTIME_PEER_CHECK_BATCH_RESP]"
+    await asyncio.to_thread(_dc_send_msg_with_stats, bot, accid, chat_id, MsgData(text=resp_msg))
+
+
+def _parse_batch_targets(raw) -> list:
+    """Requested targets, each validated like a single request; None marks a refused one (keeps positions)."""
+    targets = []
+    for t in (raw if isinstance(raw, list) else [])[:CROSS_CHECK_BATCH_MAX]:
+        if not isinstance(t, dict):
+            targets.append(None)
+            continue
+        url, check_type = str(t.get("url") or ""), str(t.get("type") or "http")
+        if check_type not in ("http", "tcp", "ping") or not is_safe_target_url(url, check_type):
+            targets.append(None)
+            continue
+        kw = t.get("expected_keyword")
+        targets.append({"id": 0, "url": url, "type": check_type,
+                        "expected_keyword": str(kw)[:200] if kw else None,
+                        "family": t.get("family") if t.get("family") in (4, 6) else None})
+    return targets
+
+
 async def _peer_cross_check_allowed(resources: list[dict]) -> bool:
     """A failing monitor's URL is only sent to peers if at least one of its chats is within the share scope."""
     if not await asyncio.to_thread(database.get_all_peers):
@@ -329,12 +513,40 @@ async def _peer_cross_check_allowed(resources: list[dict]) -> bool:
     shareable = await asyncio.to_thread(_filter_peer_shareable_resources, dc_bot_instance, dc_accid, resources)
     return bool(shareable)
 
+def pick_telemetry_batch(email: str, all_metrics: list[dict], batch_size: int) -> list[dict]:
+    """Entries for one telemetry message: status changes since the last message first, then a
+    rotating slice of the others. Everything fits: send it all."""
+    if len(all_metrics) <= batch_size:
+        _telemetry_rotation_offsets[email] = 0
+        return all_metrics
+    sent = _telemetry_last_sent.get(email, {})
+    changed = [m for m in all_metrics if sent.get(m["url"]) != m["status"]][:batch_size]
+    changed_urls = {m["url"] for m in changed}
+    batch = list(changed)
+    # The rotation walks the full list (not the list minus changes, which differs every time),
+    # so consecutive messages continue where the last one stopped
+    total = len(all_metrics)
+    pos = _telemetry_rotation_offsets.get(email, 0) % total
+    for _ in range(total):
+        if len(batch) >= batch_size:
+            break
+        m = all_metrics[pos]
+        pos = (pos + 1) % total
+        if m["url"] not in changed_urls:
+            batch.append(m)
+    _telemetry_rotation_offsets[email] = pos
+    return batch
+
+
 async def broadcast_telemetry_to_peers():
     """Periodically sends local monitor telemetry to all configured peers via 1:1 chat.
 
     Each peer receives the local monitors allowed by the share scope plus the results for the
     probe targets it asked this node to scan. Targets mirrored from one peer are never relayed
-    to other peers. Uses a rotating per-peer offset when there are more than 200 entries."""
+    to other peers. With more than 200 entries, each message carries the entries whose status
+    changed since the last one first, and fills the rest from a rotating per-peer offset: a
+    status change reaches the peer within 2 minutes even with 1000+ monitors, while the full
+    list is refreshed in turn (200 is what receivers accept per message)."""
     if not dc_bot_instance or dc_accid is None:
         return
     peers = await asyncio.to_thread(database.get_all_peers)
@@ -392,20 +604,14 @@ async def broadcast_telemetry_to_peers():
         if not all_metrics:
             continue
 
-        total = len(all_metrics)
-        if total <= batch_size:
-            metrics_batch = all_metrics
-            _telemetry_rotation_offsets[email] = 0
-        else:
-            offset = _telemetry_rotation_offsets.get(email, 0) % total
-            metrics_batch = (all_metrics[offset:] + all_metrics[:offset])[:batch_size]
-            _telemetry_rotation_offsets[email] = (offset + batch_size) % total
+        metrics_batch = pick_telemetry_batch(email, all_metrics, batch_size)
 
         payload = {
             "node_name": node_name,
             "sender_email": self_addr,
             "timestamp": now,
             "msg_id": f"{now}_{secrets.token_hex(4)}",
+            "caps": OWN_PEER_CAPS,
             "metrics": metrics_batch
         }
         msg_text = f"[UPTIME_PEER_METRICS]\n{json.dumps(payload)}\n[/UPTIME_PEER_METRICS]"
@@ -414,6 +620,11 @@ async def broadcast_telemetry_to_peers():
         if chat_id:
             try:
                 await asyncio.to_thread(_dc_send_msg_with_stats, dc_bot_instance, dc_accid, chat_id, MsgData(text=msg_text))
+                sent = _telemetry_last_sent.setdefault(email, {})
+                sent.update({m["url"]: m["status"] for m in metrics_batch})
+                if len(sent) > 2 * len(all_metrics):  # forget removed monitors
+                    live = {m["url"] for m in all_metrics}
+                    _telemetry_last_sent[email] = {u: st for u, st in sent.items() if u in live}
             except Exception as e:
                 logger.warning(f"Failed to push telemetry to peer {p.get('email')}: {e}")
 
@@ -1397,6 +1608,10 @@ async def run_single_check(resource, session=None) -> tuple[bool, str, int | Non
                                 return True, details, elapsed_ms
                             elif resp.status == 405:
                                 head_405 = True
+                    except (asyncio.TimeoutError, aiohttp.ClientConnectorError):
+                        # Timeout, refused, DNS or certificate error: a GET would fail the same way and,
+                        # for a hung target, hold a check slot for another full timeout
+                        raise
                     except Exception as head_ex:
                         logger.debug(f"HEAD check failed for {url} ({head_ex}), falling back to GET")
 
@@ -1511,6 +1726,31 @@ async def run_single_check(resource, session=None) -> tuple[bool, str, int | Non
         return False, str(e), elapsed_ms
     return False, "Unknown error", None
 
+# Per-minute check summary (one INFO line instead of one per check; see log_check_summary)
+_check_stats = {"up": 0, "down": 0, "skipped": 0, "lat_sum": 0, "lat_n": 0, "slowest": (0, "")}
+
+
+def _count_check(is_up, latency_ms, label: str) -> None:
+    key = "skipped" if is_up is None else ("up" if is_up else "down")
+    _check_stats[key] += 1
+    if is_up and isinstance(latency_ms, int):
+        _check_stats["lat_sum"] += latency_ms
+        _check_stats["lat_n"] += 1
+        if latency_ms > _check_stats["slowest"][0]:
+            _check_stats["slowest"] = (latency_ms, label)
+
+
+def log_check_summary(running: int) -> None:
+    """Logs and resets the counters: 'Checks in the last 60s: 148 (140 up, 6 down, 2 skipped) ...'."""
+    st = _check_stats
+    total = st["up"] + st["down"] + st["skipped"]
+    avg = f"{st['lat_sum'] // st['lat_n']} ms" if st["lat_n"] else "n/a"
+    slowest = f", slowest {st['slowest'][1]} ({st['slowest'][0]} ms)" if st["slowest"][1] else ""
+    logger.info(f"Checks in the last 60s: {total} ({st['up']} up, {st['down']} down, {st['skipped']} skipped), "
+                f"avg latency {avg}{slowest}; running now: {running}")
+    st.update(up=0, down=0, skipped=0, lat_sum=0, lat_n=0, slowest=(0, ""))
+
+
 async def check_network_probe(target, semaphore, session=None):
     """Executes a network check acquiring the concurrency semaphore ONLY for the duration of the network probe."""
     async with semaphore:
@@ -1526,6 +1766,7 @@ async def check_group_task(group, semaphore, session=None):
         else:
             is_up, error_msg = res
             latency_ms = None
+        _count_check(is_up, latency_ms, rep["url"])
         if is_up is None:  # this node cannot check it (no IPv6): keep the last result
             return
         status_str = "up" if is_up else "down"
@@ -1543,7 +1784,8 @@ async def check_group_task(group, semaphore, session=None):
 
     if is_up is None:
         # IPv6-only target on a node without IPv6: not an outage, so no retries, alerts or status change
-        logger.info(f"Check skipped: {rep['name'] or rep['url']} (id: {rep['id']}) in chat {rep['dc_chat_id']} ({error_msg})")
+        _count_check(None, None, rep["url"])
+        logger.debug(f"Check skipped: {rep['name'] or rep['url']} (id: {rep['id']}) in chat {rep['dc_chat_id']} ({error_msg})")
         return
 
     # Retry logic: retry if check failed and at least one resource in the group was not already DOWN.
@@ -1575,7 +1817,7 @@ async def check_group_task(group, semaphore, session=None):
     # Peer Cross-Check: verify failing target with remote probes before marking DOWN
     if not is_up and any(r["status"] != "down" for r in group) and await _peer_cross_check_allowed(group):
         try:
-            peer_results = await request_peer_cross_checks(rep, timeout=8.0)
+            peer_results = await request_peer_cross_checks_batched(rep)
             if peer_results:
                 up_peers = [pr for pr in peer_results if pr.get("status") == "up"]
                 down_peers = [pr for pr in peer_results if pr.get("status") == "down"]
@@ -1588,19 +1830,26 @@ async def check_group_task(group, semaphore, session=None):
         except Exception as ex:
             logger.warning(f"Error during peer cross-check: {ex}")
 
+    _count_check(is_up, latency_ms, rep.get("name") or rep["url"])  # the result after retries
+
+    # One transaction for the whole check: every monitor of this target + the local measurement
+    local_node = database.get_local_node_name()
+    status_str = "up" if is_up else "down"
+    await run_db(database.record_check_results,
+                 [_status_update_for(r, is_up, error_msg, latency_ms) for r in group],
+                 (rep["url"], local_node, status_str, latency_ms, error_msg))
+
     for r in group:
         if latency_ms is not None:
             r["last_latency_ms"] = latency_ms
         if rep.get("http_method"):
             r["http_method"] = rep["http_method"]
 
-        logger.info(f"Check result: {r['name'] or r['url']} (id: {r['id']}) in chat {r['dc_chat_id']} -> {'UP' if is_up else 'DOWN'} ({error_msg})")
-        await handle_check_result(r, is_up, error_msg, latency_ms=latency_ms)
-
-    # Save local node measurement for dashboard and telemetry sync
-    local_node = database.get_local_node_name()
-    status_str = "up" if is_up else "down"
-    await run_db(database.save_peer_measurement, rep["url"], local_node, status_str, latency_ms, error_msg)
+        # INFO only for what needs attention (DOWN or a change); routine UPs are in the minute summary
+        changed = r.get("status") != ("up" if is_up else "down")
+        logger.log(logging.INFO if (changed or not is_up) else logging.DEBUG,
+                   f"Check result: {r['name'] or r['url']} (id: {r['id']}) in chat {r['dc_chat_id']} -> {'UP' if is_up else 'DOWN'} ({error_msg})")
+        await handle_check_result(r, is_up, error_msg, latency_ms=latency_ms, status_written=True)
 
     # Check SSL Certificate Expiry for HTTPS targets (at most once per hour)
     if rep.get("type") == "http" and rep.get("url", "").startswith("https://"):
@@ -2010,21 +2259,32 @@ async def check_stale_downtime_notifications(resource, now: int):
             logger.error(f"Failed to send 7d notice message to chat {dc_chat_id}: {ex}")
 
 
-async def handle_check_result(resource, is_up, error_msg, latency_ms=None):
-    now = int(time.time())
-    m_until = resource.get("maintenance_until") or 0
-    in_maintenance = (now < m_until)
-
-    if in_maintenance:
+def _status_update_for(resource, is_up, error_msg, latency_ms=None) -> dict:
+    """The resources-table update for one check result (see database.batch_update_resource_status)."""
+    if int(time.time()) < (resource.get("maintenance_until") or 0):
         # Resource is in maintenance window. Suppress failure transitions and incident creation.
-        await asyncio.to_thread(database.update_resource_status, resource["id"], resource["status"], 0, error_msg, latency_ms)
+        status, failures = resource["status"], 0
+    else:
+        status = "up" if is_up else "down"
+        failures = 0 if is_up else ((resource.get("consecutive_failures") or 0) + 1)
+    return {"id": resource["id"], "status": status, "consecutive_failures": failures,
+            "error_msg": error_msg, "latency_ms": latency_ms}
+
+
+async def handle_check_result(resource, is_up, error_msg, latency_ms=None, status_written=False):
+    """Stores a check result and does what follows from it (incident sync, stale reminders).
+
+    status_written: check_group_task already stored it, together with the rest of the check's
+    writes in one transaction (database.record_check_results)."""
+    now = int(time.time())
+    in_maintenance = now < (resource.get("maintenance_until") or 0)
+    if not status_written:
+        await run_db(database.batch_update_resource_status, [_status_update_for(resource, is_up, error_msg, latency_ms)])
+    if in_maintenance:
         return
 
     status = "up" if is_up else "down"
     old_status = resource["status"]
-    
-    failures = 0 if is_up else (resource["consecutive_failures"] + 1)
-    await asyncio.to_thread(database.update_resource_status, resource["id"], status, failures, error_msg, latency_ms)
     
     should_sync = False
     if old_status != status:
@@ -2049,15 +2309,24 @@ async def run_and_track_group(group, semaphore, session=None):
 async def run_checks_parallel(tasks_list):
     await asyncio.gather(*tasks_list, return_exceptions=True)
 
+# Checks running at once. They are async (a socket each, little CPU), so the limit is about file
+# descriptors, not cores: with 50, ~150 hung targets (10 s timeouts, 3 attempts) filled every slot
+# for a minute and delayed the healthy checks. docker-compose.yml raises nofile to match.
+CHECK_CONCURRENCY = 200
+
+
 async def monitoring_scheduler_loop():
     import collections
-    semaphore = asyncio.Semaphore(50)
+    semaphore = asyncio.Semaphore(CHECK_CONCURRENCY)
     _last_peer_audit = 0
     _last_incident_audit = 0
     _last_cleanup = 0
     _last_transport_flush = 0
+    _last_summary = int(time.time())
     # Validated, TTL-pinned DNS answers (see resolve_host_safe)
-    connector = _make_safe_connector(limit=100)
+    # Above CHECK_CONCURRENCY: aiohttp counts the wait for a free connection against the request
+    # timeout, so a smaller pool would turn queueing into false "Timeout" results
+    connector = _make_safe_connector(limit=CHECK_CONCURRENCY + 50)
     async with aiohttp.ClientSession(connector=connector, headers={"User-Agent": USER_AGENT}) as shared_session:
         while True:
             try:
@@ -2144,7 +2413,7 @@ async def monitoring_scheduler_loop():
                     tasks.append(run_and_track_group(group, semaphore, session=shared_session))
                     
                 if tasks:
-                    logger.info(f"Triggering {len(tasks)} target checks (encompassing {sum(len(g) for g in due_groups.values())} resources)...")
+                    logger.debug(f"Triggering {len(tasks)} target checks (encompassing {sum(len(g) for g in due_groups.values())} resources)...")
                     asyncio.create_task(run_checks_parallel(tasks))
                     
                 # Periodically broadcast telemetry to configured peers (every 2 minutes)
@@ -2183,6 +2452,10 @@ async def monitoring_scheduler_loop():
                     pruned_locks = prune_incident_sync_locks()
                     if pruned_locks:
                         logger.info(f"Pruned {pruned_locks} idle incident sync locks from memory")
+
+                if now - _last_summary >= 60:
+                    _last_summary = now
+                    log_check_summary(len(running_resource_ids))
 
                 # Periodic transport stats flush (every 10 seconds)
                 if now - _last_transport_flush >= 10:
@@ -5209,6 +5482,7 @@ def on_new_message(bot, accid, event):
                 logger.warning(f"Dropping check request from untrusted sender {sender_addr or msg.from_id} in chat {msg.chat_id}")
                 return
             _record_peer_activity(peer["email"])
+            _note_peer_caps(peer["email"], req_data.get("caps"))
 
             # Security: Validate target_url against SSRF (no localhost / private IPs)
             if not is_safe_target_url(target_url, check_type):
@@ -5237,7 +5511,8 @@ def on_new_message(bot, accid, event):
                         "status": "skip" if is_up is None else ("up" if is_up else "down"),
                         "latency_ms": latency_ms,
                         "error_msg": error_msg,
-                        "node_name": database.get_local_node_name()
+                        "node_name": database.get_local_node_name(),
+                        "caps": OWN_PEER_CAPS,  # lets the requester switch to batched requests
                     }
                     resp_msg = f"[UPTIME_PEER_CHECK_RESP]\n{json.dumps(resp_payload)}\n[/UPTIME_PEER_CHECK_RESP]"
                     _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=resp_msg))
@@ -5255,6 +5530,64 @@ def on_new_message(bot, accid, event):
         return
 
     # 4. Peer Cross-Check Response
+    # 3b. Batched cross-check request: several targets in one message, answered in one message
+    if "[UPTIME_PEER_CHECK_BATCH_REQ]" in text and "[/UPTIME_PEER_CHECK_BATCH_REQ]" in text:
+        try:
+            start_idx = text.find("[UPTIME_PEER_CHECK_BATCH_REQ]") + len("[UPTIME_PEER_CHECK_BATCH_REQ]")
+            end_idx = text.find("[/UPTIME_PEER_CHECK_BATCH_REQ]")
+            req_data = json.loads(text[start_idx:end_idx].strip())
+            peer, sender_addr = _get_verified_peer_for_msg(bot, accid, msg, is_private_chat)
+            if not _is_trusted_peer_msg(msg, peer, is_private_chat):
+                logger.warning(f"Dropping batch check request from untrusted sender {sender_addr or msg.from_id} in chat {msg.chat_id}")
+                return
+            _record_peer_activity(peer["email"])
+            _note_peer_caps(peer["email"], req_data.get("caps"))
+            req_id = req_data.get("req_id")
+            targets = _parse_batch_targets(req_data.get("targets"))
+            if req_id and targets:
+                coro = _answer_batch_cross_check(bot, accid, msg.chat_id, str(req_id)[:64], targets)
+                if async_event_loop and async_event_loop.is_running():
+                    asyncio.run_coroutine_threadsafe(coro, async_event_loop)
+                else:
+                    asyncio.run(coro)
+        except Exception as e:
+            logger.error(f"Error processing peer batch check request: {e}")
+        return
+
+    # 4b. Batched cross-check response
+    if "[UPTIME_PEER_CHECK_BATCH_RESP]" in text and "[/UPTIME_PEER_CHECK_BATCH_RESP]" in text:
+        try:
+            start_idx = text.find("[UPTIME_PEER_CHECK_BATCH_RESP]") + len("[UPTIME_PEER_CHECK_BATCH_RESP]")
+            end_idx = text.find("[/UPTIME_PEER_CHECK_BATCH_RESP]")
+            resp_data = json.loads(text[start_idx:end_idx].strip())
+            peer, sender_addr = _get_verified_peer_for_msg(bot, accid, msg, is_private_chat)
+            if not _is_trusted_peer_msg(msg, peer, is_private_chat):
+                logger.warning(f"Dropping batch check response from untrusted sender {sender_addr or msg.from_id}")
+                return
+            _record_peer_activity(peer["email"])
+            _note_peer_caps(peer["email"], resp_data.get("caps"))
+            # Only an answer to a batch this node sent, from the chat it was sent to
+            pending = pending_batch_checks.get(resp_data.get("req_id"))
+            if not pending:
+                return
+            fut, expected_chat, count = pending
+            if msg.chat_id != expected_chat:
+                logger.warning(f"Dropping batch check response from unexpected peer {sender_addr} in chat {msg.chat_id}")
+                return
+            raw = resp_data.get("results")
+            raw = raw if isinstance(raw, list) else []
+            node_name = peer.get("node_name") or "Remote-Node"
+            # URLs come from our own request (the future's owner knows them): only positions are trusted here
+            answers = [_clean_peer_result(raw[i] if i < len(raw) else None, node_name, None) for i in range(count)]
+            if not fut.done():
+                if async_event_loop and async_event_loop.is_running():
+                    async_event_loop.call_soon_threadsafe(lambda: fut.done() or fut.set_result(answers))
+                else:
+                    fut.set_result(answers)
+        except Exception as e:
+            logger.error(f"Error handling peer batch check response: {e}")
+        return
+
     if "[UPTIME_PEER_CHECK_RESP]" in text and "[/UPTIME_PEER_CHECK_RESP]" in text:
         try:
             start_idx = text.find("[UPTIME_PEER_CHECK_RESP]") + len("[UPTIME_PEER_CHECK_RESP]")
@@ -5271,6 +5604,7 @@ def on_new_message(bot, accid, event):
                 logger.warning(f"Dropping check response from untrusted sender {sender_addr or msg.from_id}")
                 return
             _record_peer_activity(peer["email"])
+            _note_peer_caps(peer["email"], resp_data.get("caps"))
 
             # Only answers to a request this node sent to this very peer are accepted
             pending = pending_peer_checks.get(req_id) if req_id else None
@@ -5326,6 +5660,7 @@ def on_new_message(bot, accid, event):
                 logger.warning(f"Dropping telemetry from untrusted sender {sender_addr or msg.from_id}")
                 return
             _record_peer_activity(peer["email"])
+            _note_peer_caps(peer["email"], metrics_data.get("caps"))
             if not isinstance(metrics_list, list):
                 return
 

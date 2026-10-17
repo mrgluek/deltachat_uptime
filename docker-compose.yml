@@ -4,6 +4,12 @@ services:
     build: .
     init: true
     restart: unless-stopped
+    # Up to 200 checks run at once (CHECK_CONCURRENCY), plus idle keep-alive connections;
+    # Docker's default of 1024 open files would leave little headroom
+    ulimits:
+      nofile:
+        soft: 8192
+        hard: 8192
     logging:
       driver: json-file
       options:

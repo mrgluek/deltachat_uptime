@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.18.1] - 2026-10-18
+
+### Fixed
+- **Ping Checks DOWN on Nodes Without Raw Sockets**: On hosted containers without `CAP_NET_RAW` and without a `ping` binary (seen on the Botkeep.cloud node), aioping could not open its raw socket and the fallback failed with `[Errno 2] No such file or directory: 'ping'`, so every ping target was reported DOWN from that region. Ping now falls back to an unprivileged ICMP datagram socket ("ping socket", allowed by `net.ipv4.ping_group_range`, which Docker opens to all groups), which needs neither. Works over IPv4 and IPv6.
+- **No Way to Ping Is "Not Checked", Not DOWN**: If a node has no raw socket, no ping socket and no `ping` binary, its ping checks return "Ping not available on this node" and are skipped like IPv6 targets on a node without IPv6 (⚪ in `/ping`, abstains in peer votes, no alert). A warning is logged once.
+
 ## [2.18.0] - 2026-10-17
 
 ### Added

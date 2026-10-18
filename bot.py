@@ -12,6 +12,7 @@ import datetime
 import html
 import re
 import socket
+import struct
 import shlex
 import secrets
 from urllib.parse import urlparse, urljoin
@@ -57,7 +58,7 @@ import transports_view
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "2.18.0"
+VERSION = "2.18.1"
 # No "bot" in the name: some services (e.g. Hiddify subscription links) reply 400 to any User-Agent containing "bot".
 USER_AGENT = f"Delta Chat Uptime Monitor/{VERSION} (+https://git.gluek.info/gluek/deltachat_uptime)"
 
@@ -1009,6 +1010,74 @@ class NoAddressForFamilyError(OSError):
 
 
 NO_IPV6_MSG = "No IPv6 connectivity on this node"
+PING_UNAVAILABLE_MSG = "Ping not available on this node (no ICMP socket, no ping binary)"
+_ping_unavailable_warned = False
+
+
+def _warn_ping_unavailable() -> None:
+    """Logs once per run why ping checks are skipped here (they would otherwise fail silently)."""
+    global _ping_unavailable_warned
+    if not _ping_unavailable_warned:
+        _ping_unavailable_warned = True
+        logger.warning("Ping checks are skipped on this node: no raw or datagram ICMP socket and no ping binary "
+                       "(install iputils-ping, or allow the bot's group in net.ipv4.ping_group_range)")
+
+
+class PingSocketUnavailable(Exception):
+    """This node may not open an unprivileged ICMP socket (see _dgram_ping)."""
+
+
+def _icmp_checksum(data: bytes) -> int:
+    """RFC 1071 internet checksum (one's complement sum of 16-bit words)."""
+    if len(data) % 2:
+        data += b"\0"
+    total = sum(struct.unpack(f"!{len(data) // 2}H", data))
+    while total >> 16:
+        total = (total & 0xFFFF) + (total >> 16)
+    return ~total & 0xFFFF
+
+
+async def _dgram_ping(ip: str, timeout: float) -> float:
+    """One echo request over an unprivileged ICMP datagram socket; returns the round trip in seconds.
+
+    aioping needs a raw socket (root / CAP_NET_RAW), which hosted containers often do not grant, and
+    slim images have no ping binary. A "ping socket" (SOCK_DGRAM + IPPROTO_ICMP) needs neither: Linux
+    allows it for the groups in net.ipv4.ping_group_range (Docker sets it to all groups since 20.10),
+    macOS always. The kernel sets the echo id itself and hands this socket only the replies to it.
+    Raises PingSocketUnavailable if the socket cannot be opened, asyncio.TimeoutError, or OSError."""
+    is6 = ":" in ip
+    try:
+        sock = socket.socket(socket.AF_INET6 if is6 else socket.AF_INET, socket.SOCK_DGRAM,
+                             socket.IPPROTO_ICMPV6 if is6 else socket.IPPROTO_ICMP)
+    except OSError as e:  # EACCES: group not in ping_group_range; EPROTONOSUPPORT: no ping sockets
+        raise PingSocketUnavailable(str(e)) from e
+    try:
+        sock.setblocking(False)
+        echo_req, echo_reply = (128, 129) if is6 else (8, 0)
+        seq = secrets.randbelow(0x10000)
+        payload = secrets.token_bytes(16)  # matched in the reply, so a stray reply cannot count
+        header = struct.pack("!BBHHH", echo_req, 0, 0, 0, seq)
+        # The ICMPv6 checksum covers an IPv6 pseudo header and is always filled in by the kernel
+        csum = 0 if is6 else _icmp_checksum(header + payload)
+        packet = struct.pack("!BBHHH", echo_req, 0, csum, 0, seq) + payload
+        loop = asyncio.get_running_loop()
+        start = time.monotonic()
+        await loop.sock_sendto(sock, packet, (ip, 0))
+
+        async def _reply():
+            while True:
+                data, _ = await loop.sock_recvfrom(sock, 2048)
+                # Linux delivers just the ICMP message, macOS prefixes the IPv4 header
+                if not is6 and len(data) >= 20 and data[0] >> 4 == 4:
+                    data = data[(data[0] & 0x0F) * 4:]
+                if len(data) >= 8:
+                    rtype, _, _, _, rseq = struct.unpack("!BBHHH", data[:8])
+                    if rtype == echo_reply and rseq == seq and data[8:] == payload:
+                        return time.monotonic() - start
+
+        return await asyncio.wait_for(_reply(), timeout)
+    finally:
+        sock.close()
 
 
 def has_route_to(ip: str) -> bool:
@@ -1734,11 +1803,31 @@ async def run_single_check(resource, session=None) -> tuple[bool, str, int | Non
                     logger.debug(f"aioping failed for {host} ({ex}), falling back to ping subprocess")
 
             if not ping_success and elapsed_ms is None:
-                proc = await asyncio.create_subprocess_exec(
-                    "ping", "-c", "1", "-W", "2", host,
-                    stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.DEVNULL
-                )
+                # No raw socket: try an unprivileged ICMP socket before the ping binary
+                try:
+                    delay = await _dgram_ping(host, 2.0)
+                    elapsed_ms = max(1, int(delay * 1000))
+                    ping_success = True
+                except PingSocketUnavailable as ex:
+                    logger.debug(f"ICMP datagram socket unavailable ({ex}), falling back to ping subprocess")
+                except asyncio.TimeoutError:
+                    elapsed_ms = int((time.time() - start_time) * 1000)
+                    return False, "Timeout", elapsed_ms
+                except OSError as ex:  # the socket works, the target does not (e.g. host unreachable)
+                    elapsed_ms = int((time.time() - start_time) * 1000)
+                    return False, f"Ping failed: {ex.strerror or ex}", elapsed_ms
+
+            if not ping_success and elapsed_ms is None:
+                try:
+                    proc = await asyncio.create_subprocess_exec(
+                        "ping", "-c", "1", "-W", "2", host,
+                        stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.DEVNULL
+                    )
+                except FileNotFoundError:
+                    # No way to send ICMP here: abstain (like a missing IPv6) instead of reporting DOWN
+                    _warn_ping_unavailable()
+                    return None, PING_UNAVAILABLE_MSG, None
                 await proc.wait()
                 elapsed_ms = int((time.time() - start_time) * 1000)
                 if proc.returncode == 0:

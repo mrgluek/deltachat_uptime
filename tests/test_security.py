@@ -2,6 +2,7 @@ import asyncio
 import os
 import sys
 import socket
+import struct
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -323,6 +324,52 @@ class TestDnsPinning(unittest.TestCase):
             self.assertEqual(mock_aioping.ping.call_args.args[0], "2606:2800:220:1::1")
             self.assertTrue(asyncio.run(bot.run_single_check({"type": "tcp", "url": "[2606:2800:220:1::1]:443"}))[0])
             self.assertEqual(mock_open.call_args.args[:2], ("2606:2800:220:1::1", 443))
+
+    def _ping_v4(self, **patches):
+        """run_single_check on a public IPv4 ping target; aioping has no raw socket (as in hosted containers)."""
+        mock_aioping = MagicMock()
+        mock_aioping.ping = AsyncMock(side_effect=PermissionError("Operation not permitted"))
+        with patch('bot.has_route_to', return_value=True), patch.object(bot, 'aioping', mock_aioping), \
+             patch.multiple('bot', **patches):
+            return asyncio.run(bot.run_single_check({"type": "ping", "url": "93.184.216.34"}))
+
+    def test_ping_falls_back_to_datagram_icmp_socket(self):
+        dgram = AsyncMock(return_value=0.012)
+        with patch('asyncio.create_subprocess_exec', AsyncMock()) as mock_exec:
+            is_up, details, ms = self._ping_v4(_dgram_ping=dgram)
+        self.assertTrue(is_up)
+        self.assertEqual(ms, 12)
+        self.assertEqual(dgram.call_args.args[0], "93.184.216.34")
+        mock_exec.assert_not_called()
+
+    def test_datagram_ping_timeout_is_down(self):
+        is_up, details, _ = self._ping_v4(_dgram_ping=AsyncMock(side_effect=asyncio.TimeoutError()))
+        self.assertFalse(is_up)
+        self.assertEqual(details, "Timeout")
+
+    def test_no_ping_method_is_not_checked_instead_of_down(self):
+        dgram = AsyncMock(side_effect=bot.PingSocketUnavailable("Permission denied"))
+        with patch('asyncio.create_subprocess_exec', AsyncMock(side_effect=FileNotFoundError(2, "No such file", "ping"))):
+            is_up, details, ms = self._ping_v4(_dgram_ping=dgram)
+        self.assertIsNone(is_up)  # abstains in votes, like a node without IPv6
+        self.assertEqual(details, bot.PING_UNAVAILABLE_MSG)
+        self.assertIsNone(ms)
+
+    def test_ping_binary_still_used_without_icmp_socket(self):
+        proc = MagicMock(returncode=0)
+        proc.wait = AsyncMock()
+        dgram = AsyncMock(side_effect=bot.PingSocketUnavailable("Permission denied"))
+        with patch('asyncio.create_subprocess_exec', AsyncMock(return_value=proc)) as mock_exec:
+            is_up, _, _ = self._ping_v4(_dgram_ping=dgram)
+        self.assertTrue(is_up)
+        self.assertEqual(mock_exec.call_args.args[0], "ping")
+
+    def test_icmp_checksum(self):
+        # Echo request type 8, id 0, seq 1, no payload: checksum 0xF7FE
+        self.assertEqual(bot._icmp_checksum(struct.pack("!BBHHH", 8, 0, 0, 0, 1)), 0xF7FE)
+        packet = struct.pack("!BBHHH", 8, 0, 0, 0, 7) + b"abc"  # odd length is zero padded
+        csum = bot._icmp_checksum(packet)
+        self.assertEqual(bot._icmp_checksum(packet[:2] + struct.pack("!H", csum) + packet[4:]), 0)
 
     def test_family_restricted_ping(self):
         mock_aioping = MagicMock()

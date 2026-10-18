@@ -2827,7 +2827,10 @@ class TestUptimeBot(unittest.TestCase):
         orig_aioping = bot.aioping
         bot.aioping = mock_aioping
         try:
-            with patch('asyncio.create_subprocess_exec', unittest.mock.AsyncMock(return_value=mock_proc)) as mock_subproc:
+            # No ICMP datagram socket either (ping_group_range excludes the bot), so the ping binary is used
+            no_dgram = unittest.mock.AsyncMock(side_effect=bot.PingSocketUnavailable("Permission denied"))
+            with patch('asyncio.create_subprocess_exec', unittest.mock.AsyncMock(return_value=mock_proc)) as mock_subproc, \
+                 patch('bot._dgram_ping', no_dgram):
                 res = {"type": "ping", "url": "ping-fallback.com"}
                 is_up, details, lat = asyncio.run(bot.run_single_check(res))
                 self.assertTrue(is_up)
@@ -2845,7 +2848,10 @@ class TestUptimeBot(unittest.TestCase):
         orig_aioping = bot.aioping
         bot.aioping = None
         try:
-            with patch('asyncio.create_subprocess_exec', unittest.mock.AsyncMock(return_value=mock_proc)) as mock_subproc:
+            # No ICMP datagram socket either (ping_group_range excludes the bot), so the ping binary is used
+            no_dgram = unittest.mock.AsyncMock(side_effect=bot.PingSocketUnavailable("Permission denied"))
+            with patch('asyncio.create_subprocess_exec', unittest.mock.AsyncMock(return_value=mock_proc)) as mock_subproc, \
+                 patch('bot._dgram_ping', no_dgram):
                 res = {"type": "ping", "url": "ping-none.com"}
                 is_up, details, lat = asyncio.run(bot.run_single_check(res))
                 self.assertTrue(is_up)

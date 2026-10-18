@@ -1190,16 +1190,9 @@ class TestUptimeBot(unittest.TestCase):
         self.assertEqual(inc2["id"], inc2_id)
 
     def test_get_incident_update_interval(self):
-        # 0 - 1 min: 15s
-        self.assertEqual(bot.get_incident_update_interval(0), 15)
-        self.assertEqual(bot.get_incident_update_interval(59), 15)
-        # 1 - 5 min: 30s
-        self.assertEqual(bot.get_incident_update_interval(60), 30)
-        self.assertEqual(bot.get_incident_update_interval(299), 30)
-        # 5 min - 1 hour: 60s
-        self.assertEqual(bot.get_incident_update_interval(300), 60)
-        self.assertEqual(bot.get_incident_update_interval(3599), 60)
-        # 1 hour - 24 hours: 300s (5 minutes)
+        # First day: duration refreshed every 5 minutes (each edit is a mail to the chat;
+        # status changes are edited in right away regardless)
+        self.assertEqual(bot.get_incident_update_interval(0), 300)
         self.assertEqual(bot.get_incident_update_interval(3600), 300)
         self.assertEqual(bot.get_incident_update_interval(86399), 300)
         # > 24 hours: 3600s (1 hour)
@@ -1230,10 +1223,14 @@ class TestUptimeBot(unittest.TestCase):
         asyncio.run(bot.sync_chat_incident_state(chat_id, force_update=False))
         bot.dc_bot_instance.rpc.send_edit_request.assert_not_called()
 
-        # 3. Simulate 20 seconds passing (within first minute, 15s interval passed)
+        # 3. 20 seconds later: only the duration changed, still within the 5-minute interval -> no edit
         last_t, sig = bot._incident_last_edit_state[inc["id"]]
         bot._incident_last_edit_state[inc["id"]] = (last_t - 20, sig)
+        asyncio.run(bot.sync_chat_incident_state(chat_id, force_update=False))
+        bot.dc_bot_instance.rpc.send_edit_request.assert_not_called()
 
+        # 3b. 5 minutes later the duration is refreshed
+        bot._incident_last_edit_state[inc["id"]] = (last_t - 301, sig)
         asyncio.run(bot.sync_chat_incident_state(chat_id, force_update=False))
         bot.dc_bot_instance.rpc.send_edit_request.assert_called_once()
 

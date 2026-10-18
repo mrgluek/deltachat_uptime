@@ -54,11 +54,12 @@ except Exception:
 import concurrent.futures
 import database
 import transports_view
+from outbox import outbox as dc_outbox, PRIO_ALERT, PRIO_REPLY, PRIO_UPDATE, PRIO_PEER, PRIO_TELEMETRY
 
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "2.18.1"
+VERSION = "2.19.0"
 # No "bot" in the name: some services (e.g. Hiddify subscription links) reply 400 to any User-Agent containing "bot".
 USER_AGENT = f"Delta Chat Uptime Monitor/{VERSION} (+https://git.gluek.info/gluek/deltachat_uptime)"
 
@@ -146,6 +147,8 @@ OWN_PEER_CAPS = [PEER_CAP_BATCH_CHECK]
 CROSS_CHECK_BATCH_WINDOW = 5.0    # seconds to collect failing targets before sending
 CROSS_CHECK_BATCH_MAX = 100       # targets per batch message
 CROSS_CHECK_BATCH_TIMEOUT = 25.0  # a peer checks up to 100 targets (10 s timeouts) and mails back
+TELEMETRY_INTERVAL = 120  # seconds between telemetry messages to each peer
+PEER_ANSWER_TTL = 20.0  # an answer to a peer's cross-check is dropped if the outbox could not send it by then
 PEER_BATCH_CHECK_CONCURRENCY = 20
 _peer_caps = {}  # peer email (lower) -> set of capabilities it announced (in memory, re-sent every 2 min)
 _cross_check_queue = []  # (target_dict, future) waiting for the next batch
@@ -343,7 +346,9 @@ async def request_peer_cross_checks(target_dict: dict, timeout: float = 8.0, pee
 
     for p, chat_id in valid_peers:
         try:
-            await asyncio.to_thread(_dc_send_msg_with_stats, dc_bot_instance, dc_accid, chat_id, MsgData(text=msg_text))
+            # A request still queued when the answer is no longer awaited is dropped
+            await asyncio.to_thread(_dc_send_msg_with_stats, dc_bot_instance, dc_accid, chat_id, MsgData(text=msg_text),
+                                    priority=PRIO_PEER, expires_in=timeout, label="cross-check request")
         except Exception as e:
             logger.warning(f"Failed to send cross-check request to peer {p.get('email')}: {e}")
 
@@ -477,7 +482,8 @@ async def _batch_cross_check_peer(peer: dict, items: list, results: dict) -> Non
     pending_batch_checks[req_id] = (fut, chat_id, len(items))
     try:
         msg_text = f"[UPTIME_PEER_CHECK_BATCH_REQ]\n{json.dumps(payload)}\n[/UPTIME_PEER_CHECK_BATCH_REQ]"
-        await asyncio.to_thread(_dc_send_msg_with_stats, dc_bot_instance, dc_accid, chat_id, MsgData(text=msg_text))
+        await asyncio.to_thread(_dc_send_msg_with_stats, dc_bot_instance, dc_accid, chat_id, MsgData(text=msg_text),
+                                priority=PRIO_PEER, expires_in=CROSS_CHECK_BATCH_TIMEOUT, label="batch cross-check request")
         answers = await asyncio.wait_for(fut, CROSS_CHECK_BATCH_TIMEOUT)
     except asyncio.TimeoutError:
         logger.info(f"Batch cross-check {req_id} ({len(items)} targets) got no answer from {peer.get('email')} in time")
@@ -532,7 +538,9 @@ async def _answer_batch_cross_check(bot, accid, chat_id: int, req_id: str, targe
                for a in answers]
     payload = {"req_id": req_id, "node_name": database.get_local_node_name(), "caps": OWN_PEER_CAPS, "results": answers}
     resp_msg = f"[UPTIME_PEER_CHECK_BATCH_RESP]\n{json.dumps(payload)}\n[/UPTIME_PEER_CHECK_BATCH_RESP]"
-    await asyncio.to_thread(_dc_send_msg_with_stats, bot, accid, chat_id, MsgData(text=resp_msg))
+    # The requester waits CROSS_CHECK_BATCH_TIMEOUT from sending; a later answer is ignored there
+    await asyncio.to_thread(_dc_send_msg_with_stats, bot, accid, chat_id, MsgData(text=resp_msg),
+                            priority=PRIO_PEER, expires_in=PEER_ANSWER_TTL, label="batch cross-check answer")
 
 
 def _parse_batch_targets(raw) -> list:
@@ -665,15 +673,18 @@ async def broadcast_telemetry_to_peers():
 
         chat_id = await _resolve_peer_chat_id(p)
         if chat_id:
-            try:
-                await asyncio.to_thread(_dc_send_msg_with_stats, dc_bot_instance, dc_accid, chat_id, MsgData(text=msg_text))
+            def _record_sent(email=email, batch=metrics_batch, all_metrics=all_metrics):
+                # Only what really went out counts as sent (a replaced or expired message did not)
                 sent = _telemetry_last_sent.setdefault(email, {})
-                sent.update({m["url"]: m["status"] for m in metrics_batch})
+                sent.update({m["url"]: m["status"] for m in batch})
                 if len(sent) > 2 * len(all_metrics):  # forget removed monitors
                     live = {m["url"] for m in all_metrics}
                     _telemetry_last_sent[email] = {u: st for u, st in sent.items() if u in live}
-            except Exception as e:
-                logger.warning(f"Failed to push telemetry to peer {p.get('email')}: {e}")
+
+            # One telemetry message per peer at a time: a newer one replaces a still queued one
+            _dc_send_msg_with_stats(dc_bot_instance, dc_accid, chat_id, MsgData(text=msg_text),
+                                    priority=PRIO_TELEMETRY, key=("telemetry", chat_id), expires_in=TELEMETRY_INTERVAL,
+                                    label=f"telemetry to {email}", after_send=_record_sent)
 
 # Async event loop and task tracking for check scheduler
 async_event_loop = None
@@ -1485,7 +1496,8 @@ async def send_admin_notification(text: str):
 
     if chat_id:
         try:
-            await asyncio.to_thread(_dc_send_msg_with_stats, dc_bot_instance, dc_accid, chat_id, MsgData(text=text))
+            await asyncio.to_thread(_dc_send_msg_with_stats, dc_bot_instance, dc_accid, chat_id, MsgData(text=text),
+                                    priority=PRIO_ALERT, label="admin notification")
         except Exception as e:
             logger.warning(f"Failed to send admin notification to chat {chat_id}: {e}")
 
@@ -1578,15 +1590,8 @@ async def notify_ssl_alert(resource, days_left: float, exp_date_str: str, alert_
         return
 
     if dc_bot_instance and dc_accid is not None:
-        try:
-            await asyncio.to_thread(
-                dc_bot_instance.rpc.send_msg,
-                dc_accid,
-                chat_id,
-                MsgData(text=msg_text)
-            )
-        except Exception as e:
-            logger.error(f"Failed to send SSL alert to chat {chat_id}: {e}")
+        _dc_send_msg_with_stats(dc_bot_instance, dc_accid, chat_id, MsgData(text=msg_text),
+                                priority=PRIO_ALERT, label="SSL alert")
 
 async def _prewarm_target_dns(url: str, check_type: str) -> bool:
     """Resolves the target asynchronously (with the record TTL) before the synchronous SSRF check,
@@ -1881,8 +1886,10 @@ def log_check_summary(running: int) -> None:
     total = st["up"] + st["down"] + st["skipped"]
     avg = f"{st['lat_sum'] // st['lat_n']} ms" if st["lat_n"] else "n/a"
     slowest = f", slowest {st['slowest'][1]} ({st['slowest'][0]} ms)" if st["slowest"][1] else ""
+    waiting = dc_outbox.waiting()
+    queued = f", outbox waiting {sum(waiting.values())} ({', '.join(f'{k} {v}' for k, v in waiting.items())})" if waiting else ""
     logger.info(f"Checks in the last 60s: {total} ({st['up']} up, {st['down']} down, {st['skipped']} skipped), "
-                f"avg latency {avg}{slowest}; running now: {running}")
+                f"avg latency {avg}{slowest}; running now: {running}{queued}")
     st.update(up=0, down=0, skipped=0, lat_sum=0, lat_n=0, slowest=(0, ""))
 
 
@@ -2090,7 +2097,8 @@ async def _flush_degraded_notices():
         if not text or not dc_bot_instance or dc_accid is None:
             continue
         try:
-            await asyncio.to_thread(_dc_send_msg_with_stats, dc_bot_instance, dc_accid, chat_id, MsgData(text=text))
+            await asyncio.to_thread(_dc_send_msg_with_stats, dc_bot_instance, dc_accid, chat_id, MsgData(text=text),
+                                    priority=PRIO_ALERT, label="partial outage notice")
         except Exception as e:
             logger.warning(f"Failed to send partial outage notice to chat {chat_id}: {e}")
 
@@ -2424,17 +2432,44 @@ def prune_incident_sync_locks() -> int:
         return len(to_remove)
 
 def get_incident_update_interval(duration_seconds: int) -> int:
-    """Return the minimum seconds required between live duration edits based on incident age."""
-    if duration_seconds < 60:
-        return 15       # First minute: update every 15 seconds
-    elif duration_seconds < 300:
-        return 30       # 1 to 5 minutes: update every 30 seconds
-    elif duration_seconds < 3600:
-        return 60       # 5 minutes to 1 hour: update every 1 minute
-    elif duration_seconds < 86400:
-        return 300      # 1 to 24 hours: update every 5 minutes
-    else:
-        return 3600     # After 24 hours: update once an hour
+    """Minimum seconds between live edits that only refresh an incident's duration.
+
+    Every edit is a mail to the whole chat, so in an outage across many chats the old 15-60 s
+    timer used most of the send limit. Status changes are still edited in right away; the
+    message also shows the start time, so the duration only needs a refresh now and then."""
+    if duration_seconds < 86400:
+        return 300      # First day: every 5 minutes
+    return 3600         # After that: once an hour
+
+
+def _deliver_incident_message(inc_id: int, dc_chat_id: int, msg_text: str, resolved: bool):
+    """Runs in the outbox: edits the incident's message, or sends it if it has none yet (or the edit fails).
+
+    The message id is read here, at sending time: a first message still waiting in the outbox is
+    merged with later updates (same key) and goes out once, with the latest text."""
+    inc = database.get_incident_by_id(dc_chat_id, inc_id)
+    msg_id = inc.get("msg_id") if inc else None
+    if msg_id:
+        try:
+            dc_bot_instance.rpc.send_edit_request(dc_accid, msg_id, msg_text)
+            logger.info(f"{'Resolved' if resolved else 'Edited'} Incident #{inc_id} message {msg_id} in chat {dc_chat_id}")
+            return msg_id
+        except Exception as e:
+            logger.warning(f"Failed to edit Incident message {msg_id} (sending new message): {e}")
+    # No message yet (also an outage that ended before its first message went out: it gets the
+    # resolved message, so the chat still learns about it)
+    new_msg_id = dc_bot_instance.rpc.send_msg(dc_accid, dc_chat_id, MsgData(text=msg_text))
+    if isinstance(new_msg_id, int) and not resolved:
+        database.update_incident_msg_id(inc_id, new_msg_id)
+    return new_msg_id
+
+
+def _queue_incident_message(inc_id: int, dc_chat_id: int, msg_text: str, priority: int, resolved: bool = False):
+    """One outbox job per incident: a queued update is replaced by a newer one, keeping its place."""
+    if not dc_bot_instance or dc_accid is None:
+        return
+    dc_outbox.submit(lambda: _deliver_incident_message(inc_id, dc_chat_id, msg_text, resolved),
+                     priority=priority, key=("incident", inc_id), label=f"incident #{inc_id} message")
 
 async def sync_chat_incident_state(dc_chat_id: int, force_update: bool = False):
     chat_lock = get_chat_incident_lock(dc_chat_id)
@@ -2515,45 +2550,10 @@ async def sync_chat_incident_state(dc_chat_id: int, force_update: bool = False):
                     total_chat_monitors=total_chat_monitors
                 )
                 
-                if dc_bot_instance and dc_accid is not None:
-                    msg_id = inc.get("msg_id")
-                    if msg_id:
-                        try:
-                            await asyncio.to_thread(
-                                dc_bot_instance.rpc.send_edit_request,
-                                dc_accid,
-                                msg_id,
-                                msg_text
-                            )
-                            _incident_last_edit_state[inc_id] = (now, status_sig)
-                            logger.info(f"Edited Incident #{inc_id} message {msg_id} in chat {dc_chat_id}")
-                        except Exception as e:
-                            logger.warning(f"Failed to edit Incident message {msg_id} (sending new message): {e}")
-                            try:
-                                new_msg_id = await asyncio.to_thread(
-                                    dc_bot_instance.rpc.send_msg,
-                                    dc_accid,
-                                    dc_chat_id,
-                                    MsgData(text=msg_text)
-                                )
-                                if isinstance(new_msg_id, int):
-                                    await asyncio.to_thread(database.update_incident_msg_id, inc_id, new_msg_id)
-                                    _incident_last_edit_state[inc_id] = (now, status_sig)
-                            except Exception as ex:
-                                logger.error(f"Failed to send incident message to chat {dc_chat_id}: {ex}")
-                    else:
-                        try:
-                            new_msg_id = await asyncio.to_thread(
-                                dc_bot_instance.rpc.send_msg,
-                                dc_accid,
-                                dc_chat_id,
-                                MsgData(text=msg_text)
-                            )
-                            if isinstance(new_msg_id, int):
-                                await asyncio.to_thread(database.update_incident_msg_id, inc_id, new_msg_id)
-                                _incident_last_edit_state[inc_id] = (now, status_sig)
-                        except Exception as e:
-                            logger.error(f"Failed to send incident message to chat {dc_chat_id}: {e}")
+                # A new incident or a status change is an alert; a refresh of the duration can wait
+                is_alert = inc.get("msg_id") is None or status_sig != last_sig
+                _incident_last_edit_state[inc_id] = (now, status_sig)
+                _queue_incident_message(inc_id, dc_chat_id, msg_text, PRIO_ALERT if is_alert else PRIO_UPDATE)
 
             else:
                 # All events for this incident are closed -> Incident is resolved!
@@ -2585,28 +2585,7 @@ async def sync_chat_incident_state(dc_chat_id: int, force_update: bool = False):
                     dc_chat_id=dc_chat_id
                 )
                 
-                if dc_bot_instance and dc_accid is not None:
-                    msg_id = inc.get("msg_id")
-                    if msg_id:
-                        try:
-                            await asyncio.to_thread(
-                                dc_bot_instance.rpc.send_edit_request,
-                                dc_accid,
-                                msg_id,
-                                msg_text
-                            )
-                            logger.info(f"Resolved Incident #{inc_id} by editing message {msg_id} in chat {dc_chat_id}")
-                        except Exception as e:
-                            logger.warning(f"Failed to edit resolved Incident message {msg_id}: {e}")
-                            try:
-                                await asyncio.to_thread(
-                                    dc_bot_instance.rpc.send_msg,
-                                    dc_accid,
-                                    dc_chat_id,
-                                    MsgData(text=msg_text)
-                                )
-                            except Exception as ex:
-                                logger.error(f"Failed to send resolved incident message to chat {dc_chat_id}: {ex}")
+                _queue_incident_message(inc_id, dc_chat_id, msg_text, PRIO_ALERT, resolved=True)
 
 def trigger_chat_incident_sync(dc_chat_id: int, force_update: bool = False):
     """Trigger incident state sync from a synchronous handler / thread."""
@@ -2650,7 +2629,8 @@ async def check_stale_downtime_notifications(resource, now: int):
                     dc_bot_instance,
                     dc_accid,
                     dc_chat_id,
-                    MsgData(text=cleanup_text)
+                    MsgData(text=cleanup_text),
+                    priority=PRIO_ALERT,
                 )
         except Exception as ex:
             logger.error(f"Failed to send 30d auto-cleanup message to chat {dc_chat_id}: {ex}")
@@ -2673,7 +2653,8 @@ async def check_stale_downtime_notifications(resource, now: int):
                     dc_bot_instance,
                     dc_accid,
                     dc_chat_id,
-                    MsgData(text=warn_text)
+                    MsgData(text=warn_text),
+                    priority=PRIO_ALERT,
                 )
         except Exception as ex:
             logger.error(f"Failed to send 14d warning message to chat {dc_chat_id}: {ex}")
@@ -2693,7 +2674,8 @@ async def check_stale_downtime_notifications(resource, now: int):
                     dc_bot_instance,
                     dc_accid,
                     dc_chat_id,
-                    MsgData(text=notice_text)
+                    MsgData(text=notice_text),
+                    priority=PRIO_ALERT,
                 )
         except Exception as ex:
             logger.error(f"Failed to send 7d notice message to chat {dc_chat_id}: {ex}")
@@ -2867,7 +2849,7 @@ async def monitoring_scheduler_loop():
                     
                 # Periodically broadcast telemetry to configured peers (every 2 minutes)
                 global last_peer_telemetry_broadcast
-                if now - last_peer_telemetry_broadcast >= 120:
+                if now - last_peer_telemetry_broadcast >= TELEMETRY_INTERVAL:
                     last_peer_telemetry_broadcast = now
                     asyncio.create_task(broadcast_telemetry_to_peers())
 
@@ -4069,28 +4051,39 @@ def start_web_server_thread():
 
 def start_monitoring_thread():
     global async_event_loop
+    dc_outbox.start()  # from now on messages are queued and paced instead of sent inline
     loop = asyncio.new_event_loop()
     async_event_loop = loop
     asyncio.set_event_loop(loop)
     loop.run_until_complete(monitoring_scheduler_loop())
 
 # Command Handlers
-def _dc_send_msg_with_stats(bot, accid, chat_id, msg_data):
-    try:
+def _dc_send_msg_with_stats(bot, accid, chat_id, msg_data, priority=PRIO_REPLY, key=None, expires_in=None,
+                            label=None, after_send=None):
+    """Sends a message through the paced outbox (see outbox.py). Default priority: a command reply.
+
+    after_send() runs right after the message really went out (not if it was replaced or expired).
+    Returns the msg_id when it was sent right away (outbox not started, as in tests), else None:
+    the message is queued and goes out when its turn and a send token come."""
+    def send():
         msg_id = bot.rpc.send_msg(accid, chat_id, msg_data)
+        if after_send:
+            after_send()
         return msg_id
-    except Exception as e:
-        logger.error(f"Failed to send message: {e}")
-        return None
+
+    fut = dc_outbox.submit(send, priority=priority, key=key, expires_in=expires_in,
+                           label=label or f"message to chat {chat_id}")
+    if fut.done() and not fut.exception():
+        return fut.result()
+    return None
 
 def _react(bot, accid: int, msg_id: int | None, emoji: str):
     """Add or clear a reaction on a message."""
     if not bot or not hasattr(bot, "rpc") or not msg_id:
         return
-    try:
-        bot.rpc.send_reaction(accid, msg_id, [emoji] if emoji else [])
-    except Exception as e:
-        logger.debug(f"Failed to set reaction {emoji} on msg {msg_id}: {e}")
+    # Keyed by message: a ⏳ still waiting in the outbox is replaced by the final ☑️ (one mail, not two)
+    dc_outbox.submit(lambda: bot.rpc.send_reaction(accid, msg_id, [emoji] if emoji else []),
+                     priority=PRIO_REPLY, key=("reaction", msg_id), label=f"reaction {emoji} on {msg_id}")
 
 HELP_PRIVATE_NOTE = "\n\n💬 Sent privately because you asked in a group. Use /help@uptime there to show it to everyone."
 
@@ -5644,7 +5637,7 @@ def addpeer_command(bot, accid, event):
                 ) or existing
                 peer_email = existing["email"]
             database.add_or_update_peer(peer_email, node_name, chat_id, fingerprint=peer_fp)
-            _dc_send_msg_with_stats(bot, accid, chat_id, MsgData(text=_hello_text()))
+            _dc_send_msg_with_stats(bot, accid, chat_id, MsgData(text=_hello_text()), priority=PRIO_PEER, label="peer hello")
 
             _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(
                 text=f"✅ SecureJoin E2EE established with **{node_name}** (`{peer_email}`).\nChat ID: `{chat_id}`." + mutual_note
@@ -5664,7 +5657,7 @@ def addpeer_command(bot, accid, event):
         contact_id = bot.rpc.create_contact(accid, email, node_name)
         chat_id = bot.rpc.create_chat_by_contact_id(accid, contact_id)
         database.add_or_update_peer(email, node_name, chat_id)
-        _dc_send_msg_with_stats(bot, accid, chat_id, MsgData(text=_hello_text()))
+        _dc_send_msg_with_stats(bot, accid, chat_id, MsgData(text=_hello_text()), priority=PRIO_PEER, label="peer hello")
 
         _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(
             text=f"✅ Peer `{email}` (**{node_name}**) added.\nSent peering handshake via private chat (Chat ID: `{chat_id}`).\n\n"
@@ -6036,7 +6029,7 @@ def on_new_message(bot, accid, event):
                 "version": VERSION
             }
             ack_msg = f"[UPTIME_PEER_HELLO_ACK]\n{json.dumps(ack_payload)}\n[/UPTIME_PEER_HELLO_ACK]"
-            _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=ack_msg))
+            _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=ack_msg), priority=PRIO_PEER, label="peer hello ack")
         except Exception as e:
             logger.error(f"Error handling peer hello: {e}")
         return
@@ -6113,7 +6106,8 @@ def on_new_message(bot, accid, event):
                         "caps": OWN_PEER_CAPS,  # lets the requester switch to batched requests
                     }
                     resp_msg = f"[UPTIME_PEER_CHECK_RESP]\n{json.dumps(resp_payload)}\n[/UPTIME_PEER_CHECK_RESP]"
-                    _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=resp_msg))
+                    _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=resp_msg),
+                                            priority=PRIO_PEER, expires_in=PEER_ANSWER_TTL, label="cross-check answer")
 
                 if async_event_loop and async_event_loop.is_running():
                     asyncio.run_coroutine_threadsafe(_do_cross_check_reply(), async_event_loop)

@@ -126,11 +126,14 @@ class TestScaling(unittest.TestCase):
                 {"node_name": "Old", "status": "down", "url": t["url"]}])
             with patch.object(bot, "CROSS_CHECK_BATCH_WINDOW", 0.05), \
                  patch.object(bot, "request_peer_cross_checks", legacy), \
-                 patch.object(bot, "_dc_send_msg_with_stats", side_effect=lambda b, a, chat, m: sent.append((chat, m.text))):
+                 patch.object(bot, "_dc_send_msg_with_stats",
+                              side_effect=lambda b, a, chat, m, **kw: sent.append((chat, m.text, kw))):
                 tasks = [asyncio.create_task(bot.request_peer_cross_checks_batched({"url": u, "type": "http"}))
                          for u in ("https://a.example.org", "https://b.example.org", "https://a.example.org")]
-                while not bot.pending_batch_checks:
-                    await asyncio.sleep(0.01)
+                async def batch_sent():
+                    while not (bot.pending_batch_checks and sent):
+                        await asyncio.sleep(0.01)
+                await asyncio.wait_for(batch_sent(), 5)  # fail, don't hang, if nothing is sent
                 # The capable peer answers the batch: positions follow the request
                 req = _unwrap(sent[0][1])
                 answer = _wrap("UPTIME_PEER_CHECK_BATCH_RESP", {"req_id": req["req_id"], "results": [
@@ -139,8 +142,11 @@ class TestScaling(unittest.TestCase):
                 return await asyncio.gather(*tasks), req, legacy
 
         (res_a, res_b, res_a2), req, legacy = asyncio.run(run())
-        batch_msgs = [t for chat, t in sent if "UPTIME_PEER_CHECK_BATCH_REQ" in t]
+        batch_msgs = [(t, kw) for chat, t, kw in sent if "UPTIME_PEER_CHECK_BATCH_REQ" in t]
         self.assertEqual(len(batch_msgs), 1)  # one message for all targets
+        # Queued as peer traffic, dropped if it cannot go out before the answer is no longer awaited
+        self.assertEqual(batch_msgs[0][1]["priority"], bot.PRIO_PEER)
+        self.assertEqual(batch_msgs[0][1]["expires_in"], bot.CROSS_CHECK_BATCH_TIMEOUT)
         self.assertEqual(sent[0][0], 700)
         self.assertEqual([t["url"] for t in req["targets"]], ["https://a.example.org", "https://b.example.org"])
         self.assertEqual(req["caps"], bot.OWN_PEER_CAPS)

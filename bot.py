@@ -59,7 +59,7 @@ from outbox import outbox as dc_outbox, PRIO_ALERT, PRIO_REPLY, PRIO_UPDATE, PRI
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "2.19.0"
+VERSION = "2.19.1"
 # No "bot" in the name: some services (e.g. Hiddify subscription links) reply 400 to any User-Agent containing "bot".
 USER_AGENT = f"Delta Chat Uptime Monitor/{VERSION} (+https://git.gluek.info/gluek/deltachat_uptime)"
 
@@ -1945,9 +1945,41 @@ def build_votes(local_node: str, is_up: bool, latency_ms, error_msg, peer_result
     return votes
 
 
+VOTE_ERROR_MAX = 60  # characters of a node's error shown next to it in vote lines
+_CONNECT_ERROR_RE = re.compile(r"^Cannot connect to host \S+ ssl:\S+ \[(.*)\]$", re.S)
+_ERRNO_PREFIX_RE = re.compile(r"^\[Errno -?\d+\]\s*")
+
+
+def short_vote_error(error) -> str | None:
+    """A node's check error, short enough for a vote line: 'Timeout', 'Connection refused',
+    'SSL: self-signed certificate' instead of aiohttp's full 'Cannot connect to host ...' text."""
+    if not error:
+        return None
+    text = " ".join(str(error).split())
+    ssl_fail = re.search(r"certificate verify failed: ([^()'\]]+)", text)
+    if ssl_fail:
+        text = "SSL: " + ssl_fail.group(1).strip()
+    else:
+        m = _CONNECT_ERROR_RE.match(text)
+        if m and m.group(1).strip():
+            text = m.group(1).strip()
+        text = _ERRNO_PREFIX_RE.sub("", text)
+    if len(text) > VOTE_ERROR_MAX:
+        text = text[:VOTE_ERROR_MAX - 1].rstrip() + "…"
+    return text or None
+
+
 def format_votes(votes: list[dict]) -> str:
-    """🔴 DE · 🟢 IT (196ms), RU (188ms) · ⚪ RU2 (no answer)"""
-    down = [v["node"] for v in votes if v.get("status") == "down"]
+    """🔴 DE (Timeout) · 🟢 IT (196ms), RU (188ms) · ⚪ RU2 (no result)
+
+    Each failing node shows why it failed; when all of them failed the same way the reason is
+    given once: 🔴 DE, RU (Timeout)."""
+    down_votes = [v for v in votes if v.get("status") == "down"]
+    errors = [short_vote_error(v.get("error")) for v in down_votes]
+    if len(down_votes) > 1 and errors[0] and len(set(errors)) == 1:
+        down = [", ".join(v["node"] for v in down_votes) + f" ({errors[0]})"]
+    else:
+        down = [f"{v['node']} ({err})" if err else v["node"] for v, err in zip(down_votes, errors)]
     up = [f"{v['node']} ({v['latency_ms']}ms)" if v.get("latency_ms") is not None else v["node"]
           for v in votes if v.get("status") == "up"]
     other = [v["node"] for v in votes if v.get("status") not in ("up", "down")]

@@ -15,9 +15,9 @@ URL = "http://quorum-target.example.org"
 CHAT = 100  # the admin's chat, so its monitors are within the default "admin" peer share scope
 
 
-def _peer(node, status, latency_ms=None):
+def _peer(node, status, latency_ms=None, error_msg="timeout"):
     return {"node_name": node, "status": status, "latency_ms": latency_ms,
-            "error_msg": None if status == "up" else "timeout"}
+            "error_msg": None if status == "up" else error_msg}
 
 
 class TestQuorumDecision(unittest.TestCase):
@@ -77,8 +77,33 @@ class TestQuorumDecision(unittest.TestCase):
         votes = bot.build_votes("DE", False, None, "timeout",
                                 [_peer("IT", "up", 196), _peer("RU", "down"), {"node_name": "RU2", "status": "skip"},
                                  _peer("IT", "down")])  # a second answer from IT is ignored
-        self.assertEqual(bot.format_votes(votes), "🔴 DE, RU · 🟢 IT (196ms) · ⚪ RU2 (no result)")
+        self.assertEqual(bot.format_votes(votes), "🔴 DE, RU (timeout) · 🟢 IT (196ms) · ⚪ RU2 (no result)")
         self.assertEqual(bot._votes_summary(votes), "Unreachable from DE, RU; reachable from IT")
+
+    def test_format_votes_shows_why_nodes_failed(self):
+        # One reason: given once for all failing nodes
+        votes = bot.build_votes("DE", True, 57, None, [_peer("IT", "down", error_msg="Timeout"),
+                                                       _peer("RU", "down", error_msg="Timeout")])
+        self.assertEqual(bot.format_votes(votes), "🔴 IT, RU (Timeout) · 🟢 DE (57ms)")
+        # Different reasons: per node
+        votes = bot.build_votes("DE", False, None, "Timeout", [_peer("IT", "down", error_msg="[Errno 111] Connection refused")])
+        self.assertEqual(bot.format_votes(votes), "🔴 DE (Timeout), IT (Connection refused)")
+        # An UP node's error (none expected) is not shown
+        votes = bot.build_votes("DE", True, 10, "ignored", [])
+        self.assertEqual(bot.format_votes(votes), "🟢 DE (10ms)")
+
+    def test_short_vote_error(self):
+        ssl = ("Cannot connect to host home.firej.org:443 ssl:True [SSLCertVerificationError: (1, '[SSL: "
+               "CERTIFICATE_VERIFY_FAILED] certificate verify failed: self-signed certificate (_ssl.c:1032)')]")
+        self.assertEqual(bot.short_vote_error(ssl), "SSL: self-signed certificate")
+        self.assertEqual(bot.short_vote_error("Cannot connect to host a.example:443 ssl:default [Connection refused]"),
+                         "Connection refused")
+        self.assertEqual(bot.short_vote_error("[Errno -2] Name or service not known"), "Name or service not known")
+        self.assertEqual(bot.short_vote_error("503 - Service Unavailable"), "503 - Service Unavailable")
+        self.assertIsNone(bot.short_vote_error(None))
+        long_err = bot.short_vote_error("x" * 300)
+        self.assertEqual(len(long_err), bot.VOTE_ERROR_MAX)
+        self.assertTrue(long_err.endswith("…"))
 
 
 class TestQuorumChecks(unittest.TestCase):
@@ -280,7 +305,7 @@ class TestQuorumTexts(unittest.TestCase):
         text = bot.format_incident_message(7, 1700000000, [{
             "id": 1, "name": "Site", "url": URL, "type": "http", "status": "down",
             "went_down_at": 1700000000, "went_up_at": None, "last_votes": self._votes_json()}])
-        self.assertIn("🛰️ 🔴 DE, RU, RU2 · 🟢 IT (196ms)", text)
+        self.assertIn("🛰️ 🔴 DE, RU, RU2 (timeout) · 🟢 IT (196ms)", text)
 
     def test_degraded_notice_groups_starts_and_ends(self):
         r1 = {"id": 1, "name": "One", "url": "http://one.example.org", "dc_chat_id": CHAT}
@@ -573,7 +598,7 @@ class TestPartialOutageDisplay(unittest.TestCase):
         self.assertIn("1 Service(s) Unreachable From Some Regions", html_out)
         self.assertIn('class="indicator degraded"', html_out)
         self.assertIn("DEGRADED", html_out)
-        self.assertIn("Last vote: 🔴 RU · 🟢 DE (40ms), IT (9ms)", html_out)
+        self.assertIn("Last vote: 🔴 RU (timeout) · 🟢 DE (40ms), IT (9ms)", html_out)
         self.assertIn("🟠 Partial Outages", html_out)
         self.assertIn("unreachable from RU, RU2", html_out)
         self.assertIn("(10m", html_out)  # the ended one lasted 10 minutes

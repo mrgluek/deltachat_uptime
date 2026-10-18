@@ -172,12 +172,15 @@ class TestScaling(unittest.TestCase):
             "not a target",
             {"url": "2a00::1", "type": "ping", "family": 6},
         ]})
-        check = AsyncMock(side_effect=[(True, "200 - OK", 12), (None, bot.NO_IPV6_MSG, None)])
+        # Answered by target, not call order: the checks run concurrently and may start in any order
+        answers = {"https://ok.example.org": (True, "200 - OK", 12), "2a00::1": (None, bot.NO_IPV6_MSG, None)}
+        check = AsyncMock(side_effect=lambda t: answers[t["url"]])
         with patch("bot.run_single_check", check), \
              patch.object(bot, "_dc_send_msg_with_stats") as send:
             bot.on_new_message(self._peer_bot("ru@example.org"), 1, self._event(req, 702))
         self.assertEqual(check.call_count, 2)  # the refused ones are not checked
-        self.assertEqual(check.call_args_list[1].args[0]["family"], 6)
+        checked = {c.args[0]["url"]: c.args[0] for c in check.call_args_list}
+        self.assertEqual(checked["2a00::1"]["family"], 6)
         self.assertEqual(send.call_count, 1)
         resp = _unwrap(send.call_args.args[3].text)
         self.assertEqual(resp["req_id"], "r1")

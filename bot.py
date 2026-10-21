@@ -59,7 +59,7 @@ from outbox import outbox as dc_outbox, PRIO_ALERT, PRIO_REPLY, PRIO_UPDATE, PRI
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "2.22.1"
+VERSION = "2.22.2"
 # No "bot" in the name: some services (e.g. Hiddify subscription links) reply 400 to any User-Agent containing "bot".
 USER_AGENT = f"Delta Chat Uptime Monitor/{VERSION} (+https://git.gluek.info/gluek/deltachat_uptime)"
 
@@ -245,6 +245,50 @@ async def check_host_internet_connectivity(timeout: float = 2.5, max_age: float 
 _ADMIN_CHAT_MEMBERSHIP_TTL = 600
 _admin_chat_membership_cache = {}  # chat_id -> (checked_at, admin_is_member)
 
+_admin_contact_cache = {"at": 0.0, "id": None}
+ADMIN_CONTACT_TTL = 600
+
+
+def _admin_contact_id(bot, accid):
+    """The admin's contact WITH their key (fingerprint from /initadmin).
+
+    The core keeps an address-only contact and a key contact per address; lookup_contact_id_by_addr
+    and create_contact give the address-only one. A chat with it cannot be written to ("e2e
+    encryption unavailable"), and groups contain the key contact, so admin notices were lost and
+    group membership checks missed the admin."""
+    now = time.time()
+    if _admin_contact_cache["id"] and now - _admin_contact_cache["at"] < ADMIN_CONTACT_TTL:
+        return _admin_contact_cache["id"]
+    email = (database.get_admin_email() or "").lower()
+    if not email or bot is None or accid is None:
+        return None
+    fp = re.sub(r"[^0-9A-F]", "", (database.get_config("admin_dc_fingerprint") or "").upper())
+    found = None
+    try:
+        candidates = bot.rpc.get_contact_ids(accid, 0, email) or []
+    except Exception as e:
+        logger.debug(f"Could not list admin contacts: {e}")
+        candidates = []
+    for cid in candidates:
+        try:
+            c = bot.rpc.get_contact(accid, cid)
+            if (_field(c, "address") or "").lower() != email or not _field(c, "is_key_contact", False):
+                continue
+            if fp and fp not in re.sub(r"[^0-9A-F]", "", str(bot.rpc.get_contact_encryption_info(accid, cid)).upper()):
+                continue  # same address, other key: not the admin
+            found = cid
+            break
+        except Exception:
+            continue
+    if not found:
+        try:
+            found = bot.rpc.lookup_contact_id_by_addr(accid, email)  # older cores: one contact per address
+        except Exception as e:
+            logger.debug(f"Could not look up admin contact: {e}")
+    _admin_contact_cache.update(at=now, id=found)
+    return found
+
+
 def _get_admin_chat_ids(bot, accid, chat_ids) -> set:
     """Returns the subset of chat_ids that the administrator belongs to (1:1 admin chat or groups with the admin)."""
     allowed = set()
@@ -252,13 +296,7 @@ def _get_admin_chat_ids(bot, accid, chat_ids) -> set:
     if admin_chat and str(admin_chat).isdigit():
         allowed.add(int(admin_chat))
 
-    admin_contact_id = None
-    admin_email = database.get_admin_email()
-    if admin_email and bot is not None and accid is not None:
-        try:
-            admin_contact_id = bot.rpc.lookup_contact_id_by_addr(accid, admin_email)
-        except Exception as e:
-            logger.debug(f"Could not look up admin contact: {e}")
+    admin_contact_id = _admin_contact_id(bot, accid)
     if not admin_contact_id:
         return allowed & set(chat_ids)
 
@@ -1562,19 +1600,21 @@ async def send_admin_notification(text: str):
         return
     admin_chat_id_str = await asyncio.to_thread(database.get_config, "admin_chat_id")
     chat_id = int(admin_chat_id_str) if admin_chat_id_str and admin_chat_id_str.isdigit() else None
-    
-    if not chat_id:
-        admin_email = await asyncio.to_thread(database.get_config, "admin_dc_email")
-        if not admin_email:
-            return
+
+    # The 1:1 chat with the admin's key contact (see _admin_contact_id); re-resolved when the
+    # cached chat is another one (e.g. one with the address-only contact, which cannot be written to)
+    contact_id = await asyncio.to_thread(_admin_contact_id, dc_bot_instance, dc_accid)
+    if contact_id:
         try:
-            contact_id = await asyncio.to_thread(dc_bot_instance.rpc.create_contact, dc_accid, admin_email, "Admin")
-            chat_id = await asyncio.to_thread(dc_bot_instance.rpc.create_chat_by_contact_id, dc_accid, contact_id)
-            if chat_id:
+            key_chat = await asyncio.to_thread(dc_bot_instance.rpc.create_chat_by_contact_id, dc_accid, contact_id)
+            if isinstance(key_chat, int) and key_chat and key_chat != chat_id:
+                logger.info(f"Admin notifications now go to chat {key_chat} (was {chat_id})")
+                chat_id = key_chat
                 await asyncio.to_thread(database.set_config, "admin_chat_id", str(chat_id))
         except Exception as e:
-            logger.warning(f"Failed to resolve admin chat for {admin_email}: {e}")
-            return
+            logger.warning(f"Failed to resolve admin chat: {e}")
+    if not chat_id:
+        return
 
     if chat_id:
         try:

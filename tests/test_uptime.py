@@ -3167,3 +3167,49 @@ class TestAbandonedChats(unittest.TestCase):
         asyncio.run(bot.audit_abandoned_chats())
         self.assertEqual(len(database.get_all_resources()), 1)
         self.assertEqual(self.sent, [])
+
+
+class TestAdminContact(unittest.TestCase):
+    FP = "DFF2CAB1FEB7182F997C0A01466AA64DE33D8A39"
+
+    def setUp(self):
+        database.close_db()
+        database.DB_PATH = TEST_DB
+        database.init_db()
+        database.set_config("admin_dc_email", "admin@example.org")
+        database.set_config("admin_dc_fingerprint", self.FP)
+        bot._admin_contact_cache.update(at=0.0, id=None)
+        self.rpc_bot = MagicMock()
+        contacts = {
+            10: {"address": "admin@example.org", "is_key_contact": False},            # address-only
+            11: {"address": "admin@example.org", "is_key_contact": True},             # other key
+            12: {"address": "admin@example.org", "is_key_contact": True},             # the admin
+        }
+        self.rpc_bot.rpc.get_contact_ids.return_value = [10, 11, 12]
+        self.rpc_bot.rpc.get_contact.side_effect = lambda acc, cid: contacts[cid]
+        self.rpc_bot.rpc.get_contact_encryption_info.side_effect = lambda acc, cid: (
+            "End-to-end encryption available.\nAdmin:\n" + ("DFF2 CAB1 FEB7 182F 997C\n0A01 466A A64D E33D 8A39" if cid == 12 else "AAAA BBBB"))
+        self.rpc_bot.rpc.lookup_contact_id_by_addr.return_value = 10
+
+    def tearDown(self):
+        bot._admin_contact_cache.update(at=0.0, id=None)
+        database.close_db()
+        for f in (TEST_DB, TEST_DB + "-wal", TEST_DB + "-shm"):
+            if os.path.exists(f):
+                os.remove(f)
+
+    def test_key_contact_with_admin_fingerprint(self):
+        self.assertEqual(bot._admin_contact_id(self.rpc_bot, 1), 12)
+
+    def test_fallback_to_address_lookup(self):
+        self.rpc_bot.rpc.get_contact_ids.return_value = []
+        self.assertEqual(bot._admin_contact_id(self.rpc_bot, 1), 10)
+
+    def test_notification_moves_to_key_chat(self):
+        database.set_config("admin_chat_id", "30")  # chat with the address-only contact
+        self.rpc_bot.rpc.create_chat_by_contact_id.return_value = 31
+        with patch.object(bot, "dc_bot_instance", self.rpc_bot), patch.object(bot, "dc_accid", 1), \
+             patch.object(bot, "_dc_send_msg_with_stats") as send:
+            asyncio.run(bot.send_admin_notification("hello"))
+        self.assertEqual(send.call_args.args[2], 31)
+        self.assertEqual(database.get_config("admin_chat_id"), "31")

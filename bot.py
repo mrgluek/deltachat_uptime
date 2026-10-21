@@ -59,7 +59,7 @@ from outbox import outbox as dc_outbox, PRIO_ALERT, PRIO_REPLY, PRIO_UPDATE, PRI
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "2.22.2"
+VERSION = "2.23.0"
 # No "bot" in the name: some services (e.g. Hiddify subscription links) reply 400 to any User-Agent containing "bot".
 USER_AGENT = f"Delta Chat Uptime Monitor/{VERSION} (+https://git.gluek.info/gluek/deltachat_uptime)"
 
@@ -143,7 +143,10 @@ _telemetry_last_sent = {}  # peer email -> {url: status last sent}, so changes g
 # one message (and come back in one), instead of a message per target and peer. In a mass outage
 # (300 targets) that was 600 mails per peer a minute, far over the relays' 60/min send limit.
 PEER_CAP_BATCH_CHECK = "batch_check"
-OWN_PEER_CAPS = [PEER_CAP_BATCH_CHECK]
+# smtp:// targets go only to peers that announce this: older versions cannot check them
+# (they refuse the target and abstain, but a single /ping request would wait for the timeout)
+PEER_CAP_SMTP_CHECK = "smtp_check"
+OWN_PEER_CAPS = [PEER_CAP_BATCH_CHECK, PEER_CAP_SMTP_CHECK]
 CROSS_CHECK_BATCH_WINDOW = 5.0    # seconds to collect failing targets before sending
 CROSS_CHECK_BATCH_MAX = 100       # targets per batch message
 CROSS_CHECK_BATCH_TIMEOUT = 25.0  # a peer checks up to 100 targets (10 s timeouts) and mails back
@@ -426,6 +429,7 @@ async def request_peer_cross_checks(target_dict: dict, timeout: float = 8.0, pee
     and waits for responses. /ping uses it directly; monitors go through the batched variant."""
     if peers is None:
         peers = await asyncio.to_thread(database.get_all_peers)
+    peers = [p for p in peers or [] if _peer_can_check(p, target_dict)]
     if not peers or not dc_bot_instance or dc_accid is None:
         return []
 
@@ -489,6 +493,11 @@ def _cross_check_key(t: dict) -> tuple:
 
 def _peer_supports(peer: dict, cap: str) -> bool:
     return cap in _peer_caps.get((peer.get("email") or "").lower(), ())
+
+
+def _peer_can_check(peer: dict, target: dict) -> bool:
+    """Whether a peer understands the target's check type (smtp:// needs PEER_CAP_SMTP_CHECK)."""
+    return (target.get("type") or "http") != "smtp" or _peer_supports(peer, PEER_CAP_SMTP_CHECK)
 
 
 def _note_peer_caps(email: str, caps) -> None:
@@ -570,8 +579,9 @@ async def _flush_cross_checks(batch: list) -> None:
         items = [(key, target) for key, (target, _) in by_key.items()]
         jobs = []
         for p in batch_peers:
-            for i in range(0, len(items), CROSS_CHECK_BATCH_MAX):
-                jobs.append(_batch_cross_check_peer(p, items[i:i + CROSS_CHECK_BATCH_MAX], results))
+            p_items = [(key, t) for key, t in items if _peer_can_check(p, t)]
+            for i in range(0, len(p_items), CROSS_CHECK_BATCH_MAX):
+                jobs.append(_batch_cross_check_peer(p, p_items[i:i + CROSS_CHECK_BATCH_MAX], results))
         if legacy_peers:
             async def _legacy(key, target):
                 results[key].extend(await request_peer_cross_checks(target, timeout=8.0, peers=legacy_peers))
@@ -671,7 +681,7 @@ def _parse_batch_targets(raw) -> list:
             targets.append(None)
             continue
         url, check_type = str(t.get("url") or ""), str(t.get("type") or "http")
-        if check_type not in ("http", "tcp", "ping") or not is_safe_target_url(url, check_type):
+        if check_type not in ("http", "tcp", "ping", "smtp") or not is_safe_target_url(url, check_type):
             targets.append(None)
             continue
         kw = t.get("expected_keyword")
@@ -996,14 +1006,18 @@ def parse_target(target: str) -> tuple[str, str]:
     2a00::1 ends in hex digits, so "2a00::1:22" cannot tell address from port.
 
     • http(s)://...        -> http
+    • smtp://host[:port]   -> smtp (STARTTLS, port 25 by default; 465 = implicit TLS)
     • host:port, [v6]:port -> tcp ("[2a00::1]:443")
     • host, IPv4, IPv6     -> ping ("2a00::1" or "[2a00::1]")"""
     target = target.strip()
     if not target:
         raise ValueError("Target is empty")
-        
+
     if target.startswith("http://") or target.startswith("https://"):
         return "http", target
+
+    if target.lower().startswith("smtp://"):
+        return "smtp", _parse_smtp_target(target)
 
     bracketed = re.match(r'^\[([^\]]+)\](?::(\d+))?$', target)
     if bracketed:
@@ -1032,6 +1046,50 @@ def parse_target(target: str) -> tuple[str, str]:
     if not _HOSTNAME_RE.match(host):
         raise ValueError("Invalid target format. Provide an HTTP/HTTPS URL, a host:port ([IPv6]:port), or a hostname/IP.")
     return "ping", host
+
+
+SMTP_DEFAULT_PORT = 25
+SMTP_IMPLICIT_TLS_PORTS = (465,)  # SMTPS: TLS from the first byte, no STARTTLS
+
+
+def _parse_smtp_target(target: str) -> str:
+    """smtp://host[:port] -> canonical "smtp://host" (port 25) or "smtp://host:port".
+
+    Only a host and a port: no user, path or query, so one server is one monitor."""
+    rest = target[len("smtp://"):]
+    if not rest or any(c in rest for c in "/?#@"):
+        raise ValueError("SMTP targets are `smtp://host` or `smtp://host:port`, e.g. `smtp://mail.example.org`.")
+    bracketed = re.match(r'^\[([^\]]+)\](?::(\d+))?$', rest)
+    if bracketed:
+        ip6 = _ipv6_literal(bracketed.group(1))
+        if ip6 is None:
+            raise ValueError("Only IPv6 addresses go in brackets, e.g. `smtp://[2a00::1]:25`.")
+        host_fmt, port_s = f"[{ip6}]", bracketed.group(2)
+    else:
+        host, _, port_s = rest.partition(":")
+        if not _HOSTNAME_RE.match(host) or (port_s and not port_s.isdigit()):
+            raise ValueError("Invalid SMTP target. Use `smtp://host` or `smtp://host:port`.")
+        host_fmt, port_s = host.lower(), port_s or None
+    port = int(port_s) if port_s else SMTP_DEFAULT_PORT
+    if not 1 <= port <= 65535:
+        raise ValueError("Port must be between 1 and 65535.")
+    return f"smtp://{host_fmt}" + ("" if port == SMTP_DEFAULT_PORT else f":{port}")
+
+
+def _smtp_host_port(url: str) -> tuple[str, int]:
+    """Host (IPv6 without brackets) and port of a canonical smtp:// target."""
+    rest = url[len("smtp://"):]
+    if rest.startswith("["):
+        host, _, port = rest[1:].partition("]")
+        port = port.lstrip(":")
+    else:
+        host, _, port = rest.partition(":")
+    return host.lower(), int(port) if port else SMTP_DEFAULT_PORT
+
+
+def has_tls_certificate(url: str) -> bool:
+    """Targets whose certificate expiry is tracked: HTTPS sites and SMTP servers."""
+    return url.startswith("https://") or url.startswith("smtp://")
 
 
 def target_type(target: str) -> str:
@@ -1354,6 +1412,8 @@ def _target_host(validated: str, check_type: str) -> str:
         return (urlparse(validated).hostname or "").lower().strip()
     if check_type == "tcp":
         return validated.rsplit(":", 1)[0].strip("[]").lower().strip()
+    if check_type == "smtp":
+        return _smtp_host_port(validated)[0]
     return validated.lower().strip()
 
 
@@ -1626,10 +1686,14 @@ async def send_admin_notification(text: str):
 # Uptime checks execution logic
 async def check_ssl_expiry(url: str, timeout: float = 10.0) -> tuple[int | None, str | None]:
     """
-    Connects to the HTTPS host, fetches peer certificate and returns:
+    Connects to the HTTPS host (or the smtp:// server, via STARTTLS), fetches peer certificate and returns:
     (expiry_timestamp_epoch, None) on success, or (None, error_str) on failure.
     """
     try:
+        if url.startswith("smtp://"):
+            cert = await asyncio.wait_for(smtp_tls_handshake(url), timeout=timeout)
+            exp_ts = _cert_expiry_ts(cert)
+            return (exp_ts, None) if exp_ts else (None, "No certificate found")
         parsed = urlparse(url)
         host = parsed.hostname
         port = parsed.port or 443
@@ -1731,15 +1795,119 @@ async def _prewarm_target_dns(url: str, check_type: str) -> bool:
 
 async def _open_pinned_connection(host: str, port: int, family: int | None = None, **kwargs):
     """Opens a TCP connection to one of the validated addresses of host; returns the writer."""
+    _, writer = await _open_pinned_streams(host, port, family, **kwargs)
+    return writer
+
+
+async def _open_pinned_streams(host: str, port: int, family: int | None = None, **kwargs):
+    """Like _open_pinned_connection, but returns (reader, writer) for protocols that talk (SMTP)."""
     first_error = None
     for ip in await probe_addresses(host, family):
         try:
-            _, writer = await asyncio.open_connection(ip, port, **kwargs)
-            return writer
+            return await asyncio.open_connection(ip, port, **kwargs)
         except OSError as e:
             # The first address is the preferred one (IPv4 first): its error explains the outage best
             first_error = first_error or e
     raise first_error or OSError(f"Could not connect to {host}:{port}")
+
+
+class SMTPCheckError(Exception):
+    """The SMTP server answered, but not as a working TLS mail server should (message is shown as is)."""
+
+
+# Name sent in EHLO. Postfix and most servers do not check it on a session that sends no mail.
+SMTP_EHLO_NAME = os.environ.get("SMTP_EHLO_NAME") or (socket.getfqdn() if "." in socket.getfqdn() else "localhost")
+
+
+async def _smtp_read_reply(reader) -> tuple[int, list[str]]:
+    """One (possibly multi-line, "250-...") SMTP reply -> (code, text lines)."""
+    lines = []
+    while True:
+        raw = await reader.readline()
+        if not raw:
+            raise SMTPCheckError("SMTP: connection closed by server")
+        line = raw.decode("utf-8", "replace").rstrip("\r\n")
+        if len(line) < 3 or not line[:3].isdigit():
+            raise SMTPCheckError(f"SMTP: unexpected reply: {line[:100]}")
+        lines.append(line[4:])
+        if len(line) == 3 or line[3] != "-":
+            return int(line[:3]), lines
+        if len(lines) > 100:
+            raise SMTPCheckError("SMTP: reply too long")
+
+
+async def _smtp_command(reader, writer, cmd: str) -> tuple[int, list[str]]:
+    writer.write(cmd.encode() + b"\r\n")
+    await writer.drain()
+    return await _smtp_read_reply(reader)
+
+
+def _short_ssl_error(e: Exception) -> str:
+    """'SSL: certificate has expired' instead of '[SSL: CERTIFICATE_VERIFY_FAILED] ... (_ssl.c:1006)'."""
+    if isinstance(e, ssl.SSLCertVerificationError):
+        return f"SSL: {getattr(e, 'verify_message', None) or e}"
+    reason = getattr(e, "reason", None)
+    return f"SSL: {reason.replace('_', ' ').lower()}" if reason else f"SSL: {e}"
+
+
+async def smtp_tls_handshake(url: str, family: int | None = None) -> dict:
+    """Talks to an smtp:// target the way a sending mail server does and returns its verified
+    certificate (ssl.getpeercert()). Raises SMTPCheckError / ssl.SSLError / OSError on failure.
+
+    Port 25/587: greeting 220 -> EHLO -> STARTTLS must be offered -> 220 -> TLS handshake.
+    Port 465: TLS right away, then the greeting. Both end with QUIT, so the server logs an
+    ordinary session (no "lost connection" lines that fail2ban could count).
+
+    The certificate is checked like MTA-STS senders do: trusted CA and the target host name.
+    No timeout here: callers wrap it in asyncio.wait_for."""
+    host, port = _smtp_host_port(url)
+    ctx = ssl.create_default_context()
+    implicit = port in SMTP_IMPLICIT_TLS_PORTS
+    if implicit:
+        reader, writer = await _open_pinned_streams(host, port, family, ssl=ctx, server_hostname=host)
+    else:
+        reader, writer = await _open_pinned_streams(host, port, family)
+    try:
+        code, text = await _smtp_read_reply(reader)
+        if code != 220:
+            raise SMTPCheckError(f"SMTP: greeting {code} {' '.join(text)[:100]}")
+        code, text = await _smtp_command(reader, writer, f"EHLO {SMTP_EHLO_NAME}")
+        if code != 250:
+            raise SMTPCheckError(f"SMTP: EHLO refused: {code} {' '.join(text)[:100]}")
+        if not implicit:
+            if not any(t.upper().split(" ", 1)[0] == "STARTTLS" for t in text):
+                raise SMTPCheckError("SMTP: STARTTLS not offered")
+            code, text = await _smtp_command(reader, writer, "STARTTLS")
+            if code != 220:
+                raise SMTPCheckError(f"SMTP: STARTTLS refused: {code} {' '.join(text)[:100]}")
+            await writer.start_tls(ctx, server_hostname=host)
+        ssl_obj = writer.get_extra_info("ssl_object")
+        cert = ssl_obj.getpeercert() if ssl_obj else None
+        if not cert:
+            raise SMTPCheckError("SMTP: no certificate")
+        try:
+            await asyncio.wait_for(_smtp_command(reader, writer, "QUIT"), timeout=3)
+        except Exception:
+            pass  # the check already passed; a slow goodbye does not make it fail
+        return cert
+    finally:
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+
+def _cert_expiry_ts(cert: dict) -> int | None:
+    not_after_str = cert.get("notAfter") if cert else None
+    if not not_after_str:
+        return None
+    try:
+        exp_date = datetime.datetime.strptime(not_after_str, "%b %d %H:%M:%S %Y %Z")
+    except ValueError:
+        import email.utils
+        exp_date = email.utils.parsedate_to_datetime(not_after_str)
+    return int(exp_date.replace(tzinfo=datetime.timezone.utc).timestamp())
 
 _REDIRECT_STATUSES = (301, 302, 303, 307, 308)
 _MAX_SAFE_REDIRECTS = 10
@@ -1904,6 +2072,16 @@ async def run_single_check(resource, session=None) -> tuple[bool, str, int | Non
                 await writer.wait_closed()
             except Exception:
                 pass
+            elapsed_ms = int((time.time() - start_time) * 1000)
+            return True, f"{elapsed_ms} ms", elapsed_ms
+        elif rtype == "smtp":
+            # UP = greeting, STARTTLS and a certificate valid for this host, like a sending server needs
+            try:
+                await asyncio.wait_for(smtp_tls_handshake(url, family), timeout=timeout)
+            except ssl.SSLError as e:
+                return False, _short_ssl_error(e), int((time.time() - start_time) * 1000)
+            except SMTPCheckError as e:
+                return False, str(e), int((time.time() - start_time) * 1000)
             elapsed_ms = int((time.time() - start_time) * 1000)
             return True, f"{elapsed_ms} ms", elapsed_ms
         elif rtype == "ping":
@@ -2574,8 +2752,8 @@ async def check_group_task(group, semaphore, session=None):
                    f"{'' if r_up == is_up else ' by quorum, locally ' + ('UP' if is_up else 'DOWN')} ({r_err})")
         await handle_check_result(r, r_up, r_err, latency_ms=latency_ms, status_written=True)
 
-    # Check SSL Certificate Expiry for HTTPS targets (at most once per hour)
-    if rep.get("type") == "http" and rep.get("url", "").startswith("https://"):
+    # Check SSL Certificate Expiry for HTTPS and SMTP targets (at most once per hour)
+    if rep.get("type") in ("http", "smtp") and has_tls_certificate(rep.get("url", "")):
         now = int(time.time())
         ssl_last_checked = rep.get("ssl_last_checked") or 0
         if now - ssl_last_checked >= 3600:
@@ -3342,7 +3520,7 @@ def get_dashboard_html(chat_name, resources, overall_uptime, incidents=None, upt
                 """
 
             ssl_stat_html = ""
-            if r.get("url", "").startswith("https://"):
+            if has_tls_certificate(r.get("url", "")):
                 exp_ts = r.get("ssl_expiry_date")
                 if exp_ts:
                     d_left = int((exp_ts - now_ts) / 86400)
@@ -4190,14 +4368,14 @@ async def handle_index(request):
                     <span class="feature-icon">⚙️</span>
                     <div class="feature-text">
                         <h3>Multiple Check Modes</h3>
-                        <p>Support HTTP/HTTPS availability, SSL/TLS certificate expiry checks, TCP ports, and non-blocking ICMP Pings.</p>
+                        <p>Support HTTP/HTTPS availability, SMTP STARTTLS, SSL/TLS certificate expiry checks, TCP ports, and non-blocking ICMP Pings.</p>
                     </div>
                 </div>
                 <div class="feature-item">
                     <span class="feature-icon">🔒</span>
                     <div class="feature-text">
                         <h3>SSL Certificate Alerts</h3>
-                        <p>Tracks HTTPS certificate expiry with hourly checks and proactive notifications at 7d, 3d, and 24h.</p>
+                        <p>Tracks HTTPS and SMTP certificate expiry with hourly checks and proactive notifications at 7d, 3d, and 24h.</p>
                     </div>
                 </div>
                 <div class="feature-item">
@@ -4443,12 +4621,13 @@ def help_command(bot, accid, event):
     
     help_text = (
         f"👋 Welcome to Delta Chat Uptime Bot {VERSION}!\n\n"
-        f"I monitor resource availability (HTTP, TCP, Ping) and alert this chat if they go offline.\n\n"
+        f"I monitor resource availability (HTTP, SMTP, TCP, Ping) and alert this chat if they go offline.\n\n"
         f"**Public Commands:**\n"
         f"/ping [-4|-6] <target> [\"keyword\"] — Quick on-demand test & diagnostics without adding (`-6`: only over IPv6)\n"
         f"/add <target> [name] [\"keyword\"] — Monitor a resource. Target formats:\n"
         f"  • `https://example.com` (HTTP/HTTPS)\n"
         f"  • `https://api.site.com Health \"status:ok\"` (Keyword assertion)\n"
+        f"  • `smtp://mail.example.com` (SMTP: STARTTLS + certificate, port 25; `:465` = TLS)\n"
         f"  • `example.com:22` (TCP Port)\n"
         f"  • `example.com` (ICMP Ping)\n"
         f"  • `2a00::1`, `[2a00::1]:443` (IPv6: ping, TCP port)\n"
@@ -4677,6 +4856,7 @@ def ping_command(bot, accid, event):
                  "• `/ping https://gluek.info \"and enjoy\"` (HTTP + Keyword assertion)\n"
                  "• `/ping 1.1.1.1` (ICMP Ping)\n"
                  "• `/ping 2606:4700:4700::1111` (ICMP Ping, IPv6)\n"
+                 "• `/ping smtp://chatmail.uk` (SMTP: STARTTLS + certificate)\n"
                  "• `/ping example.com:443` (TCP Port)\n"
                  "• `/ping [2606:4700:4700::1111]:443` (TCP Port, IPv6)\n"
                  "• `/ping -6 example.com` (only over IPv6; `-4` only over IPv4)"
@@ -4694,6 +4874,7 @@ def ping_command(bot, accid, event):
                  "Examples:\n"
                  "• `/ping https://example.com`\n"
                  "• `/ping example.com:443`\n"
+                 "• `/ping smtp://mail.example.com`\n"
                  "• `/ping 1.1.1.1`\n"
                  "• `/ping [2a00::1]:443`"
         ))
@@ -4767,7 +4948,7 @@ def ping_command(bot, accid, event):
 
             # 2. SSL certificate check if HTTPS
             ssl_info = None
-            if check_type == "http" and validated_url.startswith("https://"):
+            if has_tls_certificate(validated_url):
                 try:
                     exp_epoch, ssl_err = await check_ssl_expiry(validated_url, timeout=4.0)
                     if exp_epoch:
@@ -4872,6 +5053,7 @@ def add_command(bot, accid, event):
             text="Usage: /add <target> [name] [\"keyword\"]\n\nExamples:\n"
                  "• `/add https://google.com Google` (HTTP)\n"
                  "• `/add https://api.site.com Health \"status:ok\"` (Keyword assertion)\n"
+                 "• `/add smtp://chatmail.uk Mail` (SMTP: STARTTLS + certificate)\n"
                  "• `/add google.com:443 Google TCP` (TCP)\n"
                  "• `/add google.com Google Ping` (Ping)\n"
                  "• `/add 2a00::1 Server` / `/add [2a00::1]:22 SSH` (IPv6 ping / TCP)"
@@ -5330,7 +5512,7 @@ def list_command(bot, accid, event):
         extra_info += slowdown_note(r, int(now_ts))
             
         ssl_info = ""
-        if r.get("url", "").startswith("https://"):
+        if has_tls_certificate(r.get("url", "")):
             exp_ts = r.get("ssl_expiry_date")
             if exp_ts:
                 d_left = int((exp_ts - now_ts) / 86400)
@@ -6297,7 +6479,7 @@ def on_new_message(bot, accid, event):
                 # Security: Force interval to be at least 60 seconds
                 interval = max(60, interval)
                 
-                if url and check_type in ("http", "ping", "tcp"):
+                if url and check_type in ("http", "ping", "tcp", "smtp"):
                     # Security: validate URL format and expected type
                     try:
                         expected_type, validated_url = parse_target(url)

@@ -1700,7 +1700,7 @@ def _target_match_keys(url: str) -> set:
         try:
             parsed = urlparse(u)
             host = parsed.hostname
-            port = parsed.port or {"https": 443, "http": 80}.get(parsed.scheme)
+            port = parsed.port or {"https": 443, "http": 80, "smtp": 25}.get(parsed.scheme)
         except ValueError:
             pass
     else:

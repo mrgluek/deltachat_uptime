@@ -1,6 +1,6 @@
 # Delta Chat Uptime Bot
 
-Delta Chat Uptime Bot is a self-hosted uptime monitoring bot (similar to Uptime Kuma) integrated directly with Delta Chat. It monitors resources (websites, APIs, TCP ports, or ping targets) and alerts you inside Delta Chat if they go offline.
+Delta Chat Uptime Bot is a self-hosted uptime monitoring bot (similar to Uptime Kuma) integrated directly with Delta Chat. It monitors resources (websites, APIs, mail servers, TCP ports, or ping targets) and alerts you inside Delta Chat if they go offline.
 
 Additionally, it automatically generates a secure, beautiful web status dashboard for each chat.
 
@@ -21,7 +21,7 @@ Additionally, it automatically generates a secure, beautiful web status dashboar
   - Supports replying `/pause [duration]` directly to incident alerts.
   - Automatically resumes normal monitoring when the maintenance window expires, or resume early with `/resume`.
 - ⚡ **Universal Latency Measurement & Response Time Tracking:**
-  - Measures probe latency in milliseconds for HTTP/HTTPS, TCP sockets, and ICMP Ping.
+  - Measures probe latency in milliseconds for HTTP/HTTPS, SMTP, TCP sockets, and ICMP Ping.
   - Real-time latency badges displayed on the Web Status Dashboard (`⚡ 124ms`) and in `/list`.
 - 📜 **Detailed Outage & Incident History:**
   - `/events` (or `/incidents`) — View the chat's historical incident log, active outages, and total downtime durations.
@@ -30,7 +30,10 @@ Additionally, it automatically generates a secure, beautiful web status dashboar
   - Automatically verifies host internet connectivity via high-speed canary checks (`1.1.1.1`, `8.8.8.8`, `9.9.9.9`, `1.0.0.1`) before declaring any resource DOWN.
   - If the bot host itself loses internet access, false mass-downtime alerts and false downtime logs are suppressed, keeping 30-day uptime metrics accurate.
 - 🌍 **IPv6:** IPv6 addresses work as targets (`2a00::1`, `[2a00::1]:443`, `https://[2a00::1]/`). A node without IPv6 (no route, or Docker without `enable_ipv6`) does not report IPv6 targets as DOWN: its checks are skipped (⚪ in `/ping`, no alert, status unchanged) and other regions answer instead. Names with both A and AAAA records are checked over IPv4 there, so an unreachable IPv6 address no longer hides the real error.
-- 🔒 **SSL Certificate Expiration Monitoring:** Automatically tracks SSL/TLS certificate expiration for HTTPS targets:
+- 📮 **SMTP / STARTTLS Checks (`smtp://host[:port]`):** Checks a mail server the way a sending server does: it reads the `220` greeting, sends `EHLO`, requires `STARTTLS` in the reply, switches to TLS and verifies the certificate against trusted CAs and the target host name (what MTA-STS senders in `mode: enforce` require), then says `QUIT`. Port 25 is the default (`smtp://chatmail.uk`), `smtp://host:587` works the same way, and port 465 uses TLS from the first byte. A plain `host:25` TCP check only shows that the port is open; this one fails with the reason when the server stops offering STARTTLS (`SMTP: STARTTLS not offered`), its certificate expired or does not match the name (`SSL: Hostname mismatch, ...`), or it greets with an error. The session ends with `QUIT`, so the server logs an ordinary connection (`ehlo=1 starttls=1 quit=1`) that fail2ban does not count. The name sent in `EHLO` is the host's FQDN (or `localhost`); set `SMTP_EHLO_NAME` to change it.
+  - **Outbound port 25 must be open on the node.** Many hosting and home providers block it; a node there sees every SMTP target as down. Use `/probeignore *:25` on that node (it covers `smtp://` targets on port 25 too) so it abstains instead of voting DOWN.
+  - Peers running older versions do not get `smtp://` targets for cross-checks (they announce no `smtp_check` capability) and do not vote on them.
+- 🔒 **SSL Certificate Expiration Monitoring:** Automatically tracks SSL/TLS certificate expiration for HTTPS and SMTP (`smtp://`) targets:
   - Periodic checks cached to run at most once per hour.
   - Staged proactive alerts sent to chat at **7 days**, **3 days**, and **24 hours (1 day)** before expiration, as well as upon expiration.
   - Automatic alert state reset when certificate is renewed.
@@ -91,10 +94,11 @@ These commands are available to any member of a chat. They support suffixes (e.g
 
 A plain `/help` sent in a group chat is answered in a private 1:1 chat with the sender, so several bots don't flood the group with help texts. Use `/help@uptime` to show the help in the group itself.
 
-- `/ping [-4|-6] <target> ["keyword"]` (or `/check`, `/test`) — Perform an immediate on-demand reachability and diagnostics test without adding to monitoring (rate-limited to 1 request per 15s per chat for non-admins; supports HTTP/HTTPS, SSL certificate inspection, keyword assertions, TCP port, ICMP Ping, and multi-region cross-checks). `-6` / `-4` check a name only over IPv6 / IPv4 (also on the other regions), e.g. `/ping -6 chatmail.uk`.
+- `/ping [-4|-6] <target> ["keyword"]` (or `/check`, `/test`) — Perform an immediate on-demand reachability and diagnostics test without adding to monitoring (rate-limited to 1 request per 15s per chat for non-admins; supports HTTP/HTTPS, SMTP STARTTLS (`/ping smtp://chatmail.uk`), SSL certificate inspection, keyword assertions, TCP port, ICMP Ping, and multi-region cross-checks). `-6` / `-4` check a name only over IPv6 / IPv4 (also on the other regions), e.g. `/ping -6 chatmail.uk`.
 - `/add <target> [name] ["keyword"]` — Add a monitor. Target formats:
   • `https://google.com Google` (HTTP/HTTPS check)
   • `https://api.site.com Health "status:ok"` (HTTP with keyword assertion)
+  • `smtp://chatmail.uk Mail` (SMTP: STARTTLS + certificate; `smtp://host:465` for implicit TLS)
   • `google.com:443 Google TCP` (TCP port check)
   • `google.com Google Ping` (ICMP Ping check)
   • `2a00::1 Server` / `[2a00::1]:22 SSH` (IPv6 ping / TCP port; with a port the address goes in brackets, as in URLs)

@@ -131,6 +131,9 @@ def init_db():
             cursor.execute("ALTER TABLE resources ADD COLUMN last_down_msg_id INTEGER")
         if "stale_warning_level" not in columns:
             cursor.execute("ALTER TABLE resources ADD COLUMN stale_warning_level INTEGER DEFAULT 0")
+        if "stale_warning_at" not in columns:
+            # When the last stale notice went out: auto-cleanup waits a few days after the 14-day warning
+            cursor.execute("ALTER TABLE resources ADD COLUMN stale_warning_at INTEGER")
         if "expected_keyword" not in columns:
             cursor.execute("ALTER TABLE resources ADD COLUMN expected_keyword TEXT")
         if "maintenance_until" not in columns:
@@ -294,6 +297,9 @@ def init_db():
         pt_columns = [row[1] for row in cursor.fetchall()]
         if "http_method" not in pt_columns:
             cursor.execute("ALTER TABLE probe_targets ADD COLUMN http_method TEXT")
+        if "down_since" not in pt_columns:
+            # Start of the current local outage of a peer's target: drives the check slowdown
+            cursor.execute("ALTER TABLE probe_targets ADD COLUMN down_since INTEGER")
 
         # Ignored probe targets (excluded from remote scanning on this probe)
         cursor.execute('''
@@ -594,11 +600,6 @@ def _apply_status_updates(cursor, updates: list[dict], now: int):
                     SET went_up_at = ? 
                     WHERE resource_id = ? AND went_up_at IS NULL
                 ''', (now, resource_id))
-                cursor.execute('''
-                    UPDATE resources 
-                    SET stale_warning_level = 0 
-                    WHERE id = ?
-                ''', (resource_id,))
         else:
             cursor.execute('''
                 UPDATE resources 
@@ -606,6 +607,13 @@ def _apply_status_updates(cursor, updates: list[dict], now: int):
                     last_latency_ms = COALESCE(?, last_latency_ms)
                 WHERE id = ?
             ''', (now, consecutive_failures, latency_ms, resource_id))
+            if status == "up":
+                # Stale notices start over only after a full day up: a target that comes up for a
+                # few minutes now and then would otherwise get the 7-day notice again after each flap.
+                cursor.execute('''
+                    UPDATE resources SET stale_warning_level = 0, stale_warning_at = NULL
+                    WHERE id = ? AND stale_warning_level > 0 AND ? - last_changed >= ?
+                ''', (resource_id, now, STALE_RESET_UP_SECONDS))
 
 
 def update_resource_status(resource_id: int, status: str, consecutive_failures: int, error_msg: str = None, latency_ms: int = None):
@@ -618,11 +626,15 @@ def update_resource_status(resource_id: int, status: str, consecutive_failures: 
         "latency_ms": latency_ms,
     }])
 
+STALE_RESET_UP_SECONDS = 86400
+
+
 def update_stale_warning_level(resource_id: int, level: int):
     """Update the highest stale downtime warning level sent for this resource (0, 7, 14)."""
     with _writer_transaction() as conn:
         cursor = conn.cursor()
-        cursor.execute("UPDATE resources SET stale_warning_level = ? WHERE id = ?", (level, resource_id))
+        cursor.execute("UPDATE resources SET stale_warning_level = ?, stale_warning_at = ? WHERE id = ?",
+                       (level, int(time.time()), resource_id))
 
 def update_resource_ssl(resource_id: int, ssl_expiry_date: int | None, ssl_last_checked: int, ssl_alert_state: int = 0):
     with _writer_transaction() as conn:
@@ -892,7 +904,7 @@ def get_incident_downtime_events(incident_id: int) -> list[dict]:
     try:
         cursor = conn.cursor()
         cursor.execute('''
-            SELECT de.*, r.name, r.url, r.type, r.status as resource_status, r.last_changed, r.consecutive_failures
+            SELECT de.*, r.name, r.url, r.type, r.status as resource_status, r.last_changed, r.consecutive_failures, r.interval
             FROM downtime_events de
             LEFT JOIN resources r ON r.id = de.resource_id
             WHERE de.incident_id = ?
@@ -1036,6 +1048,31 @@ def get_resources_uptime_30d(resource_ids: list[int]) -> dict[int, float]:
         _uptime_cache.update(new_cache)
 
     return res_dict
+
+
+def get_resource_uptime_window(resource_id: int, window_seconds: int, now: int = None) -> float | None:
+    """Uptime percentage over the last window_seconds, or None if the resource is younger than
+    that (not cached: used for the rare stale checks, any window)."""
+    now = int(now or time.time())
+    start_time = now - window_seconds
+    conn = _connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT created_at FROM resources WHERE id = ?", (resource_id,))
+        row = cursor.fetchone()
+        if not row or row[0] is None or row[0] > start_time:
+            return None
+        cursor.execute('''
+            SELECT went_down_at, went_up_at FROM downtime_events
+            WHERE resource_id = ? AND went_down_at < ? AND (went_up_at IS NULL OR went_up_at > ?)
+        ''', (resource_id, now, start_time))
+        events = cursor.fetchall()
+    finally:
+        conn.close()
+    downtime = 0
+    for went_down, went_up in events:
+        downtime += max(0, min(went_up or now, now) - max(went_down, start_time))
+    return max(0.0, min(100.0, (window_seconds - downtime) / window_seconds * 100.0))
 
 
 def get_resource_uptime_30d(resource_id: int) -> float:
@@ -1593,9 +1630,10 @@ def update_probe_target_result(url: str, status: str, latency_ms: int = None, er
         now = int(time.time())
         cursor.execute('''
             UPDATE probe_targets
-            SET last_checked = ?, last_status = ?, last_latency_ms = ?, last_error = ?
+            SET last_checked = ?, last_status = ?, last_latency_ms = ?, last_error = ?,
+                down_since = CASE WHEN ? = 'down' THEN COALESCE(down_since, ?) ELSE NULL END
             WHERE url = ?
-        ''', (now, status, latency_ms, error_msg, url))
+        ''', (now, status, latency_ms, error_msg, status, now, url))
 
 # Ignored probe targets (excluded from remote scanning on this probe node).
 # An entry is a target as written (`https://site/`, `host:25`), a host (`site.example`: every

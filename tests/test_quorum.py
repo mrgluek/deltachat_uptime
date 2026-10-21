@@ -633,7 +633,7 @@ class TestCheckCompletionTracking(unittest.TestCase):
             asyncio.run(bot.run_and_track_group([{"id": 77}, {"id": "probe_x"}], asyncio.Semaphore(1)))
         self.assertNotIn(77, bot.running_resource_ids)
         self.assertIn(77, bot._check_finished_at)
-        self.assertNotIn("probe_x", bot._check_finished_at)
+        self.assertIn("probe_x", bot._check_finished_at)  # probe targets are slowed down too
 
 
 class TestPartialOutageNodes(unittest.TestCase):

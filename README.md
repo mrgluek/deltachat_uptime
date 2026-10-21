@@ -36,9 +36,12 @@ Additionally, it automatically generates a secure, beautiful web status dashboar
   - Automatic alert state reset when certificate is renewed.
   - Real-time expiration countdown displayed in `/list` and on the Web Status Dashboard.
 - 🧹 **Stale Resource Notices & 30-Day Auto-Cleanup:**
-  - **7-Day Notice:** Sends a notice when a resource is continuously unreachable for 7 days, suggesting removal if decommissioned.
-  - **14-Day Warning:** Sends a warning at 14 days of continuous downtime, advising that 30-day unreachable monitors are automatically removed.
-  - **30-Day Auto-Cleanup:** Automatically deletes resources with continuous 0% uptime for 30 days and notifies the chat of the removal.
+  - A resource counts as unreachable for N days when its uptime over the last N days is under 1%. A short recovery (a flap) does not restart the count.
+  - **7-Day Notice:** Sends a notice after 7 days unreachable, suggesting removal if decommissioned.
+  - **14-Day Warning:** Sends a warning after 14 days, advising that monitors unreachable for 30 days are automatically removed.
+  - **30-Day Auto-Cleanup:** Deletes resources unreachable for 30 days and notifies the chat. Removal happens at least 3 days after the 14-day warning, so the warning always comes first.
+  - Notices start over only after a resource has been up for a full day.
+- 🐢 **Slower Checks for Long Outages:** A resource that stays down is checked less often: every 5 minutes after 1 day, every 15 minutes after 7 days, every hour after 14 days (never more often than its own interval). Recovery is still noticed within that time. `/list` and incident messages show it (`🐢 checked every 15 min`). Targets mirrored from peers slow down the same way and are checked once a day after 30 days, so a dead domain on one node does not keep the whole mesh busy.
 - 🛰️ **Distributed Multi-Node Peering & Cross-Probe Verification:**
   - Link multiple bot instances across different regions/servers as remote probes via private 1:1 Delta Chat DMs. Run `/invitepeer` on the other bot and send the `/addpeer <link> token=<token> [node_name]` command it prints to this bot; both bots then exchange telemetry.
   - **Closed Peering:** A bot only becomes a peer if the admin added it with `/addpeer`, or if it presents a single-use `/invitepeer` token (valid 24h). Telemetry and cross-check messages are only accepted from configured peers, in a 1:1 chat, end-to-end encrypted.

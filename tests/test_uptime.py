@@ -74,6 +74,13 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import database
 import bot
 
+
+def _backdate_outage(conn, r_id, down_since):
+    """Make the current outage of r_id start at down_since (resource created just before it)."""
+    conn.execute("UPDATE resources SET last_changed = ?, created_at = ? WHERE id = ?", (down_since, down_since - 100, r_id))
+    conn.execute("UPDATE downtime_events SET went_down_at = ? WHERE resource_id = ? AND went_up_at IS NULL", (down_since, r_id))
+
+
 class TestUptimeBot(unittest.TestCase):
     def setUp(self):
         database.close_db()
@@ -1004,7 +1011,7 @@ class TestUptimeBot(unittest.TestCase):
             # Manually backdate last_changed
             with database._lock:
                 conn = sqlite3.connect(database.DB_PATH)
-                conn.execute("UPDATE resources SET last_changed = ? WHERE id = ?", (now - 7 * 86400 - 100, r_id))
+                _backdate_outage(conn, r_id, now - 7 * 86400 - 100)
                 conn.commit()
                 conn.close()
 
@@ -1028,7 +1035,7 @@ class TestUptimeBot(unittest.TestCase):
             # 2. 14 days downtime -> Warning sent, level updated to 14
             with database._lock:
                 conn = sqlite3.connect(database.DB_PATH)
-                conn.execute("UPDATE resources SET last_changed = ? WHERE id = ?", (now - 14 * 86400 - 100, r_id))
+                _backdate_outage(conn, r_id, now - 14 * 86400 - 100)
                 conn.commit()
                 conn.close()
 
@@ -1058,7 +1065,9 @@ class TestUptimeBot(unittest.TestCase):
             database.update_resource_status(r_id, "down", 10, "Connection refused")
             with database._lock:
                 conn = sqlite3.connect(database.DB_PATH)
-                conn.execute("UPDATE resources SET last_changed = ? WHERE id = ?", (now - 30 * 86400 - 100, r_id))
+                _backdate_outage(conn, r_id, now - 30 * 86400 - 100)
+                conn.execute("UPDATE resources SET stale_warning_level = 14, stale_warning_at = ? WHERE id = ?",
+                             (now - 4 * 86400, r_id))
                 conn.commit()
                 conn.close()
 
@@ -1083,6 +1092,121 @@ class TestUptimeBot(unittest.TestCase):
         database.update_resource_status(r_id, "down", 5, "Connection error")
         database.update_stale_warning_level(r_id, 14)
         self.assertEqual(database.get_resource_by_id(r_id)["stale_warning_level"], 14)
+
+    def _stale_resource(self, chat_id, name, url, days_old):
+        r_id = database.add_resource(chat_id, name, url, "http", 60)
+        database.update_resource_status(r_id, "down", 10, "Name or service not known")
+        conn = sqlite3.connect(database.DB_PATH)
+        _backdate_outage(conn, r_id, int(time.time()) - days_old * 86400)
+        conn.commit()
+        conn.close()
+        return r_id
+
+    def test_effective_check_interval_backoff(self):
+        now = 10_000_000
+        f = bot.effective_check_interval
+        self.assertEqual(f(60, "up", now - 40 * 86400, now), 60)        # only down targets slow down
+        self.assertEqual(f(60, "down", None, now), 60)
+        self.assertEqual(f(60, "down", now - 3600, now), 60)            # first day: as configured
+        self.assertEqual(f(60, "down", now - 86400, now), 300)
+        self.assertEqual(f(60, "down", now - 7 * 86400, now), 900)
+        self.assertEqual(f(60, "down", now - 14 * 86400, now), 3600)
+        self.assertEqual(f(60, "down", now - 30 * 86400, now), 86400)
+        self.assertEqual(f(1800, "down", now - 86400, now), 1800)       # never faster than configured
+        self.assertEqual(bot.format_every(300), "5 min")
+        self.assertEqual(bot.format_every(3600), "1 h")
+        self.assertEqual(bot.format_every(86400), "day")
+
+    def test_slowdown_note(self):
+        now = int(time.time())
+        self.assertEqual(bot.slowdown_note({"status": "down", "interval": 60, "last_changed": now - 600}, now), "")
+        self.assertIn("every 15 min", bot.slowdown_note({"status": "down", "interval": 60, "last_changed": now - 8 * 86400}, now))
+        # incident rows carry the status as resource_status
+        self.assertIn("every 5 min", bot.slowdown_note({"resource_status": "down", "interval": 60, "last_changed": now - 2 * 86400}, now))
+
+    def test_stale_notice_survives_short_flap(self):
+        """A dead target that answers for a few minutes is still stale: uptime counts, not continuity."""
+        bot.dc_bot_instance = MagicMock()
+        bot.dc_accid = 1
+        now = int(time.time())
+        r_id = self._stale_resource(4501, "Flappy", "https://flappy.example", 8)
+        # up for 5 minutes yesterday, down again since
+        conn = sqlite3.connect(database.DB_PATH)
+        conn.execute("UPDATE downtime_events SET went_up_at = ? WHERE resource_id = ?", (now - 86400, r_id))
+        conn.execute("INSERT INTO downtime_events (resource_id, went_down_at) VALUES (?, ?)", (r_id, now - 86400 + 300))
+        conn.execute("UPDATE resources SET last_changed = ? WHERE id = ?", (now - 86400 + 300, r_id))
+        conn.commit()
+        conn.close()
+        with patch.object(bot, '_dc_send_msg_with_stats') as mock_send:
+            asyncio.run(bot.check_stale_downtime_notifications(database.get_resource_by_id(r_id), now))
+            mock_send.assert_called_once()
+            self.assertIn("7 Days Unreachable", mock_send.call_args[0][3].text)
+
+    def test_stale_not_sent_with_real_uptime(self):
+        bot.dc_bot_instance = MagicMock()
+        bot.dc_accid = 1
+        now = int(time.time())
+        r_id = self._stale_resource(4502, "Mostly fine", "https://fine.example", 8)
+        conn = sqlite3.connect(database.DB_PATH)
+        # it was up for 3 days in the middle of the week
+        conn.execute("UPDATE downtime_events SET went_up_at = ? WHERE resource_id = ?", (now - 5 * 86400, r_id))
+        conn.execute("INSERT INTO downtime_events (resource_id, went_down_at) VALUES (?, ?)", (r_id, now - 2 * 86400))
+        conn.commit()
+        conn.close()
+        with patch.object(bot, '_dc_send_msg_with_stats') as mock_send:
+            asyncio.run(bot.check_stale_downtime_notifications(database.get_resource_by_id(r_id), now))
+            mock_send.assert_not_called()
+
+    def test_cleanup_waits_for_warning_and_grace(self):
+        """Down 31 days but never warned (e.g. right after an upgrade): warn first, remove days later."""
+        bot.dc_bot_instance = MagicMock()
+        bot.dc_accid = 1
+        now = int(time.time())
+        r_id = self._stale_resource(4503, "Gone", "https://gone.example", 31)
+        with patch.object(bot, '_dc_send_msg_with_stats') as mock_send:
+            asyncio.run(bot.check_stale_downtime_notifications(database.get_resource_by_id(r_id), now))
+            self.assertIn("14 Days Unreachable", mock_send.call_args[0][3].text)
+            self.assertIsNotNone(database.get_resource_by_id(r_id))
+            mock_send.reset_mock()
+            # next check right away: still within the grace period
+            asyncio.run(bot.check_stale_downtime_notifications(database.get_resource_by_id(r_id), now))
+            mock_send.assert_not_called()
+            self.assertIsNotNone(database.get_resource_by_id(r_id))
+            # 3 days later: removed
+            later = now + bot.STALE_CLEANUP_GRACE + 10
+            asyncio.run(bot.check_stale_downtime_notifications(database.get_resource_by_id(r_id), later))
+            self.assertIn("Auto-Cleanup", mock_send.call_args[0][3].text)
+            self.assertIsNone(database.get_resource_by_id(r_id))
+
+    def test_stale_level_kept_on_short_up_reset_after_day(self):
+        r_id = self._stale_resource(4504, "Flip", "https://flip.example", 15)
+        database.update_stale_warning_level(r_id, 14)
+        database.update_resource_status(r_id, "up", 0)       # goes up: level stays
+        database.update_resource_status(r_id, "up", 0)
+        self.assertEqual(database.get_resource_by_id(r_id)["stale_warning_level"], 14)
+        conn = sqlite3.connect(database.DB_PATH)
+        conn.execute("UPDATE resources SET last_changed = ? WHERE id = ?", (int(time.time()) - 86400 - 10, r_id))
+        conn.commit()
+        conn.close()
+        database.update_resource_status(r_id, "up", 0)       # up for a day: starts over
+        res = database.get_resource_by_id(r_id)
+        self.assertEqual(res["stale_warning_level"], 0)
+        self.assertIsNone(res["stale_warning_at"])
+
+    def test_probe_target_down_since(self):
+        database.save_probe_targets_batch([{"url": "https://peer-target.example", "type": "http"}], source_peer="p@x.org")
+        get = lambda: [t for t in database.get_active_probe_targets() if t["url"] == "https://peer-target.example"][0]
+        database.update_probe_target_result("https://peer-target.example", "down", None, "NXDOMAIN")
+        first = get()["down_since"]
+        self.assertIsNotNone(first)
+        conn = sqlite3.connect(database.DB_PATH)
+        conn.execute("UPDATE probe_targets SET down_since = ? WHERE url = ?", (first - 5 * 86400, "https://peer-target.example"))
+        conn.commit()
+        conn.close()
+        database.update_probe_target_result("https://peer-target.example", "down", None, "NXDOMAIN")
+        self.assertEqual(get()["down_since"], first - 5 * 86400)   # kept while still down
+        database.update_probe_target_result("https://peer-target.example", "up", 50, None)
+        self.assertIsNone(get()["down_since"])
 
     def test_incident_resolves_when_failing_monitor_removed(self):
         import asyncio

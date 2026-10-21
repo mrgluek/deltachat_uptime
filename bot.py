@@ -59,7 +59,7 @@ from outbox import outbox as dc_outbox, PRIO_ALERT, PRIO_REPLY, PRIO_UPDATE, PRI
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "2.19.1"
+VERSION = "2.20.0"
 # No "bot" in the name: some services (e.g. Hiddify subscription links) reply 400 to any User-Agent containing "bot".
 USER_AGENT = f"Delta Chat Uptime Monitor/{VERSION} (+https://git.gluek.info/gluek/deltachat_uptime)"
 
@@ -2430,7 +2430,7 @@ def format_incident_message(incident_id: int, started_at: int, resources: list[d
             d_time = max(1, now - (r.get("last_changed") or r.get("went_down_at") or started_at))
             d_str = format_duration(d_time)
             uptime_val = database.get_resource_uptime_30d(r["id"])
-            lines.append(f"• 🔴 `ID: {r['id']}` **{r_name}**\n  Target: `{r['url']}` ({r_type})\n  Status: `DOWN` (down for `{d_str}`) | Uptime 30d: `{uptime_val:.2f}%`")
+            lines.append(f"• 🔴 `ID: {r['id']}` **{r_name}**\n  Target: `{r['url']}` ({r_type})\n  Status: `DOWN` (down for `{d_str}`) | Uptime 30d: `{uptime_val:.2f}%`{slowdown_note(r, now)}")
             votes = _votes_from_json(r.get("last_votes"))
             if len(votes) > 1:
                 lines.append(f"  🛰️ {format_votes(votes)}")
@@ -2630,87 +2630,85 @@ def trigger_chat_incident_sync(dc_chat_id: int, force_update: bool = False):
         except Exception as ex:
             logger.debug(f"Direct sync_chat_incident_state invocation: {ex}")
 
+# A resource counts as stale for N days when its uptime over the last N days is under this. Not
+# "continuously down": one short "up" (a flap, a peer that could still reach it) restarted that
+# clock, so a dead target that flaps now and then was never cleaned up.
+STALE_MAX_UPTIME_PCT = 1.0
+# Auto-cleanup happens at least this long after the 14-day warning, so the chat always gets it first
+STALE_CLEANUP_GRACE = 3 * 86400
+
+
+async def _send_stale_message(dc_chat_id: int, text: str, what: str):
+    try:
+        if dc_bot_instance and dc_accid:
+            await asyncio.to_thread(
+                _dc_send_msg_with_stats,
+                dc_bot_instance,
+                dc_accid,
+                dc_chat_id,
+                MsgData(text=text),
+                priority=PRIO_ALERT,
+            )
+    except Exception as ex:
+        logger.error(f"Failed to send {what} message to chat {dc_chat_id}: {ex}")
+
+
+def _is_stale_for(res_id: int, days: int, now: int) -> bool:
+    uptime = database.get_resource_uptime_window(res_id, days * 86400, now)
+    return uptime is not None and uptime < STALE_MAX_UPTIME_PCT
+
+
 async def check_stale_downtime_notifications(resource, now: int):
-    """Check for continuous prolonged downtime and send 7d notice, 14d warning, or execute 30d auto-cleanup."""
+    """Stale downtime handling for a resource that is down: 7d notice, 14d warning, 30d auto-cleanup.
+    "Down for N days" = uptime under STALE_MAX_UPTIME_PCT over the last N days."""
     res = await asyncio.to_thread(database.get_resource_by_id, resource["id"])
     if not res or res["status"] != "down":
         return
 
-    last_changed = res.get("last_changed") or now
-    down_duration = now - last_changed
+    # A resource younger than a week cannot be stale yet (get_resource_uptime_window returns None)
     stale_level = res.get("stale_warning_level") or 0
+    if now - (res.get("created_at") or now) < 7 * 86400:
+        return
 
     dc_chat_id = res["dc_chat_id"]
     res_id = res["id"]
     res_name = res.get("name") or res.get("url")
     res_url = res.get("url")
+    interval = max(10, res.get("interval") or 60)
+    slowed = effective_check_interval(interval, "down", res.get("last_changed"), now)
+    slow_text = f"\n\n🐢 _While it stays down, it is checked every {format_every(slowed)}._" if slowed > interval else ""
 
-    # 30 Days (2,592,000s): Auto-cleanup and notify chat
-    if down_duration >= 30 * 86400:
-        logger.warning(f"Resource {res_id} ({res_name}) in chat {dc_chat_id} has been down for 30+ days. Auto-removing from monitoring...")
+    if stale_level >= 14 and now - (res.get("stale_warning_at") or 0) >= STALE_CLEANUP_GRACE \
+            and await asyncio.to_thread(_is_stale_for, res_id, 30, now):
+        logger.warning(f"Resource {res_id} ({res_name}) in chat {dc_chat_id} has been down for 30 days. Auto-removing from monitoring...")
         await asyncio.to_thread(database.delete_resource, dc_chat_id, res_id)
-        cleanup_text = (
+        await _send_stale_message(dc_chat_id, (
             f"🗑️ **Auto-Cleanup (30 Days Unreachable)**\n\n"
-            f"Resource **{res_name}** (`ID: {res_id}`) targeting `{res_url}` has had 0% uptime for **30 days** "
-            f"and has been automatically removed from monitoring."
-        )
-        try:
-            if dc_bot_instance and dc_accid:
-                await asyncio.to_thread(
-                    _dc_send_msg_with_stats,
-                    dc_bot_instance,
-                    dc_accid,
-                    dc_chat_id,
-                    MsgData(text=cleanup_text),
-                    priority=PRIO_ALERT,
-                )
-        except Exception as ex:
-            logger.error(f"Failed to send 30d auto-cleanup message to chat {dc_chat_id}: {ex}")
+            f"Resource **{res_name}** (`ID: {res_id}`) targeting `{res_url}` has had practically no uptime "
+            f"(under {STALE_MAX_UPTIME_PCT:g}%) for **30 days** and has been automatically removed from monitoring."
+        ), "30d auto-cleanup")
         await sync_chat_incident_state(dc_chat_id)
         return
 
-    # 14 Days (1,209,600s): Warning before 30d auto-removal
-    elif down_duration >= 14 * 86400 and stale_level < 14:
+    if stale_level < 14 and await asyncio.to_thread(_is_stale_for, res_id, 14, now):
         await asyncio.to_thread(database.update_stale_warning_level, res_id, 14)
-        warn_text = (
+        await _send_stale_message(dc_chat_id, (
             f"⚠️ **Downtime Warning (14 Days Unreachable)**\n\n"
-            f"Resource **{res_name}** (`ID: {res_id}`) targeting `{res_url}` has been continuously unreachable for **14 days**.\n\n"
-            f"💡 _Please note: resources that remain at 0% uptime for **30 days** will be automatically removed from monitoring._ "
-            f"You can remove it anytime using `/remove {res_id}`."
-        )
-        try:
-            if dc_bot_instance and dc_accid:
-                await asyncio.to_thread(
-                    _dc_send_msg_with_stats,
-                    dc_bot_instance,
-                    dc_accid,
-                    dc_chat_id,
-                    MsgData(text=warn_text),
-                    priority=PRIO_ALERT,
-                )
-        except Exception as ex:
-            logger.error(f"Failed to send 14d warning message to chat {dc_chat_id}: {ex}")
+            f"Resource **{res_name}** (`ID: {res_id}`) targeting `{res_url}` has been unreachable for **14 days** "
+            f"(uptime under {STALE_MAX_UPTIME_PCT:g}%).\n\n"
+            f"💡 _Please note: resources that stay this way for **30 days** will be automatically removed from monitoring._ "
+            f"You can remove it anytime using `/remove {res_id}`.{slow_text}"
+        ), "14d warning")
+        return
 
-    # 7 Days (604,800s): Notice to remove decommissioned services
-    elif down_duration >= 7 * 86400 and stale_level < 7:
+    if stale_level < 7 and await asyncio.to_thread(_is_stale_for, res_id, 7, now):
         await asyncio.to_thread(database.update_stale_warning_level, res_id, 7)
-        notice_text = (
+        await _send_stale_message(dc_chat_id, (
             f"⚠️ **Downtime Notice (7 Days Unreachable)**\n\n"
-            f"Resource **{res_name}** (`ID: {res_id}`) targeting `{res_url}` has been continuously unreachable for **7 days**.\n\n"
-            f"If this service has been permanently retired or decommissioned, consider removing it from monitoring with `/remove {res_id}`."
-        )
-        try:
-            if dc_bot_instance and dc_accid:
-                await asyncio.to_thread(
-                    _dc_send_msg_with_stats,
-                    dc_bot_instance,
-                    dc_accid,
-                    dc_chat_id,
-                    MsgData(text=notice_text),
-                    priority=PRIO_ALERT,
-                )
-        except Exception as ex:
-            logger.error(f"Failed to send 7d notice message to chat {dc_chat_id}: {ex}")
+            f"Resource **{res_name}** (`ID: {res_id}`) targeting `{res_url}` has been unreachable for **7 days** "
+            f"(uptime under {STALE_MAX_UPTIME_PCT:g}%).\n\n"
+            f"If this service has been permanently retired or decommissioned, consider removing it from monitoring with `/remove {res_id}`.{slow_text}"
+        ), "7d notice")
 
 
 def _status_update_for(resource, is_up, error_msg, latency_ms=None) -> dict:
@@ -2752,6 +2750,46 @@ async def handle_check_result(resource, is_up, error_msg, latency_ms=None, statu
     if not is_up:
         await check_stale_downtime_notifications(resource, now)
 
+# Long outages are checked less often. A target down for days needs no check every minute (each
+# one costs DNS queries, retries and peer votes on every node), and a recovery is still noticed
+# within one step. (down for at least, check at most every) - longest first.
+DOWN_BACKOFF_STEPS = (
+    (30 * 86400, 86400),  # only peers' targets get here: own resources are removed after 30 days
+    (14 * 86400, 3600),
+    (7 * 86400, 900),
+    (86400, 300),
+)
+
+
+def effective_check_interval(interval: int, status: str | None, down_since: int | None, now: int) -> int:
+    """The check interval to use now: the configured one, or a longer one while down for days."""
+    if status != "down" or not down_since:
+        return interval
+    down_for = now - down_since
+    for after, every in DOWN_BACKOFF_STEPS:
+        if down_for >= after:
+            return max(interval, every)
+    return interval
+
+
+def format_every(seconds: int) -> str:
+    """5 min, 1 h, 1 day: how often a slowed-down check runs."""
+    if seconds % 86400 == 0:
+        n = seconds // 86400
+        return "day" if n == 1 else f"{n} days"
+    if seconds % 3600 == 0:
+        return f"{seconds // 3600} h"
+    return f"{max(1, seconds // 60)} min"
+
+
+def slowdown_note(resource: dict, now: int) -> str:
+    """' | 🐢 checked every 15 min' for a resource whose checks are slowed down, else ''."""
+    interval = max(10, resource.get("interval") or 60)
+    status = resource.get("resource_status") or resource.get("status")  # incident rows: resource_status
+    eff = effective_check_interval(interval, status, resource.get("last_changed"), now)
+    return f" | 🐢 checked every {format_every(eff)}" if eff > interval else ""
+
+
 # resource id -> when its last check finished. The scheduler's cached rows can be read from the DB
 # while a long check (retries, peer votes: up to a minute) is running, so they still carry the
 # previous last_checked and would start the same check again right after it ends.
@@ -2766,8 +2804,8 @@ async def run_and_track_group(group, semaphore, session=None):
             now = int(time.time())
             for r in group:
                 running_resource_ids.discard(r["id"])
-                if isinstance(r.get("id"), int):
-                    _check_finished_at[r["id"]] = now
+                # probe-only targets too ("probe_<url>"): the cached row's last_checked lags behind
+                _check_finished_at[r["id"]] = now
 
 async def run_checks_parallel(tasks_list):
     await asyncio.gather(*tasks_list, return_exceptions=True)
@@ -2825,7 +2863,8 @@ async def monitoring_scheduler_loop():
                             continue
                             
                         last_checked = max(r["last_checked"] or 0, _check_finished_at.get(r_id, 0))
-                        interval = max(10, r["interval"] or 60)
+                        interval = effective_check_interval(
+                            max(10, r["interval"] or 60), r["status"], r.get("last_changed"), now)
                         
                         slot_offset = (r_id * 11) % interval if isinstance(r_id, int) else (sum(str(r_id).encode()) * 11) % interval
                         slot_bucket = slot_offset // 5
@@ -2852,8 +2891,9 @@ async def monitoring_scheduler_loop():
                         pt_key = f"probe_{pt_url}"
                         if pt_key in running_resource_ids:
                             continue
-                        last_checked = pt.get("last_checked") or 0
-                        if now - last_checked >= 60:
+                        last_checked = max(pt.get("last_checked") or 0, _check_finished_at.get(pt_key, 0))
+                        pt_interval = effective_check_interval(60, pt.get("last_status"), pt.get("down_since"), now)
+                        if now - last_checked >= pt_interval:
                             running_resource_ids.add(pt_key)
                             probe_rep = {
                                 "id": pt_key,
@@ -2912,6 +2952,8 @@ async def monitoring_scheduler_loop():
                 if now - _last_cleanup >= 86400:
                     _last_cleanup = now
                     await run_db(database.cleanup_old_records, 90)
+                    for k in [k for k, t in _check_finished_at.items() if now - t > 2 * 86400]:
+                        del _check_finished_at[k]  # removed resources and peers' dropped targets
                     pruned_locks = prune_incident_sync_locks()
                     if pruned_locks:
                         logger.info(f"Pruned {pruned_locks} idle incident sync locks from memory")
@@ -5025,6 +5067,7 @@ def list_command(bot, accid, event):
             extra_info += f" | ⚡ `{r['last_latency_ms']}ms`"
         if r.get("expected_keyword"):
             extra_info += f" | 🔍 \"{r['expected_keyword']}\""
+        extra_info += slowdown_note(r, int(now_ts))
             
         ssl_info = ""
         if r.get("url", "").startswith("https://"):

@@ -661,3 +661,107 @@ class TestPartialOutageNodes(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _votes(down_nodes, up_nodes, local="DE"):
+    votes = [{"node": n, "status": "down", "error": "Timeout", "local": n == local} for n in down_nodes]
+    votes += [{"node": n, "status": "up", "latency_ms": 50, "local": n == local} for n in up_nodes]
+    return votes
+
+
+class TestUnstableNodes(unittest.TestCase):
+    def setUp(self):
+        bot._node_outliers.clear()
+        bot._node_unstable_until.clear()
+        bot._node_unstable_since.clear()
+        bot._silent_partial_outages.clear()
+
+    def test_outlier_needs_two_others_up_and_minority(self):
+        self.assertTrue(bot.is_outlier_down(_votes(["RU"], ["DE", "IT"])[0], _votes(["RU"], ["DE", "IT"])))
+        one_up = _votes(["RU"], ["DE"])  # 1 vs 1: unclear which side has the problem
+        self.assertFalse(bot.is_outlier_down(one_up[0], one_up))
+        half = _votes(["RU", "IT"], ["DE", "FI"])  # not a minority
+        self.assertFalse(bot.is_outlier_down(half[0], half))
+
+    def test_node_becomes_unstable_after_many_targets(self):
+        now = 1000.0
+        for i in range(bot.NODE_UNSTABLE_TARGETS - 1):
+            self.assertEqual(bot.note_vote_outliers(f"https://t{i}.example", _votes(["RU"], ["DE", "IT"]), now), [])
+        # the same target again does not count twice
+        self.assertEqual(bot.note_vote_outliers("https://t0.example", _votes(["RU"], ["DE", "IT"]), now), [])
+        newly = bot.note_vote_outliers("https://t-last.example", _votes(["RU"], ["DE", "IT"]), now)
+        self.assertEqual(newly, [("RU", bot.NODE_UNSTABLE_TARGETS)])
+        self.assertTrue(bot.is_node_unstable("RU", now))
+        self.assertFalse(bot.is_node_unstable("DE", now))
+        # already unstable: no second notice
+        self.assertEqual(bot.note_vote_outliers("https://t-more.example", _votes(["RU"], ["DE", "IT"]), now), [])
+
+    def test_old_outliers_expire(self):
+        for i in range(bot.NODE_UNSTABLE_TARGETS - 1):
+            bot.note_vote_outliers(f"https://t{i}.example", _votes(["RU"], ["DE", "IT"]), 1000.0)
+        later = 1000.0 + bot.NODE_UNSTABLE_WINDOW + 1
+        self.assertEqual(bot.note_vote_outliers("https://new.example", _votes(["RU"], ["DE", "IT"]), later), [])
+
+    def test_mask_and_votes_text(self):
+        now = 1000.0
+        bot._node_unstable_until["RU"] = now + 100
+        votes = bot.mask_unstable_votes(_votes(["RU"], ["DE", "IT"]), now)
+        self.assertEqual(votes[0]["status"], "unstable")
+        self.assertEqual(bot.decide_quorum(votes), "up")  # the unstable node abstains
+        self.assertIn("⚪ RU (node network unstable, not counted)", bot.format_votes(votes))
+        # a real outage: most nodes down, the unstable one abstaining does not hide it
+        votes = bot.mask_unstable_votes(_votes(["RU", "DE", "IT"], ["FI"]), now)
+        self.assertEqual(bot.decide_quorum(votes), "down")
+
+    def test_recovery(self):
+        bot._node_unstable_until["RU"] = 2000.0
+        bot._node_unstable_since["RU"] = 1000.0
+        self.assertEqual(bot.pop_recovered_nodes(1500.0), [])
+        self.assertEqual(bot.pop_recovered_nodes(2001.0), [("RU", 1001)])
+        self.assertEqual(bot.pop_recovered_nodes(2002.0), [])
+
+    def test_queued_notice_dropped_when_its_node_is_unstable(self):
+        bot.dc_bot_instance, bot.dc_accid = MagicMock(), 1
+        r = {"id": 7, "name": "Seven", "url": "http://seven.example.org", "dc_chat_id": CHAT}
+        votes = _votes(["RU"], ["DE", "IT"])
+
+        async def scenario(kind):
+            with patch("bot.DEGRADED_NOTIFY_WINDOW", 0):
+                bot._queue_degraded_notice(kind, r, votes, 1)
+                await bot._degraded_flush_task
+
+        import time as _t
+        bot._node_unstable_until["RU"] = _t.time() + 600
+        with patch("bot._dc_send_msg_with_stats") as send:
+            asyncio.run(scenario("start"))
+            asyncio.run(scenario("end"))   # its end stays silent too
+        send.assert_not_called()
+
+
+class TestIPv4Recheck(unittest.TestCase):
+    ERR6 = "Cannot connect to host meet.jit.si:443 ssl:default [Connect call failed ('2a06:98c1:3101::ac40:96fa', 443, 0, 0)]"
+
+    def test_failed_ipv6_address(self):
+        self.assertEqual(bot._failed_ipv6_address(self.ERR6), "2a06:98c1:3101::ac40:96fa")
+        self.assertIsNone(bot._failed_ipv6_address("Cannot connect to host x:443 ssl:default [Connect call failed ('1.2.3.4', 443)]"))
+        self.assertIsNone(bot._failed_ipv6_address("Timeout"))
+
+    def test_up_over_ipv4(self):
+        res = {"type": "http", "url": "https://meet.jit.si/"}
+        with patch("bot.probe_addresses", AsyncMock(return_value=["172.64.150.250"])), \
+             patch("bot.run_single_check", AsyncMock(return_value=(True, "200 OK", 80))) as rc:
+            self.assertEqual(asyncio.run(bot._recheck_over_ipv4(res, self.ERR6)), (True, "200 OK", 80))
+        self.assertEqual(rc.call_args.args[0]["family"], 4)
+
+    def test_both_families_reported(self):
+        res = {"type": "http", "url": "https://meet.jit.si/"}
+        with patch("bot.probe_addresses", AsyncMock(return_value=["172.64.150.250"])), \
+             patch("bot.run_single_check", AsyncMock(return_value=(False, "Timeout", None))):
+            up, err, _ = asyncio.run(bot._recheck_over_ipv4(res, self.ERR6))
+        self.assertFalse(up)
+        self.assertEqual(err, "IPv4: Timeout · IPv6: Connect call failed")
+
+    def test_ipv6_only_host_keeps_error(self):
+        res = {"type": "http", "url": "https://v6only.example/"}
+        with patch("bot.probe_addresses", AsyncMock(side_effect=bot.NoAddressForFamilyError("x"))):
+            self.assertEqual(asyncio.run(bot._recheck_over_ipv4(res, self.ERR6)), (False, self.ERR6, None))

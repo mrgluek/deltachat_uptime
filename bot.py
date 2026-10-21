@@ -59,7 +59,7 @@ from outbox import outbox as dc_outbox, PRIO_ALERT, PRIO_REPLY, PRIO_UPDATE, PRI
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "2.20.0"
+VERSION = "2.21.0"
 # No "bot" in the name: some services (e.g. Hiddify subscription links) reply 400 to any User-Agent containing "bot".
 USER_AGENT = f"Delta Chat Uptime Monitor/{VERSION} (+https://git.gluek.info/gluek/deltachat_uptime)"
 
@@ -1859,12 +1859,42 @@ async def run_single_check(resource, session=None) -> tuple[bool, str, int | Non
             return None, NO_IPV6_MSG, None
         if isinstance(os_error, NoAddressForFamilyError):
             return False, str(os_error), None
+        if rtype == "http" and not resource.get("family") and _failed_ipv6_address(str(e)):
+            return await _recheck_over_ipv4(resource, str(e))
         elapsed_ms = int((time.time() - start_time) * 1000)
         return False, str(e), elapsed_ms
     except Exception as e:
         elapsed_ms = int((time.time() - start_time) * 1000)
         return False, str(e), elapsed_ms
     return False, "Unknown error", None
+
+_CONNECT_ADDR_RE = re.compile(r"\('([0-9A-Fa-f:.]+)', \d+(?:, \d+, \d+)?\)")
+
+
+def _failed_ipv6_address(error: str) -> str | None:
+    """The IPv6 address in aiohttp's "Connect call failed ('2a06::1', 443, 0, 0)", if any."""
+    m = _CONNECT_ADDR_RE.search(error or "")
+    return m.group(1) if m and ":" in m.group(1) else None
+
+
+async def _recheck_over_ipv4(resource: dict, ipv6_error: str):
+    """A dual-stack HTTP check failed and aiohttp reported its last attempt, an IPv6 address.
+
+    aiohttp tries the addresses in rounds and keeps only the last error, so "Connect call failed
+    ('2a06:...')" hid what happened over IPv4, the preferred family. Check again over IPv4 only:
+    if that works the target is up; otherwise report both families."""
+    host = urlparse(resource["url"]).hostname or ""
+    try:
+        if not await probe_addresses(host, 4):
+            raise NoAddressForFamilyError(host)
+    except Exception:
+        return False, ipv6_error, None  # IPv6-only host (or DNS gone): the IPv6 error is the answer
+    is_up, err4, latency = await run_single_check({**resource, "family": 4})
+    if is_up:
+        return is_up, err4, latency
+    v6 = _CONNECT_ADDR_RE.sub("", short_vote_error(ipv6_error) or ipv6_error).strip()
+    return False, f"IPv4: {short_vote_error(err4) or err4} · IPv6: {v6}", latency
+
 
 # Per-minute check summary (one INFO line instead of one per check; see log_check_summary)
 _check_stats = {"up": 0, "down": 0, "skipped": 0, "lat_sum": 0, "lat_n": 0, "slowest": (0, "")}
@@ -1933,6 +1963,82 @@ def _vote_entry(node: str, status: str, latency_ms=None, error_msg=None, local: 
     return v
 
 
+# A node whose own network has trouble (home connection, provider filtering) fails many targets at
+# once that the other nodes reach. Each of those became a separate partial outage notice (one node
+# caused ~100 a week). Such a node is marked unstable and its DOWN votes abstain until it recovers.
+NODE_UNSTABLE_TARGETS = 5     # distinct targets a node fails alone ...
+NODE_UNSTABLE_WINDOW = 300    # ... within this many seconds: unstable
+NODE_UNSTABLE_HOLD = 600      # stays unstable this long after the last time it met the threshold
+UNSTABLE_NODE_ERROR = "node network unstable"
+_node_outliers: dict[str, dict[str, float]] = {}  # node -> target url -> when it last failed it alone
+_node_unstable_until: dict[str, float] = {}       # node -> unstable until (time.time())
+_node_unstable_since: dict[str, float] = {}       # node -> when it became unstable (notified)
+
+
+def is_outlier_down(vote: dict, votes: list[dict]) -> bool:
+    """vote is DOWN while at least two other nodes reach the target and DOWN is the minority."""
+    voters = [v for v in votes if v.get("status") in ("up", "down")]
+    up = sum(1 for v in voters if v["status"] == "up")
+    down = len(voters) - up
+    return vote.get("status") == "down" and up >= 2 and down * 2 < len(voters)
+
+
+def note_vote_outliers(url: str, votes: list[dict], now: float = None) -> list[tuple[str, int]]:
+    """Records the nodes that failed url alone. Returns (node, targets failed) for each node that
+    just became unstable."""
+    now = now or time.time()
+    newly = []
+    for v in votes or []:
+        if not is_outlier_down(v, votes):
+            continue
+        node = v["node"]
+        recent = _node_outliers.setdefault(node, {})
+        recent[url] = now
+        for u in [u for u, t in recent.items() if now - t > NODE_UNSTABLE_WINDOW]:
+            del recent[u]
+        if len(recent) >= NODE_UNSTABLE_TARGETS:
+            if not is_node_unstable(node, now):
+                newly.append((node, len(recent)))
+            _node_unstable_until[node] = now + NODE_UNSTABLE_HOLD
+            _node_unstable_since.setdefault(node, now)
+    return newly
+
+
+def is_node_unstable(node: str, now: float = None) -> bool:
+    return _node_unstable_until.get(node, 0) > (now or time.time())
+
+
+def mask_unstable_votes(votes: list[dict], now: float = None) -> list[dict]:
+    """DOWN votes of unstable nodes abstain (status "unstable"): they say more about the node than
+    about the target. A real outage is still seen by the other nodes."""
+    return [{**v, "status": "unstable", "error": UNSTABLE_NODE_ERROR}
+            if v.get("status") == "down" and is_node_unstable(v["node"], now) else v
+            for v in votes]
+
+
+def pop_recovered_nodes(now: float = None) -> list[tuple[str, int]]:
+    """(node, seconds it was unstable) for each node whose unstable period just ended."""
+    now = now or time.time()
+    done = [n for n, since in _node_unstable_since.items() if not is_node_unstable(n, now)]
+    out = []
+    for n in done:
+        out.append((n, int(now - _node_unstable_since.pop(n))))
+        _node_unstable_until.pop(n, None)
+        _node_outliers.pop(n, None)
+    return out
+
+
+async def notify_unstable_nodes(newly: list[tuple[str, int]]):
+    for node, count in newly:
+        logger.warning(f"Node {node} failed {count} targets within {NODE_UNSTABLE_WINDOW}s that other nodes reach: marking it unstable")
+        await send_admin_notification(
+            f"🛰️ **Node Network Problem**: {node}\n"
+            f"It failed **{count}** targets within {NODE_UNSTABLE_WINDOW // 60} min that the other nodes reach, "
+            f"so the problem is most likely its own network.\n\n"
+            f"Its DOWN votes are ignored (no partial outage notices from it) until it has been stable for "
+            f"{NODE_UNSTABLE_HOLD // 60} min. Outages seen by the other nodes are still reported.")
+
+
 def build_votes(local_node: str, is_up: bool, latency_ms, error_msg, peer_results) -> list[dict]:
     votes = [_vote_entry(local_node, "up" if is_up else "down", latency_ms, error_msg, local=True)]
     seen = {local_node}
@@ -1982,12 +2088,15 @@ def format_votes(votes: list[dict]) -> str:
         down = [f"{v['node']} ({err})" if err else v["node"] for v, err in zip(down_votes, errors)]
     up = [f"{v['node']} ({v['latency_ms']}ms)" if v.get("latency_ms") is not None else v["node"]
           for v in votes if v.get("status") == "up"]
-    other = [v["node"] for v in votes if v.get("status") not in ("up", "down")]
+    unstable = [v["node"] for v in votes if v.get("status") == "unstable"]
+    other = [v["node"] for v in votes if v.get("status") not in ("up", "down", "unstable")]
     parts = []
     if down:
         parts.append("🔴 " + ", ".join(down))
     if up:
         parts.append("🟢 " + ", ".join(up))
+    if unstable:
+        parts.append("⚪ " + ", ".join(unstable) + f" ({UNSTABLE_NODE_ERROR}, not counted)")
     if other:
         parts.append("⚪ " + ", ".join(other) + " (no result)")
     return " · ".join(parts)
@@ -2116,6 +2225,9 @@ def format_degraded_notice(items: list) -> str:
     return "\n".join(lines)
 
 
+_silent_partial_outages: set = set()  # resource ids whose partial outage notice was dropped
+
+
 async def _flush_degraded_notices():
     await asyncio.sleep(DEGRADED_NOTIFY_WINDOW)
     queued = dict(_degraded_notify_queue)
@@ -2125,7 +2237,18 @@ async def _flush_degraded_notices():
         latest = {}
         for item in items:
             latest[item[1]["id"]] = item
-        text = format_degraded_notice(list(latest.values()))
+        keep = []
+        for item in latest.values():
+            kind, r, votes = item[0], item[1], item[2]
+            down_nodes = [v["node"] for v in votes if v.get("status") == "down"]
+            if kind == "start" and down_nodes and all(is_node_unstable(n) for n in down_nodes):
+                _silent_partial_outages.add(r["id"])  # its node turned out unstable: the end stays silent too
+                continue
+            if kind == "end" and r["id"] in _silent_partial_outages:
+                _silent_partial_outages.discard(r["id"])
+                continue
+            keep.append(item)
+        text = format_degraded_notice(keep)
         if not text or not dc_bot_instance or dc_accid is None:
             continue
         try:
@@ -2261,6 +2384,11 @@ async def check_group_task(group, semaphore, session=None):
         logger.warning(f"Error during peer cross-check: {ex}")
 
     votes = build_votes(local_node, is_up, latency_ms, error_msg, peer_results) if peer_results is not None else None
+    if votes:
+        newly_unstable = note_vote_outliers(rep["url"], votes)
+        if newly_unstable:
+            asyncio.create_task(notify_unstable_nodes(newly_unstable))
+        votes = mask_unstable_votes(votes)
     votes_json = json.dumps(votes) if votes and len(votes) > 1 else None
 
     # Local-mode monitors: this node decides; peers' answers are added to the error text
@@ -2934,6 +3062,10 @@ async def monitoring_scheduler_loop():
 
                 if now - _last_peer_audit >= 30:
                     _last_peer_audit = now
+                    for node, secs in pop_recovered_nodes():
+                        logger.info(f"Node {node} is stable again after {format_duration(secs)}")
+                        asyncio.create_task(send_admin_notification(
+                            f"✅ **Node Stable Again**: {node}\nIts votes count again (it was unstable for `{format_duration(secs)}`)."))
                     newly_offline_peers = await run_db(database.audit_peers_offline, 360)
                     for p in newly_offline_peers:
                         p_node = p.get("node_name") or "Remote"

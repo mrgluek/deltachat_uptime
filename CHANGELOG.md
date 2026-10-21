@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.22.1] - 2026-10-21
+
+### Fixed
+- **1:1 Chats Paused by Mistake**: The chat audit of 2.22.0 treated every 1:1 chat as "bot removed from the group": the core reports `self_in_group = false` for 1:1 chats (and for channels the bot sends), although the bot can write there. All monitors of private chats, including the admin's, were paused at start. Only groups are checked for membership now; chats paused by mistake resume at the next audit (at start).
+
 ## [2.22.0] - 2026-10-21
 
 ### Added

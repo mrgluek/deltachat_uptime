@@ -3118,6 +3118,11 @@ class TestAbandonedChats(unittest.TestCase):
         self.assertEqual(bot.chat_send_state(rpc_bot, 1, 5), ("blocked", "Ann"))
         rpc_bot.rpc.get_contact.return_value = {"is_blocked": False}
         self.assertEqual(bot.chat_send_state(rpc_bot, 1, 5), ("ok", "Ann"))
+        # what the core really reports for a normal 1:1 chat and an own channel: not "removed"
+        rpc_bot.rpc.get_full_chat_by_id.return_value = {"name": "Ann", "chat_type": "Single", "self_in_group": False, "contact_ids": [10]}
+        self.assertEqual(bot.chat_send_state(rpc_bot, 1, 5), ("ok", "Ann"))
+        rpc_bot.rpc.get_full_chat_by_id.return_value = {"name": "News", "chat_type": "OutBroadcast", "self_in_group": False, "contact_ids": []}
+        self.assertEqual(bot.chat_send_state(rpc_bot, 1, 5), ("ok", "News"))
         rpc_bot.rpc.get_full_chat_by_id.side_effect = Exception(
             "{'code': -1, 'message': 'Failed loading chat Chat#5 from database: Query returned no rows'}")
         self.assertEqual(bot.chat_send_state(rpc_bot, 1, 5)[0], "gone")

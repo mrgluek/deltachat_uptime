@@ -92,6 +92,12 @@ def init_db():
             )
         ''')
         
+        cursor.execute("PRAGMA table_info(chats)")
+        if "abandoned_at" not in [row[1] for row in cursor.fetchall()]:
+            # Set while the bot cannot write to the chat (removed from the group, chat deleted,
+            # contact blocked): its monitors are paused, and deleted after a grace period
+            cursor.execute("ALTER TABLE chats ADD COLUMN abandoned_at INTEGER")
+
         # Resources table storing monitored targets per chat
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS resources (
@@ -471,6 +477,43 @@ def update_resource_latency(resource_id: int, latency_ms: int):
         cursor = conn.cursor()
         cursor.execute("UPDATE resources SET last_latency_ms = ? WHERE id = ?", (latency_ms, resource_id))
 
+def get_monitored_chats() -> dict[int, int | None]:
+    """chat id -> abandoned_at (None while active) for every chat that has monitors."""
+    conn = _connect()
+    try:
+        rows = conn.execute('''
+            SELECT DISTINCT r.dc_chat_id, c.abandoned_at FROM resources r
+            LEFT JOIN chats c ON c.dc_chat_id = r.dc_chat_id
+        ''').fetchall()
+        return {row[0]: row[1] for row in rows}
+    finally:
+        conn.close()
+
+
+def set_chat_abandoned(dc_chat_id: int, abandoned_at: int | None):
+    """Pause (abandoned_at = time) or resume (None) the monitors of a chat."""
+    get_or_create_chat_token(dc_chat_id)  # the chats row may not exist yet
+    with _writer_transaction() as conn:
+        conn.execute("UPDATE chats SET abandoned_at = ? WHERE dc_chat_id = ?", (abandoned_at, dc_chat_id))
+
+
+def delete_chat_data(dc_chat_id: int) -> int:
+    """Removes a chat's monitors with their history, incidents and the chat itself. Returns how
+    many monitors were deleted."""
+    with _writer_transaction() as conn:
+        cursor = conn.cursor()
+        ids = [row[0] for row in cursor.execute("SELECT id FROM resources WHERE dc_chat_id = ?", (dc_chat_id,))]
+        for rid in ids:
+            invalidate_uptime_cache(rid)
+            cursor.execute("DELETE FROM downtime_events WHERE resource_id = ?", (rid,))
+            cursor.execute("DELETE FROM partial_outages WHERE resource_id = ?", (rid,))
+        cursor.execute("DELETE FROM resources WHERE dc_chat_id = ?", (dc_chat_id,))
+        cursor.execute("DELETE FROM incidents WHERE dc_chat_id = ?", (dc_chat_id,))
+        cursor.execute("DELETE FROM chats WHERE dc_chat_id = ?", (dc_chat_id,))
+        cursor.execute("DELETE FROM config WHERE key = ?", (f"alert_mode:{dc_chat_id}",))
+        return len(ids)
+
+
 def delete_resource(dc_chat_id: int, resource_id: int) -> bool:
     with _writer_transaction() as conn:
         cursor = conn.cursor()
@@ -504,11 +547,15 @@ def get_resource_by_id(resource_id: int) -> dict | None:
         conn.close()
 
 def get_all_resources() -> list[dict]:
+    """Monitors of all chats the bot can still write to (abandoned chats are paused)."""
     conn = _connect()
     conn.row_factory = sqlite3.Row
     try:
         cursor = conn.cursor()
-        cursor.execute("SELECT * FROM resources ORDER BY id ASC")
+        cursor.execute('''
+            SELECT r.* FROM resources r LEFT JOIN chats c ON c.dc_chat_id = r.dc_chat_id
+            WHERE c.abandoned_at IS NULL ORDER BY r.id ASC
+        ''')
         rows = cursor.fetchall()
         return [dict(r) for r in rows]
     finally:
@@ -750,11 +797,15 @@ def reopen_incident(incident_id: int):
         ''', (incident_id,))
 
 def get_all_active_incidents() -> list[dict]:
+    """Ongoing incidents, except in abandoned chats (nobody can be told about them there)."""
     conn = _connect()
     conn.row_factory = sqlite3.Row
     try:
         cursor = conn.cursor()
-        cursor.execute("SELECT * FROM incidents WHERE status = 'ongoing' ORDER BY id ASC")
+        cursor.execute('''
+            SELECT i.* FROM incidents i LEFT JOIN chats c ON c.dc_chat_id = i.dc_chat_id
+            WHERE i.status = 'ongoing' AND c.abandoned_at IS NULL ORDER BY i.id ASC
+        ''')
         rows = cursor.fetchall()
         return [dict(r) for r in rows]
     finally:

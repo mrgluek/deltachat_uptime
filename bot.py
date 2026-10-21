@@ -59,7 +59,7 @@ from outbox import outbox as dc_outbox, PRIO_ALERT, PRIO_REPLY, PRIO_UPDATE, PRI
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "2.21.0"
+VERSION = "2.22.0"
 # No "bot" in the name: some services (e.g. Hiddify subscription links) reply 400 to any User-Agent containing "bot".
 USER_AGENT = f"Delta Chat Uptime Monitor/{VERSION} (+https://git.gluek.info/gluek/deltachat_uptime)"
 
@@ -278,6 +278,85 @@ def _get_admin_chat_ids(bot, accid, chat_ids) -> set:
         if is_member:
             allowed.add(chat_id)
     return allowed & set(chat_ids)
+
+# Chats the bot can no longer write to (removed from the group, chat deleted, contact blocked):
+# their monitors are paused instead of being checked for nobody, and deleted after a grace period
+# unless the bot is added back (then they resume with all settings).
+ABANDONED_CHAT_GRACE = 30 * 86400
+CHAT_AUDIT_INTERVAL = 3600
+
+
+def _field(obj, name, default=None):
+    return obj.get(name, default) if isinstance(obj, dict) else getattr(obj, name, default)
+
+
+def chat_send_state(bot, accid, chat_id: int) -> tuple[str | None, str]:
+    """-> (state, chat name). state: "ok", "gone" (chat deleted), "removed" (bot no longer in the
+    group), "blocked" (1:1 contact blocked), or None when the core could not be asked (no change)."""
+    try:
+        chat = bot.rpc.get_full_chat_by_id(accid, chat_id)
+    except Exception as e:
+        # the core's answer for a chat id that no longer exists
+        if "query returned no rows" in str(e).lower():  # "Failed loading chat Chat#N from database: ..."
+            return "gone", f"chat {chat_id}"
+        logger.warning(f"Chat audit: could not load chat {chat_id}: {e}")
+        return None, f"chat {chat_id}"
+    name = _field(chat, "name") or f"chat {chat_id}"
+    if _field(chat, "self_in_group", True) is False:
+        return "removed", name
+    if str(_field(chat, "chat_type", "")) in ("Single", "100"):
+        for contact_id in _field(chat, "contact_ids", None) or []:
+            if contact_id <= 9:  # special ids (1 = this bot)
+                continue
+            try:
+                if _field(bot.rpc.get_contact(accid, contact_id), "is_blocked", False):
+                    return "blocked", name
+            except Exception:
+                pass
+    return "ok", name
+
+
+_ABANDON_REASONS = {"gone": "the chat was deleted", "removed": "the bot was removed from the group",
+                    "blocked": "the contact was blocked"}
+
+
+async def audit_abandoned_chats(now: int = None) -> None:
+    """Pauses monitors of chats the bot cannot write to, resumes them when it can again and
+    deletes them after ABANDONED_CHAT_GRACE. Runs at start and every CHAT_AUDIT_INTERVAL."""
+    if not dc_bot_instance or dc_accid is None:
+        return
+    now = now or int(time.time())
+    changed = False
+    for chat_id, abandoned_at in (await run_db(database.get_monitored_chats)).items():
+        state, name = await asyncio.to_thread(chat_send_state, dc_bot_instance, dc_accid, chat_id)
+        if state is None:
+            continue
+        count = len(await run_db(database.get_resources, chat_id))
+        if state != "ok" and abandoned_at is None:
+            await run_db(database.set_chat_abandoned, chat_id, now)
+            changed = True
+            until = datetime.datetime.fromtimestamp(now + ABANDONED_CHAT_GRACE, tz=datetime.timezone.utc).strftime('%Y-%m-%d')
+            logger.warning(f"Chat {chat_id} ({name}): {_ABANDON_REASONS[state]}; pausing its {count} monitor(s)")
+            await send_admin_notification(
+                f"⏸️ **Monitoring Paused**: **{name}** (chat `{chat_id}`)\n"
+                f"{_ABANDON_REASONS[state].capitalize()}, so alerts cannot be delivered there. "
+                f"**{count}** monitor(s) are paused and no longer shared with peers.\n\n"
+                f"They will be deleted on `{until}` unless the bot is added back; then they resume with all settings.")
+        elif state == "ok" and abandoned_at is not None:
+            await run_db(database.set_chat_abandoned, chat_id, None)
+            changed = True
+            logger.info(f"Chat {chat_id} ({name}) can be written to again; resuming its {count} monitor(s)")
+            await send_admin_notification(f"▶️ **Monitoring Resumed**: **{name}** (chat `{chat_id}`)\n"
+                                          f"The bot can write there again: **{count}** monitor(s) are checked again.")
+        elif state != "ok" and now - abandoned_at >= ABANDONED_CHAT_GRACE:
+            deleted = await run_db(database.delete_chat_data, chat_id)
+            changed = True
+            logger.warning(f"Chat {chat_id} ({name}) abandoned for 30 days: deleted {deleted} monitor(s)")
+            await send_admin_notification(f"🗑️ **Paused Monitors Deleted**: **{name}** (chat `{chat_id}`)\n"
+                                          f"The bot was not added back within 30 days: **{deleted}** monitor(s) and their history were deleted.")
+    if changed:
+        _scheduler_cache["resources"] = None  # the scheduler picks the change up at once
+
 
 def _filter_peer_shareable_resources(bot, accid, resources: list[dict]) -> list[dict]:
     """Applies the peer share scope (/peershare) to local monitors before disclosing them to peers."""
@@ -2950,6 +3029,7 @@ async def monitoring_scheduler_loop():
     _last_peer_audit = 0
     _last_incident_audit = 0
     _last_cleanup = 0
+    _last_chat_audit = 0
     _last_transport_flush = 0
     _last_summary = int(time.time())
     # Validated, TTL-pinned DNS answers (see resolve_host_safe)
@@ -3079,6 +3159,11 @@ async def monitoring_scheduler_loop():
                             f"⚠️ This probe is no longer responding or sending telemetry. Distributed cross-checks and multi-region metrics for this node are paused."
                         )
                         asyncio.create_task(send_admin_notification(alert_txt))
+
+                # Chats the bot was removed from (also right after start)
+                if now - _last_chat_audit >= CHAT_AUDIT_INTERVAL:
+                    _last_chat_audit = now
+                    asyncio.create_task(audit_abandoned_chats())
 
                 # Periodic database cleanup (every 24 hours)
                 if now - _last_cleanup >= 86400:
@@ -5689,6 +5774,9 @@ def peers_command(bot, accid, event):
     reply += f"📊 **Network Stats:**\n"
     reply += f"• Local Monitored Targets: `{unique_local_urls}` unique URLs (`{len(all_resources)}` across chats)\n"
     reply += f"• Mirrored Remote Probe Targets: `{len(probe_targets)}`\n"
+    paused = [c for c, at in database.get_monitored_chats().items() if at is not None]
+    if paused:
+        reply += f"• Paused Chats (bot removed or chat gone): `{len(paused)}`\n"
     reply += f"• Cached Remote Measurements: `{len(all_peer_measurements)}`\n\n"
 
     if not peers:

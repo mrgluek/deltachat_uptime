@@ -3082,3 +3082,83 @@ if __name__ == '__main__':
 
 
 
+
+
+class TestAbandonedChats(unittest.TestCase):
+    def setUp(self):
+        database.close_db()
+        database.DB_PATH = TEST_DB
+        database.init_db()
+        self.sent = []
+        self.addCleanup(patch.stopall)
+        patch("bot.send_admin_notification", AsyncMock(side_effect=lambda t: self.sent.append(t))).start()
+        bot.dc_bot_instance, bot.dc_accid = MagicMock(), 1
+
+    def tearDown(self):
+        database.close_db()
+        for f in (TEST_DB, TEST_DB + "-wal", TEST_DB + "-shm"):
+            if os.path.exists(f):
+                os.remove(f)
+
+    def _rpc_chat(self, **fields):
+        """Chat 77 gets these fields; every other chat is a normal group the bot is in."""
+        def full_chat(accid, chat_id):
+            chat = {"name": f"Chat {chat_id}", "chat_type": "Group", "self_in_group": True, "contact_ids": [10]}
+            if chat_id == 77:
+                chat.update(fields)
+            return chat
+        bot.dc_bot_instance.rpc.get_full_chat_by_id.side_effect = full_chat
+
+    def test_chat_send_state(self):
+        rpc_bot = MagicMock()
+        rpc_bot.rpc.get_full_chat_by_id.return_value = {"name": "Ops", "chat_type": "Group", "self_in_group": False}
+        self.assertEqual(bot.chat_send_state(rpc_bot, 1, 5), ("removed", "Ops"))
+        rpc_bot.rpc.get_full_chat_by_id.return_value = {"name": "Ann", "chat_type": "Single", "self_in_group": True, "contact_ids": [10]}
+        rpc_bot.rpc.get_contact.return_value = {"is_blocked": True}
+        self.assertEqual(bot.chat_send_state(rpc_bot, 1, 5), ("blocked", "Ann"))
+        rpc_bot.rpc.get_contact.return_value = {"is_blocked": False}
+        self.assertEqual(bot.chat_send_state(rpc_bot, 1, 5), ("ok", "Ann"))
+        rpc_bot.rpc.get_full_chat_by_id.side_effect = Exception(
+            "{'code': -1, 'message': 'Failed loading chat Chat#5 from database: Query returned no rows'}")
+        self.assertEqual(bot.chat_send_state(rpc_bot, 1, 5)[0], "gone")
+        rpc_bot.rpc.get_full_chat_by_id.side_effect = Exception("database is locked")
+        self.assertIsNone(bot.chat_send_state(rpc_bot, 1, 5)[0])  # unknown: change nothing
+
+    def test_pause_resume_and_delete(self):
+        rid = database.add_resource(77, "https://a.example", "A", "http")
+        other = database.add_resource(78, "https://b.example", "B", "http")
+        inc = database.create_incident(77)
+        now = int(time.time())
+
+        self._rpc_chat(self_in_group=False)
+        asyncio.run(bot.audit_abandoned_chats(now))
+        self.assertEqual([r["id"] for r in database.get_all_resources()], [other])
+        self.assertNotIn(inc, [i["id"] for i in database.get_all_active_incidents()])
+        self.assertIn("Monitoring Paused", self.sent[0])
+        self.assertIn("removed from the group", self.sent[0])
+        self.assertEqual(database.get_monitored_chats()[77], now)
+
+        # added back: resumes with its monitor
+        self._rpc_chat(self_in_group=True)
+        self.sent.clear()
+        asyncio.run(bot.audit_abandoned_chats(now + 60))
+        self.assertIn(rid, [r["id"] for r in database.get_all_resources()])
+        self.assertTrue(any("Monitoring Resumed" in t for t in self.sent))
+
+        # removed again and never added back: deleted after the grace period, not before
+        self._rpc_chat(self_in_group=False)
+        asyncio.run(bot.audit_abandoned_chats(now + 120))
+        asyncio.run(bot.audit_abandoned_chats(now + 120 + bot.ABANDONED_CHAT_GRACE - 10))
+        self.assertIsNotNone(database.get_resource_by_id(rid))
+        self.sent.clear()
+        asyncio.run(bot.audit_abandoned_chats(now + 120 + bot.ABANDONED_CHAT_GRACE))
+        self.assertIsNone(database.get_resource_by_id(rid))
+        self.assertNotIn(77, database.get_monitored_chats())
+        self.assertTrue(any("Paused Monitors Deleted" in t for t in self.sent))
+
+    def test_unknown_state_changes_nothing(self):
+        database.add_resource(79, "https://c.example", "C", "http")
+        bot.dc_bot_instance.rpc.get_full_chat_by_id.side_effect = Exception("database is locked")
+        asyncio.run(bot.audit_abandoned_chats())
+        self.assertEqual(len(database.get_all_resources()), 1)
+        self.assertEqual(self.sent, [])

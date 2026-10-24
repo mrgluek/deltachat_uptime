@@ -316,6 +316,15 @@ def init_db():
             )
         ''')
 
+        # Usual ping round trip of this node per pinged address (degraded path detection)
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS ping_baselines (
+                ip TEXT PRIMARY KEY,
+                rtt_ms REAL NOT NULL,
+                updated_at INTEGER
+            )
+        ''')
+
 # Config functions
 def set_config(key: str, value: str):
     with _writer_transaction() as conn:
@@ -1583,6 +1592,22 @@ def save_peer_measurements_batch(node_name: str, metrics_list: list[dict]):
                 error_msg = excluded.error_msg,
                 last_checked = excluded.last_checked
         ''', rows)
+
+def get_ping_baseline(ip: str) -> float | None:
+    conn = _connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT rtt_ms FROM ping_baselines WHERE ip = ?", (ip,))
+        row = cursor.fetchone()
+        return row[0] if row else None
+    finally:
+        conn.close()
+
+def set_ping_baseline(ip: str, rtt_ms: float):
+    with _writer_transaction() as conn:
+        conn.cursor().execute(
+            "INSERT OR REPLACE INTO ping_baselines (ip, rtt_ms, updated_at) VALUES (?, ?, ?)",
+            (ip, rtt_ms, int(time.time())))
 
 def get_peer_measurements_for_url(url: str) -> list[dict]:
     conn = _connect()

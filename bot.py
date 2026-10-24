@@ -14,6 +14,7 @@ import re
 import socket
 import struct
 import shlex
+import statistics
 import secrets
 from urllib.parse import urlparse, urljoin
 import aiohttp
@@ -59,7 +60,7 @@ from outbox import outbox as dc_outbox, PRIO_ALERT, PRIO_REPLY, PRIO_UPDATE, PRI
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "2.23.0"
+VERSION = "2.24.0"
 # No "bot" in the name: some services (e.g. Hiddify subscription links) reply 400 to any User-Agent containing "bot".
 USER_AGENT = f"Delta Chat Uptime Monitor/{VERSION} (+https://git.gluek.info/gluek/deltachat_uptime)"
 
@@ -174,6 +175,24 @@ _degraded_flush_task = None
 # regular check asks all peers and votes (the case "this node reaches it, most others don't").
 PEER_SUSPECT_MAX_AGE = 300  # seconds a report stays valid, and how old the peer's result may be
 _peer_suspects = {}  # url -> (monotonic time, reporting node)
+
+# Path quality of ping checks: a target that answers through a congested or lossy path (e.g. a bad
+# peering between this node's provider and the target's) is still reachable, so it is not DOWN.
+# Such a check returns CHECK_DEGRADED instead of True and this node votes "degraded": in quorum
+# chats that makes a DEGRADED notice (never an incident) that names the node and why.
+CHECK_DEGRADED = "degraded"   # truthy on purpose: code that only asks "reachable?" sees it as up
+PING_COUNT = 5                # echoes per check, sent PING_SPACING apart, each waiting PING_TIMEOUT
+PING_SPACING = 0.2
+PING_TIMEOUT = 2.0
+DEGRADED_LOSS_PCT = 40        # 2 of 5 lost: one lost echo happens on healthy paths too
+DEGRADED_RTT_FACTOR = 3       # median RTT this many times the usual one ...
+DEGRADED_RTT_MIN_EXTRA_MS = 100  # ... and at least this much above it (5 -> 15 ms is no problem)
+DEGRADED_VOTE_ERROR_MAX = 160    # a degraded vote also carries the traceroute hint
+PATH_TRACE_TTL = 900          # seconds a traceroute of a degraded path is reused
+_path_traces = {}             # ip -> (time.time(), summary or "") of the last traceroute
+_path_trace_tasks = {}        # ip -> running traceroute task
+_ping_baseline_cache = {}     # ip -> usual RTT in ms (persisted in database.ping_baselines)
+_local_degraded = {}          # url -> time.time() of this node's last degraded result (telemetry)
 
 # Protocol message deduplication cache (bounded set of recent msg_ids)
 _processed_msg_ids = set()
@@ -636,7 +655,7 @@ def _clean_peer_result(item, node_name: str, url: str) -> dict:
     """A peer's answer for one target, with the same limits as single responses."""
     item = item if isinstance(item, dict) else {}
     status = item.get("status")
-    if status not in ("up", "down"):
+    if status not in VOTING_STATUSES:
         status = "unknown"  # also "skip": the peer could not check it (no IPv6 there)
     latency_ms = item.get("latency_ms")
     if not isinstance(latency_ms, int) or isinstance(latency_ms, bool) or not 0 <= latency_ms <= 600000:
@@ -660,8 +679,7 @@ async def _answer_batch_cross_check(bot, accid, chat_id: int, req_id: str, targe
             return {"status": "skip", "latency_ms": None, "error_msg": "Ignored on this node (/probeignore)"}
         async with _peer_batch_semaphore:
             is_up, error_msg, latency_ms = await run_single_check(t)
-        return {"status": "skip" if is_up is None else ("up" if is_up else "down"),
-                "latency_ms": latency_ms, "error_msg": error_msg}
+        return {"status": check_status(is_up), "latency_ms": latency_ms, "error_msg": error_msg}
 
     answers = await asyncio.gather(*[one(t) for t in targets], return_exceptions=True)
     answers = [a if isinstance(a, dict) else {"status": "unknown", "latency_ms": None, "error_msg": str(a)[:200]}
@@ -758,7 +776,8 @@ async def broadcast_telemetry_to_peers():
             "url": url,
             "type": r.get("type") or "http",
             "expected_keyword": r.get("expected_keyword"),
-            "status": r.get("status", "unknown"),
+            # A monitor stays UP while its path is degraded; peers learn it here and vote on it
+            "status": "degraded" if r.get("status") == "up" and url in _local_degraded else r.get("status", "unknown"),
             "latency_ms": r.get("last_latency_ms"),
             "last_checked": r.get("last_checked") or now
         })
@@ -1267,6 +1286,204 @@ async def _dgram_ping(ip: str, timeout: float) -> float:
         return await asyncio.wait_for(_reply(), timeout)
     finally:
         sock.close()
+
+
+class _PingMethodUnavailable(Exception):
+    """This way of sending echoes does not work on this node; ping_series tries the next one."""
+
+
+async def _aioping_once(ip: str, timeout: float) -> float:
+    try:
+        return await aioping.ping(ip, timeout=timeout)
+    except asyncio.TimeoutError:
+        raise
+    except Exception as e:  # PermissionError without CAP_NET_RAW, other raw socket errors
+        raise _PingMethodUnavailable(str(e)) from e
+
+
+async def _dgram_ping_once(ip: str, timeout: float) -> float:
+    try:
+        return await _dgram_ping(ip, timeout)
+    except PingSocketUnavailable as e:
+        raise _PingMethodUnavailable(str(e)) from e
+
+
+async def _echo_series(send_one, ip: str, count: int) -> tuple[list[float], str | None]:
+    """count echoes PING_SPACING apart, in flight together, so a check takes about
+    count * PING_SPACING + PING_TIMEOUT at most. Returns the round trips (seconds) of the answered
+    echoes and the last socket error (e.g. host unreachable). Raises _PingMethodUnavailable."""
+    async def probe(i):
+        await asyncio.sleep(i * PING_SPACING)
+        return await send_one(ip, PING_TIMEOUT)
+
+    rtts, error = [], None
+    for r in await asyncio.gather(*(probe(i) for i in range(count)), return_exceptions=True):
+        if isinstance(r, _PingMethodUnavailable):
+            raise r
+        if isinstance(r, (int, float)) and not isinstance(r, bool):
+            rtts.append(float(r))
+        elif isinstance(r, asyncio.TimeoutError):  # before OSError: TimeoutError is one
+            continue
+        elif isinstance(r, OSError):
+            error = r.strerror or str(r)
+        elif isinstance(r, Exception):
+            error = str(r)
+    return rtts, error
+
+
+_PING_TIME_RE = re.compile(r"time[=<]([\d.]+) ?ms")
+
+
+async def _ping_binary_series(ip: str, count: int) -> tuple[list[float], str | None]:
+    """The ping binary as last resort. Raises FileNotFoundError if there is none."""
+    proc = await asyncio.create_subprocess_exec(
+        "ping", "-n", "-c", str(count), "-i", str(PING_SPACING), "-W", str(int(PING_TIMEOUT)), ip,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=count * PING_SPACING + PING_TIMEOUT + 5)
+    except asyncio.TimeoutError:
+        proc.kill()
+        return [], None
+    return [float(t) / 1000 for t in _PING_TIME_RE.findall(out.decode(errors="replace"))], None
+
+
+async def ping_series(ip: str, count: int = PING_COUNT) -> tuple[list[float], str | None]:
+    """Sends count echoes with the first method that works here: aioping (raw socket), an
+    unprivileged ICMP datagram socket, the ping binary. Returns (round trips in seconds of the
+    answered echoes, last socket error). Raises FileNotFoundError when no method works."""
+    methods = ([_aioping_once] if aioping is not None else []) + [_dgram_ping_once]
+    for send_one in methods:
+        try:
+            return await _echo_series(send_one, ip, count)
+        except _PingMethodUnavailable as e:
+            logger.debug(f"{send_one.__name__} unavailable for {ip} ({e}), trying the next ping method")
+    return await _ping_binary_series(ip, count)
+
+
+def assess_ping(rtts_ms: list[int], sent: int, usual_ms: float | None) -> tuple[bool | str, str]:
+    """(True | CHECK_DEGRADED, details) for a ping series with at least one answer.
+
+    DEGRADED: DEGRADED_LOSS_PCT or more of the echoes lost, or the median round trip far above the
+    usual one of this node (DEGRADED_RTT_FACTOR times and DEGRADED_RTT_MIN_EXTRA_MS more)."""
+    median = int(statistics.median(rtts_ms))
+    loss = round(100 * (sent - len(rtts_ms)) / sent)
+    slow = (usual_ms is not None and median >= usual_ms * DEGRADED_RTT_FACTOR
+            and median - usual_ms >= DEGRADED_RTT_MIN_EXTRA_MS)
+    parts = [f"{median} ms"] + ([f"loss {loss}%"] if loss else [])
+    if loss >= DEGRADED_LOSS_PCT or slow:
+        if usual_ms is not None:
+            parts.append(f"usual {round(usual_ms)} ms")
+        return CHECK_DEGRADED, ", ".join(parts)
+    return True, ", ".join(parts)
+
+
+def next_ping_baseline(usual_ms: float | None, sample_ms: int, degraded: bool) -> float | None:
+    """The usual round trip after one more check: an average that follows faster round trips
+    quickly and slower ones slowly, and ignores degraded checks, so a long bad period does not
+    become the new normal."""
+    if degraded:
+        return usual_ms
+    if usual_ms is None:
+        return float(sample_ms)
+    alpha = 0.3 if sample_ms < usual_ms else 0.05
+    return usual_ms + alpha * (sample_ms - usual_ms)
+
+
+def get_ping_baseline(ip: str) -> float | None:
+    if ip not in _ping_baseline_cache:
+        try:
+            _ping_baseline_cache[ip] = database.get_ping_baseline(ip)
+        except Exception as e:
+            logger.debug(f"Could not read the ping baseline of {ip}: {e}")
+            return None
+    return _ping_baseline_cache[ip]
+
+
+def note_ping_sample(ip: str, sample_ms: int, degraded: bool) -> None:
+    usual = get_ping_baseline(ip)
+    new = next_ping_baseline(usual, sample_ms, degraded)
+    if new is None or new == usual:
+        return
+    _ping_baseline_cache[ip] = new
+    if usual is None or abs(new - usual) >= 0.5:  # no write for every sub-millisecond drift
+        try:
+            database.set_ping_baseline(ip, new)
+        except Exception as e:
+            logger.debug(f"Could not store the ping baseline of {ip}: {e}")
+
+
+_TRACE_HOP_RE = re.compile(r"^\s*(\d+)\s+(.*)$")
+_TRACE_ADDR_RE = re.compile(r"(?<![\w:.])(\d{1,3}(?:\.\d{1,3}){3}|[0-9a-fA-F]{0,4}(?::[0-9a-fA-F]{0,4}){2,7})(?![\w:.])")
+
+
+def summarize_traceroute(output: str) -> str:
+    """'trace: +324 ms between hop 6 213.19.194.214 and hop 7 79.104.235.205': the link where the
+    median round trip rises most, i.e. where a congested path most likely starts. '' if no link
+    adds DEGRADED_RTT_MIN_EXTRA_MS / 2 (the trouble is loss, which traceroute cannot place)."""
+    hops = []
+    for line in output.splitlines():
+        m = _TRACE_HOP_RE.match(line)
+        if not m:
+            continue
+        addr = _TRACE_ADDR_RE.search(m.group(2))
+        rtts = [float(x) for x in re.findall(r"([\d.]+) ms", m.group(2))]
+        if addr and rtts:
+            hops.append((int(m.group(1)), addr.group(1), statistics.median(rtts)))
+    best = None
+    for (n1, a1, r1), (n2, a2, r2) in zip(hops, hops[1:]):
+        if best is None or r2 - r1 > best[0]:
+            best = (r2 - r1, n1, a1, n2, a2)
+    if not best or best[0] < DEGRADED_RTT_MIN_EXTRA_MS / 2:
+        return ""
+    rise, n1, a1, n2, a2 = best
+    return f"trace: +{round(rise)} ms between hop {n1} {a1} and hop {n2} {a2}"
+
+
+async def _trace_path(ip: str) -> None:
+    summary = ""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "traceroute", "-n", "-q", "3", "-w", "2", "-m", "20", ip,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+        # Read hop by hop: silent hops at the end (3 x 2 s each where traceroute probes one hop at
+        # a time, as on macOS) may outlast the deadline, and the hops seen so far are what matters
+        lines = []
+        deadline = time.monotonic() + 60
+        try:
+            while True:
+                line = await asyncio.wait_for(proc.stdout.readline(), timeout=max(0.1, deadline - time.monotonic()))
+                if not line:
+                    break
+                lines.append(line.decode(errors="replace"))
+        except asyncio.TimeoutError:
+            proc.kill()
+        await proc.wait()
+        summary = summarize_traceroute("".join(lines))
+    except FileNotFoundError:
+        logger.debug("traceroute is not installed: degraded ping results come without a path hint")
+    except Exception as e:
+        logger.debug(f"traceroute to {ip} failed: {e}")
+    _path_traces[ip] = (time.time(), summary)
+
+
+def path_trace_hint(ip: str) -> str:
+    """The traceroute summary of a degraded path, from cache. A missing or older one is (re)made in
+    the background, so the first degraded result comes without it and the confirming one with it."""
+    cached = _path_traces.get(ip)
+    if not cached or time.time() - cached[0] >= PATH_TRACE_TTL:
+        task = _path_trace_tasks.get(ip)
+        if task is None or task.done():
+            _path_trace_tasks[ip] = asyncio.create_task(_trace_path(ip))
+    return cached[1] if cached else ""
+
+
+def check_status(is_up) -> str:
+    """The status of a run_single_check result as peers exchange it and nodes vote."""
+    if is_up is None:
+        return "skip"
+    if is_up == CHECK_DEGRADED:
+        return "degraded"
+    return "up" if is_up else "down"
 
 
 def has_route_to(ip: str) -> bool:
@@ -2089,59 +2306,27 @@ async def run_single_check(resource, session=None) -> tuple[bool, str, int | Non
             if not (_HOSTNAME_RE.match(host) or _ipv6_literal(host)):
                 return False, "Invalid hostname format", None
 
-            ping_success = False
-            elapsed_ms = None
             # Ping the validated address itself so the ping tool cannot resolve to something else
             host = (await probe_addresses(host, family))[0]
-
-            if aioping is not None:
-                try:
-                    delay = await aioping.ping(host, timeout=2.0)
-                    elapsed_ms = max(1, int(delay * 1000))
-                    ping_success = True
-                except (PermissionError, OSError) as perm_ex:
-                    logger.debug(f"aioping raw socket failed for {host} ({perm_ex}), falling back to ping subprocess")
-                except asyncio.TimeoutError:
-                    elapsed_ms = int((time.time() - start_time) * 1000)
-                    return False, "Timeout", elapsed_ms
-                except Exception as ex:
-                    logger.debug(f"aioping failed for {host} ({ex}), falling back to ping subprocess")
-
-            if not ping_success and elapsed_ms is None:
-                # No raw socket: try an unprivileged ICMP socket before the ping binary
-                try:
-                    delay = await _dgram_ping(host, 2.0)
-                    elapsed_ms = max(1, int(delay * 1000))
-                    ping_success = True
-                except PingSocketUnavailable as ex:
-                    logger.debug(f"ICMP datagram socket unavailable ({ex}), falling back to ping subprocess")
-                except asyncio.TimeoutError:
-                    elapsed_ms = int((time.time() - start_time) * 1000)
-                    return False, "Timeout", elapsed_ms
-                except OSError as ex:  # the socket works, the target does not (e.g. host unreachable)
-                    elapsed_ms = int((time.time() - start_time) * 1000)
-                    return False, f"Ping failed: {ex.strerror or ex}", elapsed_ms
-
-            if not ping_success and elapsed_ms is None:
-                try:
-                    proc = await asyncio.create_subprocess_exec(
-                        "ping", "-c", "1", "-W", "2", host,
-                        stdout=asyncio.subprocess.DEVNULL,
-                        stderr=asyncio.subprocess.DEVNULL
-                    )
-                except FileNotFoundError:
-                    # No way to send ICMP here: abstain (like a missing IPv6) instead of reporting DOWN
-                    _warn_ping_unavailable()
-                    return None, PING_UNAVAILABLE_MSG, None
-                await proc.wait()
+            try:
+                rtts, ping_error = await ping_series(host)
+            except FileNotFoundError:
+                # No way to send ICMP here: abstain (like a missing IPv6) instead of reporting DOWN
+                _warn_ping_unavailable()
+                return None, PING_UNAVAILABLE_MSG, None
+            if not rtts:
                 elapsed_ms = int((time.time() - start_time) * 1000)
-                if proc.returncode == 0:
-                    ping_success = True
-
-            if ping_success:
-                return True, f"{elapsed_ms} ms", elapsed_ms
-            else:
-                return False, "Ping failed", elapsed_ms
+                return False, f"Ping failed: {ping_error}" if ping_error else "Timeout", elapsed_ms
+            rtts_ms = [max(1, int(r * 1000)) for r in rtts]
+            usual = await asyncio.to_thread(get_ping_baseline, host)
+            state, details = assess_ping(rtts_ms, PING_COUNT, usual)
+            latency_ms = int(statistics.median(rtts_ms))
+            await asyncio.to_thread(note_ping_sample, host, latency_ms, state == CHECK_DEGRADED)
+            if state == CHECK_DEGRADED:
+                hint = path_trace_hint(host)
+                if hint:
+                    details = f"{details}; {hint}"
+            return state, details, latency_ms
     except asyncio.TimeoutError:
         elapsed_ms = int((time.time() - start_time) * 1000)
         return False, "Timeout", elapsed_ms
@@ -2223,19 +2408,23 @@ def log_check_summary(running: int) -> None:
     st.update(up=0, down=0, skipped=0, lat_sum=0, lat_n=0, slowest=(0, ""))
 
 
-def decide_quorum(votes: list[dict]) -> str:
-    """up / degraded / down from per-node results. Only "up" and "down" votes count; others abstain.
+VOTING_STATUSES = ("up", "degraded", "down")  # other votes ("unknown", "unstable") abstain
 
-    down: more than half of the voting nodes cannot reach the target. degraded: some can't.
+
+def decide_quorum(votes: list[dict]) -> str:
+    """up / degraded / down from per-node results. Only up, degraded and down votes count.
+
+    down: more than half of the voting nodes cannot reach the target. degraded: some can't, or some
+    reach it only through a bad path (a degraded vote alone never makes it DOWN).
     With fewer than two voters the local result decides (as without peers)."""
-    voters = [v for v in votes if v.get("status") in ("up", "down")]
+    voters = [v for v in votes if v.get("status") in VOTING_STATUSES]
     if len(voters) < 2:
         local = next((v for v in votes if v.get("local")), None)
         return "down" if local and local.get("status") == "down" else "up"
     down = sum(1 for v in voters if v["status"] == "down")
-    if down == 0:
-        return "up"
-    return "down" if down * 2 > len(voters) else "degraded"
+    if down * 2 > len(voters):
+        return "down"
+    return "degraded" if any(v["status"] != "up" for v in voters) else "up"
 
 
 def next_alert_state(resource_id: int, prev: str, raw: str) -> str:
@@ -2255,7 +2444,7 @@ def next_alert_state(resource_id: int, prev: str, raw: str) -> str:
 
 
 def _vote_entry(node: str, status: str, latency_ms=None, error_msg=None, local: bool = False) -> dict:
-    v = {"node": str(node or "Peer")[:64], "status": status if status in ("up", "down") else "unknown",
+    v = {"node": str(node or "Peer")[:64], "status": status if status in VOTING_STATUSES else "unknown",
          "latency_ms": latency_ms if isinstance(latency_ms, int) and not isinstance(latency_ms, bool) else None,
          "error": str(error_msg)[:200] if error_msg and status != "up" else None}
     if local:
@@ -2276,11 +2465,11 @@ _node_unstable_since: dict[str, float] = {}       # node -> when it became unsta
 
 
 def is_outlier_down(vote: dict, votes: list[dict]) -> bool:
-    """vote is DOWN while at least two other nodes reach the target and DOWN is the minority."""
-    voters = [v for v in votes if v.get("status") in ("up", "down")]
+    """vote is DOWN or DEGRADED while at least two other nodes reach the target fine and they are
+    the majority."""
+    voters = [v for v in votes if v.get("status") in VOTING_STATUSES]
     up = sum(1 for v in voters if v["status"] == "up")
-    down = len(voters) - up
-    return vote.get("status") == "down" and up >= 2 and down * 2 < len(voters)
+    return vote.get("status") in ("down", "degraded") and up >= 2 and up * 2 > len(voters)
 
 
 def note_vote_outliers(url: str, votes: list[dict], now: float = None) -> list[tuple[str, int]]:
@@ -2309,10 +2498,10 @@ def is_node_unstable(node: str, now: float = None) -> bool:
 
 
 def mask_unstable_votes(votes: list[dict], now: float = None) -> list[dict]:
-    """DOWN votes of unstable nodes abstain (status "unstable"): they say more about the node than
-    about the target. A real outage is still seen by the other nodes."""
+    """DOWN and DEGRADED votes of unstable nodes abstain (status "unstable"): they say more about
+    the node than about the target. A real outage is still seen by the other nodes."""
     return [{**v, "status": "unstable", "error": UNSTABLE_NODE_ERROR}
-            if v.get("status") == "down" and is_node_unstable(v["node"], now) else v
+            if v.get("status") in ("down", "degraded") and is_node_unstable(v["node"], now) else v
             for v in votes]
 
 
@@ -2333,14 +2522,14 @@ async def notify_unstable_nodes(newly: list[tuple[str, int]]):
         logger.warning(f"Node {node} failed {count} targets within {NODE_UNSTABLE_WINDOW}s that other nodes reach: marking it unstable")
         await send_admin_notification(
             f"🛰️ **Node Network Problem**: {node}\n"
-            f"It failed **{count}** targets within {NODE_UNSTABLE_WINDOW // 60} min that the other nodes reach, "
+            f"It failed or degraded **{count}** targets within {NODE_UNSTABLE_WINDOW // 60} min that the other nodes reach, "
             f"so the problem is most likely its own network.\n\n"
             f"Its DOWN votes are ignored (no partial outage notices from it) until it has been stable for "
             f"{NODE_UNSTABLE_HOLD // 60} min. Outages seen by the other nodes are still reported.")
 
 
-def build_votes(local_node: str, is_up: bool, latency_ms, error_msg, peer_results) -> list[dict]:
-    votes = [_vote_entry(local_node, "up" if is_up else "down", latency_ms, error_msg, local=True)]
+def build_votes(local_node: str, is_up, latency_ms, error_msg, peer_results) -> list[dict]:
+    votes = [_vote_entry(local_node, check_status(is_up), latency_ms, error_msg, local=True)]
     seen = {local_node}
     for pr in peer_results or []:
         node = pr.get("node_name") or "Peer"
@@ -2356,7 +2545,7 @@ _CONNECT_ERROR_RE = re.compile(r"^Cannot connect to host \S+ ssl:\S+ \[(.*)\]$",
 _ERRNO_PREFIX_RE = re.compile(r"^\[Errno -?\d+\]\s*")
 
 
-def short_vote_error(error) -> str | None:
+def short_vote_error(error, limit: int = VOTE_ERROR_MAX) -> str | None:
     """A node's check error, short enough for a vote line: 'Timeout', 'Connection refused',
     'SSL: self-signed certificate' instead of aiohttp's full 'Cannot connect to host ...' text."""
     if not error:
@@ -2370,13 +2559,13 @@ def short_vote_error(error) -> str | None:
         if m and m.group(1).strip():
             text = m.group(1).strip()
         text = _ERRNO_PREFIX_RE.sub("", text)
-    if len(text) > VOTE_ERROR_MAX:
-        text = text[:VOTE_ERROR_MAX - 1].rstrip() + "…"
+    if len(text) > limit:
+        text = text[:limit - 1].rstrip() + "…"
     return text or None
 
 
 def format_votes(votes: list[dict]) -> str:
-    """🔴 DE (Timeout) · 🟢 IT (196ms), RU (188ms) · ⚪ RU2 (no result)
+    """🔴 DE (Timeout) · 🟠 HOME (550 ms, loss 60%, usual 60 ms) · 🟢 IT (196ms) · ⚪ RU2 (no result)
 
     Each failing node shows why it failed; when all of them failed the same way the reason is
     given once: 🔴 DE, RU (Timeout)."""
@@ -2386,13 +2575,17 @@ def format_votes(votes: list[dict]) -> str:
         down = [", ".join(v["node"] for v in down_votes) + f" ({errors[0]})"]
     else:
         down = [f"{v['node']} ({err})" if err else v["node"] for v, err in zip(down_votes, errors)]
+    degraded = [f"{v['node']} ({short_vote_error(v.get('error'), DEGRADED_VOTE_ERROR_MAX) or 'degraded'})"
+                for v in votes if v.get("status") == "degraded"]
     up = [f"{v['node']} ({v['latency_ms']}ms)" if v.get("latency_ms") is not None else v["node"]
           for v in votes if v.get("status") == "up"]
     unstable = [v["node"] for v in votes if v.get("status") == "unstable"]
-    other = [v["node"] for v in votes if v.get("status") not in ("up", "down", "unstable")]
+    other = [v["node"] for v in votes if v.get("status") not in ("up", "degraded", "down", "unstable")]
     parts = []
     if down:
         parts.append("🔴 " + ", ".join(down))
+    if degraded:
+        parts.append("🟠 " + ", ".join(degraded))
     if up:
         parts.append("🟢 " + ", ".join(up))
     if unstable:
@@ -2412,9 +2605,15 @@ def _votes_from_json(raw) -> list[dict]:
 
 def _votes_summary(votes: list[dict]) -> str:
     down = [v["node"] for v in votes if v.get("status") == "down"]
+    degraded = [v["node"] for v in votes if v.get("status") == "degraded"]
     up = [v["node"] for v in votes if v.get("status") == "up"]
-    text = f"Unreachable from {', '.join(down)}" if down else "Reachable from all nodes"
-    if down and up:
+    parts = ([f"Unreachable from {', '.join(down)}"] if down else []) + \
+            ([f"degraded path from {', '.join(degraded)}"] if degraded else [])
+    if not parts:
+        return "Reachable from all nodes"
+    text = "; ".join(parts)
+    text = text[0].upper() + text[1:]
+    if up:
         text += f"; reachable from {', '.join(up)}"
     return text
 
@@ -2424,7 +2623,7 @@ def note_peer_reported_down(peer_node: str, metrics: list[dict]) -> int:
     now = int(time.time())
     down_urls = set()
     for m in metrics or []:
-        if not isinstance(m, dict) or m.get("status") != "down":
+        if not isinstance(m, dict) or m.get("status") not in ("down", "degraded"):
             continue
         checked = m.get("last_checked")
         if isinstance(checked, (int, float)) and not isinstance(checked, bool) and now - checked > PEER_SUSPECT_MAX_AGE:
@@ -2447,7 +2646,7 @@ def note_peer_reported_down(peer_node: str, metrics: list[dict]) -> int:
         _peer_suspects[r["url"]] = (time.monotonic(), peer_node)
         marked.add(r["url"])
     if marked:
-        logger.info(f"Peer {peer_node} reports DOWN for {len(marked)} target(s) that are UP here; voting on their next check")
+        logger.info(f"Peer {peer_node} reports DOWN or DEGRADED for {len(marked)} target(s) that are UP here; voting on their next check")
     return len(marked)
 
 
@@ -2511,7 +2710,7 @@ def format_degraded_notice(items: list) -> str:
     now = int(time.time())
     lines = []
     if starts:
-        lines.append(f"🟠 **Partial Outage** — {len(starts)} monitor(s) unreachable from some nodes\n")
+        lines.append(f"🟠 **Partial Outage** — {len(starts)} monitor(s) unreachable or degraded from some nodes\n")
         for _, r, votes, _ in starts:
             lines.append(f"• 🟠 `ID: {r['id']}` **{r.get('name') or r['url']}**\n  Target: `{r['url']}`\n  {format_votes(votes)}")
         lines.append("\n_Not counted as downtime: most nodes still reach these targets._")
@@ -2540,7 +2739,7 @@ async def _flush_degraded_notices():
         keep = []
         for item in latest.values():
             kind, r, votes = item[0], item[1], item[2]
-            down_nodes = [v["node"] for v in votes if v.get("status") == "down"]
+            down_nodes = [v["node"] for v in votes if v.get("status") in ("down", "degraded")]
             if kind == "start" and down_nodes and all(is_node_unstable(n) for n in down_nodes):
                 _silent_partial_outages.add(r["id"])  # its node turned out unstable: the end stays silent too
                 continue
@@ -2570,7 +2769,7 @@ async def apply_quorum_state(r: dict, votes: list[dict], votes_json: str) -> str
         await run_db(database.update_resource_votes, r["id"], votes_json)
         return prev
     new = next_alert_state(r["id"], prev, decide_quorum(votes))
-    nodes_down = json.dumps([v["node"] for v in votes if v.get("status") == "down"])
+    nodes_down = json.dumps([v["node"] for v in votes if v.get("status") in ("down", "degraded")])
     degraded_since = r.get("degraded_since") or 0
     if new == "degraded":
         if prev != "degraded":
@@ -2607,7 +2806,7 @@ async def check_group_task(group, semaphore, session=None):
         _count_check(is_up, latency_ms, rep["url"])
         if is_up is None:  # this node cannot check it (no IPv6): keep the last result
             return
-        status_str = "up" if is_up else "down"
+        status_str = check_status(is_up)  # "degraded" goes to the requesting peer in telemetry
         local_node = database.get_local_node_name()
         await run_db(database.update_probe_target_result, rep["url"], status_str, latency_ms, error_msg)
         await run_db(database.save_peer_measurement, rep["url"], local_node, status_str, latency_ms, error_msg)
@@ -2658,8 +2857,15 @@ async def check_group_task(group, semaphore, session=None):
 
     local_node = database.get_local_node_name()
     in_alert = any(_in_alert(r) for r in group)
+    # Reachable through a bad path from here: the peers say whether it is only this node's path
+    locally_degraded = is_up == CHECK_DEGRADED
+    if locally_degraded:
+        _local_degraded[rep["url"]] = time.time()
+    else:
+        _local_degraded.pop(rep["url"], None)
     reported_by = _take_peer_suspect(rep) if is_up and not in_alert else None
-    quorum_ids = await _quorum_resource_ids(group) if (not is_up or in_alert or reported_by) else set()
+    quorum_ids = (await _quorum_resource_ids(group)
+                  if (not is_up or in_alert or reported_by or locally_degraded) else set())
     quorum_group = [r for r in group if r["id"] in quorum_ids]
 
     # Peers are asked when this node newly sees the target failing (fresh answers), and, for quorum
@@ -2680,6 +2886,10 @@ async def check_group_task(group, semaphore, session=None):
         elif reported_by and quorum_group:
             logger.info(f"{rep.get('name') or rep['url']}: UP here but {reported_by} reports it DOWN; asking all peers")
             peer_results = await collect_peer_votes(rep, is_up, fresh=True)
+        elif locally_degraded and quorum_group:
+            # Not fresh: answers are re-used for QUORUM_REVOTE_INTERVAL, so a path that stays bad
+            # (e.g. this node's provider) does not ask the peers every minute
+            peer_results = await collect_peer_votes(rep, is_up)
     except Exception as ex:
         logger.warning(f"Error during peer cross-check: {ex}")
 
@@ -2728,12 +2938,12 @@ async def check_group_task(group, semaphore, session=None):
             await run_db(database.update_resource_alert_state, r["id"], "up" if is_up else "down",
                          r.get("last_votes"), 0)
             r["alert_state"] = "up" if is_up else "down"
-        outcomes[r["id"]] = (is_up, local_error_msg)
+        outcomes[r["id"]] = (bool(is_up), local_error_msg)
 
     _count_check(is_up, latency_ms, rep.get("name") or rep["url"])  # the result after retries
 
     # One transaction for the whole check: every monitor of this target + the local measurement
-    status_str = "up" if is_up else "down"
+    status_str = check_status(is_up)
     await run_db(database.record_check_results,
                  [_status_update_for(r, outcomes[r["id"]][0], outcomes[r["id"]][1], latency_ms) for r in group],
                  (rep["url"], local_node, status_str, latency_ms, error_msg))
@@ -2747,9 +2957,10 @@ async def check_group_task(group, semaphore, session=None):
 
         # INFO only for what needs attention (DOWN or a change); routine UPs are in the minute summary
         changed = r.get("status") != ("up" if r_up else "down")
-        logger.log(logging.INFO if (changed or not r_up or not is_up) else logging.DEBUG,
-                   f"Check result: {r['name'] or r['url']} (id: {r['id']}) in chat {r['dc_chat_id']} -> {'UP' if r_up else 'DOWN'}"
-                   f"{'' if r_up == is_up else ' by quorum, locally ' + ('UP' if is_up else 'DOWN')} ({r_err})")
+        shown, local_word = ("UP" if r_up else "DOWN"), check_status(is_up).upper()
+        logger.log(logging.INFO if (changed or not r_up or not is_up or locally_degraded) else logging.DEBUG,
+                   f"Check result: {r['name'] or r['url']} (id: {r['id']}) in chat {r['dc_chat_id']} -> {shown}"
+                   f"{'' if shown == local_word else ' by quorum, locally ' + local_word} ({r_err})")
         await handle_check_result(r, r_up, r_err, latency_ms=latency_ms, status_written=True)
 
     # Check SSL Certificate Expiry for HTTPS and SMTP targets (at most once per hour)
@@ -3499,7 +3710,8 @@ def get_dashboard_html(chat_name, resources, overall_uptime, incidents=None, upt
                 for pm in remote_measurements:
                     pm_status = pm.get("status")
                     pm_lat = f"{pm['latency_ms']}ms" if pm.get("latency_ms") is not None else (pm_status.upper() if pm_status else "UNKNOWN")
-                    pm_color = "var(--color-up)" if pm_status == "up" else ("var(--color-down)" if pm_status == "down" else "var(--text-muted)")
+                    pm_color = {"up": "var(--color-up)", "degraded": "var(--color-warn)",
+                                "down": "var(--color-down)"}.get(pm_status, "var(--text-muted)")
                     probe_badges_html += f'<span style="background: rgba(255, 255, 255, 0.05); padding: 2px 6px; border-radius: 4px; border: 1px solid rgba(255, 255, 255, 0.1);">🛰️ <b>{html.escape(pm["node_name"])}</b>: <span style="color: {pm_color};">{pm_lat}</span></span>'
                 probe_badges_html += '</div>'
 
@@ -6294,14 +6506,38 @@ def probeunignore_command(bot, accid, event):
         ))
 
 
+def ensure_configured_account(bot, args) -> None:
+    """On `serve` without a configured account, let the core create one on a relay it picks.
+
+    init_transports (core 2.62+) with no QR code probes the core's built-in chatmail relay list,
+    configures the fastest one and later adds further relays in the background, so a new bot needs
+    no `init` step. An explicit `bot.py init <addr|DCACCOUNT:...>` still works and takes precedence."""
+    if getattr(getattr(args, "cmd", None), "__name__", "") != "_serve_cmd":
+        return
+    accids = [args.account] if getattr(args, "account", None) else bot.rpc.get_all_account_ids()
+    if any(bot.rpc.is_configured(a) for a in accids):
+        return
+    accid = accids[0] if accids else bot.rpc.add_account()
+    bot.logger.info("No configured account: creating one on a chatmail relay chosen by the core...")
+    try:
+        bot.rpc.set_config(accid, "bot", "1")
+        bot.rpc.init_transports(accid, None)
+        addr = bot.rpc.get_config(accid, "configured_addr")
+        bot.logger.info(f"Account created: {addr}")
+    except Exception as e:
+        # serve then exits with "no configured accounts" and the container restart retries
+        bot.logger.error(f"Automatic account creation failed: {e}")
+
+
 @dc_cli.on_init
 def on_init(bot, args):
     setup_custom_command_parser(bot)
     bot.logger.info(f"Initializing Uptime Bot v{VERSION}...")
-    
+    ensure_configured_account(bot, args)
+
     global dc_bot_instance, dc_accid
     dc_bot_instance = bot
-    
+
     for accid in bot.rpc.get_all_account_ids():
         dc_accid = accid
         try:
@@ -6619,7 +6855,7 @@ def on_new_message(bot, accid, event):
                         "req_id": req_id,
                         "url": target_url,
                         # "skip": not checked (no IPv6 here); the receiver files it as "unknown"
-                        "status": "skip" if is_up is None else ("up" if is_up else "down"),
+                        "status": check_status(is_up),
                         "latency_ms": latency_ms,
                         "error_msg": error_msg,
                         "node_name": database.get_local_node_name(),
@@ -6729,7 +6965,7 @@ def on_new_message(bot, accid, event):
             expected_chats.discard(msg.chat_id)
 
             node_name = peer.get("node_name") or "Remote-Node"
-            if status not in ("up", "down"):
+            if status not in VOTING_STATUSES:
                 status = "unknown"
             if not isinstance(latency_ms, int) or isinstance(latency_ms, bool):
                 latency_ms = None

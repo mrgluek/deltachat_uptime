@@ -357,11 +357,12 @@ class TestDnsPinning(unittest.TestCase):
 
     def test_ping_binary_still_used_without_icmp_socket(self):
         proc = MagicMock(returncode=0)
-        proc.wait = AsyncMock()
+        proc.communicate = AsyncMock(return_value=(b"64 bytes from 93.184.216.34: icmp_seq=1 ttl=55 time=12.3 ms\n" * 5, b""))
         dgram = AsyncMock(side_effect=bot.PingSocketUnavailable("Permission denied"))
         with patch('asyncio.create_subprocess_exec', AsyncMock(return_value=proc)) as mock_exec:
-            is_up, _, _ = self._ping_v4(_dgram_ping=dgram)
+            is_up, _, ms = self._ping_v4(_dgram_ping=dgram)
         self.assertTrue(is_up)
+        self.assertEqual(ms, 12)
         self.assertEqual(mock_exec.call_args.args[0], "ping")
 
     def test_icmp_checksum(self):

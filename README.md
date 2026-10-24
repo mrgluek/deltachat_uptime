@@ -54,7 +54,8 @@ Additionally, it automatically generates a secure, beautiful web status dashboar
   - **Zero Group Spam:** All protocol handshakes, background telemetry, and instant cross-checks happen in private DMs between bots.
   - **Cross-Probe Verification:** Outages are verified across remote probes in real-time before alerting, distinguishing global downtime from regional/routing reachability issues.
   - **Quorum Alerting (`/alertmode quorum`, default):** When a target fails, this node and its live peers vote. If most nodes cannot reach it, it is 🔴 DOWN (incident). If only some cannot (e.g. 1–2 of 4, or only this node), it is 🟠 DEGRADED: one grouped notice in the chat, no incident and no downtime. Alerts show which nodes can and cannot reach the target and why they failed (`🔴 DE, RU (Timeout) · 🟢 IT (196ms)`; with different reasons per node: `🔴 DE (Timeout), RU (SSL: self-signed certificate)`). Nodes that are offline, cannot check the target (IPv6) or ignore it (`/probeignore`) abstain; with fewer than two voters this node decides alone. DEGRADED is entered and left after two consecutive votes. `/alertmode local` keeps the previous behaviour (this node decides).
-  - **Unstable Nodes Do Not Cause Notices:** A node that fails 5 or more targets within 5 minutes that at least two other nodes reach has a network problem of its own (a home connection, provider filtering). It is marked unstable: its DOWN votes abstain (`⚪ RU (node network unstable, not counted)`) and partial outage notices it alone caused are dropped, until it has met that threshold no more for 10 minutes. The admin gets one notice when this starts and one when it ends. Outages most nodes see are still reported.
+  - **Degraded Paths (ICMP Ping):** A ping check sends 5 echoes (about 3 s at most). If 2 or more are lost, or the median round trip is at least 3 times this node's usual one for that address and 100 ms above it, the target is reachable but its path is bad (e.g. a congested peering between this node's provider and the target's network): the node votes 🟠 degraded instead of up. In quorum chats this makes a DEGRADED notice, never an incident or downtime: `🟠 HOME (561 ms, loss 80%, usual 60 ms; trace: +589 ms between hop 6 171.75.9.210 and hop 7 213.19.194.214) · 🟢 DE (44ms)`. The usual round trip is learned per address from healthy checks (degraded ones are ignored, so a long bad period does not become the new normal) and kept across restarts. The `trace:` hint comes from one `traceroute` of the bad path (cached for 15 min) and names the link where the round trip rises most. A node that runs only as a peer reports degraded paths in its telemetry, so a home node is enough to notice that only its own connection is affected.
+  - **Unstable Nodes Do Not Cause Notices:** A node that fails or degrades 5 or more targets within 5 minutes that at least two other nodes reach has a network problem of its own (a home connection, provider filtering). It is marked unstable: its DOWN and DEGRADED votes abstain (`⚪ RU (node network unstable, not counted)`) and partial outage notices it alone caused are dropped, until it has met that threshold no more for 10 minutes. The admin gets one notice when this starts and one when it ends. Outages most nodes see are still reported.
   - **Errors per Address Family:** When an HTTP check of a host with IPv4 and IPv6 addresses fails, aiohttp reports only its last attempt, often an IPv6 address, which hid what happened over IPv4. The check is then repeated over IPv4 only: if that works the target is up, otherwise both reasons are shown (`IPv4: Timeout · IPv6: Connect call failed`).
   - **Failures Seen Only by Peers:** If a peer reports a target DOWN in its telemetry while this node still reaches it, the target's next check asks all peers and votes too, so a target most nodes cannot reach becomes DOWN even when this node can (and DEGRADED if only some cannot).
   - **Status Page & History:** DEGRADED monitors are shown in orange with the last vote; partial outages are listed on the status page, in `/events` and in `/history <id>` (not counted as downtime).
@@ -141,7 +142,7 @@ Relay selection and failover are handled by the Delta Chat core (2.61+): it keep
 
 ### Prerequisites
 - Docker and Docker Compose installed.
-- A dedicated email address for the bot (e.g. `uptimebot@yourdomain.com`).
+- Optional: a dedicated email address for the bot (e.g. `uptimebot@yourdomain.com`). Without one the bot creates its own chatmail account at first start.
 - A domain name pointing to your host for the status pages (e.g. `up.gluek.info`).
 
 ### 1. Build and Prepare
@@ -151,13 +152,16 @@ cd deltachat_uptime
 docker compose build
 ```
 
-### 2. Configure Email and Admin
-Initialize the bot account with your email and password:
+### 2. Configure Email and Admin (Optional)
+Skip this step and the bot creates its account by itself at first start: the Delta Chat core (2.62+) picks the fastest chatmail relay from its built-in list and later adds further relays in the background.
+
+To choose the account yourself, initialize it with your email and password, or with `DCACCOUNT:server.tld` for an account on a specific chatmail relay:
 ```bash
 docker compose run --rm uptime_bot python bot.py init uptimebot@yourdomain.com "your_email_password"
+docker compose run --rm uptime_bot python bot.py init DCACCOUNT:server.tld
 ```
 
-Configure your admin email address and optionally your cryptographic fingerprint on the server:
+Configure your admin email address and your cryptographic fingerprint on the server (or do it later inside the bot chat with the `/initadmin` command):
 ```bash
 docker compose run --rm uptime_bot python set_admin.py --email admin@yourdomain.com
 docker compose run --rm uptime_bot python set_admin.py --fingerprint 1234ABCD1234ABCD1234ABCD1234ABCD1234ABCD

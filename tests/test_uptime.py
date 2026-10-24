@@ -444,7 +444,10 @@ class TestUptimeBot(unittest.TestCase):
         'AVATAR_PATH': 'custom_icon.png'
     })
     @patch('os.path.exists')
-    def test_profile_customization(self, mock_exists):
+    # on_init starts the monitoring and web server threads. Real ones outlive this test and keep
+    # writing to SQLite while later tests delete the DB files under them: SIGBUS in walIndexAppend.
+    @patch('bot.threading.Thread')
+    def test_profile_customization(self, mock_thread, mock_exists):
         mock_exists.side_effect = lambda path: 'custom_icon.png' in path or 'icon.png' in path
         
         mock_bot = MagicMock()
@@ -2943,7 +2946,8 @@ class TestUptimeBot(unittest.TestCase):
 
         mock_proc = MagicMock()
         mock_proc.returncode = 0
-        mock_proc.wait = unittest.mock.AsyncMock(return_value=0)
+        mock_proc.communicate = unittest.mock.AsyncMock(
+            return_value=(b"64 bytes from 93.184.216.34: icmp_seq=1 ttl=55 time=12.3 ms\n" * 5, b""))
 
         orig_aioping = bot.aioping
         bot.aioping = mock_aioping
@@ -2964,7 +2968,8 @@ class TestUptimeBot(unittest.TestCase):
         """When aioping is None (e.g. uninstalled or failed import), ping uses subprocess directly."""
         mock_proc = MagicMock()
         mock_proc.returncode = 0
-        mock_proc.wait = unittest.mock.AsyncMock(return_value=0)
+        mock_proc.communicate = unittest.mock.AsyncMock(
+            return_value=(b"64 bytes from 93.184.216.34: icmp_seq=1 ttl=55 time=12.3 ms\n" * 5, b""))
 
         orig_aioping = bot.aioping
         bot.aioping = None

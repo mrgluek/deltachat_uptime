@@ -184,6 +184,11 @@ Tell the bot your public status domain so that it generates correct dashboard li
 /url https://up.gluek.info
 ```
 
+### 6. Updates
+Run `./update.sh` (e.g. from cron) to deploy the newest release: the highest `vX.Y.Z` tag, from GitHub or, when GitHub is unreachable, from the Forgejo mirror; `-f` rebuilds the container without changes. Commits on `main` that are not released yet are not deployed. In `.env.local`, `UPDATE_REF=v2.24.0` stays on that release (to roll back; remove it to follow new releases again), `UPDATE_REF=main` follows the branch, and `MONITOR_URL` pings a healthcheck on start, success and failure.
+
+Releasing: merge into `main`, then `git tag -a vX.Y.Z -m "..." <commit> && git push origin vX.Y.Z`. Pushing the tag publishes the GitHub release with that version's `CHANGELOG.md` section (`bot.py` must have that `VERSION`) and sends the ntfy notification and the Home Assistant add-on sync.
+
 ## Configuration & Profile Customization
 
 You can customize the bot's name, avatar, and status text by passing environment variables (e.g. in your `.env` file or `docker-compose.yml`):

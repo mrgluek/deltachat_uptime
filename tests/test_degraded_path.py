@@ -67,6 +67,30 @@ class TestPingBaseline(unittest.TestCase):
         self.assertLess(up, 105)
 
 
+class TestConfirmDegraded(unittest.TestCase):
+    def setUp(self):
+        bot._ping_bad_streaks.clear()
+
+    def test_needs_three_series_over_three_minutes(self):
+        t = 1000.0
+        self.assertFalse(bot.confirm_degraded("x", True, t))
+        self.assertFalse(bot.confirm_degraded("x", True, t + 60))
+        self.assertFalse(bot.confirm_degraded("x", True, t + 120))  # 3 series, only 2 minutes
+        self.assertTrue(bot.confirm_degraded("x", True, t + 180))
+
+    def test_quick_peer_checks_do_not_shortcut_the_duration(self):
+        t = 1000.0
+        for i in range(5):
+            self.assertFalse(bot.confirm_degraded("x", True, t + i))
+
+    def test_good_series_starts_over(self):
+        t = 1000.0
+        for i in range(3):
+            bot.confirm_degraded("x", True, t + 60 * i)
+        self.assertFalse(bot.confirm_degraded("x", False, t + 180))
+        self.assertFalse(bot.confirm_degraded("x", True, t + 240))
+
+
 class TestTraceroute(unittest.TestCase):
     def test_finds_the_biggest_rise(self):
         self.assertEqual(bot.summarize_traceroute(TRACE),
@@ -136,6 +160,7 @@ class TestPingSeries(unittest.TestCase):
         database.init_db()
         bot._ping_baseline_cache.clear()
         bot._path_traces.clear()
+        bot._ping_bad_streaks.clear()
 
     def tearDown(self):
         database.close_db()
@@ -162,6 +187,8 @@ class TestPingSeries(unittest.TestCase):
 
     def test_lossy_path_is_degraded_with_trace(self):
         bot.note_ping_sample("93.184.216.34", 60, False)
+        # already bad for 2 series over 4 minutes: this third one confirms it
+        bot._ping_bad_streaks["93.184.216.34"] = (bot.time.time() - 240, 2)
         lost = asyncio.TimeoutError()
         dgram = AsyncMock(side_effect=[0.547, lost, 0.548, lost, lost])
         is_up, details, ms = self._check(dgram)
@@ -169,6 +196,13 @@ class TestPingSeries(unittest.TestCase):
         self.assertEqual(details, "547 ms, loss 60%, usual 60 ms; trace: +324 ms between hop 6 a and hop 7 b")
         self.assertEqual(ms, 547)
         self.assertEqual(database.get_ping_baseline("93.184.216.34"), 60.0)  # not learned
+
+    def test_first_bad_series_is_still_up(self):
+        bot.note_ping_sample("93.184.216.34", 4, False)
+        is_up, details, ms = self._check(AsyncMock(return_value=0.178))
+        self.assertIs(is_up, True)
+        self.assertEqual(details, "178 ms, usual 4 ms")  # reachable, but the details already tell
+        self.assertAlmostEqual(database.get_ping_baseline("93.184.216.34"), 4.0)  # not learned either
 
     def test_all_lost_is_down(self):
         is_up, details, _ = self._check(AsyncMock(side_effect=asyncio.TimeoutError()))

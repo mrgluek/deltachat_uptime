@@ -60,7 +60,7 @@ from outbox import outbox as dc_outbox, PRIO_ALERT, PRIO_REPLY, PRIO_UPDATE, PRI
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "2.25.0"
+VERSION = "2.25.1"
 # No "bot" in the name: some services (e.g. Hiddify subscription links) reply 400 to any User-Agent containing "bot".
 USER_AGENT = f"Delta Chat Uptime Monitor/{VERSION} (+https://git.gluek.info/gluek/deltachat_uptime)"
 
@@ -188,6 +188,10 @@ DEGRADED_LOSS_PCT = 40        # 2 of 5 lost: one lost echo happens on healthy pa
 DEGRADED_RTT_FACTOR = 3       # median RTT this many times the usual one ...
 DEGRADED_RTT_MIN_EXTRA_MS = 100  # ... and at least this much above it (5 -> 15 ms is no problem)
 DEGRADED_VOTE_ERROR_MAX = 160    # a degraded vote also carries the traceroute hint
+DEGRADED_MIN_SAMPLES = 3      # bad series in a row before this node calls a path degraded ...
+DEGRADED_MIN_DURATION = 180   # ... spanning at least this many seconds: a short burst on the node's
+                              # own uplink (several targets at once, gone in a minute) is not a bad path
+_ping_bad_streaks = {}        # ip -> (time.time() of the first bad series in a row, bad series in a row)
 PATH_TRACE_TTL = 900          # seconds a traceroute of a degraded path is reused
 _path_traces = {}             # ip -> (time.time(), summary or "") of the last traceroute
 _path_trace_tasks = {}        # ip -> running traceroute task
@@ -1183,6 +1187,11 @@ def _dns_cache_put(host: str, ips, ttl) -> tuple:
     return ips
 
 
+def _dns_cache_forget(host: str) -> None:
+    with _dns_cache_lock:
+        _dns_cache.pop((host or "").strip().lower().rstrip("."), None)
+
+
 def _validated_ips(host: str, ips) -> list[str]:
     """Raises BlockedAddressError unless every resolved address is publicly routable."""
     import ipaddress
@@ -1389,6 +1398,19 @@ def next_ping_baseline(usual_ms: float | None, sample_ms: int, degraded: bool) -
     return usual_ms + alpha * (sample_ms - usual_ms)
 
 
+def confirm_degraded(ip: str, bad: bool, now: float = None) -> bool:
+    """Records one ping series of ip and returns True once its path has been bad for
+    DEGRADED_MIN_SAMPLES series in a row spanning DEGRADED_MIN_DURATION. A good series starts over.
+    Checks asked for by peers count too, so the duration matters, not only the number."""
+    now = now or time.time()
+    if not bad:
+        _ping_bad_streaks.pop(ip, None)
+        return False
+    since, count = _ping_bad_streaks.get(ip, (now, 0))
+    _ping_bad_streaks[ip] = (since, count + 1)
+    return count + 1 >= DEGRADED_MIN_SAMPLES and now - since >= DEGRADED_MIN_DURATION
+
+
 def get_ping_baseline(ip: str) -> float | None:
     if ip not in _ping_baseline_cache:
         try:
@@ -1554,20 +1576,35 @@ def _get_aiodns_resolver():
     return resolver
 
 
+_DNS_NO_RECORD_CODES = (1, 4)  # c-ares ARES_ENODATA, ARES_ENOTFOUND: the name has no such record
+
+
+def _dns_query_failed(err: BaseException) -> bool:
+    """True if a query failed (timeout, SERVFAIL, refused...), False if the record just does not exist."""
+    code = err.args[0] if getattr(err, "args", None) else None
+    return code not in _DNS_NO_RECORD_CODES
+
+
 async def _query_with_ttl(host: str):
-    """Returns (ips, ttl) using aiodns so the record TTL is known; raises if nothing resolves."""
+    """Returns (ips, ttl) using aiodns so the record TTL is known; raises if nothing resolves.
+
+    If one of the A / AAAA queries failed while the other answered, the answer lacks a family the
+    host may well have (a home resolver timing out on A left only the AAAA address, and a check over
+    a broken IPv6 then had no IPv4 to fall back to for the record's TTL). Such a partial answer is
+    cached for DNS_CACHE_MIN_TTL only, so the next check asks again."""
     resolver = _get_aiodns_resolver()
     results = await asyncio.gather(resolver.query(host, "A"), resolver.query(host, "AAAA"), return_exceptions=True)
-    ips, ttls = [], []
+    ips, ttls, partial = [], [], False
     for res in results:
         if isinstance(res, BaseException):
+            partial = partial or _dns_query_failed(res)
             continue
         for rec in res:
             ips.append(rec.host)
             ttls.append(getattr(rec, "ttl", DNS_CACHE_DEFAULT_TTL))
     if not ips:
         raise socket.gaierror(socket.EAI_NONAME, f"DNS lookup failed for {host}")
-    return ips, min(ttls)
+    return ips, DNS_CACHE_MIN_TTL if partial else min(ttls)
 
 
 async def resolve_host_safe(host: str) -> list[str]:
@@ -2321,7 +2358,12 @@ async def run_single_check(resource, session=None) -> tuple[bool, str, int | Non
             usual = await asyncio.to_thread(get_ping_baseline, host)
             state, details = assess_ping(rtts_ms, PING_COUNT, usual)
             latency_ms = int(statistics.median(rtts_ms))
-            await asyncio.to_thread(note_ping_sample, host, latency_ms, state == CHECK_DEGRADED)
+            bad = state == CHECK_DEGRADED
+            await asyncio.to_thread(note_ping_sample, host, latency_ms, bad)  # a bad series never teaches the baseline
+            if bad and not confirm_degraded(host, True):
+                state = True  # not yet: reachable, the details still say how slow
+            elif not bad:
+                confirm_degraded(host, False)
             if state == CHECK_DEGRADED:
                 hint = path_trace_hint(host)
                 if hint:
@@ -2370,8 +2412,12 @@ async def _recheck_over_ipv4(resource: dict, ipv6_error: str):
     if that works the target is up; otherwise report both families."""
     host = urlparse(resource["url"]).hostname or ""
     try:
-        if not await probe_addresses(host, 4):
-            raise NoAddressForFamilyError(host)
+        try:
+            await probe_addresses(host, 4)
+        except NoAddressForFamilyError:
+            # The cached answer may lack IPv4 only because the A query failed: ask DNS once more
+            _dns_cache_forget(host)
+            await probe_addresses(host, 4)
     except Exception:
         return False, ipv6_error, None  # IPv6-only host (or DNS gone): the IPv6 error is the answer
     is_up, err4, latency = await run_single_check({**resource, "family": 4})

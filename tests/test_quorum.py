@@ -761,6 +761,36 @@ class TestIPv4Recheck(unittest.TestCase):
         self.assertFalse(up)
         self.assertEqual(err, "IPv4: Timeout · IPv6: Connect call failed")
 
+    def test_missing_ipv4_is_resolved_again(self):
+        # The cached answer had only AAAA (the A query had failed); DNS now answers A as well
+        res = {"type": "http", "url": "https://delta.chat/"}
+        lookups = AsyncMock(side_effect=[bot.NoAddressForFamilyError("x"), ["95.217.73.81"]])
+        with patch("bot.probe_addresses", lookups), patch("bot._dns_cache_forget") as forget, \
+             patch("bot.run_single_check", AsyncMock(return_value=(True, "200 OK", 40))):
+            self.assertEqual(asyncio.run(bot._recheck_over_ipv4(res, self.ERR6)), (True, "200 OK", 40))
+        forget.assert_called_once_with("delta.chat")
+
+    def _query(self, a, aaaa):
+        resolver = MagicMock()
+        resolver.query = AsyncMock(side_effect=lambda host, qtype: a if qtype == "A" else aaaa)
+        with patch("bot._get_aiodns_resolver", return_value=resolver):
+            return asyncio.run(bot._query_with_ttl("delta.chat"))
+
+    def _rec(self, host, ttl):
+        return [MagicMock(host=host, ttl=ttl)]
+
+    def test_partial_dns_answer_is_cached_briefly(self):
+        import aiodns
+        timeout = aiodns.error.DNSError(12, "Timeout while contacting DNS servers")
+        ips, ttl = self._query(timeout, self._rec("2a01:4f8:1c18:fba0::1", 3600))
+        self.assertEqual((ips, ttl), (["2a01:4f8:1c18:fba0::1"], bot.DNS_CACHE_MIN_TTL))
+
+    def test_missing_record_keeps_the_ttl(self):
+        import aiodns
+        nodata = aiodns.error.DNSError(1, "DNS server returned answer with no data")
+        ips, ttl = self._query(self._rec("95.217.73.81", 3600), nodata)
+        self.assertEqual((ips, ttl), (["95.217.73.81"], 3600))
+
     def test_ipv6_only_host_keeps_error(self):
         res = {"type": "http", "url": "https://v6only.example/"}
         with patch("bot.probe_addresses", AsyncMock(side_effect=bot.NoAddressForFamilyError("x"))):

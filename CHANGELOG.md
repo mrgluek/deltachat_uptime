@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.25.4] - 2026-10-26
+
+### Fixed
+- **Peering by Invite Link Was One-Sided**: `/addpeer <link> token=...` sent the HELLO with the invite token right after `secure_join()` returned, before the handshake had finished; the core had no key for the other bot yet and only sends encrypted, so the HELLO failed and was lost. This bot then sent cross-checks to the other one, which did not know it and dropped them ("Dropping check request from untrusted sender"). The HELLO is now sent from the background once SecureJoin has finished, retried every 5 s for up to 2 minutes; if it never goes out, the admin gets a notice to run `/invitepeer` on the other bot again. Re-running `/addpeer` with a new token repairs an already one-sided link (the peer is recognised by its key).
+
 ## [2.25.3] - 2026-10-26
 
 ### Fixed

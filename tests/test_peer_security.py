@@ -424,7 +424,16 @@ class TestPeerFederationSecurity(unittest.TestCase):
         mock_bot.rpc.check_qr.return_value = {"address": "remote@chatmail.example"}
         mock_bot.rpc.secure_join.return_value = 321
         event.payload = "https://i.delta.chat/#invite token=abc123 Frankfurt DE"
-        bot.addpeer_command(mock_bot, 1, event)
+
+        class _InlineThread:  # the HELLO goes out from a thread: run it here, deterministically
+            def __init__(self, target, args=(), **_):
+                self.target, self.args = target, args
+
+            def start(self):
+                self.target(*self.args)
+
+        with patch("bot.threading.Thread", _InlineThread):
+            bot.addpeer_command(mock_bot, 1, event)
 
         peer = database.get_peer("remote@chatmail.example")
         self.assertEqual(peer["node_name"], "Frankfurt DE")

@@ -60,7 +60,7 @@ from outbox import outbox as dc_outbox, PRIO_ALERT, PRIO_REPLY, PRIO_UPDATE, PRI
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "2.25.3"
+VERSION = "2.25.4"
 # No "bot" in the name: some services (e.g. Hiddify subscription links) reply 400 to any User-Agent containing "bot".
 USER_AGENT = f"Delta Chat Uptime Monitor/{VERSION} (+https://git.gluek.info/gluek/deltachat_uptime)"
 
@@ -6444,6 +6444,42 @@ def invitepeer_command(bot, accid, event):
         logger.error(f"Failed to generate invite link: {e}")
         _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text="❌ Failed to generate invite link. Check server logs for details."))
 
+# /addpeer with an invite link: secure_join() returns before the handshake is done, and until then
+# the core has no key for the other bot and cannot send to it (it only sends encrypted). The HELLO
+# with the invite token was sent at once, failed, and was lost: the other bot never learned this one
+# and dropped its cross-check requests as "untrusted sender" (2026-10-26).
+PEER_HELLO_RETRY_INTERVAL = 5
+PEER_HELLO_RETRY_FOR = 120
+
+
+def send_peer_hello_when_ready(bot, accid, chat_id: int, hello_text: str, node_name: str,
+                               sleep=time.sleep) -> bool:
+    """Sends the peering HELLO, retrying every PEER_HELLO_RETRY_INTERVAL until SecureJoin has
+    finished and the send succeeds, for up to PEER_HELLO_RETRY_FOR. Tells the admin if it never
+    does. Runs in its own thread."""
+    deadline = time.monotonic() + PEER_HELLO_RETRY_FOR
+    while True:
+        fut = dc_outbox.submit(lambda: bot.rpc.send_msg(accid, chat_id, MsgData(text=hello_text)),
+                               priority=PRIO_PEER, label="peer hello")
+        try:
+            fut.result(timeout=60)
+            return True
+        except Exception as e:
+            last_error = e
+        if time.monotonic() >= deadline:
+            break
+        sleep(PEER_HELLO_RETRY_INTERVAL)
+    logger.warning(f"Peer HELLO to {node_name} (chat {chat_id}) not sent within {PEER_HELLO_RETRY_FOR}s: {last_error}")
+    if async_event_loop and async_event_loop.is_running():
+        asyncio.run_coroutine_threadsafe(send_admin_notification(
+            f"⚠️ **Peering Not Completed**: {node_name}\n"
+            f"The SecureJoin handshake did not finish within {PEER_HELLO_RETRY_FOR // 60} min, so the "
+            f"invite token was not delivered and the other bot does not know this one yet.\n\n"
+            f"Run `/invitepeer` on the other bot again and send its `/addpeer` command here."
+        ), async_event_loop)
+    return False
+
+
 @dc_cli.on(events.NewMessage(command="/addpeer"))
 def addpeer_command(bot, accid, event):
     msg = event.msg
@@ -6531,10 +6567,14 @@ def addpeer_command(bot, accid, event):
                 ) or existing
                 peer_email = existing["email"]
             database.add_or_update_peer(peer_email, node_name, chat_id, fingerprint=peer_fp)
-            _dc_send_msg_with_stats(bot, accid, chat_id, MsgData(text=_hello_text()), priority=PRIO_PEER, label="peer hello")
+            # Not right away: the handshake is still running (see send_peer_hello_when_ready)
+            threading.Thread(target=send_peer_hello_when_ready, args=(bot, accid, chat_id, _hello_text(), node_name),
+                             daemon=True, name="peer-hello").start()
 
             _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(
-                text=f"✅ SecureJoin E2EE established with **{node_name}** (`{peer_email}`).\nChat ID: `{chat_id}`." + mutual_note
+                text=f"✅ SecureJoin started with **{node_name}** (`{peer_email}`).\nChat ID: `{chat_id}`. "
+                     f"The handshake is sent as soon as it completes; if it does not within "
+                     f"{PEER_HELLO_RETRY_FOR // 60} min, you get a notice." + mutual_note
             ))
         except Exception as e:
             logger.error(f"Failed to process SecureJoin invite: {e}")

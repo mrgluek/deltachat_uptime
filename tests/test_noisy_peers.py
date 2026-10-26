@@ -140,6 +140,28 @@ class TestTrimPeerChats(_DbCase):
         b.rpc.delete_messages.assert_not_called()
 
 
+class TestPeerHello(unittest.TestCase):
+    def test_retried_until_securejoin_is_done(self):
+        b = MagicMock()
+        b.rpc.send_msg.side_effect = [RuntimeError("e2e encryption unavailable")] * 2 + [42]
+        sleeps = []
+        self.assertTrue(bot.send_peer_hello_when_ready(b, 1, 49, "[UPTIME_PEER_HELLO]", "DE", sleep=sleeps.append))
+        self.assertEqual(b.rpc.send_msg.call_count, 3)
+        self.assertEqual(sleeps, [bot.PEER_HELLO_RETRY_INTERVAL] * 2)
+
+    def test_admin_told_when_it_never_goes_out(self):
+        b = MagicMock()
+        b.rpc.send_msg.side_effect = RuntimeError("e2e encryption unavailable")
+        loop = MagicMock()
+        loop.is_running.return_value = True
+        with patch.object(bot, "PEER_HELLO_RETRY_FOR", 0), patch.object(bot, "async_event_loop", loop), \
+             patch("bot.asyncio.run_coroutine_threadsafe") as run, \
+             patch("bot.send_admin_notification", MagicMock(return_value="coro")) as notify:
+            self.assertFalse(bot.send_peer_hello_when_ready(b, 1, 49, "[UPTIME_PEER_HELLO]", "DE", sleep=lambda s: None))
+        self.assertIn("Peering Not Completed", notify.call_args.args[0])
+        run.assert_called_once_with("coro", loop)
+
+
 class TestHealth(unittest.TestCase):
     def test_health_json(self):
         resp = asyncio.run(bot.handle_health(MagicMock()))

@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import sys
 import time
@@ -107,6 +108,44 @@ class TestLoneReporter(unittest.TestCase):
         for status in ("down", "degraded"):
             self.assertFalse(bot.note_lone_reporter("https://x.example/", "MAC", self._votes(status), now=100.0))
         self.assertNotIn(("https://x.example/", "MAC"), bot._lone_reporters)
+
+
+class TestUnconfirmedReport(unittest.TestCase):
+    def setUp(self):
+        bot._lone_reporters.clear()
+
+    def test_reporter_answering_up_is_held_briefly(self):
+        votes = [{"node": "DE", "status": "up", "local": True}, {"node": "PL", "status": "up"}]
+        self.assertTrue(bot.note_lone_reporter("gluek.info", "PL", votes, now=100.0))
+        self.assertEqual(bot._lone_reporters[("gluek.info", "PL")], 100.0 + bot.UNCONFIRMED_REPORT_HOLD)
+
+
+class TestTrimPeerChats(_DbCase):
+    def test_keeps_newest_and_deletes_in_chunks(self):
+        b = MagicMock()
+        b.rpc.get_message_ids.return_value = list(range(1, 1101))
+        with patch("bot.database.get_all_peers", return_value=[{"chat_id": 7, "node_name": "PL"}, {"chat_id": None}]):
+            n = bot.trim_peer_chats(b, 1)
+        self.assertEqual(n, 1100 - bot.PEER_CHAT_KEEP)
+        deleted = [i for call in b.rpc.delete_messages.call_args_list for i in call.args[1]]
+        self.assertEqual(deleted, list(range(1, 1101 - bot.PEER_CHAT_KEEP)))
+        self.assertTrue(all(len(c.args[1]) <= bot.PEER_CHAT_TRIM_CHUNK for c in b.rpc.delete_messages.call_args_list))
+        b.rpc.get_message_ids.assert_called_once_with(1, 7, False, False)
+
+    def test_short_chat_is_left_alone(self):
+        b = MagicMock()
+        b.rpc.get_message_ids.return_value = list(range(5))
+        with patch("bot.database.get_all_peers", return_value=[{"chat_id": 7}]):
+            self.assertEqual(bot.trim_peer_chats(b, 1), 0)
+        b.rpc.delete_messages.assert_not_called()
+
+
+class TestHealth(unittest.TestCase):
+    def test_health_json(self):
+        resp = asyncio.run(bot.handle_health(MagicMock()))
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(json.loads(resp.text), {"status": "ok", "version": bot.VERSION})
+        self.assertEqual(resp.headers["Cache-Control"], "no-store")
 
 
 class TestBlockedForPeers(_DbCase):

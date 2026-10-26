@@ -60,7 +60,7 @@ from outbox import outbox as dc_outbox, PRIO_ALERT, PRIO_REPLY, PRIO_UPDATE, PRI
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "2.25.2"
+VERSION = "2.25.3"
 # No "bot" in the name: some services (e.g. Hiddify subscription links) reply 400 to any User-Agent containing "bot".
 USER_AGENT = f"Delta Chat Uptime Monitor/{VERSION} (+https://git.gluek.info/gluek/deltachat_uptime)"
 
@@ -180,6 +180,9 @@ _peer_suspects = {}  # url -> (monotonic time, reporting node)
 # it started another vote - a noisy node (bad home network, Docker Desktop ICMP, split-horizon DNS)
 # made the main node ask all peers ~450 times an hour, each time encrypted mail to every peer.
 LONE_REPORTER_HOLD = 1800
+# A report its own sender no longer confirms (asked a minute later it answers UP: a short burst, or
+# a stale result from an older peer) is not heard again for that target for a shorter while
+UNCONFIRMED_REPORT_HOLD = 600
 _lone_reporters = {}  # (url, node) -> monotonic time until which its reports for url are ignored
 
 # Path quality of ping checks: a target that answers through a congested or lossy path (e.g. a bad
@@ -354,6 +357,12 @@ def _get_admin_chat_ids(bot, accid, chat_ids) -> set:
 # unless the bot is added back (then they resume with all settings).
 ABANDONED_CHAT_GRACE = 30 * 86400
 CHAT_AUDIT_INTERVAL = 3600
+# Peer chats carry only protocol messages, handled as they arrive. Kept for the account's
+# delete_device_after (a day, which incident edits in user chats need), they piled up to ~65k
+# messages and a 175 MB database, and the core spent ~0.5 s CPU per message instead of ~0.1 s.
+PEER_CHAT_TRIM_INTERVAL = 600
+PEER_CHAT_KEEP = 20       # newest messages left in each peer chat (a reply may still be on its way)
+PEER_CHAT_TRIM_CHUNK = 500
 
 
 def _field(obj, name, default=None):
@@ -391,6 +400,26 @@ def chat_send_state(bot, accid, chat_id: int) -> tuple[str | None, str]:
 
 _ABANDON_REASONS = {"gone": "the chat was deleted", "removed": "the bot was removed from the group",
                     "blocked": "the contact was blocked"}
+
+
+def trim_peer_chats(bot, accid) -> int:
+    """Deletes all but the newest PEER_CHAT_KEEP messages of every peer chat, on this device only
+    (delete_messages, not for all). Returns how many."""
+    deleted = 0
+    for peer in database.get_all_peers():
+        chat_id = peer.get("chat_id")
+        if not chat_id:
+            continue
+        try:
+            old = bot.rpc.get_message_ids(accid, chat_id, False, False)[:-PEER_CHAT_KEEP]
+            for i in range(0, len(old), PEER_CHAT_TRIM_CHUNK):
+                bot.rpc.delete_messages(accid, old[i:i + PEER_CHAT_TRIM_CHUNK])
+                deleted += len(old[i:i + PEER_CHAT_TRIM_CHUNK])
+        except Exception as e:
+            logger.warning(f"Could not trim peer chat {chat_id} ({peer.get('node_name')}): {e}")
+    if deleted:
+        logger.info(f"Deleted {deleted} old protocol messages from peer chats")
+    return deleted
 
 
 async def audit_abandoned_chats(now: int = None) -> None:
@@ -2746,17 +2775,20 @@ def note_peer_reported_down(peer_node: str, metrics: list[dict]) -> int:
 
 def note_lone_reporter(url: str, reporter: str, votes: list[dict], now: float = None) -> bool:
     """After a vote that a peer's report started (votes as counted, unstable ones masked): if the
-    reporter's vote abstained as unstable, ignore its reports for url for LONE_REPORTER_HOLD.
-    A reporter whose vote counts is heard: two of its reports in a row make the target DEGRADED.
+    reporter's vote abstained as unstable, ignore its reports for url for LONE_REPORTER_HOLD; if the
+    reporter itself now answers UP, for UNCONFIRMED_REPORT_HOLD. A reporter whose vote still fails
+    the target is heard: two of its reports in a row make the target DEGRADED.
     Returns True if it is ignored now."""
     now = now or time.monotonic()
     vote = next((v for v in votes if v.get("node") == reporter), None)
-    if vote and vote.get("status") == "unstable":
-        _lone_reporters[(url, reporter)] = now + LONE_REPORTER_HOLD
+    hold = {"unstable": LONE_REPORTER_HOLD, "up": UNCONFIRMED_REPORT_HOLD}.get((vote or {}).get("status"))
+    if hold:
+        _lone_reporters[(url, reporter)] = now + hold
         if len(_lone_reporters) > 5000:
             for key in [k for k, until in _lone_reporters.items() if until <= now]:
                 del _lone_reporters[key]
-        logger.info(f"{url}: {reporter} is unstable; ignoring its reports for this target for {LONE_REPORTER_HOLD // 60} min")
+        why = "is unstable" if vote["status"] == "unstable" else "answers UP now"
+        logger.info(f"{url}: {reporter} {why}; ignoring its reports for this target for {hold // 60} min")
         return True
     _lone_reporters.pop((url, reporter), None)
     return False
@@ -3580,6 +3612,7 @@ async def monitoring_scheduler_loop():
     _last_incident_audit = 0
     _last_cleanup = 0
     _last_chat_audit = 0
+    _last_peer_chat_trim = 0
     _last_transport_flush = 0
     _last_summary = int(time.time())
     # Validated, TTL-pinned DNS answers (see resolve_host_safe)
@@ -3714,6 +3747,11 @@ async def monitoring_scheduler_loop():
                 if now - _last_chat_audit >= CHAT_AUDIT_INTERVAL:
                     _last_chat_audit = now
                     asyncio.create_task(audit_abandoned_chats())
+
+                # Protocol messages in peer chats (also right after start)
+                if now - _last_peer_chat_trim >= PEER_CHAT_TRIM_INTERVAL and dc_bot_instance and dc_accid is not None:
+                    _last_peer_chat_trim = now
+                    asyncio.create_task(asyncio.to_thread(trim_peer_chats, dc_bot_instance, dc_accid))
 
                 # Periodic database cleanup (every 24 hours)
                 if now - _last_cleanup >= 86400:
@@ -4399,6 +4437,11 @@ async def handle_status_page(request):
                                       partial_outages=partial_outages)
     return web.Response(text=html_content, content_type="text/html")
 
+async def handle_health(request):
+    """For monitors and other nodes: no database, no page, just alive and which version."""
+    return web.json_response({"status": "ok", "version": VERSION}, headers={"Cache-Control": "no-store"})
+
+
 async def handle_index(request):
     if not check_rate_limit(request, bucket="web_index", max_requests=120, window_seconds=60):
         return web.Response(text="Rate limit exceeded. Try again later.", status=429, headers={"Retry-After": "60"})
@@ -4871,6 +4914,7 @@ async def _run_web_server():
     app.router.add_get('/qr.png', handle_qr_png)
     app.router.add_get('/robots.txt', handle_robots_txt)
     app.router.add_get('/', handle_index)
+    app.router.add_get('/health', handle_health)
     app.router.add_get('/{token:[a-zA-Z0-9]{12}}', handle_status_page)
     
     runner = web.AppRunner(app)

@@ -28,6 +28,7 @@ class TestPeerFederationSecurity(unittest.TestCase):
         bot._processed_msg_ids.clear()
         bot._admin_chat_membership_cache.clear()
         bot._telemetry_rotation_offsets.clear()
+        bot._telemetry_sent_at.clear()  # each test's broadcast sends to every peer
         self.orig_dc_bot = bot.dc_bot_instance
         self.orig_accid = bot.dc_accid
         # No real DNS in unit tests (CI has network access; queries would stay in flight)

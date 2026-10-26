@@ -61,7 +61,7 @@ from outbox import outbox as dc_outbox, PRIO_ALERT, PRIO_REPLY, PRIO_UPDATE, PRI
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "2.26.0"
+VERSION = "2.26.1"
 # No "bot" in the name: some services (e.g. Hiddify subscription links) reply 400 to any User-Agent containing "bot".
 USER_AGENT = f"Delta Chat Uptime Monitor/{VERSION} (+https://git.gluek.info/gluek/deltachat_uptime)"
 
@@ -159,6 +159,18 @@ TELEMETRY_INTERVAL_STEPS = ((20, 300), (10, 180))
 PEER_OFFLINE_INTERVALS = 3   # a peer is offline after this many of its telemetry intervals without a word
 _peer_telemetry_interval = {}  # peer email (lower) -> interval it announced (default TELEMETRY_INTERVAL)
 _telemetry_interval_now = TELEMETRY_INTERVAL  # this node's, set at each broadcast from its peer count
+# In a star (one hub linked to every node, the others only to the hub) each leaf has one peer and
+# would keep sending every 2 minutes while the hub receives from all of them. So every node also
+# says how often it wants to receive (desired_interval, from its own peer count), and a sender
+# uses the longer of its own interval and the receiver's wish, per peer.
+TELEMETRY_TICK = 60           # the broadcast runs this often; each peer gets mail when its interval is due
+_peer_desired_interval = {}   # peer email (lower) -> how often it wants telemetry
+_telemetry_sent_at = {}       # peer email (lower) -> time.time() this node last queued telemetry to it
+
+
+def interval_for_peer(email: str, own: int) -> int:
+    """How often this node sends telemetry to one peer: its own interval or the peer's wish."""
+    return max(own, _peer_desired_interval.get((email or "").lower(), 0))
 
 
 def current_telemetry_interval() -> int:
@@ -638,9 +650,10 @@ def _note_peer_announcement(peer: dict, data) -> dict:
     if not isinstance(data, dict):
         return peer
     _note_peer_caps(peer["email"], data.get("caps"))
-    interval = data.get("telemetry_interval")
-    if isinstance(interval, int) and not isinstance(interval, bool):
-        _peer_telemetry_interval[peer["email"].lower()] = min(900, max(60, interval))
+    for field, store in (("telemetry_interval", _peer_telemetry_interval), ("desired_interval", _peer_desired_interval)):
+        value = data.get(field)
+        if isinstance(value, int) and not isinstance(value, bool):
+            store[peer["email"].lower()] = min(900, max(60, value))
     claimed = data.get("node_name")
     claimed = claimed.strip()[:64] if isinstance(claimed, str) else ""
     current = peer.get("node_name") or ""
@@ -947,9 +960,14 @@ async def broadcast_telemetry_to_peers():
 
     for p in peers:
         email = (p.get("email") or "").lower()
+        peer_interval = interval_for_peer(email, interval)
+        # A few seconds of slack: the loop ticks every TELEMETRY_TICK, not exactly on time
+        if time.time() - _telemetry_sent_at.get(email, 0) < peer_interval - 5:
+            continue
         all_metrics = probe_by_source.get(email, []) + shared_metrics
         if not all_metrics:
             continue
+        _telemetry_sent_at[email] = time.time()
 
         metrics_batch = pick_telemetry_batch(email, all_metrics, batch_size)
 
@@ -959,7 +977,8 @@ async def broadcast_telemetry_to_peers():
             "timestamp": now,
             "msg_id": f"{now}_{secrets.token_hex(4)}",
             "caps": OWN_PEER_CAPS,
-            "telemetry_interval": interval,  # lets the peer judge when this node is offline
+            "telemetry_interval": peer_interval,  # to this peer: lets it judge when this node is offline
+            "desired_interval": interval,  # how often this node wants telemetry (from its peer count)
             "metrics": metrics_batch
         }
         msg_text = f"[UPTIME_PEER_METRICS]\n{json.dumps(payload)}\n[/UPTIME_PEER_METRICS]"
@@ -976,7 +995,7 @@ async def broadcast_telemetry_to_peers():
 
             # One telemetry message per peer at a time: a newer one replaces a still queued one
             _dc_send_msg_with_stats(dc_bot_instance, dc_accid, chat_id, MsgData(text=msg_text),
-                                    priority=PRIO_TELEMETRY, key=("telemetry", chat_id), expires_in=interval,
+                                    priority=PRIO_TELEMETRY, key=("telemetry", chat_id), expires_in=peer_interval,
                                     label=f"telemetry to {email}", after_send=_record_sent)
 
 # Async event loop and task tracking for check scheduler
@@ -3823,7 +3842,7 @@ async def monitoring_scheduler_loop():
                     
                 # Periodically broadcast telemetry to configured peers (2-5 min, see telemetry_interval)
                 global last_peer_telemetry_broadcast
-                if now - last_peer_telemetry_broadcast >= current_telemetry_interval():
+                if now - last_peer_telemetry_broadcast >= TELEMETRY_TICK:  # each peer only when due
                     last_peer_telemetry_broadcast = now
                     asyncio.create_task(broadcast_telemetry_to_peers())
 
@@ -6580,7 +6599,10 @@ def build_stats_report(bot, accid) -> str:
         "",
         "**Peers**",
         f"• {len(peers)} peers, {len(live)} online" + (f", unstable now: {', '.join(unstable)}" if unstable else ""),
-        f"• Telemetry every `{format_duration(current_telemetry_interval())}`; votes ask up to {VOTE_SAMPLE_SIZE} peers",
+        f"• Telemetry every `{format_duration(current_telemetry_interval())}`"
+        + (f" (less often to {slower} peers that asked for it)" if (slower := sum(
+            1 for p in peers if interval_for_peer(p["email"], current_telemetry_interval()) > current_telemetry_interval())) else "")
+        + f"; votes ask up to {VOTE_SAMPLE_SIZE} peers",
         f"• Last hour: {stat_last_hour('vote', now)} votes sent to peers, {stat_last_hour('held', now)} reports held back",
         f"• Old protocol messages deleted since start: {_bot_stats['trimmed']}",
         "",

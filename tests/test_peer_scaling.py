@@ -63,6 +63,46 @@ class TestTelemetryInterval(_DbCase):
         self.assertEqual([p["email"] for p in offline], ["fast@example.org"])
 
 
+class TestDesiredInterval(_DbCase):
+    def setUp(self):
+        super().setUp()
+        bot._peer_desired_interval.clear()
+        bot._peer_telemetry_interval.clear()
+        bot._telemetry_sent_at.clear()
+
+    def test_leaf_follows_the_hubs_wish(self):
+        hub = {"email": "Hub@example.org", "node_name": "HUB"}
+        with patch("bot.database.get_all_peers", return_value=[]):
+            bot._note_peer_announcement(hub, {"desired_interval": 180})
+        self.assertEqual(bot.interval_for_peer("hub@example.org", 120), 180)
+        self.assertEqual(bot.interval_for_peer("other@example.org", 120), 120)
+        self.assertEqual(bot.interval_for_peer("hub@example.org", 300), 300)  # never more often than its own
+
+    def test_broadcast_sends_each_peer_when_due(self):
+        peers = [{"email": "hub@example.org", "node_name": "HUB", "chat_id": 5},
+                 {"email": "leaf@example.org", "node_name": "LEAF", "chat_id": 6}]
+        bot._peer_desired_interval["hub@example.org"] = 300
+        sent = []
+        res = [{"id": 1, "url": "https://a.example.org", "type": "http", "status": "up", "dc_chat_id": 100}]
+        with patch.object(bot, "dc_bot_instance", MagicMock()), patch.object(bot, "dc_accid", 1), \
+             patch("bot.database.get_all_peers", return_value=peers), \
+             patch("bot.database.get_all_resources", return_value=res), \
+             patch("bot._filter_peer_shareable_resources", side_effect=lambda b, a, r: r), \
+             patch("bot.database.get_active_probe_targets", return_value=[]), \
+             patch("bot._get_self_addr", return_value="me@example.org"), \
+             patch("bot._resolve_peer_chat_id", AsyncMock(side_effect=lambda p: p["chat_id"])), \
+             patch("bot._dc_send_msg_with_stats", side_effect=lambda b, a, chat, m, **kw: sent.append((chat, m.text))):
+            asyncio.run(bot.broadcast_telemetry_to_peers())
+            self.assertEqual(sorted(c for c, _ in sent), [5, 6])
+            payload = bot.json.loads(next(t for c, t in sent if c == 5).split("\n")[1])
+            self.assertEqual((payload["telemetry_interval"], payload["desired_interval"]), (300, 120))
+            sent.clear()
+            for email in bot._telemetry_sent_at:  # 2.5 minutes later: only the leaf is due
+                bot._telemetry_sent_at[email] -= 150
+            asyncio.run(bot.broadcast_telemetry_to_peers())
+            self.assertEqual([c for c, _ in sent], [6])
+
+
 class TestVoteSample(unittest.TestCase):
     def setUp(self):
         bot._node_vote_history.clear()

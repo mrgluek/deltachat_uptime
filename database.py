@@ -306,6 +306,10 @@ def init_db():
         if "down_since" not in pt_columns:
             # Start of the current local outage of a peer's target: drives the check slowdown
             cursor.execute("ALTER TABLE probe_targets ADD COLUMN down_since INTEGER")
+        # Before 2.25.2 a peer's smtp:// target was stored as "http" and checked as a web page, so
+        # it was always DOWN here: fix the type and forget that result
+        cursor.execute("""UPDATE probe_targets SET type = 'smtp', last_status = NULL, last_error = NULL,
+                          down_since = NULL WHERE url LIKE 'smtp://%' AND type != 'smtp'""")
 
         # Ignored probe targets (excluded from remote scanning on this probe)
         cursor.execute('''
@@ -1667,7 +1671,7 @@ def save_probe_targets_batch(targets: list[dict], source_peer: str = None, max_p
                 known_urls.add(url)
             name = str(item.get("name") or url).strip()[:200]
             chk_type = str(item.get("type") or "http").strip().lower()
-            if chk_type not in ("http", "tcp", "ping"):
+            if chk_type not in ("http", "tcp", "ping", "smtp"):
                 chk_type = "http"
             raw_kw = item.get("expected_keyword")
             kw = str(raw_kw).strip()[:200] if raw_kw else None

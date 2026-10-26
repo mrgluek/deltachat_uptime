@@ -60,7 +60,7 @@ from outbox import outbox as dc_outbox, PRIO_ALERT, PRIO_REPLY, PRIO_UPDATE, PRI
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "2.25.1"
+VERSION = "2.25.2"
 # No "bot" in the name: some services (e.g. Hiddify subscription links) reply 400 to any User-Agent containing "bot".
 USER_AGENT = f"Delta Chat Uptime Monitor/{VERSION} (+https://git.gluek.info/gluek/deltachat_uptime)"
 
@@ -175,6 +175,12 @@ _degraded_flush_task = None
 # regular check asks all peers and votes (the case "this node reaches it, most others don't").
 PEER_SUSPECT_MAX_AGE = 300  # seconds a report stays valid, and how old the peer's result may be
 _peer_suspects = {}  # url -> (monotonic time, reporting node)
+# A peer whose report could not count (its vote abstained because the node is unstable) is not heard
+# again for that target for a while: its votes are masked, the target stays UP, so every report of
+# it started another vote - a noisy node (bad home network, Docker Desktop ICMP, split-horizon DNS)
+# made the main node ask all peers ~450 times an hour, each time encrypted mail to every peer.
+LONE_REPORTER_HOLD = 1800
+_lone_reporters = {}  # (url, node) -> monotonic time until which its reports for url are ignored
 
 # Path quality of ping checks: a target that answers through a congested or lossy path (e.g. a bad
 # peering between this node's provider and the target's) is still reachable, so it is not DOWN.
@@ -683,6 +689,7 @@ async def _answer_batch_cross_check(bot, accid, chat_id: int, req_id: str, targe
             return {"status": "skip", "latency_ms": None, "error_msg": "Ignored on this node (/probeignore)"}
         async with _peer_batch_semaphore:
             is_up, error_msg, latency_ms = await run_single_check(t)
+        is_up = for_peers(is_up, error_msg)
         return {"status": check_status(is_up), "latency_ms": latency_ms, "error_msg": error_msg}
 
     answers = await asyncio.gather(*[one(t) for t in targets], return_exceptions=True)
@@ -1227,6 +1234,14 @@ class NoAddressForFamilyError(OSError):
 
 
 NO_IPV6_MSG = "No IPv6 connectivity on this node"
+BLOCKED_TARGET_MSG = "Target blocked: internal or private network address"
+
+
+def for_peers(is_up, error_msg):
+    """A check result as this node reports it to peers (cross-check answers, mirrored targets):
+    a name that resolves to a private address here (split-horizon DNS at home, a VPN) cannot be
+    checked by this node, which says nothing about the target, so it abstains instead of DOWN."""
+    return None if is_up is False and error_msg == BLOCKED_TARGET_MSG else is_up
 PING_UNAVAILABLE_MSG = "Ping not available on this node (no ICMP socket, no ping binary)"
 _ping_unavailable_warned = False
 
@@ -1238,6 +1253,32 @@ def _warn_ping_unavailable() -> None:
         _ping_unavailable_warned = True
         logger.warning("Ping checks are skipped on this node: no raw or datagram ICMP socket and no ping binary "
                        "(install iputils-ping, or allow the bot's group in net.ipv4.ping_group_range)")
+
+
+PING_UNRELIABLE_MSG = "Ping not reliable on this node (Docker Desktop drops ICMP replies)"
+_ping_reliable = None
+
+
+def ping_is_reliable() -> bool:
+    """False on Docker Desktop (macOS / Windows): its VM (kernel "linuxkit") passes ICMP through a
+    user-space proxy that drops replies as soon as several echoes are in flight (measured 2026-10-26:
+    68% lost with 5 targets at once, 89% with 20, 17% even one at a time next to the running bot;
+    0% on a Linux host). Ping results there would be false DOWN and degraded votes, so the node
+    abstains on ping targets. PING_ON_DOCKER_DESKTOP=1 checks them anyway."""
+    global _ping_reliable
+    if _ping_reliable is None:
+        try:
+            with open("/proc/version", encoding="utf-8") as f:
+                desktop = "linuxkit" in f.read().lower()
+        except OSError:
+            desktop = False
+        forced = os.environ.get("PING_ON_DOCKER_DESKTOP", "").strip().lower() in ("1", "true", "yes")
+        _ping_reliable = forced or not desktop
+        if not _ping_reliable:
+            logger.warning("Docker Desktop detected: ping targets are not checked on this node (it abstains "
+                           "in votes), because its network proxy drops ICMP replies. "
+                           "Set PING_ON_DOCKER_DESKTOP=1 to check them anyway.")
+    return _ping_reliable
 
 
 class PingSocketUnavailable(Exception):
@@ -2196,7 +2237,7 @@ async def run_single_check(resource, session=None) -> tuple[bool, str, int | Non
     family = resource.get("family") if resource.get("family") in (4, 6) else None
 
     if not await _prewarm_target_dns(url, rtype) or not is_safe_target_url(url, rtype):
-        return False, "Target blocked: internal or private network address", None
+        return False, BLOCKED_TARGET_MSG, None
 
     start_time = time.time()
     try:
@@ -2343,6 +2384,8 @@ async def run_single_check(resource, session=None) -> tuple[bool, str, int | Non
             if not (_HOSTNAME_RE.match(host) or _ipv6_literal(host)):
                 return False, "Invalid hostname format", None
 
+            if not ping_is_reliable():
+                return None, PING_UNRELIABLE_MSG, None  # abstain, like a node without ICMP
             # Ping the validated address itself so the ping tool cannot resolve to something else
             host = (await probe_addresses(host, family))[0]
             try:
@@ -2373,7 +2416,7 @@ async def run_single_check(resource, session=None) -> tuple[bool, str, int | Non
         elapsed_ms = int((time.time() - start_time) * 1000)
         return False, "Timeout", elapsed_ms
     except BlockedAddressError:
-        return False, "Target blocked: internal or private network address", None
+        return False, BLOCKED_TARGET_MSG, None
     except NoIPv6Error:
         return None, NO_IPV6_MSG, None  # None = not checked here: neither UP nor DOWN
     except NoAddressForFamilyError as e:
@@ -2381,7 +2424,7 @@ async def run_single_check(resource, session=None) -> tuple[bool, str, int | Non
     except aiohttp.ClientConnectorError as e:
         os_error = getattr(e, "os_error", None)
         if isinstance(os_error, BlockedAddressError):
-            return False, "Target blocked: internal or private network address", None
+            return False, BLOCKED_TARGET_MSG, None
         if isinstance(os_error, NoIPv6Error):
             return None, NO_IPV6_MSG, None
         if isinstance(os_error, NoAddressForFamilyError):
@@ -2679,6 +2722,11 @@ def note_peer_reported_down(peer_node: str, metrics: list[dict]) -> int:
         return 0
     marked = set()
     modes = {}
+    now_mono = time.monotonic()
+    for url in [u for u in down_urls if _lone_reporters.get((u, peer_node), 0) > now_mono]:
+        down_urls.discard(url)  # the last vote showed only this node failing it
+    if not down_urls:
+        return 0
     for r in database.get_resources_by_urls(down_urls):
         if r["url"] in marked or r.get("status") != "up" or r.get("alert_state") not in (None, "up"):
             continue  # DOWN/DEGRADED targets are re-voted by their regular checks anyway
@@ -2694,6 +2742,24 @@ def note_peer_reported_down(peer_node: str, metrics: list[dict]) -> int:
     if marked:
         logger.info(f"Peer {peer_node} reports DOWN or DEGRADED for {len(marked)} target(s) that are UP here; voting on their next check")
     return len(marked)
+
+
+def note_lone_reporter(url: str, reporter: str, votes: list[dict], now: float = None) -> bool:
+    """After a vote that a peer's report started (votes as counted, unstable ones masked): if the
+    reporter's vote abstained as unstable, ignore its reports for url for LONE_REPORTER_HOLD.
+    A reporter whose vote counts is heard: two of its reports in a row make the target DEGRADED.
+    Returns True if it is ignored now."""
+    now = now or time.monotonic()
+    vote = next((v for v in votes if v.get("node") == reporter), None)
+    if vote and vote.get("status") == "unstable":
+        _lone_reporters[(url, reporter)] = now + LONE_REPORTER_HOLD
+        if len(_lone_reporters) > 5000:
+            for key in [k for k, until in _lone_reporters.items() if until <= now]:
+                del _lone_reporters[key]
+        logger.info(f"{url}: {reporter} is unstable; ignoring its reports for this target for {LONE_REPORTER_HOLD // 60} min")
+        return True
+    _lone_reporters.pop((url, reporter), None)
+    return False
 
 
 def _take_peer_suspect(rep: dict) -> str | None:
@@ -2850,7 +2916,11 @@ async def check_group_task(group, semaphore, session=None):
             is_up, error_msg = res
             latency_ms = None
         _count_check(is_up, latency_ms, rep["url"])
-        if is_up is None:  # this node cannot check it (no IPv6): keep the last result
+        is_up = for_peers(is_up, error_msg)
+        if is_up is None:  # this node cannot check it (no IPv6, private address here)
+            if error_msg in (BLOCKED_TARGET_MSG, PING_UNRELIABLE_MSG, PING_UNAVAILABLE_MSG):
+                # Not the last result: an earlier "down" would keep going to the peer in telemetry
+                await run_db(database.update_probe_target_result, rep["url"], "skip", None, error_msg)
             return
         status_str = check_status(is_up)  # "degraded" goes to the requesting peer in telemetry
         local_node = database.get_local_node_name()
@@ -2945,6 +3015,8 @@ async def check_group_task(group, semaphore, session=None):
         if newly_unstable:
             asyncio.create_task(notify_unstable_nodes(newly_unstable))
         votes = mask_unstable_votes(votes)
+        if reported_by:
+            note_lone_reporter(rep["url"], reported_by, votes)
     votes_json = json.dumps(votes) if votes and len(votes) > 1 else None
 
     # Local-mode monitors: this node decides; peers' answers are added to the error text
@@ -6897,6 +6969,7 @@ def on_new_message(bot, accid, event):
                     else:
                         is_up, error_msg = res
                         latency_ms = None
+                    is_up = for_peers(is_up, error_msg)
                     resp_payload = {
                         "req_id": req_id,
                         "url": target_url,

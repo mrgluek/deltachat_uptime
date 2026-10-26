@@ -446,6 +446,7 @@ class TestPeerReportedDown(unittest.TestCase):
         bot._alert_streaks.clear()
         bot._vote_cache.clear()
         bot._peer_suspects.clear()
+        bot._lone_reporters.clear()
         bot._admin_chat_membership_cache.clear()
         self.orig_dc_bot, self.orig_accid = bot.dc_bot_instance, bot.dc_accid
         bot.dc_bot_instance, bot.dc_accid = None, None

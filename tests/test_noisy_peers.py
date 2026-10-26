@@ -90,7 +90,7 @@ class TestLoneReporter(unittest.TestCase):
 
     def test_unstable_reporter_is_ignored_for_a_while(self):
         self.assertTrue(bot.note_lone_reporter("https://x.example/", "MAC", self._votes("unstable"), now=100.0))
-        with patch("bot.time.monotonic", return_value=100.0 + bot.LONE_REPORTER_HOLD - 1), \
+        with patch("bot.time.time", return_value=100.0 + bot.LONE_REPORTER_HOLD - 1), \
              patch("bot.database.get_resources_by_urls") as lookup:
             n = bot.note_peer_reported_down("MAC", [{"url": "https://x.example/", "status": "down"}])
         self.assertEqual(n, 0)
@@ -98,7 +98,7 @@ class TestLoneReporter(unittest.TestCase):
 
     def test_heard_again_after_the_hold(self):
         bot.note_lone_reporter("https://x.example/", "MAC", self._votes("unstable"), now=100.0)
-        with patch("bot.time.monotonic", return_value=100.0 + bot.LONE_REPORTER_HOLD + 1), \
+        with patch("bot.time.time", return_value=100.0 + bot.LONE_REPORTER_HOLD + 1), \
              patch("bot.database.get_resources_by_urls", return_value=[]) as lookup:
             bot.note_peer_reported_down("MAC", [{"url": "https://x.example/", "status": "down"}])
         lookup.assert_called_once()
@@ -117,7 +117,50 @@ class TestUnconfirmedReport(unittest.TestCase):
     def test_reporter_answering_up_is_held_briefly(self):
         votes = [{"node": "DE", "status": "up", "local": True}, {"node": "PL", "status": "up"}]
         self.assertTrue(bot.note_lone_reporter("gluek.info", "PL", votes, now=100.0))
-        self.assertEqual(bot._lone_reporters[("gluek.info", "PL")], 100.0 + bot.UNCONFIRMED_REPORT_HOLD)
+        self.assertEqual(bot._lone_reporters[("gluek.info", "PL")], (100.0 + bot.UNCONFIRMED_REPORT_HOLD, 1))
+
+
+class TestEscalatingHold(_DbCase):
+    URL = "smtp://chatmail.uk"
+
+    def setUp(self):
+        super().setUp()
+        bot._lone_reporters.clear()
+        bot._lone_reporters_loaded = True
+
+    def _vote(self, status, now):
+        votes = [{"node": "DE", "status": "up", "local": True}, {"node": "PL", "status": status}]
+        bot.note_lone_reporter(self.URL, "PL", votes, now=now)
+        return bot._lone_reporters.get((self.URL, "PL"))
+
+    def test_doubles_up_to_two_hours(self):
+        now, holds = 1_000_000.0, []
+        for _ in range(6):
+            until, _streak = self._vote("up", now)
+            holds.append(int(until - now) // 60)
+            now = until + 1  # its next report, right after the hold
+        self.assertEqual(holds, [10, 20, 40, 80, 120, 120])
+
+    def test_confirmed_report_starts_over(self):
+        now = 1_000_000.0
+        self._vote("up", now)
+        self._vote("up", now + 700)
+        self.assertIsNone(self._vote("down", now + 2000))
+        until, streak = self._vote("up", now + 2100)
+        self.assertEqual((int(until - now - 2100), streak), (bot.UNCONFIRMED_REPORT_HOLD, 1))
+
+    def test_no_answer_changes_nothing(self):
+        now = 1_000_000.0
+        first = self._vote("up", now)
+        self.assertEqual(self._vote("unknown", now + 60), first)
+
+    def test_survives_a_restart(self):
+        now = time.time()
+        self._vote("up", now)
+        bot._lone_reporters.clear()
+        bot._lone_reporters_loaded = False  # as after a restart
+        self.assertTrue(bot.report_held(self.URL, "PL", now + 60))
+        self.assertFalse(bot.report_held(self.URL, "PL", now + bot.UNCONFIRMED_REPORT_HOLD + 1))
 
 
 class TestTrimPeerChats(_DbCase):

@@ -61,7 +61,7 @@ from outbox import outbox as dc_outbox, PRIO_ALERT, PRIO_REPLY, PRIO_UPDATE, PRI
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "2.26.1"
+VERSION = "2.26.2"
 # No "bot" in the name: some services (e.g. Hiddify subscription links) reply 400 to any User-Agent containing "bot".
 USER_AGENT = f"Delta Chat Uptime Monitor/{VERSION} (+https://git.gluek.info/gluek/deltachat_uptime)"
 
@@ -233,7 +233,32 @@ LONE_REPORTER_HOLD = 1800
 # A report its own sender no longer confirms (asked a minute later it answers UP: a short burst, or
 # a stale result from an older peer) is not heard again for that target for a shorter while
 UNCONFIRMED_REPORT_HOLD = 600
-_lone_reporters = {}  # (url, node) -> monotonic time until which its reports for url are ignored
+# ... and each time it is unconfirmed again the hold doubles, up to this: an old peer that keeps
+# reporting a target wrongly (an smtp:// target it checks as a web page) costs a vote every 2 h,
+# not every 10 min. A report its sender confirms resets it.
+UNCONFIRMED_REPORT_HOLD_MAX = 7200
+DOWNLOAD_LIMIT = 65536
+# (url, node) -> (time.time() until which its reports for url are ignored, unconfirmed in a row);
+# also in the database (held_reports), so a restart does not start every hold over
+_lone_reporters = {}
+_lone_reporters_loaded = False
+
+
+def _held_reports() -> dict:
+    global _lone_reporters_loaded
+    if not _lone_reporters_loaded:
+        _lone_reporters_loaded = True
+        try:
+            for url, node, until, streak in database.get_held_reports(time.time() - UNCONFIRMED_REPORT_HOLD_MAX):
+                _lone_reporters.setdefault((url, node), (until, streak))
+        except Exception as e:
+            logger.debug(f"Could not load held peer reports: {e}")
+    return _lone_reporters
+
+
+def report_held(url: str, node: str, now: float = None) -> bool:
+    entry = _held_reports().get((url, node))
+    return bool(entry) and entry[0] > (now or time.time())
 
 # Path quality of ping checks: a target that answers through a congested or lossy path (e.g. a bad
 # peering between this node's provider and the target's) is still reachable, so it is not DOWN.
@@ -2879,9 +2904,8 @@ def note_peer_reported_down(peer_node: str, metrics: list[dict]) -> int:
         return 0
     marked = set()
     modes = {}
-    now_mono = time.monotonic()
-    for url in [u for u in down_urls if _lone_reporters.get((u, peer_node), 0) > now_mono]:
-        down_urls.discard(url)  # the last vote showed only this node failing it
+    for url in [u for u in down_urls if report_held(u, peer_node)]:
+        down_urls.discard(url)  # the last vote did not confirm this node's report
     if not down_urls:
         return 0
     for r in database.get_resources_by_urls(down_urls):
@@ -2904,23 +2928,43 @@ def note_peer_reported_down(peer_node: str, metrics: list[dict]) -> int:
 def note_lone_reporter(url: str, reporter: str, votes: list[dict], now: float = None) -> bool:
     """After a vote that a peer's report started (votes as counted, unstable ones masked): if the
     reporter's vote abstained as unstable, ignore its reports for url for LONE_REPORTER_HOLD; if the
-    reporter itself now answers UP, for UNCONFIRMED_REPORT_HOLD. A reporter whose vote still fails
-    the target is heard: two of its reports in a row make the target DEGRADED.
-    Returns True if it is ignored now."""
-    now = now or time.monotonic()
-    vote = next((v for v in votes if v.get("node") == reporter), None)
-    hold = {"unstable": LONE_REPORTER_HOLD, "up": UNCONFIRMED_REPORT_HOLD}.get((vote or {}).get("status"))
-    if hold:
-        _lone_reporters[(url, reporter)] = now + hold
-        stat_event("held")
-        if len(_lone_reporters) > 5000:
-            for key in [k for k, until in _lone_reporters.items() if until <= now]:
-                del _lone_reporters[key]
-        why = "is unstable" if vote["status"] == "unstable" else "answers UP now"
-        logger.info(f"{url}: {reporter} {why}; ignoring its reports for this target for {hold // 60} min")
-        return True
-    _lone_reporters.pop((url, reporter), None)
-    return False
+    reporter itself now answers UP, for UNCONFIRMED_REPORT_HOLD, doubled for each time in a row
+    (up to UNCONFIRMED_REPORT_HOLD_MAX). A reporter whose vote still fails the target is heard (two
+    of its reports in a row make the target DEGRADED) and its count starts over; a reporter that
+    did not answer changes nothing. Returns True if it is ignored now."""
+    now = now or time.time()
+    held = _held_reports()
+    status = next((v.get("status") for v in votes if v.get("node") == reporter), None)
+    until, streak = held.get((url, reporter), (0, 0))
+    if now - until > UNCONFIRMED_REPORT_HOLD_MAX:
+        streak = 0  # the last unconfirmed report is long ago
+    if status == "unstable":
+        hold = LONE_REPORTER_HOLD
+    elif status == "up":
+        hold = min(UNCONFIRMED_REPORT_HOLD * 2 ** streak, UNCONFIRMED_REPORT_HOLD_MAX)
+        streak += 1
+    elif status in ("down", "degraded"):
+        if held.pop((url, reporter), None):
+            _db_quietly(database.delete_held_report, url, reporter)
+        return False
+    else:
+        return False  # no answer: nothing learned
+    held[(url, reporter)] = (now + hold, streak)
+    _db_quietly(database.set_held_report, url, reporter, now + hold, streak)
+    stat_event("held")
+    if len(held) > 5000:
+        for key in [k for k, (u, _) in held.items() if now - u > UNCONFIRMED_REPORT_HOLD_MAX]:
+            del held[key]
+    why = "is unstable" if status == "unstable" else "answers UP now"
+    logger.info(f"{url}: {reporter} {why}; ignoring its reports for this target for {hold // 60} min")
+    return True
+
+
+def _db_quietly(fn, *args) -> None:
+    try:
+        fn(*args)
+    except Exception as e:
+        logger.debug(f"{fn.__name__} failed: {e}")
 
 
 def _take_peer_suspect(rep: dict) -> str | None:
@@ -7085,9 +7129,12 @@ def on_start(bot, _args):
     if accounts:
         dc_accid = accounts[0]
         try:
-            bot.rpc.set_config(dc_accid, "download_limit", "1")
+            # Attachments over 64 KB (photos, GIFs, files) are not downloaded: the bot never needs
+            # them. Not 1 byte: the core then defers every message, also plain text, to a
+            # one-by-one "download later" instead of the normal batch, which delayed peer answers.
+            bot.rpc.set_config(dc_accid, "download_limit", str(DOWNLOAD_LIMIT))
             bot.rpc.set_config(dc_accid, "delete_device_after", "86400")
-            logger.info("Successfully set auto-download limit to 1 byte to optimize storage.")
+            logger.info(f"Auto-download limit set to {DOWNLOAD_LIMIT // 1024} KB (larger attachments are not downloaded).")
         except Exception as e:
             logger.error(f"Failed to set storage optimizations: {e}")
             

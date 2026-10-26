@@ -320,6 +320,17 @@ def init_db():
             )
         ''')
 
+        # Peer reports the main node ignores for a while (see bot.note_lone_reporter)
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS held_reports (
+                url TEXT NOT NULL,
+                node TEXT NOT NULL,
+                until_ts REAL NOT NULL,
+                streak INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (url, node)
+            )
+        ''')
+
         # Usual ping round trip of this node per pinged address (degraded path detection)
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS ping_baselines (
@@ -1600,6 +1611,24 @@ def save_peer_measurements_batch(node_name: str, metrics_list: list[dict]):
                 error_msg = excluded.error_msg,
                 last_checked = excluded.last_checked
         ''', rows)
+
+def get_held_reports(newer_than: float) -> list[tuple]:
+    """(url, node, until_ts, streak) of the holds that ended after newer_than; older rows are dropped."""
+    with _writer_transaction() as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM held_reports WHERE until_ts < ?", (newer_than,))
+        cursor.execute("SELECT url, node, until_ts, streak FROM held_reports")
+        return cursor.fetchall()
+
+def set_held_report(url: str, node: str, until_ts: float, streak: int):
+    with _writer_transaction() as conn:
+        conn.cursor().execute(
+            "INSERT OR REPLACE INTO held_reports (url, node, until_ts, streak) VALUES (?, ?, ?, ?)",
+            (url, node, until_ts, streak))
+
+def delete_held_report(url: str, node: str):
+    with _writer_transaction() as conn:
+        conn.cursor().execute("DELETE FROM held_reports WHERE url = ? AND node = ?", (url, node))
 
 def get_ping_baseline(ip: str) -> float | None:
     conn = _connect()

@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.26.4] - 2026-10-26
+
+### Fixed
+- **GET Is Memorized When Only HEAD Fails**: A monitor switched to `GET` for good only after `405 Method Not Allowed`. A server that answers `HEAD` with another error but `GET` with 200 - changedetection.io returns `500` to `HEAD /login` and logs a traceback - stayed green through the `GET` fallback, but got the failing `HEAD` again on every check from every node. Now `GET` is memorized when `HEAD` returns any 4xx/5xx and the `GET` right after it succeeds; if `GET` fails too, nothing is memorized. Timeouts and connection errors are handled as before.
+
 ## [2.26.3] - 2026-10-26
 
 ### Added

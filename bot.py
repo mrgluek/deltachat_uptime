@@ -61,7 +61,7 @@ from outbox import outbox as dc_outbox, PRIO_ALERT, PRIO_REPLY, PRIO_UPDATE, PRI
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "2.26.3"
+VERSION = "2.26.4"
 # No "bot" in the name: some services (e.g. Hiddify subscription links) reply 400 to any User-Agent containing "bot".
 USER_AGENT = f"Delta Chat Uptime Monitor/{VERSION} (+https://git.gluek.info/gluek/deltachat_uptime)"
 
@@ -2509,6 +2509,28 @@ async def run_single_check(resource, session=None) -> tuple[bool, str, int | Non
                     else:
                         return False, details, elapsed_ms
 
+            async def _memorize_get():
+                resource["http_method"] = "GET"
+                try:
+                    await run_db(database.set_url_http_method, url, "GET")
+                except Exception as db_err:
+                    logger.warning(f"Failed to persist http_method for {url}: {db_err}")
+
+                # Update in-memory scheduler cache if present
+                try:
+                    cached_res = _scheduler_cache.get("resources")
+                    if cached_res:
+                        for cr in cached_res:
+                            if cr.get("url") == url:
+                                cr["http_method"] = "GET"
+                    cached_pt = _scheduler_cache.get("probe_targets")
+                    if cached_pt:
+                        for cpt in cached_pt:
+                            if cpt.get("url") == url:
+                                cpt["http_method"] = "GET"
+                except Exception:
+                    pass
+
             async def _check_http(sess, is_local: bool):
                 http_method = (resource.get("http_method") or "").strip().upper()
                 if not expected_kw and http_method != "GET" and hasattr(sess, "head"):
@@ -2517,8 +2539,10 @@ async def run_single_check(resource, session=None) -> tuple[bool, str, int | Non
                     if not is_local:
                         head_kwargs["timeout"] = req_timeout
                     head_405 = False
+                    head_status = None
                     try:
                         async with _safe_http_request(sess, "HEAD", url, **head_kwargs) as resp:
+                            head_status = resp.status
                             if 200 <= resp.status < 400:
                                 elapsed_ms = int((time.time() - start_time) * 1000)
                                 try:
@@ -2538,29 +2562,17 @@ async def run_single_check(resource, session=None) -> tuple[bool, str, int | Non
 
                     if head_405:
                         logger.info(f"HEAD check returned 405 Method Not Allowed for {url}. Memorizing GET method for this monitor.")
-                        resource["http_method"] = "GET"
-                        try:
-                            await run_db(database.set_url_http_method, url, "GET")
-                        except Exception as db_err:
-                            logger.warning(f"Failed to persist http_method for {url}: {db_err}")
-
-                        # Update in-memory scheduler cache if present
-                        try:
-                            cached_res = _scheduler_cache.get("resources")
-                            if cached_res:
-                                for cr in cached_res:
-                                    if cr.get("url") == url:
-                                        cr["http_method"] = "GET"
-                            cached_pt = _scheduler_cache.get("probe_targets")
-                            if cached_pt:
-                                for cpt in cached_pt:
-                                    if cpt.get("url") == url:
-                                        cpt["http_method"] = "GET"
-                        except Exception:
-                            pass
+                        await _memorize_get()
 
                     # If HEAD was not 2xx/3xx or threw an exception, fall back to GET (max 16KB)
-                    return await _do_get(sess, 16384, is_local)
+                    result = await _do_get(sess, 16384, is_local)
+                    if head_status is not None and not head_405 and result[0]:
+                        # HEAD answered 4xx/5xx but GET works (e.g. an app that only routes GET and
+                        # crashes on HEAD): use GET from now on, so the server is not hit with a failing
+                        # HEAD on every check
+                        logger.info(f"HEAD check returned {head_status} for {url} but GET succeeded. Memorizing GET method for this monitor.")
+                        await _memorize_get()
+                    return result
                 elif not expected_kw:
                     return await _do_get(sess, 16384, is_local)
                 else:

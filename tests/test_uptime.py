@@ -2846,6 +2846,75 @@ class TestUptimeBot(unittest.TestCase):
         self.assertEqual(len(head_calls), 0, "Subsequent check should not call HEAD after memorizing GET")
         self.assertEqual(len(get_calls), 1, "Subsequent check should call GET directly")
 
+    def _head_get_session(self, head_status, get_status):
+        """Mock session whose HEAD and GET answer with the given statuses; records calls."""
+        head_resp = MagicMock()
+        head_resp.status = head_status
+        get_resp = MagicMock()
+        get_resp.status = get_status
+        get_resp.headers = {"Content-Type": "text/html"}
+        async def mock_read(n=None):
+            return b"<html><head><title>Login</title></head><body>ok</body></html>"
+        get_resp.content.read = mock_read
+
+        calls = {"head": 0, "get": 0}
+        class Ctx:
+            def __init__(self, resp):
+                self.resp = resp
+            async def __aenter__(self):
+                return self.resp
+            async def __aexit__(self, *args):
+                pass
+        class MockSession:
+            def head(self, url, **kwargs):
+                calls["head"] += 1
+                return Ctx(head_resp)
+            def get(self, url, **kwargs):
+                calls["get"] += 1
+                return Ctx(get_resp)
+        return MockSession(), calls
+
+    def test_run_single_check_head_500_get_200_memorizes_get(self):
+        """HEAD 500 (app crashes on HEAD) but GET 200: memorize GET so HEAD is not sent again."""
+        sess, calls = self._head_get_session(500, 200)
+        r_id = database.add_resource(12345, "https://head-500.org/login", "HEAD 500", "http")
+        res = database.get_resource_by_id(r_id)
+
+        is_up, details, _ = asyncio.run(bot.run_single_check(res, session=sess))
+        self.assertTrue(is_up)
+        self.assertIn("200 - OK", details)
+        self.assertEqual(calls, {"head": 1, "get": 1})
+        self.assertEqual(res.get("http_method"), "GET")
+        self.assertEqual(database.get_resource_by_id(r_id)["http_method"], "GET")
+
+        calls.update(head=0, get=0)
+        is_up2, _, _ = asyncio.run(bot.run_single_check(res, session=sess))
+        self.assertTrue(is_up2)
+        self.assertEqual(calls, {"head": 0, "get": 1})
+
+    def test_run_single_check_head_500_get_500_does_not_memorize(self):
+        """HEAD and GET both fail: the target is down, keep trying HEAD first."""
+        sess, calls = self._head_get_session(500, 500)
+        r_id = database.add_resource(12345, "https://both-500.org", "Both 500", "http")
+        res = database.get_resource_by_id(r_id)
+
+        is_up, _, _ = asyncio.run(bot.run_single_check(res, session=sess))
+        self.assertFalse(is_up)
+        self.assertEqual(calls, {"head": 1, "get": 1})
+        self.assertNotEqual((res.get("http_method") or "").upper(), "GET")
+        self.assertNotEqual((database.get_resource_by_id(r_id)["http_method"] or "").upper(), "GET")
+
+    def test_run_single_check_head_405_get_500_memorizes_get(self):
+        """HEAD 405 still memorizes GET regardless of the GET result, as before."""
+        sess, calls = self._head_get_session(405, 500)
+        r_id = database.add_resource(12345, "https://head-405-down.org", "405 down", "http")
+        res = database.get_resource_by_id(r_id)
+
+        is_up, _, _ = asyncio.run(bot.run_single_check(res, session=sess))
+        self.assertFalse(is_up)
+        self.assertEqual(res.get("http_method"), "GET")
+        self.assertEqual(database.get_resource_by_id(r_id)["http_method"], "GET")
+
     def test_run_single_check_skips_head_when_method_is_get(self):
         """When resource already has http_method='GET', run_single_check directly issues GET without calling HEAD."""
         mock_get_resp = MagicMock()

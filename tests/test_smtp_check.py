@@ -254,8 +254,8 @@ class TestSmtpPeers(unittest.IsolatedAsyncioTestCase):
             sent[peer["email"]] = [t["type"] for _, t in items]
 
         fut_smtp, fut_http = asyncio.get_running_loop().create_future(), asyncio.get_running_loop().create_future()
-        batch = [({"type": "smtp", "url": "smtp://1.1.1.1"}, fut_smtp),
-                 ({"type": "http", "url": "https://1.1.1.1"}, fut_http)]
+        batch = [({"type": "smtp", "url": "smtp://1.1.1.1"}, fut_smtp, None),
+                 ({"type": "http", "url": "https://1.1.1.1"}, fut_http, None)]
         with patch("bot.database.get_all_peers", return_value=[self.new, self.old]), \
              patch("bot._batch_cross_check_peer", side_effect=fake_batch):
             await bot._flush_cross_checks(batch)

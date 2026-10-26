@@ -428,7 +428,7 @@ class TestQuorumTexts(unittest.TestCase):
         async def scenario():
             fut = asyncio.get_running_loop().create_future()
             fut_holder["f"] = fut
-            await bot._flush_cross_checks([({"url": URL, "type": "http"}, fut)])
+            await bot._flush_cross_checks([({"url": URL, "type": "http"}, fut, None)])
 
         with patch("bot.request_peer_cross_checks", fake_single):
             asyncio.run(scenario())

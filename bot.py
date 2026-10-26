@@ -1,4 +1,5 @@
 import asyncio
+import collections
 import contextlib
 import io
 import logging
@@ -60,7 +61,7 @@ from outbox import outbox as dc_outbox, PRIO_ALERT, PRIO_REPLY, PRIO_UPDATE, PRI
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "2.25.4"
+VERSION = "2.26.0"
 # No "bot" in the name: some services (e.g. Hiddify subscription links) reply 400 to any User-Agent containing "bot".
 USER_AGENT = f"Delta Chat Uptime Monitor/{VERSION} (+https://git.gluek.info/gluek/deltachat_uptime)"
 
@@ -151,11 +152,48 @@ OWN_PEER_CAPS = [PEER_CAP_BATCH_CHECK, PEER_CAP_SMTP_CHECK]
 CROSS_CHECK_BATCH_WINDOW = 5.0    # seconds to collect failing targets before sending
 CROSS_CHECK_BATCH_MAX = 100       # targets per batch message
 CROSS_CHECK_BATCH_TIMEOUT = 25.0  # a peer checks up to 100 targets (10 s timeouts) and mails back
-TELEMETRY_INTERVAL = 120  # seconds between telemetry messages to each peer
+TELEMETRY_INTERVAL = 120  # seconds between telemetry messages to each peer (up to 10 peers)
+# Telemetry is mail to every peer; with more peers it goes out less often, so the relay's send limit
+# keeps room for what matters in an outage (alerts, votes). (more than N peers, interval)
+TELEMETRY_INTERVAL_STEPS = ((20, 300), (10, 180))
+PEER_OFFLINE_INTERVALS = 3   # a peer is offline after this many of its telemetry intervals without a word
+_peer_telemetry_interval = {}  # peer email (lower) -> interval it announced (default TELEMETRY_INTERVAL)
+_telemetry_interval_now = TELEMETRY_INTERVAL  # this node's, set at each broadcast from its peer count
+
+
+def current_telemetry_interval() -> int:
+    return _telemetry_interval_now
 PEER_ANSWER_TTL = 20.0  # an answer to a peer's cross-check is dropped if the outbox could not send it by then
 PEER_BATCH_CHECK_CONCURRENCY = 20
 _peer_caps = {}  # peer email (lower) -> set of capabilities it announced (in memory, re-sent every 2 min)
-_cross_check_queue = []  # (target_dict, future) waiting for the next batch
+_cross_check_queue = []  # (target_dict, future, reporting node or None) waiting for the next batch
+# A vote asks a sample of the most stable peers, not all: every peer asked is two mails, and a
+# quorum of 7 tells "down / only some" about as well as 20. Up to this many peers all are asked.
+VOTE_SAMPLE_SIZE = 7
+VOTE_HISTORY_WINDOW = 86400   # how far back a node's lone failures count against its stability
+_node_vote_history = {}       # node -> deque of (time.time(), alone_failing: bool) of its counted votes
+
+# /stats: counters since start and events of the last hour (in memory, reset on restart)
+_bot_stats = {"started": time.time(), "trimmed": 0}
+_stat_events = collections.defaultdict(collections.deque)  # name -> times of the last hour
+_cpu_samples = collections.deque(maxlen=4)  # (time.monotonic(), {name: cpu seconds}) once a minute
+_last_check_summary = {}
+
+
+def stat_event(name: str, now: float = None) -> None:
+    now = now or time.time()
+    q = _stat_events[name]
+    q.append(now)
+    while q and now - q[0] > 3600:
+        q.popleft()
+
+
+def stat_last_hour(name: str, now: float = None) -> int:
+    now = now or time.time()
+    q = _stat_events[name]
+    while q and now - q[0] > 3600:
+        q.popleft()
+    return len(q)
 _cross_check_flush_task = None
 pending_batch_checks = {}  # req_id -> (Future, chat_id, number of targets)
 _peer_batch_semaphore = None
@@ -412,13 +450,27 @@ def trim_peer_chats(bot, accid) -> int:
             continue
         try:
             old = bot.rpc.get_message_ids(accid, chat_id, False, False)[:-PEER_CHAT_KEEP]
-            for i in range(0, len(old), PEER_CHAT_TRIM_CHUNK):
-                bot.rpc.delete_messages(accid, old[i:i + PEER_CHAT_TRIM_CHUNK])
-                deleted += len(old[i:i + PEER_CHAT_TRIM_CHUNK])
         except Exception as e:
-            logger.warning(f"Could not trim peer chat {chat_id} ({peer.get('node_name')}): {e}")
+            logger.warning(f"Could not list peer chat {chat_id} ({peer.get('node_name')}): {e}")
+            continue
+        for i in range(0, len(old), PEER_CHAT_TRIM_CHUNK):
+            chunk = old[i:i + PEER_CHAT_TRIM_CHUNK]
+            try:
+                bot.rpc.delete_messages(accid, chunk)
+                deleted += len(chunk)
+            except Exception:
+                # The core stops at the first message that is gone - usually one its own
+                # delete_device_after removed meanwhile (both start with the oldest). One by one,
+                # skipping those, the rest of the chunk still goes.
+                for msg_id in chunk:
+                    try:
+                        bot.rpc.delete_messages(accid, [msg_id])
+                        deleted += 1
+                    except Exception:
+                        pass
     if deleted:
         logger.info(f"Deleted {deleted} old protocol messages from peer chats")
+        _bot_stats["trimmed"] += deleted
     return deleted
 
 
@@ -558,6 +610,20 @@ def _peer_can_check(peer: dict, target: dict) -> bool:
     return (target.get("type") or "http") != "smtp" or _peer_supports(peer, PEER_CAP_SMTP_CHECK)
 
 
+def telemetry_interval(peer_count: int) -> int:
+    """Seconds between this node's telemetry messages: 2 min up to 10 peers, 3 min up to 20, then 5."""
+    for more_than, interval in TELEMETRY_INTERVAL_STEPS:
+        if peer_count > more_than:
+            return interval
+    return TELEMETRY_INTERVAL
+
+
+def peer_offline_after(email: str) -> int:
+    """Silence after which a peer counts as offline: PEER_OFFLINE_INTERVALS of the telemetry
+    interval it announced (older peers announce none: 2 min, so 6 min as before)."""
+    return PEER_OFFLINE_INTERVALS * _peer_telemetry_interval.get((email or "").lower(), TELEMETRY_INTERVAL)
+
+
 def _note_peer_caps(email: str, caps) -> None:
     if email and isinstance(caps, list):
         _peer_caps[email.lower()] = {str(c)[:40] for c in caps[:20]}
@@ -572,6 +638,9 @@ def _note_peer_announcement(peer: dict, data) -> dict:
     if not isinstance(data, dict):
         return peer
     _note_peer_caps(peer["email"], data.get("caps"))
+    interval = data.get("telemetry_interval")
+    if isinstance(interval, int) and not isinstance(interval, bool):
+        _peer_telemetry_interval[peer["email"].lower()] = min(900, max(60, interval))
     claimed = data.get("node_name")
     claimed = claimed.strip()[:64] if isinstance(claimed, str) else ""
     current = peer.get("node_name") or ""
@@ -588,7 +657,7 @@ def _note_peer_announcement(peer: dict, data) -> dict:
     return peer
 
 
-async def request_peer_cross_checks_batched(target_dict: dict) -> list[dict]:
+async def request_peer_cross_checks_batched(target_dict: dict, reporter: str = None) -> list[dict]:
     """Cross-check of a failing monitor, sent together with the others failing at the same time.
 
     Waits up to CROSS_CHECK_BATCH_WINDOW for more targets, then sends one request per peer (peers
@@ -596,7 +665,7 @@ async def request_peer_cross_checks_batched(target_dict: dict) -> list[dict]:
     answers for this target, like request_peer_cross_checks."""
     global _cross_check_flush_task
     fut = asyncio.get_running_loop().create_future()
-    _cross_check_queue.append((target_dict, fut))
+    _cross_check_queue.append((target_dict, fut, reporter))
     if len(_cross_check_queue) >= CROSS_CHECK_BATCH_MAX:
         batch = _cross_check_queue[:]
         _cross_check_queue.clear()
@@ -607,6 +676,32 @@ async def request_peer_cross_checks_batched(target_dict: dict) -> list[dict]:
         return await asyncio.wait_for(asyncio.shield(fut), CROSS_CHECK_BATCH_WINDOW + CROSS_CHECK_BATCH_TIMEOUT + 5)
     except asyncio.TimeoutError:
         return []
+
+
+def node_lone_failure_share(node: str, now: float = None) -> float:
+    """Share of a node's counted votes in VOTE_HISTORY_WINDOW where it alone failed the target."""
+    now = now or time.time()
+    hist = _node_vote_history.get(node)
+    if not hist:
+        return 0.0
+    while hist and now - hist[0][0] > VOTE_HISTORY_WINDOW:
+        hist.popleft()
+    return sum(1 for _, alone in hist if alone) / len(hist) if hist else 0.0
+
+
+def pick_vote_peers(peers: list[dict], reporters=(), size: int = VOTE_SAMPLE_SIZE, now: float = None) -> list[dict]:
+    """The peers a vote asks: all of them up to size; beyond that the nodes whose report started
+    the vote (so they can confirm it) plus the most stable others - not unstable now, fewest lone
+    failures in the last day, the most recently heard from first."""
+    if len(peers) <= size:
+        return peers
+    now = now or time.time()
+    required = [p for p in peers if p.get("node_name") in reporters]
+    rest = sorted((p for p in peers if p.get("node_name") not in reporters),
+                  key=lambda p: (is_node_unstable(p.get("node_name") or ""),
+                                 node_lone_failure_share(p.get("node_name") or "", now),
+                                 -(p.get("last_seen") or 0)))
+    return required + rest[:max(0, size - len(required))]
 
 
 async def _delayed_cross_check_flush():
@@ -625,13 +720,18 @@ async def _flush_cross_checks(batch: list) -> None:
     if not batch:
         return
     by_key = {}
-    for target, fut in batch:
+    reporters = set()
+    for target, fut, reporter in batch:
         by_key.setdefault(_cross_check_key(target), (target, []))[1].append(fut)
+        if reporter:
+            reporters.add(reporter)
     results = {key: [] for key in by_key}
     try:
         peers = await asyncio.to_thread(database.get_all_peers) or []
         # Peers known to be offline would only make everyone wait for the timeout
         peers = [p for p in peers if not p.get("is_offline")]
+        peers = pick_vote_peers(peers, reporters)
+        stat_event("vote")
         batch_peers = [p for p in peers if _peer_supports(p, PEER_CAP_BATCH_CHECK)]
         legacy_peers = [p for p in peers if not _peer_supports(p, PEER_CAP_BATCH_CHECK)]
         items = [(key, target) for key, (target, _) in by_key.items()]
@@ -790,9 +890,12 @@ async def broadcast_telemetry_to_peers():
     changed since the last one first, and fills the rest from a rotating per-peer offset: a
     status change reaches the peer within 2 minutes even with 1000+ monitors, while the full
     list is refreshed in turn (200 is what receivers accept per message)."""
+    global _telemetry_interval_now
     if not dc_bot_instance or dc_accid is None:
         return
     peers = await asyncio.to_thread(database.get_all_peers)
+    interval = telemetry_interval(len(peers or []))
+    _telemetry_interval_now = interval
     if not peers:
         return
 
@@ -856,6 +959,7 @@ async def broadcast_telemetry_to_peers():
             "timestamp": now,
             "msg_id": f"{now}_{secrets.token_hex(4)}",
             "caps": OWN_PEER_CAPS,
+            "telemetry_interval": interval,  # lets the peer judge when this node is offline
             "metrics": metrics_batch
         }
         msg_text = f"[UPTIME_PEER_METRICS]\n{json.dumps(payload)}\n[/UPTIME_PEER_METRICS]"
@@ -872,7 +976,7 @@ async def broadcast_telemetry_to_peers():
 
             # One telemetry message per peer at a time: a newer one replaces a still queued one
             _dc_send_msg_with_stats(dc_bot_instance, dc_accid, chat_id, MsgData(text=msg_text),
-                                    priority=PRIO_TELEMETRY, key=("telemetry", chat_id), expires_in=TELEMETRY_INTERVAL,
+                                    priority=PRIO_TELEMETRY, key=("telemetry", chat_id), expires_in=interval,
                                     label=f"telemetry to {email}", after_send=_record_sent)
 
 # Async event loop and task tracking for check scheduler
@@ -2523,6 +2627,8 @@ def log_check_summary(running: int) -> None:
     queued = f", outbox waiting {sum(waiting.values())} ({', '.join(f'{k} {v}' for k, v in waiting.items())})" if waiting else ""
     logger.info(f"Checks in the last 60s: {total} ({st['up']} up, {st['down']} down, {st['skipped']} skipped), "
                 f"avg latency {avg}{slowest}; running now: {running}{queued}")
+    _last_check_summary.update(total=total, up=st["up"], down=st["down"], skipped=st["skipped"], avg=avg)
+    _cpu_samples.append((time.monotonic(), process_cpu_seconds()))
     st.update(up=0, down=0, skipped=0, lat_sum=0, lat_n=0, slowest=(0, ""))
 
 
@@ -2596,6 +2702,9 @@ def note_vote_outliers(url: str, votes: list[dict], now: float = None) -> list[t
     now = now or time.time()
     newly = []
     for v in votes or []:
+        if v.get("status") in VOTING_STATUSES and not v.get("local"):
+            hist = _node_vote_history.setdefault(v["node"], collections.deque(maxlen=2000))
+            hist.append((now, is_outlier_down(v, votes)))
         if not is_outlier_down(v, votes):
             continue
         node = v["node"]
@@ -2784,6 +2893,7 @@ def note_lone_reporter(url: str, reporter: str, votes: list[dict], now: float = 
     hold = {"unstable": LONE_REPORTER_HOLD, "up": UNCONFIRMED_REPORT_HOLD}.get((vote or {}).get("status"))
     if hold:
         _lone_reporters[(url, reporter)] = now + hold
+        stat_event("held")
         if len(_lone_reporters) > 5000:
             for key in [k for k, until in _lone_reporters.items() if until <= now]:
                 del _lone_reporters[key]
@@ -2825,7 +2935,8 @@ async def _quorum_resource_ids(group: list[dict]) -> set:
     return {r["id"] for r in shareable}
 
 
-async def collect_peer_votes(rep: dict, local_up: bool, fresh: bool = False, revote_interval: float = QUORUM_REVOTE_INTERVAL) -> list[dict]:
+async def collect_peer_votes(rep: dict, local_up: bool, fresh: bool = False, revote_interval: float = QUORUM_REVOTE_INTERVAL,
+                             reporter: str = None) -> list[dict]:
     """The peers' results for this target. Re-used for revote_interval while this node's own
     result is unchanged, so targets that stay down or degraded do not ask peers every minute."""
     key = _cross_check_key(rep)
@@ -2833,7 +2944,7 @@ async def collect_peer_votes(rep: dict, local_up: bool, fresh: bool = False, rev
     cached = _vote_cache.get(key)
     if cached and not fresh and cached[1] == local_up and now - cached[0] < revote_interval:
         return cached[2]
-    results = await request_peer_cross_checks_batched(rep)
+    results = await request_peer_cross_checks_batched(rep, reporter)
     if len(_vote_cache) > 5000:
         _vote_cache.clear()
     _vote_cache[key] = (now, local_up, results)
@@ -3033,7 +3144,7 @@ async def check_group_task(group, semaphore, session=None):
                 rep, is_up, revote_interval=QUORUM_REVOTE_INTERVAL_LONG if long_running else QUORUM_REVOTE_INTERVAL)
         elif reported_by and quorum_group:
             logger.info(f"{rep.get('name') or rep['url']}: UP here but {reported_by} reports it DOWN; asking all peers")
-            peer_results = await collect_peer_votes(rep, is_up, fresh=True)
+            peer_results = await collect_peer_votes(rep, is_up, fresh=True, reporter=reported_by)
         elif locally_degraded and quorum_group:
             # Not fresh: answers are re-used for QUORUM_REVOTE_INTERVAL, so a path that stays bad
             # (e.g. this node's provider) does not ask the peers every minute
@@ -3710,9 +3821,9 @@ async def monitoring_scheduler_loop():
                     logger.debug(f"Triggering {len(tasks)} target checks (encompassing {sum(len(g) for g in due_groups.values())} resources)...")
                     asyncio.create_task(run_checks_parallel(tasks))
                     
-                # Periodically broadcast telemetry to configured peers (every 2 minutes)
+                # Periodically broadcast telemetry to configured peers (2-5 min, see telemetry_interval)
                 global last_peer_telemetry_broadcast
-                if now - last_peer_telemetry_broadcast >= TELEMETRY_INTERVAL:
+                if now - last_peer_telemetry_broadcast >= current_telemetry_interval():
                     last_peer_telemetry_broadcast = now
                     asyncio.create_task(broadcast_telemetry_to_peers())
 
@@ -3729,7 +3840,9 @@ async def monitoring_scheduler_loop():
                         logger.info(f"Node {node} is stable again after {format_duration(secs)}")
                         asyncio.create_task(send_admin_notification(
                             f"✅ **Node Stable Again**: {node}\nIts votes count again (it was unstable for `{format_duration(secs)}`)."))
-                    newly_offline_peers = await run_db(database.audit_peers_offline, 360)
+                    newly_offline_peers = await run_db(database.audit_peers_offline, PEER_OFFLINE_INTERVALS * TELEMETRY_INTERVAL,
+                                                       None, {p["email"]: peer_offline_after(p["email"])
+                                                              for p in await run_db(database.get_all_peers)})
                     for p in newly_offline_peers:
                         p_node = p.get("node_name") or "Remote"
                         p_email = p.get("email")
@@ -4953,6 +5066,7 @@ def _dc_send_msg_with_stats(bot, accid, chat_id, msg_data, priority=PRIO_REPLY, 
     the message is queued and goes out when its turn and a send token come."""
     def send():
         msg_id = bot.rpc.send_msg(accid, chat_id, msg_data)
+        stat_event("mail_out")
         if after_send:
             after_send()
         return msg_id
@@ -5034,6 +5148,7 @@ def help_command(bot, accid, event):
             f"/nodename [name] — Set/view local probe node name (e.g. `Frankfurt-DE`)\n"
             f"/invitepeer — Generate SecureJoin E2EE invite link for pairing with other bots\n"
             f"/peers (or /probes) — List distributed peer bots and their status\n"
+            f"/stats — Bot load, mail, peer traffic and relays\n"
             f"/addpeer <email|link> [node_name] — Add remote peer bot (via email or SecureJoin invite)\n"
             f"/rmpeer <email|key> — Remove remote peer bot\n"
             f"/peershare [admin|all|none] — Choose which local monitors are disclosed to peers\n"
@@ -6352,6 +6467,143 @@ def nodename_command(bot, accid, event):
         current_name = database.get_local_node_name()
         _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=f"📍 Current local probe node name: `{current_name}`\n\nTo change it: `/nodename <name>` (e.g. `/nodename Frankfurt-DE`, `/nodename RU-Moscow`)."))
 
+def _proc_stat(pid) -> tuple[float, float] | None:
+    """(cpu seconds, start time in seconds since boot) of a process, from /proc (Linux only)."""
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as f:
+            fields = f.read().rsplit(")", 1)[1].split()
+        tick = os.sysconf("SC_CLK_TCK")
+        return (int(fields[11]) + int(fields[12])) / tick, int(fields[19]) / tick
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _core_pid() -> int | None:
+    """The deltachat-rpc-server process (the core) this bot talks to."""
+    try:
+        for pid in os.listdir("/proc"):
+            if pid.isdigit():
+                try:
+                    with open(f"/proc/{pid}/cmdline", "rb") as f:
+                        if b"deltachat-rpc-server" in f.read():
+                            return int(pid)
+                except OSError:
+                    continue
+    except OSError:
+        pass
+    return None
+
+
+def process_cpu_seconds() -> dict:
+    """CPU seconds used so far by the bot ("bot") and the core ("core"), where /proc has them."""
+    out = {}
+    for name, pid in (("bot", os.getpid()), ("core", _core_pid())):
+        st = _proc_stat(pid) if pid else None
+        if st:
+            out[name] = st
+    return out
+
+
+def _cpu_report() -> str:
+    """'bot 2% (avg 3%), core 11% (avg 14%)': over the last minutes and since the process started."""
+    now_cpu, now = process_cpu_seconds(), time.monotonic()
+    if not now_cpu:
+        return "n/a (no /proc)"
+    try:
+        with open("/proc/uptime", encoding="utf-8") as f:
+            boot_secs = float(f.read().split()[0])
+    except (OSError, ValueError):
+        boot_secs = None
+    old = next(((t, c) for t, c in _cpu_samples if now - t >= 30), None)
+    parts = []
+    for name, (cpu, started) in now_cpu.items():
+        recent = f"{100 * (cpu - old[1][name][0]) / (now - old[0]):.0f}%" if old and name in old[1] else "?"
+        avg = f", avg {100 * cpu / (boot_secs - started):.0f}%" if boot_secs and boot_secs > started else ""
+        parts.append(f"{name} {recent}{avg}")
+    return ", ".join(parts)
+
+
+def _size(path) -> str:
+    try:
+        n = os.path.getsize(path)
+    except (OSError, TypeError):
+        return "?"
+    return f"{n / 1048576:.1f} MB" if n >= 1048576 else f"{n // 1024} KB"
+
+
+def build_stats_report(bot, accid) -> str:
+    now = time.time()
+    resources = database.get_all_resources() or []
+    by_type = collections.Counter(r.get("type") or "http" for r in resources)
+    def _state(r):
+        if r.get("status") == "paused":
+            return "paused"  # chat the bot was removed from
+        if now < (r.get("maintenance_until") or 0):
+            return "maintenance"
+        if r.get("status") == "down":
+            return "down"
+        return "degraded" if r.get("alert_state") == "degraded" else (r.get("status") or "unknown")
+    by_state = collections.Counter(_state(r) for r in resources)
+    peers = database.get_all_peers() or []
+    live = [p for p in peers if not p.get("is_offline")]
+    unstable = [p["node_name"] for p in live if is_node_unstable(p.get("node_name") or "")]
+    try:
+        core_db = bot.rpc.get_info(accid).get("database_dir")
+    except Exception:
+        core_db = None
+    try:
+        relays = [t.get("addr") if isinstance(t, dict) else getattr(t, "addr", "?") for t in bot.rpc.list_transports(accid)]
+    except Exception:
+        relays = []
+    ob = dc_outbox.stats
+    waiting = dc_outbox.waiting()
+    cs = _last_check_summary
+    checks = (f"{cs['total']} in the last minute ({cs['up']} up, {cs['down']} down, {cs['skipped']} skipped), "
+              f"avg latency {cs['avg']}") if cs else "no summary yet"
+    lines = [
+        f"📊 **Uptime Bot Statistics** — v{VERSION}, node **{database.get_local_node_name()}**",
+        f"Running for `{format_duration(int(now - _bot_stats['started']))}`",
+        "",
+        "**Load**",
+        f"• CPU: {_cpu_report()}",
+        f"• Core database: {_size(core_db)} · bot database: {_size(database.DB_PATH)}",
+        "",
+        "**Monitors**",
+        (f"• {len(resources)} monitors: " + ", ".join(f"{n} {t}" for t, n in by_type.most_common())) if resources else "• No monitors",
+        ("• State: " + ", ".join(f"{n} {s}" for s, n in by_state.most_common())) if resources else None,
+        f"• Checks: {checks}",
+        "",
+        "**Mail (last hour)**",
+        f"• Received {stat_last_hour('mail_in', now)}, sent {stat_last_hour('mail_out', now)}",
+        f"• Outbox since start: {ob.get('sent', 0)} sent, {ob.get('failed', 0)} failed, {ob.get('merged', 0)} merged"
+        + (f"; waiting now: " + ", ".join(f"{k} {v}" for k, v in waiting.items()) if waiting else "; nothing waiting"),
+        "",
+        "**Peers**",
+        f"• {len(peers)} peers, {len(live)} online" + (f", unstable now: {', '.join(unstable)}" if unstable else ""),
+        f"• Telemetry every `{format_duration(current_telemetry_interval())}`; votes ask up to {VOTE_SAMPLE_SIZE} peers",
+        f"• Last hour: {stat_last_hour('vote', now)} votes sent to peers, {stat_last_hour('held', now)} reports held back",
+        f"• Old protocol messages deleted since start: {_bot_stats['trimmed']}",
+        "",
+        "**Relays**",
+        (f"• {len(relays)}: " + ", ".join(f"`{r}`" for r in relays)) if relays else "• n/a",
+    ]
+    return "\n".join(l for l in lines if l is not None)
+
+
+@dc_cli.on(events.NewMessage(command="/stats"))
+def stats_command(bot, accid, event):
+    msg = event.msg
+    if not _is_dc_admin(bot, accid, msg.from_id):
+        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text="❌ This command is only for the administrator."))
+        return
+    try:
+        reply = build_stats_report(bot, accid)
+    except Exception as e:
+        logger.error(f"Failed to build /stats: {e}")
+        reply = "❌ Failed to collect statistics. Check server logs for details."
+    _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=reply))
+
+
 @dc_cli.on(events.NewMessage(command="/peers"))
 @dc_cli.on(events.NewMessage(command="/probes"))
 def peers_command(bot, accid, event):
@@ -6874,6 +7126,8 @@ def on_new_message(bot, accid, event):
     msg = event.msg
     if msg.is_info:
         return
+    if msg.from_id != 1:
+        stat_event("mail_in")
         
 
     text = (msg.text or "").strip()

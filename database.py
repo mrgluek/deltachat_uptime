@@ -1463,13 +1463,15 @@ def update_peer_last_seen(email: str, timestamp: int = None) -> tuple[bool, int,
         cursor.execute("UPDATE peers SET last_seen = ?, is_offline = 0, went_offline_at = 0 WHERE email = ?", (now, email))
         return was_offline, downtime, peer
 
-def audit_peers_offline(threshold_seconds: int = 360, now: int = None) -> list[dict]:
+def audit_peers_offline(threshold_seconds: int = 360, now: int = None, thresholds: dict = None) -> list[dict]:
     """
     Finds active peers that have stopped responding (last_seen older than threshold)
     and marks them offline, returning list of newly offline peers.
+    thresholds: email -> seconds for peers that announced a longer telemetry interval.
     """
     cur_time = now if now is not None else int(time.time())
-    cutoff = cur_time - threshold_seconds
+    thresholds = thresholds or {}
+    cutoff = cur_time - min([threshold_seconds] + list(thresholds.values()))
     newly_offline = []
     with _writer_transaction() as conn:
         cursor = conn.cursor()
@@ -1479,6 +1481,8 @@ def audit_peers_offline(threshold_seconds: int = 360, now: int = None) -> list[d
         ''', (cutoff,))
         rows = cursor.fetchall()
         for r in rows:
+            if r[3] >= cur_time - thresholds.get(r[0], threshold_seconds):
+                continue  # silent for less than its own threshold
             p = {
                 "email": r[0],
                 "node_name": r[1],

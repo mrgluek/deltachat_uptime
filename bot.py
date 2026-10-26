@@ -61,7 +61,7 @@ from outbox import outbox as dc_outbox, PRIO_ALERT, PRIO_REPLY, PRIO_UPDATE, PRI
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "2.26.2"
+VERSION = "2.26.3"
 # No "bot" in the name: some services (e.g. Hiddify subscription links) reply 400 to any User-Agent containing "bot".
 USER_AGENT = f"Delta Chat Uptime Monitor/{VERSION} (+https://git.gluek.info/gluek/deltachat_uptime)"
 
@@ -661,6 +661,43 @@ def peer_offline_after(email: str) -> int:
     return PEER_OFFLINE_INTERVALS * _peer_telemetry_interval.get((email or "").lower(), TELEMETRY_INTERVAL)
 
 
+_VERSION_RE = re.compile(r"^\d{1,4}\.\d{1,4}\.\d{1,4}$")
+_peer_versions = {}  # peer email (lower) -> version last stored, so telemetry does not rewrite it
+
+
+def version_tuple(version) -> tuple:
+    try:
+        return tuple(int(x) for x in str(version).split("."))
+    except ValueError:
+        return ()
+
+
+def note_peer_version(email: str, version) -> None:
+    """Stores the bot version a peer announces (telemetry and handshakes), when it changed."""
+    if not email or not isinstance(version, str) or not _VERSION_RE.match(version.strip()):
+        return
+    version, key = version.strip(), email.lower()
+    if _peer_versions.get(key) != version:
+        _peer_versions[key] = version
+        try:
+            database.set_peer_version(email, version)
+        except Exception as e:
+            logger.debug(f"Could not store the version of peer {email}: {e}")
+
+
+def outdated_peers(peers: list[dict]) -> list[str]:
+    """'🇵🇱 v2.24.1', '🇷🇺 ≤2.26.2' for peers older than this node (no version: from before 2.26.3)."""
+    own = version_tuple(VERSION)
+    out = []
+    for p in peers:
+        v = p.get("version")
+        if not v:
+            out.append(f"{p.get('node_name') or p.get('email')} ≤2.26.2")
+        elif version_tuple(v) < own:
+            out.append(f"{p.get('node_name') or p.get('email')} v{v}")
+    return out
+
+
 def _note_peer_caps(email: str, caps) -> None:
     if email and isinstance(caps, list):
         _peer_caps[email.lower()] = {str(c)[:40] for c in caps[:20]}
@@ -675,6 +712,7 @@ def _note_peer_announcement(peer: dict, data) -> dict:
     if not isinstance(data, dict):
         return peer
     _note_peer_caps(peer["email"], data.get("caps"))
+    note_peer_version(peer["email"], data.get("version"))
     for field, store in (("telemetry_interval", _peer_telemetry_interval), ("desired_interval", _peer_desired_interval)):
         value = data.get(field)
         if isinstance(value, int) and not isinstance(value, bool):
@@ -1004,6 +1042,7 @@ async def broadcast_telemetry_to_peers():
             "caps": OWN_PEER_CAPS,
             "telemetry_interval": peer_interval,  # to this peer: lets it judge when this node is offline
             "desired_interval": interval,  # how often this node wants telemetry (from its peer count)
+            "version": VERSION,  # shown in the peer's /peers and /stats
             "metrics": metrics_batch
         }
         msg_text = f"[UPTIME_PEER_METRICS]\n{json.dumps(payload)}\n[/UPTIME_PEER_METRICS]"
@@ -6643,6 +6682,7 @@ def build_stats_report(bot, accid) -> str:
         "",
         "**Peers**",
         f"• {len(peers)} peers, {len(live)} online" + (f", unstable now: {', '.join(unstable)}" if unstable else ""),
+        ("• Outdated (older than this node): " + ", ".join(old)) if (old := outdated_peers(peers)) else "• All peers run this version or newer",
         f"• Telemetry every `{format_duration(current_telemetry_interval())}`"
         + (f" (less often to {slower} peers that asked for it)" if (slower := sum(
             1 for p in peers if interval_for_peer(p["email"], current_telemetry_interval()) > current_telemetry_interval())) else "")
@@ -6728,7 +6768,9 @@ def peers_command(bot, accid, event):
             fp = p.get("fingerprint")
             # First 16 hex digits identify the key; the address only shows the relay it last used
             key_lbl = f"Key: `{' '.join(fp[i:i + 4] for i in range(0, 16, 4))}…`" if fp else "Key: `not bound yet`"
-            reply += f"• {status_icon} **{p_node}** — `{p['email']}`\n  {key_lbl} | {chat_lbl} | Last seen: `{seen_str}` | Active metrics: `{node_meas_count}`\n\n"
+            ver = p.get("version")
+            ver_lbl = (f"`v{ver}`" + (" ⚠️ outdated" if version_tuple(ver) < version_tuple(VERSION) else "")) if ver else "`≤2.26.2` ⚠️ outdated"
+            reply += f"• {status_icon} **{p_node}** — `{p['email']}`\n  {key_lbl} | {chat_lbl} | Version: {ver_lbl} | Last seen: `{seen_str}` | Active metrics: `{node_meas_count}`\n\n"
         reply += "Commands:\n• `/invitepeer` — Generate E2EE invite link\n• `/addpeer <email|link> [node_name]`\n• `/rmpeer <email|key>`\n• `/peershare [admin|all|none]`\n• `/nodename <name>`\n• `/probeignore [url|host|pattern]` — Exclude targets on this node (e.g. `*:25`), or list them\n• `/probeunignore <entry>` — Resume probing on this node"
     _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=reply.strip()))
 
@@ -7302,6 +7344,7 @@ def on_new_message(bot, accid, event):
             else:
                 database.add_or_update_peer(peer["email"], peer_node, msg.chat_id, int(time.time()))
             _record_peer_activity(peer["email"] if peer else sender_addr)
+            note_peer_version(peer["email"] if peer else sender_addr, hello_data.get("version"))
 
             self_addr = _get_self_addr(bot, accid)
             ack_payload = {
@@ -7330,6 +7373,7 @@ def on_new_message(bot, accid, event):
                 return
             database.add_or_update_peer(peer["email"], peer_node, msg.chat_id, int(time.time()))
             _record_peer_activity(peer["email"])
+            note_peer_version(peer["email"], ack_data.get("version"))
         except Exception as e:
             logger.error(f"Error handling peer hello ack: {e}")
         return

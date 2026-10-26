@@ -96,11 +96,38 @@ class TestDesiredInterval(_DbCase):
             self.assertEqual(sorted(c for c, _ in sent), [5, 6])
             payload = bot.json.loads(next(t for c, t in sent if c == 5).split("\n")[1])
             self.assertEqual((payload["telemetry_interval"], payload["desired_interval"]), (300, 120))
+            self.assertEqual(payload["version"], bot.VERSION)
             sent.clear()
             for email in bot._telemetry_sent_at:  # 2.5 minutes later: only the leaf is due
                 bot._telemetry_sent_at[email] -= 150
             asyncio.run(bot.broadcast_telemetry_to_peers())
             self.assertEqual([c for c, _ in sent], [6])
+
+
+class TestPeerVersions(_DbCase):
+    def setUp(self):
+        super().setUp()
+        bot._peer_versions.clear()
+        database.add_or_update_peer("pl@example.org", "PL", 1, int(time.time()))
+
+    def test_announced_version_is_stored(self):
+        with patch("bot.database.get_all_peers", return_value=[]):
+            bot._note_peer_announcement({"email": "pl@example.org", "node_name": "PL"}, {"version": "2.26.3"})
+        self.assertEqual(database.get_peer("pl@example.org")["version"], "2.26.3")
+
+    def test_garbage_is_ignored(self):
+        for bad in ("2.26", "v2.26.3", "2.26.3; DROP TABLE", 2263, None):
+            bot.note_peer_version("pl@example.org", bad)
+        self.assertIsNone(database.get_peer("pl@example.org")["version"])
+
+    def test_outdated_list(self):
+        with patch.object(bot, "VERSION", "2.26.3"):
+            out = bot.outdated_peers([{"node_name": "A", "version": "2.24.1"}, {"node_name": "B", "version": "2.26.3"},
+                                      {"node_name": "C", "version": "2.27.0"}, {"node_name": "D", "version": None}])
+        self.assertEqual(out, ["A v2.24.1", "D ≤2.26.2"])
+
+    def test_version_tuple_orders_numerically(self):
+        self.assertLess(bot.version_tuple("2.9.0"), bot.version_tuple("2.10.0"))
 
 
 class TestVoteSample(unittest.TestCase):

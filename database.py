@@ -261,6 +261,9 @@ def init_db():
             cursor.execute("ALTER TABLE peers ADD COLUMN is_offline INTEGER DEFAULT 0")
         if "went_offline_at" not in peer_cols:
             cursor.execute("ALTER TABLE peers ADD COLUMN went_offline_at INTEGER DEFAULT 0")
+        if "version" not in peer_cols:
+            # Bot version the peer last announced (telemetry since 2.26.3, handshakes before)
+            cursor.execute("ALTER TABLE peers ADD COLUMN version TEXT")
         # A peer is identified by its OpenPGP key: bots with several relays send from different
         # addresses, so the address is only kept for display. NULL until the first encrypted message.
         if "fingerprint" not in peer_cols:
@@ -1629,6 +1632,10 @@ def set_held_report(url: str, node: str, until_ts: float, streak: int):
 def delete_held_report(url: str, node: str):
     with _writer_transaction() as conn:
         conn.cursor().execute("DELETE FROM held_reports WHERE url = ? AND node = ?", (url, node))
+
+def set_peer_version(email: str, version: str):
+    with _writer_transaction() as conn:
+        conn.cursor().execute("UPDATE peers SET version = ? WHERE email = ?", (version, email))
 
 def get_ping_baseline(ip: str) -> float | None:
     conn = _connect()

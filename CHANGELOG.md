@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.26.3] - 2026-10-26
+
+### Added
+- **Peer Versions**: Telemetry now carries the bot version, and the version a peer announces (in telemetry, or in the peering handshake of older versions) is stored. `/peers` shows each peer's version, marked ⚠️ when older than this node; `/stats` lists the outdated peers in one line. Peers that do not send it yet are shown as `≤2.26.2`.
+
 ## [2.26.2] - 2026-10-26
 
 ### Changed

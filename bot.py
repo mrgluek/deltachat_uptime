@@ -62,7 +62,7 @@ from outbox import outbox as dc_outbox, PRIO_ALERT, PRIO_REPLY, PRIO_UPDATE, PRI
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "2.27.0"
+VERSION = "2.28.0"
 # No "bot" in the name: some services (e.g. Hiddify subscription links) reply 400 to any User-Agent containing "bot".
 USER_AGENT = f"Delta Chat Uptime Monitor/{VERSION} (+https://git.gluek.info/gluek/deltachat_uptime)"
 
@@ -1112,17 +1112,7 @@ def setup_custom_command_parser(bot):
             
             if suffix_lower:
                 # 1. Get bot's self address
-                try:
-                    contact = bot.rpc.get_contact(accid, 1)
-                    self_address = getattr(contact, 'address', '') or (contact.get('address') if isinstance(contact, dict) else '')
-                except Exception:
-                    self_address = ""
-                if not self_address:
-                    try:
-                        self_address = bot.rpc.get_config(accid, "configured_addr") or bot.rpc.get_config(accid, "addr") or ""
-                    except Exception:
-                        self_address = ""
-                self_address = self_address.lower()
+                self_address = dc_fingerprint.get_self_addr(bot.rpc, accid).lower()
 
                 # 2. Derive this bot's unique identifiers
                 bot_identifiers = []
@@ -6401,7 +6391,7 @@ def accounts_command(bot, accid, event):
     reply = "🤖 **Configured Delta Chat Accounts:**\n\n"
     for a_id in accids:
         try:
-            addr = bot.rpc.get_config(a_id, "addr")
+            addr = dc_fingerprint.get_self_addr(bot.rpc, a_id)
             primary = " (Primary)" if a_id == accid else ""
             reply += f"• ID: `{a_id}` - `{addr}`{primary}\n"
         except Exception:
@@ -6542,13 +6532,7 @@ def resilient_command(bot, accid, event):
     _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=f"⚠️ /resilient is deprecated and disabled. {RELAY_SELECTION_NOTE}"))
 
 def _get_self_addr(bot, accid) -> str:
-    try:
-        addr = bot.rpc.get_config(accid, "configured_addr") or bot.rpc.get_config(accid, "addr")
-        if isinstance(addr, str):
-            return addr
-        return ""
-    except Exception:
-        return ""
+    return dc_fingerprint.get_self_addr(bot.rpc, accid)
 
 # Peer administration commands
 def _configured_display_name() -> str:
@@ -6811,7 +6795,7 @@ def invitepeer_command(bot, accid, event):
     try:
         qr_link = bot.rpc.get_chat_securejoin_qr_code(accid, None)
         node_name = database.get_local_node_name()
-        addr = bot.rpc.get_config(accid, "configured_addr") or bot.rpc.get_config(accid, "addr")
+        addr = dc_fingerprint.get_self_addr(bot.rpc, accid)
         token = database.create_peer_invite_token()
         ttl_hours = database.PEER_INVITE_TTL_SECONDS // 3600
 
@@ -7111,7 +7095,7 @@ def ensure_configured_account(bot, args) -> None:
     try:
         bot.rpc.set_config(accid, "bot", "1")
         bot.rpc.init_transports(accid, None)
-        addr = bot.rpc.get_config(accid, "configured_addr")
+        addr = dc_fingerprint.get_self_addr(bot.rpc, accid)
         bot.logger.info(f"Account created: {addr}")
     except Exception as e:
         # serve then exits with "no configured accounts" and the container restart retries

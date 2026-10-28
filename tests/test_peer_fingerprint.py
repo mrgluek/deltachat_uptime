@@ -68,6 +68,8 @@ class TestPeerFingerprintBinding(unittest.TestCase):
         mock_bot.rpc.get_contact.return_value = contact
         mock_bot.rpc.get_basic_chat_info.return_value = {"chat_type": "Single"}
         mock_bot.rpc.get_contact_encryption_info.return_value = _encinfo(sender_addr, fp) if fp else "No encryption."
+        # Our own key is recognised by the fingerprint in our invite link
+        mock_bot.rpc.get_chat_securejoin_qr_code.return_value = f"https://i.delta.chat/#{SELF_FP}&v=3&i=a&s=b"
         return mock_bot
 
     def _event(self, text: str, chat_id: int, padlock: bool = True):
@@ -101,6 +103,11 @@ class TestPeerFingerprintBinding(unittest.TestCase):
         self.assertEqual(bot._get_peer_fingerprint(mock_bot, 1, 42, "ruptimebot@chatmail.uk"), RU_FP)
         # Address in the header differs (e.g. contact shows another relay): the single non-"Me" key is used
         self.assertEqual(bot._get_peer_fingerprint(mock_bot, 1, 42, "other@example.org"), RU_FP)
+        # Core 2.66 prints no addresses and sorts the blocks by fingerprint
+        mock_bot.rpc.get_contact_encryption_info.return_value = (
+            "Messages are end-to-end encrypted.\nFingerprints:\n\n"
+            f"ruptimebot:\n{_grouped(RU_FP)}\n\nMe:\n{_grouped(SELF_FP)}")
+        self.assertEqual(bot._get_peer_fingerprint(mock_bot, 1, 42, "ruptimebot@chatmail.uk"), RU_FP)
 
     def test_peer_fingerprint_unavailable(self):
         mock_bot = self._make_bot("ruptimebot@chatmail.uk", None)

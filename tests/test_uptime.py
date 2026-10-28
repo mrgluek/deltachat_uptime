@@ -3245,6 +3245,8 @@ class TestAbandonedChats(unittest.TestCase):
 
 class TestAdminContact(unittest.TestCase):
     FP = "DFF2CAB1FEB7182F997C0A01466AA64DE33D8A39"
+    SELF_FP = "D58B5E6C55482F94F9F5B84B6FB9FE3AD2658082"
+    OTHER_FP = "9E1B0E5B8CB9CAE6A9D4F0D558C6D85CE9BD3041"
 
     def setUp(self):
         database.close_db()
@@ -3261,9 +3263,18 @@ class TestAdminContact(unittest.TestCase):
         }
         self.rpc_bot.rpc.get_contact_ids.return_value = [10, 11, 12]
         self.rpc_bot.rpc.get_contact.side_effect = lambda acc, cid: contacts[cid]
-        self.rpc_bot.rpc.get_contact_encryption_info.side_effect = lambda acc, cid: (
-            "End-to-end encryption available.\nAdmin:\n" + ("DFF2 CAB1 FEB7 182F 997C\n0A01 466A A64D E33D 8A39" if cid == 12 else "AAAA BBBB"))
+        self.rpc_bot.rpc.get_chat_securejoin_qr_code.return_value = f"https://i.delta.chat/#{self.SELF_FP}&v=3&i=a&s=b"
+        self.rpc_bot.rpc.get_contact_encryption_info.side_effect = lambda acc, cid: self._encinfo(
+            self.FP if cid == 12 else self.OTHER_FP)
         self.rpc_bot.rpc.lookup_contact_id_by_addr.return_value = 10
+
+    def _encinfo(self, contact_fp, name="Admin"):
+        """get_contact_encryption_info() text in the core 2.66 format (no addresses)."""
+        def grouped(fp):
+            g = [fp[i:i + 4] for i in range(0, 40, 4)]
+            return " ".join(g[:5]) + "\n" + " ".join(g[5:])
+        return (f"Messages are end-to-end encrypted.\nFingerprints:\n\n"
+                f"Me:\n{grouped(self.SELF_FP)}\n\n{name}:\n{grouped(contact_fp)}")
 
     def tearDown(self):
         bot._admin_contact_cache.update(at=0.0, id=None)
@@ -3284,9 +3295,16 @@ class TestAdminContact(unittest.TestCase):
         }
         self.rpc_bot.rpc.get_contact_ids.side_effect = lambda acc, flags, query: [10] if query else [10, 14, 13]
         self.rpc_bot.rpc.get_contact.side_effect = lambda acc, cid: contacts[cid]
-        self.rpc_bot.rpc.get_contact_encryption_info.side_effect = lambda acc, cid: (
-            "DFF2 CAB1 FEB7 182F 997C\n0A01 466A A64D E33D 8A39" if cid == 13 else "AAAA BBBB")
+        self.rpc_bot.rpc.get_contact_encryption_info.side_effect = lambda acc, cid: self._encinfo(
+            self.FP if cid == 13 else self.OTHER_FP)
         self.assertEqual(bot._admin_contact_id(self.rpc_bot, 1), 13)
+
+    def test_admin_fingerprint_in_a_name_is_not_the_admin(self):
+        # Contact 11 named itself "x<admin fingerprint>x"; the old substring search picked it
+        self.rpc_bot.rpc.get_contact_encryption_info.side_effect = lambda acc, cid: (
+            self._encinfo(self.OTHER_FP, name=f"x{self.FP}x") if cid == 11 else self._encinfo(
+                self.FP if cid == 12 else self.OTHER_FP))
+        self.assertEqual(bot._admin_contact_id(self.rpc_bot, 1), 12)
 
     def test_fallback_to_address_lookup(self):
         self.rpc_bot.rpc.get_contact_ids.return_value = []

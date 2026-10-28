@@ -55,13 +55,14 @@ except Exception:
 
 import concurrent.futures
 import database
+import dc_fingerprint
 import transports_view
 from outbox import outbox as dc_outbox, PRIO_ALERT, PRIO_REPLY, PRIO_UPDATE, PRIO_PEER, PRIO_TELEMETRY
 
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "2.26.5"
+VERSION = "2.26.6"
 # No "bot" in the name: some services (e.g. Hiddify subscription links) reply 400 to any User-Agent containing "bot".
 USER_AGENT = f"Delta Chat Uptime Monitor/{VERSION} (+https://git.gluek.info/gluek/deltachat_uptime)"
 
@@ -373,6 +374,9 @@ def _admin_contact_id(bot, accid):
     if not email or bot is None or accid is None:
         return None
     fp = re.sub(r"[^0-9A-F]", "", (database.get_config("admin_dc_fingerprint") or "").upper())
+    # Read once for the loops below; a substring search of the whole encryption info would also
+    # match a contact who put the admin's fingerprint into their display name
+    self_fp = dc_fingerprint.get_self_fingerprint(bot.rpc, accid) if fp else None
     found = None
     try:
         candidates = bot.rpc.get_contact_ids(accid, 0, email) or []
@@ -384,7 +388,7 @@ def _admin_contact_id(bot, accid):
             c = bot.rpc.get_contact(accid, cid)
             if (_field(c, "address") or "").lower() != email or not _field(c, "is_key_contact", False):
                 continue
-            if fp and fp not in re.sub(r"[^0-9A-F]", "", str(bot.rpc.get_contact_encryption_info(accid, cid)).upper()):
+            if fp and dc_fingerprint.get_contact_fingerprint(bot.rpc, accid, cid, self_fp=self_fp) != fp:
                 continue  # same address, other key: not the admin
             found = cid
             break
@@ -407,7 +411,7 @@ def _admin_contact_id(bot, accid):
                 c = bot.rpc.get_contact(accid, cid)
                 if not _field(c, "is_key_contact", False):
                     continue
-                if fp in re.sub(r"[^0-9A-F]", "", str(bot.rpc.get_contact_encryption_info(accid, cid)).upper()):
+                if dc_fingerprint.get_contact_fingerprint(bot.rpc, accid, cid, self_fp=self_fp) == fp:
                     found = cid
                     break
             except Exception:
@@ -2006,32 +2010,10 @@ def is_safe_target_url(url: str, check_type: str = "http") -> bool:
         return False
 
 def _get_peer_fingerprint(bot, accid, contact_id, contact_addr: str = "") -> str | None:
-    """Returns the OpenPGP fingerprint Delta Chat holds for a peer contact, or None.
+    """Returns the OpenPGP fingerprint Delta Chat holds for a peer contact, or None; see dc_fingerprint.
 
-    get_contact_encryption_info() lists one block per key ("<name> (<addr>):" followed by the
-    fingerprint in groups of four), ours first. The peer's block is the one with its address; if the
-    address does not match any block, a single block that is not ours ("Me (...)") is used."""
-    try:
-        info = bot.rpc.get_contact_encryption_info(accid, contact_id)
-    except Exception:
-        return None
-    if not isinstance(info, str):
-        return None
-    blocks = []
-    for block in info.split("\n\n"):
-        lines = block.strip().splitlines()
-        if len(lines) < 2 or not lines[0].endswith("):"):
-            continue
-        fp = database.normalize_fingerprint("".join(lines[1:]))
-        if fp:
-            blocks.append((lines[0], fp))
-    addr = (contact_addr or "").lower().strip()
-    if addr:
-        for header, fp in blocks:
-            if header.lower().endswith(f"({addr}):"):
-                return fp
-    others = [fp for header, fp in blocks if not header.startswith("Me (")]
-    return others[0] if len(others) == 1 else None
+    `contact_addr` is unused: core 2.66 no longer prints addresses in the encryption info."""
+    return dc_fingerprint.get_contact_fingerprint(bot.rpc, accid, contact_id)
 
 def _get_verified_peer_for_msg(bot, accid, msg, is_private_chat: bool = True) -> tuple[dict | None, str]:
     """Resolves the peer sending a protocol message from Delta Chat contact data.
@@ -2114,46 +2096,8 @@ def _is_trusted_peer_msg(msg, peer: dict | None, is_private_chat: bool) -> bool:
 
 # Admin detection helper
 def _get_contact_fingerprint(bot, accid, contact_id, contact=None):
-    try:
-        self_fps = []
-        try:
-            self_enc = bot.rpc.get_contact_encryption_info(accid, 1)
-            if self_enc:
-                self_fps = [m.upper() for m in re.findall(r'[0-9a-fA-F]{32,64}', "".join(self_enc.split()).replace(':', ''))]
-        except Exception:
-            pass
-
-        if contact:
-            get_val = getattr(contact, 'get', lambda k: getattr(contact, k, None))
-            for attr in ['fingerprint', 'key_fingerprint', 'public_key']:
-                val = get_val(attr)
-                if val:
-                    matches = re.findall(r'[0-9a-fA-F]{32,64}', str(val).replace(' ', '').replace(':', ''))
-                    valid_matches = [m.upper() for m in matches if m.upper() not in self_fps]
-                    if valid_matches:
-                        return ",".join(valid_matches)
-
-        try:
-            fp = bot.rpc.get_contact_config(accid, contact_id, "fp")
-            if fp and fp.upper().replace(' ', '') not in self_fps:
-                return fp.upper().replace(' ', '')
-        except Exception:
-            pass
-
-        for args in [(accid, contact_id), (contact_id,)]:
-            try:
-                enc_info = bot.rpc.get_contact_encryption_info(*args)
-                if enc_info:
-                    cleaned_info = "".join(enc_info.split()).replace(':', '')
-                    matches = re.findall(r'[0-9a-fA-F]{32,64}', cleaned_info)
-                    valid_matches = [m.upper() for m in matches if m.upper() not in self_fps]
-                    if valid_matches:
-                        return ",".join(valid_matches)
-            except Exception:
-                continue
-    except Exception as e:
-        logger.error(f"Error checking fingerprint: {e}")
-    return None
+    """The contact's key fingerprint, or None; see dc_fingerprint. `contact` is unused, kept for callers."""
+    return dc_fingerprint.get_contact_fingerprint(bot.rpc, accid, contact_id)
 
 def _is_dc_admin(bot, accid, contact_id, chat_id: int = None):
     try:
@@ -5028,7 +4972,7 @@ async def handle_index(request):
                     <span class="feature-icon">🌍</span>
                     <div class="feature-text">
                         <h3>Federated Multi-Location Checks</h3>
-                        <p>Connect multiple Uptime bots as peers over encrypted Delta Chat DMs. Outages are verified from several locations before alerting, so regional or routing problems show up as "degraded" instead of false downtime, and you see exactly which regions can reach your service.</p>
+                        <p>Link several Uptime bots as peers over encrypted Delta Chat DMs. Outages are confirmed from multiple locations, so regional problems show as "degraded", not false downtime.</p>
                     </div>
                 </div>
             </div>

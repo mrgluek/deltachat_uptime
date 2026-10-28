@@ -1963,6 +1963,32 @@ class TestUptimeBot(unittest.TestCase):
         args, kwargs = mock_bot.rpc.send_msg.call_args
         self.assertIn("only for the administrator", args[2].text)
 
+    @patch('bot._is_dc_admin', return_value=True)
+    def test_nodename_updates_display_name_when_not_configured(self, _admin):
+        mock_bot = MagicMock()
+        mock_event = MagicMock()
+        mock_event.payload = "Frankfurt-DE"
+        env = {k: v for k, v in os.environ.items() if k != "DISPLAY_NAME"}
+        with patch.dict(os.environ, env, clear=True):
+            bot.nodename_command(mock_bot, 1, mock_event)
+        mock_bot.rpc.set_config.assert_called_once_with(1, "displayname", "Uptime Bot (Frankfurt-DE)")
+        self.assertIn("display name is now `Uptime Bot (Frankfurt-DE)`", mock_bot.rpc.send_msg.call_args[0][2].text)
+
+    @patch('bot._is_dc_admin', return_value=True)
+    def test_nodename_keeps_configured_display_name(self, _admin):
+        mock_bot = MagicMock()
+        mock_event = MagicMock()
+        mock_event.payload = "Frankfurt-DE"
+        with patch.dict(os.environ, {"DISPLAY_NAME": "My Monitor"}):
+            bot.nodename_command(mock_bot, 1, mock_event)
+            self.assertEqual(bot._configured_display_name(), "My Monitor")
+        mock_bot.rpc.set_config.assert_not_called()
+        self.assertNotIn("display name", mock_bot.rpc.send_msg.call_args[0][2].text)
+
+    def test_default_display_name_uses_node_name(self):
+        database.set_local_node_name("RU-Moscow")
+        self.assertEqual(bot._node_display_name(), "Uptime Bot (RU-Moscow)")
+
     @patch('bot._is_dc_admin')
     def test_peers_and_addpeer_rmpeer_commands(self, mock_is_admin):
         mock_is_admin.return_value = True

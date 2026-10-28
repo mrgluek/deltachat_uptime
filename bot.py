@@ -62,7 +62,7 @@ from outbox import outbox as dc_outbox, PRIO_ALERT, PRIO_REPLY, PRIO_UPDATE, PRI
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "2.26.6"
+VERSION = "2.27.0"
 # No "bot" in the name: some services (e.g. Hiddify subscription links) reply 400 to any User-Agent containing "bot".
 USER_AGENT = f"Delta Chat Uptime Monitor/{VERSION} (+https://git.gluek.info/gluek/deltachat_uptime)"
 
@@ -6551,6 +6551,23 @@ def _get_self_addr(bot, accid) -> str:
         return ""
 
 # Peer administration commands
+def _configured_display_name() -> str:
+    """Display name set by the operator: DISPLAY_NAME, or display_name in the Home Assistant options."""
+    name = (os.environ.get("DISPLAY_NAME") or "").strip()
+    if not name and os.path.exists("/data/options.json"):
+        try:
+            with open("/data/options.json", "r", encoding="utf-8") as f:
+                name = (json.load(f).get("display_name") or "").strip()
+        except Exception:
+            pass
+    return name
+
+
+def _node_display_name() -> str:
+    """Default display name: shows which node it is when several Uptime bots are peers."""
+    return f"Uptime Bot ({database.get_local_node_name()})"
+
+
 @dc_cli.on(events.NewMessage(command="/nodename"))
 def nodename_command(bot, accid, event):
     msg = event.msg
@@ -6565,8 +6582,16 @@ def nodename_command(bot, accid, event):
         database.rename_measurement_node(old_name, payload.strip())
         # Peers learn the new name from the next telemetry message: send it on the next scheduler tick
         last_peer_telemetry_broadcast = 0.0
+        name_note = ""
+        if not _configured_display_name():
+            # The profile name follows the node name; contacts get it with the bot's next message
+            try:
+                bot.rpc.set_config(accid, "displayname", _node_display_name())
+                name_note = f"\nBot display name is now `{_node_display_name()}`."
+            except Exception as e:
+                logger.warning(f"Could not update display name: {e}")
         _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(
-            text=f"✅ Local probe node name set to: `{payload}`\nPeers on 2.17.2+ pick it up with the next telemetry message."))
+            text=f"✅ Local probe node name set to: `{payload}`\nPeers on 2.17.2+ pick it up with the next telemetry message.{name_note}"))
     else:
         current_name = database.get_local_node_name()
         _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=f"📍 Current local probe node name: `{current_name}`\n\nTo change it: `/nodename <name>` (e.g. `/nodename Frankfurt-DE`, `/nodename RU-Moscow`)."))
@@ -7105,18 +7130,8 @@ def on_init(bot, args):
     for accid in bot.rpc.get_all_account_ids():
         dc_accid = accid
         try:
-            bot_name = os.environ.get("DISPLAY_NAME")
-            if not bot_name and os.path.exists("/data/options.json"):
-                try:
-                    with open("/data/options.json", "r", encoding="utf-8") as f:
-                        opts = json.load(f)
-                        bot_name = opts.get("display_name", "").strip()
-                except Exception:
-                    pass
-            if not bot_name:
-                bot_name = "Delta Chat Uptime Bot"
-            bot.rpc.set_config(accid, "displayname", bot_name)
-            
+            bot.rpc.set_config(accid, "displayname", _configured_display_name() or _node_display_name())
+
             status_text = os.environ.get("STATUS_TEXT")
             if not status_text and os.path.exists("/data/options.json"):
                 try:

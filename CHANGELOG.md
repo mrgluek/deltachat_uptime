@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.27.0] - 2026-10-28
+
+### Changed
+- **Display Name Shows the Node**: Without `DISPLAY_NAME` (or `display_name` in the Home Assistant options) the bot is named `Uptime Bot (<node name>)` instead of `Delta Chat Uptime Bot`, so peers and the admin can tell the nodes apart. `/nodename <name>` updates it right away, no restart needed; contacts see the new name with the bot's next message. A display name set by the operator is never touched.
+
 ## [2.26.6] - 2026-10-28
 
 ### Security

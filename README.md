@@ -127,7 +127,7 @@ These commands are only executable by the configured administrator.
 - `/url` — View current base external status URL.
 - `/url <url>` — Update the base external status URL (e.g., `/url https://up.gluek.info`) to generate correct status links.
 - `/probeignore [url|host|pattern]` — On this node, stop probing targets it cannot reach (e.g. blocked in its region or by its ISP) and abstain when peers vote on them. Accepts a target as shown in alerts (`https://nine.testrun.org/`, `dnd.wb.ru:25`), a host (`nine.testrun.org`: all its targets) or a pattern with `*` matched against the target, its host and host:port (`*:25` — all SMTP port checks, `*.testrun.org`). Without arguments lists the entries; `/probeunignore <entry>` removes one.
-- `/nodename [name]` — View or set the local probe node identifier (e.g. `/nodename Frankfurt-DE`). Peers (2.17.2+) pick up a new name from the next telemetry message; a name already used by another node is refused.
+- `/nodename [name]` — View or set the local probe node identifier (e.g. `/nodename Frankfurt-DE`). Peers (2.17.2+) pick up a new name from the next telemetry message; a name already used by another node is refused. Without `DISPLAY_NAME` the bot's display name follows it: `Uptime Bot (<node name>)`.
 - `/invitepeer` — Generate a SecureJoin E2E encrypted invite link (`https://i.delta.chat/#...`) with a single-use pairing token (valid 24h) for linking another bot.
 - `/peers` (or `/probes`) — List distributed monitoring peers, node names, key fingerprints, the relay address each one last used, their bot version (⚠️ when older than this node) and last seen activity.
 - `/stats` — Bot statistics and diagnostics: version and uptime, CPU of the bot and the Delta Chat core (last minutes and average), database sizes, monitors by type and state, checks per minute, mail received/sent in the last hour, outbox counters and queue, peers (online, unstable, which run an older version), telemetry interval, votes and held reports in the last hour, relays.
@@ -199,7 +199,7 @@ Releasing: merge into `main`, then `git tag -a vX.Y.Z -m "..." <commit> && git p
 
 You can customize the bot's name, avatar, and status text by passing environment variables (e.g. in your `.env` file or `docker-compose.yml`):
 
-- `DISPLAY_NAME` — Customize the display name of the bot (default: `Delta Chat Uptime Bot`).
+- `DISPLAY_NAME` — Customize the display name of the bot (default: `Uptime Bot (<node name>)`, updated by `/nodename` while the bot runs).
 - `STATUS_TEXT` — Customize the status/about text of the bot.
 - `AVATAR_PATH` — Path to an image file (PNG/JPG) to use as the bot's profile avatar (default: falls back to `icon.png` or `icon.jpg` in the project root).
 

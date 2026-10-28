@@ -229,5 +229,58 @@ class TestBlockedForPeers(_DbCase):
         self.assertEqual(t["last_status"], "skip")
 
 
+class TestPeerFlood(_DbCase):
+    """A peer with a broken network reports dozens of targets DOWN that are UP here."""
+
+    def setUp(self):
+        super().setUp()
+        bot._peer_flood_until.clear()
+        bot._peer_suspects.clear()
+
+    def tearDown(self):
+        bot._peer_flood_until.clear()
+        bot._peer_suspects.clear()
+        super().tearDown()
+
+    def _report(self, n):
+        return [{"url": f"https://t{i}.example/", "status": "down"} for i in range(n)]
+
+    def _up_here(self, n):
+        return [{"url": f"https://t{i}.example/", "status": "up", "alert_state": "up", "dc_chat_id": 5}
+                for i in range(n)]
+
+    def test_few_targets_are_voted_as_before(self):
+        with patch("bot.database.get_resources_by_urls", return_value=self._up_here(3)), \
+             patch("bot.database.get_chat_alert_mode", return_value="quorum"):
+            self.assertEqual(bot.note_peer_reported_down("MAC", self._report(3)), 3)
+        self.assertEqual(len(bot._peer_suspects), 3)
+        self.assertNotIn("MAC", bot._peer_flood_until)
+
+    def test_flood_is_ignored_and_the_peer_held(self):
+        with patch("bot.database.get_resources_by_urls", return_value=self._up_here(bot.PEER_FLOOD_TARGETS)), \
+             patch("bot.database.get_chat_alert_mode", return_value="quorum"):
+            self.assertEqual(bot.note_peer_reported_down("MAC", self._report(bot.PEER_FLOOD_TARGETS)), 0)
+        self.assertEqual(bot._peer_suspects, {})
+        self.assertGreater(bot._peer_flood_until["MAC"], time.time())
+
+    def test_held_peer_is_not_even_looked_up(self):
+        bot._peer_flood_until["MAC"] = time.time() + 60
+        with patch("bot.database.get_resources_by_urls") as lookup:
+            self.assertEqual(bot.note_peer_reported_down("MAC", self._report(2)), 0)
+        lookup.assert_not_called()
+
+    def test_heard_again_after_the_hold(self):
+        bot._peer_flood_until["MAC"] = time.time() - 1
+        with patch("bot.database.get_resources_by_urls", return_value=self._up_here(2)), \
+             patch("bot.database.get_chat_alert_mode", return_value="quorum"):
+            self.assertEqual(bot.note_peer_reported_down("MAC", self._report(2)), 2)
+
+    def test_other_peers_are_not_affected(self):
+        bot._peer_flood_until["MAC"] = time.time() + 60
+        with patch("bot.database.get_resources_by_urls", return_value=self._up_here(2)), \
+             patch("bot.database.get_chat_alert_mode", return_value="quorum"):
+            self.assertEqual(bot.note_peer_reported_down("PL", self._report(2)), 2)
+
+
 if __name__ == "__main__":
     unittest.main()

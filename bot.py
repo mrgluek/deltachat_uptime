@@ -61,7 +61,7 @@ from outbox import outbox as dc_outbox, PRIO_ALERT, PRIO_REPLY, PRIO_UPDATE, PRI
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "2.26.4"
+VERSION = "2.26.5"
 # No "bot" in the name: some services (e.g. Hiddify subscription links) reply 400 to any User-Agent containing "bot".
 USER_AGENT = f"Delta Chat Uptime Monitor/{VERSION} (+https://git.gluek.info/gluek/deltachat_uptime)"
 
@@ -390,6 +390,28 @@ def _admin_contact_id(bot, accid):
             break
         except Exception:
             continue
+    if not found and fp:
+        # The admin's key contact can sit under another address than the one in /initadmin (their
+        # transport changed, e.g. to an anonymous address on chat.gluek.info); the fingerprint is
+        # the identity, so look through all key contacts. Without it admin notices went to the
+        # address-only contact and failed with "e2e encryption unavailable".
+        try:
+            everyone = bot.rpc.get_contact_ids(accid, 0, None) or []
+        except Exception as e:
+            logger.debug(f"Could not list contacts: {e}")
+            everyone = []
+        for cid in everyone:
+            if cid in candidates:
+                continue  # already checked by address
+            try:
+                c = bot.rpc.get_contact(accid, cid)
+                if not _field(c, "is_key_contact", False):
+                    continue
+                if fp in re.sub(r"[^0-9A-F]", "", str(bot.rpc.get_contact_encryption_info(accid, cid)).upper()):
+                    found = cid
+                    break
+            except Exception:
+                continue
     if not found:
         try:
             found = bot.rpc.lookup_contact_id_by_addr(accid, email)  # older cores: one contact per address
@@ -2782,6 +2804,14 @@ _node_outliers: dict[str, dict[str, float]] = {}  # node -> target url -> when i
 _node_unstable_until: dict[str, float] = {}       # node -> unstable until (time.time())
 _node_unstable_since: dict[str, float] = {}       # node -> when it became unstable (notified)
 
+# A peer whose DNS or network is broken reports dozens of targets DOWN that are UP here. It also
+# answers DOWN when asked again, so the per-target holds never applied: one node caused ~600
+# revotes in 2.5 hours (a core CPU peak on de2). Past this many such targets in one report its
+# reports are ignored altogether for a while.
+PEER_FLOOD_TARGETS = 10
+PEER_FLOOD_HOLD = 1800
+_peer_flood_until: dict[str, float] = {}          # peer node -> ignored until (time.time())
+
 
 def is_outlier_down(vote: dict, votes: list[dict]) -> bool:
     """vote is DOWN or DEGRADED while at least two other nodes reach the target fine and they are
@@ -2953,6 +2983,8 @@ def note_peer_reported_down(peer_node: str, metrics: list[dict]) -> int:
         down_urls.add(str(m.get("url") or ""))
     if not down_urls:
         return 0
+    if _peer_flood_until.get(peer_node, 0) > time.time():
+        return 0  # flooding: see PEER_FLOOD_TARGETS
     marked = set()
     modes = {}
     for url in [u for u in down_urls if report_held(u, peer_node)]:
@@ -2969,8 +3001,15 @@ def note_peer_reported_down(peer_node: str, metrics: list[dict]) -> int:
             modes[chat] = database.get_chat_alert_mode(chat)
         if modes[chat] != "quorum":
             continue
-        _peer_suspects[r["url"]] = (time.monotonic(), peer_node)
         marked.add(r["url"])
+    if len(marked) >= PEER_FLOOD_TARGETS:
+        _peer_flood_until[peer_node] = time.time() + PEER_FLOOD_HOLD
+        logger.warning(f"Peer {peer_node} reports {len(marked)} targets DOWN or DEGRADED that are UP here: "
+                       f"its network is probably broken, ignoring its reports for {PEER_FLOOD_HOLD // 60} min")
+        stat_event("held")
+        return 0
+    for url in marked:
+        _peer_suspects[url] = (time.monotonic(), peer_node)
     if marked:
         logger.info(f"Peer {peer_node} reports DOWN or DEGRADED for {len(marked)} target(s) that are UP here; voting on their next check")
     return len(marked)
@@ -4983,6 +5022,13 @@ async def handle_index(request):
                     <div class="feature-text">
                         <h3>Smart Retry Logic</h3>
                         <p>Retries 2 times (30s apart) on failures to avoid false alerts. Recovery is marked UP instantly.</p>
+                    </div>
+                </div>
+                <div class="feature-item">
+                    <span class="feature-icon">🌍</span>
+                    <div class="feature-text">
+                        <h3>Federated Multi-Location Checks</h3>
+                        <p>Connect multiple Uptime bots as peers over encrypted Delta Chat DMs. Outages are verified from several locations before alerting, so regional or routing problems show up as "degraded" instead of false downtime, and you see exactly which regions can reach your service.</p>
                     </div>
                 </div>
             </div>

@@ -3275,6 +3275,19 @@ class TestAdminContact(unittest.TestCase):
     def test_key_contact_with_admin_fingerprint(self):
         self.assertEqual(bot._admin_contact_id(self.rpc_bot, 1), 12)
 
+    def test_key_contact_under_another_address(self):
+        # the admin's transport changed: the key contact has another address, only the fingerprint matches
+        contacts = {
+            10: {"address": "admin@example.org", "is_key_contact": False},
+            13: {"address": "p3xjn215np@chat.example", "is_key_contact": True},
+            14: {"address": "someone@chat.example", "is_key_contact": True},
+        }
+        self.rpc_bot.rpc.get_contact_ids.side_effect = lambda acc, flags, query: [10] if query else [10, 14, 13]
+        self.rpc_bot.rpc.get_contact.side_effect = lambda acc, cid: contacts[cid]
+        self.rpc_bot.rpc.get_contact_encryption_info.side_effect = lambda acc, cid: (
+            "DFF2 CAB1 FEB7 182F 997C\n0A01 466A A64D E33D 8A39" if cid == 13 else "AAAA BBBB")
+        self.assertEqual(bot._admin_contact_id(self.rpc_bot, 1), 13)
+
     def test_fallback_to_address_lookup(self):
         self.rpc_bot.rpc.get_contact_ids.return_value = []
         self.assertEqual(bot._admin_contact_id(self.rpc_bot, 1), 10)

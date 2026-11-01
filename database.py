@@ -17,7 +17,7 @@ _writer_conn_db_path = None
 
 def close_db():
     """Explicitly closes the persistent writer connection (useful for tests and shutdown)."""
-    global _writer_conn, _writer_conn_db_path
+    global _writer_conn, _writer_conn_db_path, _node_ignored_cache
     with _write_lock:
         if _writer_conn is not None:
             try:
@@ -26,6 +26,7 @@ def close_db():
                 pass
             _writer_conn = None
             _writer_conn_db_path = None
+    _node_ignored_cache = None
 
 def _get_writer_conn() -> sqlite3.Connection:
     """Returns a shared, persistent connection for write operations guarded by _write_lock."""
@@ -322,6 +323,17 @@ def init_db():
                 created_at INTEGER DEFAULT (strftime('%s','now'))
             )
         ''')
+
+        # Node-ignored targets: exclude specific targets/patterns from specific peer nodes/patterns
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS node_ignored_targets (
+                node_pattern TEXT NOT NULL,
+                target_pattern TEXT NOT NULL,
+                created_at INTEGER DEFAULT (strftime('%s','now')),
+                PRIMARY KEY (node_pattern, target_pattern)
+            )
+        ''')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_node_ignored_targets_node ON node_ignored_targets(node_pattern)')
 
         # Peer reports the main node ignores for a while (see bot.note_lone_reporter)
         cursor.execute('''
@@ -1579,6 +1591,8 @@ def save_peer_measurements_batch(node_name: str, metrics_list: list[dict]):
         url = str(item.get("url") or "").strip()[:500]
         if not url:
             continue
+        if is_node_target_ignored(clean_node, url):
+            continue
         status = str(item.get("status") or "unknown").strip().lower()
         if status not in ("up", "down", "unknown", "paused"):
             status = "unknown"
@@ -1845,6 +1859,96 @@ def get_all_ignored_probe_targets() -> list[dict]:
         return [dict(r) for r in rows]
     finally:
         conn.close()
+
+def node_matches_pattern(node_name: str, pattern: str) -> bool:
+    """Matches node_name against a pattern with optional '*' wildcards, case-insensitively."""
+    node = (node_name or "").strip().lower()
+    p = (pattern or "").strip().lower()
+    if not node or not p:
+        return False
+    if p == "*":
+        return True
+    if "*" in p:
+        rx = _ignore_pattern_regex(p)
+        return bool(rx.match(node))
+    return node == p
+
+_node_ignored_cache = None
+
+def get_all_node_ignored_targets() -> list[dict]:
+    global _node_ignored_cache
+    if _node_ignored_cache is not None:
+        return _node_ignored_cache
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT node_pattern, target_pattern, created_at FROM node_ignored_targets ORDER BY node_pattern ASC, target_pattern ASC")
+        rows = [dict(r) for r in cursor.fetchall()]
+        _node_ignored_cache = rows
+        return rows
+    finally:
+        conn.close()
+
+def add_node_ignored_target(node_pattern: str, target_pattern: str) -> int:
+    """Adds a node-ignored target rule; cleans up existing matching peer_measurements.
+    Returns how many peer measurements were cleaned up."""
+    global _node_ignored_cache
+    node_pat = (node_pattern or "").strip()
+    target_pat = (target_pattern or "").strip()
+    if not node_pat or not target_pat:
+        return 0
+    with _writer_transaction() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT OR REPLACE INTO node_ignored_targets (node_pattern, target_pattern) VALUES (?, ?)",
+            (node_pat, target_pat)
+        )
+        _node_ignored_cache = None
+        # Clean up any existing peer_measurements matching this rule
+        cursor.execute("SELECT DISTINCT node_name, url FROM peer_measurements")
+        to_del = []
+        for n_name, u in cursor.fetchall():
+            if node_matches_pattern(n_name, node_pat) and target_matches_ignore(u, [target_pat]):
+                to_del.append((n_name, u))
+        for n_name, u in to_del:
+            cursor.execute("DELETE FROM peer_measurements WHERE node_name = ? AND url = ?", (n_name, u))
+        return len(to_del)
+
+def remove_node_ignored_target(node_pattern: str, target_pattern: str = None) -> int:
+    """Removes matching rule(s). If target_pattern is None or '*', removes all rules for node_pattern.
+    Returns count of removed rules."""
+    global _node_ignored_cache
+    node_pat = (node_pattern or "").strip()
+    target_pat = (target_pattern or "").strip() if target_pattern else None
+    if not node_pat:
+        return 0
+    with _writer_transaction() as conn:
+        cursor = conn.cursor()
+        if target_pat and target_pat != "*":
+            cursor.execute(
+                "DELETE FROM node_ignored_targets WHERE LOWER(node_pattern) = LOWER(?) AND LOWER(target_pattern) = LOWER(?)",
+                (node_pat, target_pat)
+            )
+        else:
+            cursor.execute(
+                "DELETE FROM node_ignored_targets WHERE LOWER(node_pattern) = LOWER(?)",
+                (node_pat,)
+            )
+        removed = cursor.rowcount
+        _node_ignored_cache = None
+        return removed
+
+def is_node_target_ignored(node_name: str, url: str) -> bool:
+    """Checks whether a target URL is ignored for a specific node name by any active rule."""
+    if not node_name or not url:
+        return False
+    rules = get_all_node_ignored_targets()
+    for rule in rules:
+        if node_matches_pattern(node_name, rule["node_pattern"]):
+            if target_matches_ignore(url, [rule["target_pattern"]]):
+                return True
+    return False
 
 # Initialize DB on module import
 init_db()

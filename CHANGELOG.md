@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.29.0] - 2026-11-01
+
+### Added
+- **Centralized Node-Specific Target Ignoring (`/nodeignore`, `/nodeunignore`)**: Administrators can now centrally exclude targets and patterns from being probed on specific remote peer nodes (e.g. `/nodeignore RU* facebook.*`, `/nodeignore *home *:25`, `/nodeignore Node-1 https://site.org/`).
+  - Wildcard pattern matching (`*`) is supported for both node names and target patterns.
+  - Cross-check requests for matching targets are no longer sent to those nodes over the network, saving relay bandwidth and preventing false DOWN or DEGRADED votes.
+  - Incoming peer telemetry reports for matching targets from those nodes are discarded and do not trigger votes.
+  - Adding a rule immediately cleans up existing stale peer measurements for matching pairs.
+  - `/nodeunignore <node_pattern> [target_pattern]` resumes checks for individual rules or all rules for a node pattern.
+
 ## [2.28.0] - 2026-10-28
 
 ### Changed

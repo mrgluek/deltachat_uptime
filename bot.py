@@ -62,7 +62,7 @@ from outbox import outbox as dc_outbox, PRIO_ALERT, PRIO_REPLY, PRIO_UPDATE, PRI
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "2.28.0"
+VERSION = "2.29.0"
 # No "bot" in the name: some services (e.g. Hiddify subscription links) reply 400 to any User-Agent containing "bot".
 USER_AGENT = f"Delta Chat Uptime Monitor/{VERSION} (+https://git.gluek.info/gluek/deltachat_uptime)"
 
@@ -602,9 +602,26 @@ async def request_peer_cross_checks(target_dict: dict, timeout: float = 8.0, pee
     and waits for responses. /ping uses it directly; monitors go through the batched variant."""
     if peers is None:
         peers = await asyncio.to_thread(database.get_all_peers)
-    peers = [p for p in peers or [] if _peer_can_check(p, target_dict)]
-    if not peers or not dc_bot_instance or dc_accid is None:
-        return []
+    url = target_dict.get("url", "")
+    active_peers = []
+    ignored_responses = []
+    for p in peers or []:
+        if not _peer_can_check(p, target_dict):
+            continue
+        p_node = p.get("node_name") or ""
+        if p_node and await asyncio.to_thread(database.is_node_target_ignored, p_node, url):
+            ignored_responses.append({
+                "url": url,
+                "node_name": p_node,
+                "status": "skip",
+                "latency_ms": None,
+                "error_msg": "Ignored for node (/nodeignore)"
+            })
+            continue
+        active_peers.append(p)
+
+    if not active_peers or not dc_bot_instance or dc_accid is None:
+        return ignored_responses
 
     req_id = secrets.token_hex(12)
     req_payload = {
@@ -622,19 +639,19 @@ async def request_peer_cross_checks(target_dict: dict, timeout: float = 8.0, pee
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
-        return []
+        return ignored_responses
 
     fut = loop.create_future()
     responses = []
 
     valid_peers = []
-    for p in peers:
+    for p in active_peers:
         chat_id = await _resolve_peer_chat_id(p)
         if chat_id:
             valid_peers.append((p, chat_id))
 
     if not valid_peers:
-        return []
+        return ignored_responses
 
     # Only the peers this request was sent to may answer it, each once and in its own 1:1 chat.
     # Chats rather than addresses: a peer may answer from another relay address than it used before.
@@ -658,7 +675,7 @@ async def request_peer_cross_checks(target_dict: dict, timeout: float = 8.0, pee
     finally:
         pending_peer_checks.pop(req_id, None)
 
-    return responses
+    return responses + ignored_responses
 
 def _cross_check_key(t: dict) -> tuple:
     return (t.get("type") or "http", t.get("url"), t.get("expected_keyword") or "", t.get("family") or 0)
@@ -839,7 +856,21 @@ async def _flush_cross_checks(batch: list) -> None:
         items = [(key, target) for key, (target, _) in by_key.items()]
         jobs = []
         for p in batch_peers:
-            p_items = [(key, t) for key, t in items if _peer_can_check(p, t)]
+            p_node = p.get("node_name") or ""
+            p_items = []
+            for key, t in items:
+                if not _peer_can_check(p, t):
+                    continue
+                if p_node and database.is_node_target_ignored(p_node, t.get("url", "")):
+                    results[key].append({
+                        "url": t.get("url"),
+                        "node_name": p_node,
+                        "status": "skip",
+                        "latency_ms": None,
+                        "error_msg": "Ignored for node (/nodeignore)"
+                    })
+                    continue
+                p_items.append((key, t))
             for i in range(0, len(p_items), CROSS_CHECK_BATCH_MAX):
                 jobs.append(_batch_cross_check_peer(p, p_items[i:i + CROSS_CHECK_BATCH_MAX], results))
         if legacy_peers:
@@ -2911,10 +2942,13 @@ def note_peer_reported_down(peer_node: str, metrics: list[dict]) -> int:
     for m in metrics or []:
         if not isinstance(m, dict) or m.get("status") not in ("down", "degraded"):
             continue
+        u = str(m.get("url") or "")
+        if not u or database.is_node_target_ignored(peer_node, u):
+            continue
         checked = m.get("last_checked")
         if isinstance(checked, (int, float)) and not isinstance(checked, bool) and now - checked > PEER_SUSPECT_MAX_AGE:
             continue  # an old result (e.g. late in a >200 target rotation) is not evidence
-        down_urls.add(str(m.get("url") or ""))
+        down_urls.add(u)
     if not down_urls:
         return 0
     if _peer_flood_until.get(peer_node, 0) > time.time():
@@ -5246,6 +5280,8 @@ def help_command(bot, accid, event):
             f"/addpeer <email|link> [node_name] — Add remote peer bot (via email or SecureJoin invite)\n"
             f"/rmpeer <email|key> — Remove remote peer bot\n"
             f"/peershare [admin|all|none] — Choose which local monitors are disclosed to peers\n"
+            f"/nodeignore [node_pat] [target_pat] — Ignore targets on peer node(s) (e.g. `RU* facebook.*`)\n"
+            f"/nodeunignore <node_pat> [target_pat] — Resume checks for node(s)\n"
             f"/accounts — List configured bot accounts\n"
             f"/rmaccount <id> — Delete a bot account\n"
             f"/transports — Show mail relays & stats\n"
@@ -6782,7 +6818,7 @@ def peers_command(bot, accid, event):
             ver = p.get("version")
             ver_lbl = (f"`v{ver}`" + (" ⚠️ outdated" if version_tuple(ver) < version_tuple(VERSION) else "")) if ver else "`≤2.26.2` ⚠️ outdated"
             reply += f"• {status_icon} **{p_node}** — `{p['email']}`\n  {key_lbl} | {chat_lbl} | Version: {ver_lbl} | Last seen: `{seen_str}` | Active metrics: `{node_meas_count}`\n\n"
-        reply += "Commands:\n• `/invitepeer` — Generate E2EE invite link\n• `/addpeer <email|link> [node_name]`\n• `/rmpeer <email|key>`\n• `/peershare [admin|all|none]`\n• `/nodename <name>`\n• `/probeignore [url|host|pattern]` — Exclude targets on this node (e.g. `*:25`), or list them\n• `/probeunignore <entry>` — Resume probing on this node"
+        reply += "Commands:\n• `/invitepeer` — Generate E2EE invite link\n• `/addpeer <email|link> [node_name]`\n• `/rmpeer <email|key>`\n• `/peershare [admin|all|none]`\n• `/nodename <name>`\n• `/probeignore [url|host|pattern]` — Exclude targets on this node (e.g. `*:25`), or list them\n• `/probeunignore <entry>` — Resume probing on this node\n• `/nodeignore [node_pat] [target_pat]` — Exclude targets on peer node(s) (e.g. `RU* facebook.*`)\n• `/nodeunignore <node_pat> [target_pat]` — Resume checks on node(s)"
     _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=reply.strip()))
 
 @dc_cli.on(events.NewMessage(command="/invitepeer"))
@@ -7076,6 +7112,95 @@ def probeunignore_command(bot, accid, event):
     else:
         _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(
             text=f"❌ Target `{url}` was not found in the ignored probe list on `{local_node}`."
+        ))
+
+
+@dc_cli.on(events.NewMessage(command="/nodeignore"))
+@dc_cli.on(events.NewMessage(command="/ignorenode"))
+def nodeignore_command(bot, accid, event):
+    msg = event.msg
+    if not _is_dc_admin(bot, accid, msg.from_id):
+        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text="❌ This command is only for the administrator."))
+        return
+    payload = (event.payload or "").strip()
+    parts = payload.split(maxsplit=1) if payload else []
+    if not parts:
+        rules = database.get_all_node_ignored_targets()
+        if not rules:
+            _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(
+                text="ℹ️ No node-ignored targets configured.\n\n"
+                     "To ignore targets on specific nodes or node patterns:\n"
+                     "• `/nodeignore <node_pattern> <target_pattern>`\n\n"
+                     "Examples:\n"
+                     "• `/nodeignore RU* facebook.*` — all nodes starting with `RU` ignore Facebook\n"
+                     "• `/nodeignore *home *:25` — all nodes ending with `home` ignore port 25\n"
+                     "• `/nodeignore Node-1 https://site.org/` — single node ignores specific URL"
+            ))
+            return
+        reply = f"🚫 **Node-Ignored Targets ({len(rules)}):**\n\n"
+        for r in rules:
+            reply += f"• `{r['node_pattern']}` ➔ `{r['target_pattern']}`\n"
+        reply += "\nTo remove a rule: `/nodeunignore <node_pattern> <target_pattern>`"
+        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=reply))
+        return
+
+    if len(parts) == 1:
+        node_pat = parts[0]
+        rules = database.get_all_node_ignored_targets()
+        matching = [r for r in rules if r["node_pattern"].lower() == node_pat.lower() or database.node_matches_pattern(r["node_pattern"], node_pat)]
+        if not matching:
+            _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(
+                text=f"ℹ️ No node-ignored targets configured matching `{node_pat}`.\n\n"
+                     f"To add: `/nodeignore {node_pat} <target_pattern>`"
+            ))
+            return
+        reply = f"🚫 **Node-Ignored Targets for `{node_pat}` ({len(matching)}):**\n\n"
+        for r in matching:
+            reply += f"• `{r['node_pattern']}` ➔ `{r['target_pattern']}`\n"
+        reply += f"\nTo remove: `/nodeunignore {node_pat} <target_pattern>`"
+        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=reply))
+        return
+
+    node_pat, target_pat = parts[0], parts[1].lower()
+    cleaned = database.add_node_ignored_target(node_pat, target_pat)
+    clean_note = f" (cleared {cleaned} stale peer measurement(s))" if cleaned else ""
+    _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(
+        text=f"✅ Added node ignore rule: `{node_pat}` ➔ `{target_pat}`{clean_note}.\n\n"
+             f"Checks matching `{target_pat}` will not be sent to nodes matching `{node_pat}`, "
+             f"and their reports for them will be ignored in quorum."
+    ))
+
+
+@dc_cli.on(events.NewMessage(command="/nodeunignore"))
+@dc_cli.on(events.NewMessage(command="/unignorenode"))
+def nodeunignore_command(bot, accid, event):
+    msg = event.msg
+    if not _is_dc_admin(bot, accid, msg.from_id):
+        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text="❌ This command is only for the administrator."))
+        return
+    payload = (event.payload or "").strip()
+    parts = payload.split(maxsplit=1) if payload else []
+    if not parts:
+        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(
+            text="Usage: `/nodeunignore <node_pattern> [target_pattern]`\n"
+                 "Examples:\n"
+                 "• `/nodeunignore RU* facebook.*` — remove specific rule\n"
+                 "• `/nodeunignore RU*` — remove all rules for node pattern `RU*`"
+        ))
+        return
+
+    node_pat = parts[0]
+    target_pat = parts[1].lower() if len(parts) > 1 else None
+    removed = database.remove_node_ignored_target(node_pat, target_pat)
+    if removed:
+        what = f"`{node_pat}` ➔ `{target_pat}`" if target_pat else f"all rules for `{node_pat}`"
+        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(
+            text=f"✅ Removed node ignore rule(s) for {what} ({removed} rule(s) removed).\n"
+                 f"Checks for matching targets will be resumed on these nodes."
+        ))
+    else:
+        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(
+            text=f"❌ No matching node ignore rule found for `{node_pat}`" + (f" and `{target_pat}`." if target_pat else ".")
         ))
 
 

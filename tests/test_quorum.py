@@ -326,6 +326,13 @@ class TestQuorumTexts(unittest.TestCase):
         r2 = {"id": 2, "name": "Two", "url": "http://two.example.org", "dc_chat_id": CHAT}
         r3 = {"id": 3, "name": "Three", "url": "http://three.example.org", "dc_chat_id": 555}
 
+        for r in (r1, r2, r3):
+            rid = database.add_resource(r["dc_chat_id"], r["url"], r["name"], "http")
+            r["id"] = rid
+            database.set_chat_report_partial(r["dc_chat_id"], 0)
+            database.start_partial_outage(rid, 1, '["DE"]')
+            database.update_resource_alert_state(rid, "degraded", json.dumps(votes), 1)
+
         async def scenario():
             with patch("bot.DEGRADED_NOTIFY_WINDOW", 0):
                 bot._queue_degraded_notice("start", r1, votes)
@@ -333,11 +340,10 @@ class TestQuorumTexts(unittest.TestCase):
                 bot._queue_degraded_notice("start", r3, votes)
                 await bot._degraded_flush_task
 
-        with patch("bot._dc_send_msg_with_stats") as send:
-            asyncio.run(scenario())
-        chats = sorted(c.args[2] for c in send.call_args_list)
+        asyncio.run(scenario())
+        chats = sorted(c.args[1] for c in mock_bot.rpc.send_msg.call_args_list)
         self.assertEqual(chats, [CHAT, 555])
-        text = next(c.args[3].text for c in send.call_args_list if c.args[2] == CHAT)
+        text = next(c.args[2].text for c in mock_bot.rpc.send_msg.call_args_list if c.args[1] == CHAT)
         self.assertIn("2 monitor(s)", text)
 
     def test_list_and_status_show_degraded(self):

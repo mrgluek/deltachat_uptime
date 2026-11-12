@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.30.0] - 2026-11-12
+
+### Added
+- **Per-Chat Report Delays (`/report`)**: Partial outage notices now wait 10 minutes and incident messages wait 2 minutes of continuous DOWN by default. Any chat member can change either delay (0–1440 minutes), disable partial notices with `/report partial off`, or restore immediate reporting with `/report all`. `/status` shows the current settings.
+
+### Changed
+- **Short Outages Stay Silent**: Recovery notices follow only an announced outage. Detection, stored outage history and uptime statistics remain immediate; pending delays survive restarts, with uncertain sends dropped to avoid duplicate messages.
+
 ## [2.29.0] - 2026-11-01
 
 ### Added

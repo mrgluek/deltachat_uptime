@@ -161,6 +161,7 @@ class TestOutboxInBot(unittest.TestCase):
     def test_incident_updates_merge_while_waiting(self):
         chat_id = 4321
         database.get_or_create_chat_token(chat_id)
+        database.set_chat_report_full(chat_id, 0)  # exercise outbox behaviour without a report delay
         r1 = database.add_resource(chat_id, "https://one.example.org", "One", "http", 60)
         database.update_resource_status(r1, "down", 1, "HTTP 500")
         bot.dc_bot_instance = MagicMock()
@@ -193,9 +194,10 @@ class TestOutboxInBot(unittest.TestCase):
         self.assertEqual(bot.dc_bot_instance.rpc.send_edit_request.call_args.args[1], 777)
         self.assertIn("Resolved", bot.dc_bot_instance.rpc.send_edit_request.call_args.args[2])
 
-    def test_outage_resolved_before_first_message_still_reported(self):
+    def test_outage_resolved_before_first_message_is_silent(self):
         chat_id = 4322
         database.get_or_create_chat_token(chat_id)
+        database.set_chat_report_full(chat_id, 0)  # exercise outbox behaviour without a report delay
         r1 = database.add_resource(chat_id, "https://blip.example.org", "Blip", "http", 60)
         database.update_resource_status(r1, "down", 1, "HTTP 502")
         bot.dc_bot_instance = MagicMock()
@@ -205,12 +207,12 @@ class TestOutboxInBot(unittest.TestCase):
         database.update_resource_status(r1, "up", 0)
         asyncio.run(bot.sync_chat_incident_state(chat_id))
         drain(self.ob)
-        bot.dc_bot_instance.rpc.send_msg.assert_called_once()  # one message: the resolved one
-        self.assertIn("Resolved", bot.dc_bot_instance.rpc.send_msg.call_args.args[2].text)
+        bot.dc_bot_instance.rpc.send_msg.assert_not_called()
 
     def test_duration_refresh_is_low_priority(self):
         chat_id = 4323
         database.get_or_create_chat_token(chat_id)
+        database.set_chat_report_full(chat_id, 0)  # exercise outbox behaviour without a report delay
         r1 = database.add_resource(chat_id, "https://long.example.org", "Long", "http", 60)
         database.update_resource_status(r1, "down", 1, "HTTP 500")
         bot.dc_bot_instance = MagicMock()

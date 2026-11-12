@@ -114,12 +114,24 @@ A plain `/help` sent in a group chat is answered in a private 1:1 chat with the 
 - `/keyword <id|url> [keyword|none]` — Configure or remove expected keyword assertion.
 - `/list` — List monitored resources, status, latency, and SSL expiration in this chat.
 - `/status` — View monthly uptime statistics (online / degraded / offline, alert mode) and get the link to the chat's secure Web Status Page.
+- `/report [all|partial <N|off>|full <N>]` — Configure per-chat outage notification delays; see below.
 - `/alertmode [quorum|local]` — How this chat is alerted: `quorum` (default) — DOWN when most nodes cannot reach a target, DEGRADED notice when some cannot; `local` — this node's checks only.
 - `/events` — View recent incidents and active outages for this chat.
 - `/history [id]` — View downtime history for monitors.
 - `/sync` — Synchronize monitored resources with other bots in the same chat (rate-limited to 1/minute for non-admins).
 - `/donate` — Support bot development ❤️
 - `/help` — View available commands and system information.
+
+### Outage report delays (`/report`)
+
+Any chat member can change when this chat receives outage notifications:
+
+- `/report` shows the current settings and usage.
+- `/report partial <N|off>` waits N minutes before announcing a partial outage (default: 10). `off` disables partial notices.
+- `/report full <N>` waits N minutes of continuous DOWN before announcing an incident (default: 2).
+- `/report all` sets both delays to 0 for immediate notifications.
+
+N must be an integer from 0 to 1440. Short outages that recover before the delay stay silent, and recovery messages are sent only for outages already announced. Detection, incident history, partial outage history and uptime statistics remain immediate. Pending delays survive restarts; uncertain sends are dropped to avoid duplicates. The existing scheduler checks pending notices about every 30 seconds, and the outbox may delay delivery further.
 
 ### Admin-Only Commands
 These commands are only executable by the configured administrator.

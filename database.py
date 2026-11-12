@@ -169,6 +169,10 @@ def init_db():
                 FOREIGN KEY(resource_id) REFERENCES resources(id) ON DELETE CASCADE
             )
         ''')
+        cursor.execute("PRAGMA table_info(partial_outages)")
+        if "notice_state" not in [row[1] for row in cursor.fetchall()]:
+            # Existing outages have unknown delivery history: never repeat their start.
+            cursor.execute("ALTER TABLE partial_outages ADD COLUMN notice_state INTEGER DEFAULT -1")
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_partial_outages_resource ON partial_outages(resource_id, ended_at)')
 
         # Downtime events for uptime calculations
@@ -213,6 +217,11 @@ def init_db():
                 FOREIGN KEY(dc_chat_id) REFERENCES chats(dc_chat_id)
             )
         ''')
+        cursor.execute("PRAGMA table_info(incidents)")
+        if "message_claimed" not in [row[1] for row in cursor.fetchall()]:
+            cursor.execute("ALTER TABLE incidents ADD COLUMN message_claimed INTEGER DEFAULT 0")
+            # Legacy NULL ids have no durable send history, unlike new pending incidents.
+            cursor.execute("UPDATE incidents SET message_claimed = 1 WHERE msg_id IS NULL")
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_incidents_chat ON incidents(dc_chat_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_incidents_status ON incidents(status)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_incidents_chat_status ON incidents(dc_chat_id, status)')
@@ -550,6 +559,8 @@ def delete_chat_data(dc_chat_id: int) -> int:
         cursor.execute("DELETE FROM incidents WHERE dc_chat_id = ?", (dc_chat_id,))
         cursor.execute("DELETE FROM chats WHERE dc_chat_id = ?", (dc_chat_id,))
         cursor.execute("DELETE FROM config WHERE key = ?", (f"alert_mode:{dc_chat_id}",))
+        for kind in ("partial", "full"):
+            cursor.execute("DELETE FROM config WHERE key = ?", (f"report_{kind}:{dc_chat_id}",))
         return len(ids)
 
 
@@ -1968,6 +1979,73 @@ def set_chat_alert_mode(dc_chat_id: int, mode: str):
         raise ValueError(f"alert mode must be one of {ALERT_MODES}")
     set_config(f"alert_mode:{dc_chat_id}", mode)
 
+def get_chat_report_partial(dc_chat_id: int) -> int | str:
+    value = get_config(f"report_partial:{dc_chat_id}")
+    return "off" if value == "off" else int(value) if value is not None else 10
+
+
+def get_chat_report_full(dc_chat_id: int) -> int:
+    value = get_config(f"report_full:{dc_chat_id}")
+    return int(value) if value is not None else 2
+
+
+def _validate_report_minutes(minutes, allow_off=False):
+    if allow_off and minutes == "off":
+        return
+    if type(minutes) is not int or not 0 <= minutes <= 1440:
+        raise ValueError("report delay must be 0..1440 minutes" + (" or off" if allow_off else ""))
+
+
+def set_chat_report_partial(dc_chat_id: int, minutes: int | str):
+    _validate_report_minutes(minutes, allow_off=True)
+    set_config(f"report_partial:{dc_chat_id}", str(minutes))
+
+
+def set_chat_report_full(dc_chat_id: int, minutes: int):
+    _validate_report_minutes(minutes)
+    set_config(f"report_full:{dc_chat_id}", str(minutes))
+
+
+def claim_incident_message(incident_id: int) -> bool:
+    """Claim before RPC; an interrupted send is dropped rather than repeated on restart."""
+    with _writer_transaction() as conn:
+        return conn.execute(
+            "UPDATE incidents SET message_claimed = 1 WHERE id = ? AND message_claimed = 0 AND msg_id IS NULL AND status = 'ongoing'",
+            (incident_id,)).rowcount == 1
+
+
+def get_pending_partial_notices() -> list[dict]:
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    try:
+        return [dict(row) for row in conn.execute("""
+            SELECT r.*, po.id AS partial_id, po.started_at AS partial_started_at,
+                   po.ended_at AS partial_ended_at, po.notice_state
+            FROM partial_outages po JOIN resources r ON r.id = po.resource_id
+            WHERE (po.ended_at IS NULL AND po.notice_state = 0)
+               OR (po.ended_at IS NOT NULL AND po.notice_state = 2)
+        """)]
+    finally:
+        conn.close()
+
+
+def claim_partial_notice(partial_id: int, start: bool) -> bool:
+    """States: -1 unknown, 0 pending, 1 start claimed, 2 start sent, 3 end claimed.
+
+    Claims survive crashes; neither an uncertain start nor an uncertain end is retried.
+    """
+    with _writer_transaction() as conn:
+        return conn.execute(
+            "UPDATE partial_outages SET notice_state = ? WHERE id = ? AND notice_state = ? "
+            + ("AND ended_at IS NULL" if start else "AND ended_at IS NOT NULL"),
+            (1 if start else 3, partial_id, 0 if start else 2)).rowcount == 1
+
+
+def mark_partial_notice_sent(partial_id: int):
+    with _writer_transaction() as conn:
+        conn.execute("UPDATE partial_outages SET notice_state = 2 WHERE id = ? AND notice_state = 1", (partial_id,))
+
+
 def update_resource_alert_state(resource_id: int, alert_state: str, last_votes: str | None, degraded_since: int = 0):
     with _writer_transaction() as conn:
         conn.execute(
@@ -1991,11 +2069,11 @@ def start_partial_outage(resource_id: int, started_at: int, nodes_down: str):
                 cursor.execute("UPDATE partial_outages SET nodes_down = ? WHERE id = ?", (nodes_down, row[0]))
         else:
             cursor.execute(
-                "INSERT INTO partial_outages (resource_id, started_at, nodes_down) VALUES (?, ?, ?)",
+                "INSERT INTO partial_outages (resource_id, started_at, nodes_down, notice_state) VALUES (?, ?, ?, 0)",
                 (resource_id, started_at, nodes_down)
             )
 
-def end_partial_outage(resource_id: int, ended_at: int) -> int | None:
+def end_partial_outage(resource_id: int, ended_at: int, notify_end: bool = True) -> int | None:
     """Closes the open partial outage; returns when it started (None if none was open)."""
     with _writer_transaction() as conn:
         cursor = conn.cursor()
@@ -2003,7 +2081,11 @@ def end_partial_outage(resource_id: int, ended_at: int) -> int | None:
         row = cursor.fetchone()
         if not row:
             return None
-        cursor.execute("UPDATE partial_outages SET ended_at = ? WHERE id = ?", (ended_at, row[0]))
+        # Escalation also cancels a start currently inside its RPC, so its completion
+        # cannot restore a pending recovery after the incident has taken over.
+        cursor.execute(
+            "UPDATE partial_outages SET ended_at = ?, notice_state = CASE WHEN ? THEN notice_state ELSE 3 END WHERE id = ?",
+            (ended_at, notify_end, row[0]))
         return row[1]
 
 def get_partial_outages(resource_id: int, limit: int = 20) -> list[dict]:

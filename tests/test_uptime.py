@@ -816,6 +816,7 @@ class TestUptimeBot(unittest.TestCase):
     def test_incident_lifecycle_and_message_editing(self):
         import asyncio
         chat_id = 9933
+        database.set_chat_report_full(chat_id, 0)  # test immediate incident message behaviour
         r1_id = database.add_resource(chat_id, "https://site-a.org", "Site A", "http")
         r2_id = database.add_resource(chat_id, "https://site-b.org", "Site B", "http")
         
@@ -1329,6 +1330,7 @@ class TestUptimeBot(unittest.TestCase):
     def test_incident_edit_rate_limiting_and_immediate_state_change(self):
         import asyncio
         chat_id = 9988
+        database.set_chat_report_full(chat_id, 0)  # test immediate incident message behaviour
         database.get_or_create_chat_token(chat_id)
         r1 = database.add_resource(chat_id, "https://throttled.org", "Throttled App", "http", 60)
         database.update_resource_status(r1, "down", 3, "HTTP 500")
@@ -1409,6 +1411,7 @@ class TestUptimeBot(unittest.TestCase):
     def test_incident_split_after_one_hour_gap(self):
         import asyncio
         chat_id = 9992
+        database.set_chat_report_full(chat_id, 0)  # test immediate incident message behaviour
         database.get_or_create_chat_token(chat_id)
 
         r1_id = database.add_resource(chat_id, "https://site-a.org", "Site A", "http")
@@ -1519,6 +1522,7 @@ class TestUptimeBot(unittest.TestCase):
     def test_incident_reopened_on_service_flapping_within_one_hour(self):
         import asyncio
         chat_id = 9993
+        database.set_chat_report_full(chat_id, 0)  # test immediate incident message behaviour
         database.get_or_create_chat_token(chat_id)
         r_id = database.add_resource(chat_id, "https://flapping-site.org", "Flapping Site", "http")
 
@@ -1634,6 +1638,7 @@ class TestUptimeBot(unittest.TestCase):
     def test_delete_by_quote_incident_msg_id(self):
         import asyncio
         chat_id = 9996
+        database.set_chat_report_full(chat_id, 0)  # test immediate incident message behaviour
         database.get_or_create_chat_token(chat_id)
         r_id = database.add_resource(chat_id, "https://quote-inc.org", "Quote Inc Site", "http")
 

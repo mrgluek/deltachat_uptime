@@ -62,7 +62,7 @@ from outbox import outbox as dc_outbox, PRIO_ALERT, PRIO_REPLY, PRIO_UPDATE, PRI
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "2.29.0"
+VERSION = "2.30.0"
 # No "bot" in the name: some services (e.g. Hiddify subscription links) reply 400 to any User-Agent containing "bot".
 USER_AGENT = f"Delta Chat Uptime Monitor/{VERSION} (+https://git.gluek.info/gluek/deltachat_uptime)"
 
@@ -3100,37 +3100,82 @@ def format_degraded_notice(items: list) -> str:
     return "\n".join(lines)
 
 
-_silent_partial_outages: set = set()  # resource ids whose partial outage notice was dropped
+def should_notify_start(started_at, now, minutes, ended_at=None) -> bool:
+    """Only an open outage whose delay has elapsed may announce its start."""
+    return minutes != "off" and ended_at is None and started_at is not None and now >= started_at + minutes * 60
+
+
+def should_notify_resolved(start_sent: bool) -> bool:
+    return bool(start_sent)
+
+
+_silent_partial_outages: set = set()  # compatibility for diagnostics/tests
+
+
+def _deliver_degraded_notices(chat_id: int):
+    """Recheck persisted state when the outbox actually sends, including queued recoveries."""
+    if not dc_bot_instance or dc_accid is None:
+        return
+    minutes = database.get_chat_report_partial(chat_id)
+    if minutes == "off":
+        return
+    keep = []
+    claimed_starts = []
+    for r in database.get_pending_partial_notices():
+        if r["dc_chat_id"] != chat_id:
+            continue
+        start = r["partial_ended_at"] is None
+        votes = _votes_from_json(r.get("last_votes"))
+        if start:
+            if r.get("alert_state") != "degraded" or r.get("status") == "down":
+                continue
+            if not should_notify_start(r["partial_started_at"], int(time.time()), minutes):
+                continue
+            down_nodes = [v["node"] for v in votes if v.get("status") in ("down", "degraded")]
+            if down_nodes and all(is_node_unstable(n) for n in down_nodes):
+                database.claim_partial_notice(r["partial_id"], True)  # suppress this outage permanently
+                continue
+        elif r.get("status") == "down" or r.get("alert_state") == "down":
+            # Escalation is covered by the full incident; do not call it recovered.
+            database.claim_partial_notice(r["partial_id"], False)
+            continue
+        if database.claim_partial_notice(r["partial_id"], start):
+            keep.append(("start" if start else "end", r, votes, r["partial_started_at"]))
+            if start:
+                claimed_starts.append(r["partial_id"])
+    if keep:
+        msg_id = dc_bot_instance.rpc.send_msg(dc_accid, chat_id, MsgData(text=format_degraded_notice(keep)))
+        stat_event("mail_out")
+        for partial_id in claimed_starts:
+            database.mark_partial_notice_sent(partial_id)
+        return msg_id
+
+
+async def _check_report_notices():
+    pending = await run_db(database.get_pending_partial_notices)
+    settings = {}
+    due_chats = set()
+    now = int(time.time())
+    for r in pending:
+        chat_id = r["dc_chat_id"]
+        if chat_id not in settings:
+            settings[chat_id] = await run_db(database.get_chat_report_partial, chat_id)
+        minutes = settings[chat_id]
+        if minutes == "off":
+            continue
+        if r["partial_ended_at"] is not None or (
+                r.get("alert_state") == "degraded" and r.get("status") != "down"
+                and should_notify_start(r["partial_started_at"], now, minutes)):
+            due_chats.add(chat_id)
+    for chat_id in due_chats:
+        dc_outbox.submit(lambda chat=chat_id: _deliver_degraded_notices(chat),
+                         priority=PRIO_ALERT, key=("partial", chat_id), label="partial outage notice")
 
 
 async def _flush_degraded_notices():
     await asyncio.sleep(DEGRADED_NOTIFY_WINDOW)
-    queued = dict(_degraded_notify_queue)
     _degraded_notify_queue.clear()
-    for chat_id, items in queued.items():
-        # A monitor that started and ended within the window only needs its latest change
-        latest = {}
-        for item in items:
-            latest[item[1]["id"]] = item
-        keep = []
-        for item in latest.values():
-            kind, r, votes = item[0], item[1], item[2]
-            down_nodes = [v["node"] for v in votes if v.get("status") in ("down", "degraded")]
-            if kind == "start" and down_nodes and all(is_node_unstable(n) for n in down_nodes):
-                _silent_partial_outages.add(r["id"])  # its node turned out unstable: the end stays silent too
-                continue
-            if kind == "end" and r["id"] in _silent_partial_outages:
-                _silent_partial_outages.discard(r["id"])
-                continue
-            keep.append(item)
-        text = format_degraded_notice(keep)
-        if not text or not dc_bot_instance or dc_accid is None:
-            continue
-        try:
-            await asyncio.to_thread(_dc_send_msg_with_stats, dc_bot_instance, dc_accid, chat_id, MsgData(text=text),
-                                    priority=PRIO_ALERT, label="partial outage notice")
-        except Exception as e:
-            logger.warning(f"Failed to send partial outage notice to chat {chat_id}: {e}")
+    await _check_report_notices()
 
 
 async def apply_quorum_state(r: dict, votes: list[dict], votes_json: str) -> str:
@@ -3153,7 +3198,7 @@ async def apply_quorum_state(r: dict, votes: list[dict], votes_json: str) -> str
             _queue_degraded_notice("start", r, votes)
         await run_db(database.start_partial_outage, r["id"], degraded_since, nodes_down)
     elif prev == "degraded":
-        started_at = await run_db(database.end_partial_outage, r["id"], now)
+        started_at = await run_db(database.end_partial_outage, r["id"], now, new == "up")
         if new == "up":
             _queue_degraded_notice("end", r, votes, started_at or degraded_since or None)
         degraded_since = 0  # to DOWN: the incident message takes over
@@ -3502,6 +3547,18 @@ def _deliver_incident_message(inc_id: int, dc_chat_id: int, msg_text: str, resol
     merged with later updates (same key) and goes out once, with the latest text."""
     inc = database.get_incident_by_id(dc_chat_id, inc_id)
     msg_id = inc.get("msg_id") if inc else None
+    if not inc or (resolved != (inc["status"] == "resolved")):
+        return
+    if not msg_id:
+        if resolved or inc["status"] != "ongoing":
+            return
+        events = database.get_incident_downtime_events(inc_id)
+        open_events = [ev for ev in events if ev.get("went_up_at") is None]
+        minutes = database.get_chat_report_full(dc_chat_id)
+        if not any(should_notify_start(ev["went_down_at"], int(time.time()), minutes) for ev in open_events):
+            return
+        if not database.claim_incident_message(inc_id):
+            return
     if msg_id:
         try:
             dc_bot_instance.rpc.send_edit_request(dc_accid, msg_id, msg_text)
@@ -3509,11 +3566,20 @@ def _deliver_incident_message(inc_id: int, dc_chat_id: int, msg_text: str, resol
             return msg_id
         except Exception as e:
             logger.warning(f"Failed to edit Incident message {msg_id} (sending new message): {e}")
-    # No message yet (also an outage that ended before its first message went out: it gets the
-    # resolved message, so the chat still learns about it)
+    # A first send was claimed above; edits retain the existing replacement fallback.
     new_msg_id = dc_bot_instance.rpc.send_msg(dc_accid, dc_chat_id, MsgData(text=msg_text))
     if isinstance(new_msg_id, int) and not resolved:
         database.update_incident_msg_id(inc_id, new_msg_id)
+        current = database.get_incident_by_id(dc_chat_id, inc_id)
+        if current and current["status"] == "resolved":
+            # Recovery may have raced the first RPC while its msg_id was still unknown.
+            ids = {ev["resource_id"] for ev in database.get_incident_downtime_events(inc_id)}
+            resources = database.get_resources(dc_chat_id)
+            text = format_incident_message(
+                inc_id, current["started_at"], [r for r in resources if r["id"] in ids],
+                is_resolved=True, resolved_at=current["resolved_at"],
+                total_chat_monitors=len(resources), dc_chat_id=dc_chat_id)
+            _queue_incident_message(inc_id, dc_chat_id, text, PRIO_ALERT, resolved=True)
     return new_msg_id
 
 
@@ -3563,6 +3629,11 @@ async def sync_chat_incident_state(dc_chat_id: int, force_update: bool = False):
             open_events = [ev for ev in events if ev.get("went_up_at") is None and ev["resource_id"] in active_res_map]
             
             if open_events:
+                # Grouped/reopened incidents may be older than the continuous DOWN interval.
+                minutes = await run_db(database.get_chat_report_full, dc_chat_id)
+                if not inc.get("msg_id") and (inc.get("message_claimed") or not any(
+                        should_notify_start(ev["went_down_at"], now, minutes) for ev in open_events)):
+                    continue
                 # Incident is ongoing
                 started_at = inc["started_at"]
                 duration = max(0, now - started_at)
@@ -3638,7 +3709,8 @@ async def sync_chat_incident_state(dc_chat_id: int, force_update: bool = False):
                     dc_chat_id=dc_chat_id
                 )
                 
-                _queue_incident_message(inc_id, dc_chat_id, msg_text, PRIO_ALERT, resolved=True)
+                if should_notify_resolved(inc.get("msg_id")):
+                    _queue_incident_message(inc_id, dc_chat_id, msg_text, PRIO_ALERT, resolved=True)
 
 def trigger_chat_incident_sync(dc_chat_id: int, force_update: bool = False):
     """Trigger incident state sync from a synchronous handler / thread."""
@@ -3951,6 +4023,7 @@ async def monitoring_scheduler_loop():
                 # Audit incidents and peer liveness every 30 seconds (not every 5s)
                 if now - _last_incident_audit >= 30:
                     _last_incident_audit = now
+                    await _check_report_notices()
                     active_incidents = await run_db(database.get_all_active_incidents)
                     for inc in active_incidents:
                         asyncio.create_task(sync_chat_incident_state(inc["dc_chat_id"]))
@@ -5253,6 +5326,7 @@ def help_command(bot, accid, event):
         f"/keyword <id|url> [keyword|none] — Set or remove required keyword assertion\n"
         f"/list — List all monitors in this chat with uptime, latency & SSL\n"
         f"/status — Show monthly uptime statistics & web link\n"
+        f"/report [all|partial <N|off>|full <N>] — Delay outage notices (minutes)\n"
         f"/alertmode [quorum|local] — Alert when most nodes cannot reach a target (default), or on this node's checks only\n"
         f"/events — View incident history and active outages\n"
         f"/history [id] — View downtime history for monitors\n"
@@ -6191,6 +6265,37 @@ def alertmode_command(bot, accid, event):
     reply += "Change with `/alertmode quorum` or `/alertmode local`."
     _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=reply))
 
+def report_settings_text(chat_id: int) -> str:
+    partial = database.get_chat_report_partial(chat_id)
+    full = database.get_chat_report_full(chat_id)
+    return f"partial: {'off' if partial == 'off' else str(partial) + ' min'}, full: {full} min"
+
+
+@dc_cli.on(events.NewMessage(command="/report"))
+def report_command(bot, accid, event):
+    """Any chat member may configure notification delays."""
+    chat_id = event.msg.chat_id
+    args = (event.payload or "").strip().lower().split()
+    usage = "Usage: `/report`, `/report all`, `/report partial <0..1440|off>`, `/report full <0..1440>`."
+    try:
+        if args == ["all"]:
+            database.set_chat_report_partial(chat_id, 0)
+            database.set_chat_report_full(chat_id, 0)
+        elif len(args) == 2 and args[0] in ("partial", "full"):
+            value = "off" if args[1] == "off" else int(args[1])
+            setter = database.set_chat_report_partial if args[0] == "partial" else database.set_chat_report_full
+            setter(chat_id, value)
+        elif args:
+            raise ValueError("invalid report command")
+    except ValueError:
+        _dc_send_msg_with_stats(bot, accid, chat_id, MsgData(text=f"❌ {usage}"))
+        return
+    text = ("✅ " if args else "") + f"🔔 **Report settings:** {report_settings_text(chat_id)}\n\n"
+    text += "Only chat notifications are delayed; monitoring and uptime statistics stay immediate.\n"
+    text += "Resolved notices follow only an announced outage. Zero means immediate; partial off disables partial notices.\n\n" + usage
+    _dc_send_msg_with_stats(bot, accid, chat_id, MsgData(text=text))
+
+
 @dc_cli.on(events.NewMessage(command="/status"))
 def status_command(bot, accid, event):
     msg = event.msg
@@ -6215,7 +6320,8 @@ def status_command(bot, accid, event):
         f"📈 Overall Uptime: `{avg_uptime:.2f}%`\n"
         f"🖥️ Total Monitors: `{total_monitors}`\n"
         f"🟢 Online: `{up_monitors}` | 🟠 Degraded: `{degraded_monitors}` | 🔴 Offline: `{down_monitors}`\n"
-        f"🛰️ Alert mode: `{database.get_chat_alert_mode(msg.chat_id)}` (`/alertmode`)\n\n"
+        f"🛰️ Alert mode: `{database.get_chat_alert_mode(msg.chat_id)}` (`/alertmode`)\n"
+        f"🔔 Report: {report_settings_text(msg.chat_id)} (`/report`)\n\n"
         f"🔗 **Web Status Dashboard:**\n"
         f"{status_page_url}"
     )

@@ -831,9 +831,9 @@ class TestUptimeBot(unittest.TestCase):
         
         mock_bot.rpc.send_msg.assert_called_once()
         msg_text = mock_bot.rpc.send_msg.call_args[0][2].text
-        self.assertIn("🚨 **Incident #", msg_text)
+        self.assertIn("🚨 Incident #", msg_text)
         self.assertIn("Site A", msg_text)
-        self.assertIn("DOWN", msg_text)
+        self.assertIn("· down ", msg_text)
         
         active_inc = database.get_active_incident(chat_id)
         self.assertIsNotNone(active_inc)
@@ -865,7 +865,7 @@ class TestUptimeBot(unittest.TestCase):
         mock_bot.rpc.send_edit_request.assert_called_once()
         edit_args = mock_bot.rpc.send_edit_request.call_args[0]
         self.assertEqual(edit_args[1], 10001)
-        self.assertIn("Ongoing (Partial Recovery)", edit_args[2])
+        self.assertIn("· recovered ", edit_args[2])
         self.assertIn("1 / 2 monitors down", edit_args[2])
         
         # 4. Site B recovers -> all UP! Incident resolved, message edited to Resolved
@@ -879,8 +879,8 @@ class TestUptimeBot(unittest.TestCase):
         mock_bot.rpc.send_edit_request.assert_called_once()
         edit_args = mock_bot.rpc.send_edit_request.call_args[0]
         self.assertEqual(edit_args[1], 10001)
-        self.assertIn("✅ **Incident #", edit_args[2])
-        self.assertIn("Resolved", edit_args[2])
+        self.assertIn("✅ Incident #", edit_args[2])
+        self.assertIn("resolved ·", edit_args[2])
         self.assertIn("All 2 monitors operational", edit_args[2])
         
         # Incident in DB should now be resolved
@@ -1249,7 +1249,7 @@ class TestUptimeBot(unittest.TestCase):
             1, 77001, unittest.mock.ANY
         )
         edited_text = bot.dc_bot_instance.rpc.send_edit_request.call_args[0][2]
-        self.assertIn("Resolved", edited_text)
+        self.assertIn("resolved ·", edited_text)
         self.assertIn("All 1 monitors operational", edited_text)
         self.assertNotIn("Good App", edited_text)
 
@@ -1402,7 +1402,7 @@ class TestUptimeBot(unittest.TestCase):
         edited_text = bot.dc_bot_instance.rpc.send_edit_request.call_args[0][2]
         
         self.assertIn("All 3 monitors operational", edited_text)
-        self.assertIn("Recovered Monitors:", edited_text)
+        self.assertIn(f"🟢 #{r1} Affected Site (HTTP) · 30d", edited_text)
         self.assertIn("Affected Site", edited_text)
         # Healthy sites that never went down MUST NOT be listed in the recovered breakdown
         self.assertNotIn("Healthy Site 1", edited_text)
@@ -1457,7 +1457,7 @@ class TestUptimeBot(unittest.TestCase):
         resolved_calls = [c for c in mock_bot.rpc.send_edit_request.call_args_list if c[0][1] == 20002]
         self.assertEqual(len(resolved_calls), 1)
         self.assertIn(f"Incident #{inc2_id}", resolved_calls[0][0][2])
-        self.assertIn("Resolved", resolved_calls[0][0][2])
+        self.assertIn("resolved ·", resolved_calls[0][0][2])
         self.assertIn("Site B", resolved_calls[0][0][2])
 
         # Verify only Incident #1 is still active
@@ -1475,7 +1475,7 @@ class TestUptimeBot(unittest.TestCase):
         resolved_calls = [c for c in mock_bot.rpc.send_edit_request.call_args_list if c[0][1] == 20001]
         self.assertEqual(len(resolved_calls), 1)
         self.assertIn(f"Incident #{inc1_id}", resolved_calls[0][0][2])
-        self.assertIn("Resolved", resolved_calls[0][0][2])
+        self.assertIn("resolved ·", resolved_calls[0][0][2])
         self.assertIn("Site A", resolved_calls[0][0][2])
 
         # Both incidents resolved
@@ -1556,7 +1556,7 @@ class TestUptimeBot(unittest.TestCase):
         mock_bot.rpc.send_edit_request.assert_called_once()
         edit_args = mock_bot.rpc.send_edit_request.call_args[0]
         self.assertEqual(edit_args[1], 30001)
-        self.assertIn("Resolved", edit_args[2])
+        self.assertIn("resolved ·", edit_args[2])
         self.assertEqual(len(database.get_active_incidents_for_chat(chat_id)), 0)
 
         # 3. Flaps DOWN again at t1 + 300s (T = t0 + 600s, < 1 hour) -> Reopens Incident #1!
@@ -1596,7 +1596,7 @@ class TestUptimeBot(unittest.TestCase):
         edit_args = mock_bot.rpc.send_edit_request.call_args[0]
         self.assertEqual(edit_args[1], 30001)
         self.assertIn(f"Incident #{inc1_id}", edit_args[2])
-        self.assertIn("Resolved", edit_args[2])
+        self.assertIn("resolved ·", edit_args[2])
         self.assertEqual(len(database.get_active_incidents_for_chat(chat_id)), 0)
 
     def test_delete_by_numeric_id(self):

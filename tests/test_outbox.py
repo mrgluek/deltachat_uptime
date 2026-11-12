@@ -192,7 +192,7 @@ class TestOutboxInBot(unittest.TestCase):
         self.assertEqual(self.ob.waiting(), {"alert": 1})
         drain(self.ob)
         self.assertEqual(bot.dc_bot_instance.rpc.send_edit_request.call_args.args[1], 777)
-        self.assertIn("Resolved", bot.dc_bot_instance.rpc.send_edit_request.call_args.args[2])
+        self.assertIn("resolved ·", bot.dc_bot_instance.rpc.send_edit_request.call_args.args[2])
 
     def test_outage_resolved_before_first_message_is_silent(self):
         chat_id = 4322

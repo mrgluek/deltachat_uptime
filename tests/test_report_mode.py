@@ -137,7 +137,7 @@ class TestReportMode(unittest.TestCase):
         bot._deliver_degraded_notices(1)
         bot._deliver_degraded_notices(1)
         self.assertEqual(bot.dc_bot_instance.rpc.send_msg.call_count, 2)
-        self.assertIn("Resolved", bot.dc_bot_instance.rpc.send_msg.call_args.args[2].text)
+        self.assertIn("Partial outage resolved:", bot.dc_bot_instance.rpc.send_msg.call_args.args[2].text)
 
     def test_zero_partial_is_immediate_and_off_suppresses_its_end(self):
         database.set_chat_report_partial(1, 0)
@@ -279,7 +279,7 @@ class TestReportMode(unittest.TestCase):
         drain(self.ob)
         bot.dc_bot_instance.rpc.send_msg.assert_called_once()
         bot.dc_bot_instance.rpc.send_edit_request.assert_called_once()
-        self.assertIn("Still unreachable", bot.dc_bot_instance.rpc.send_edit_request.call_args.args[2])
+        self.assertIn("🟠 still partial:", bot.dc_bot_instance.rpc.send_edit_request.call_args.args[2])
 
     def test_escalation_during_partial_rpc_cannot_restore_a_recovery(self):
         self.partial()
@@ -309,7 +309,7 @@ class TestReportMode(unittest.TestCase):
         drain(self.ob)
         bot.dc_bot_instance.rpc.send_msg.assert_called_once()
         bot.dc_bot_instance.rpc.send_edit_request.assert_called_once()
-        self.assertIn("Resolved", bot.dc_bot_instance.rpc.send_edit_request.call_args.args[2])
+        self.assertIn("resolved ·", bot.dc_bot_instance.rpc.send_edit_request.call_args.args[2])
 
     def test_report_command(self):
         for payload, expected in (("", "10 min"), ("all", "full: 0 min"),

@@ -62,7 +62,7 @@ from outbox import outbox as dc_outbox, PRIO_ALERT, PRIO_REPLY, PRIO_UPDATE, PRI
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "2.30.0"
+VERSION = "2.31.0"
 # No "bot" in the name: some services (e.g. Hiddify subscription links) reply 400 to any User-Agent containing "bot".
 USER_AGENT = f"Delta Chat Uptime Monitor/{VERSION} (+https://git.gluek.info/gluek/deltachat_uptime)"
 
@@ -3086,17 +3086,25 @@ def format_degraded_notice(items: list) -> str:
     now = int(time.time())
     lines = []
     if starts:
-        lines.append(f"🟠 **Partial Outage** — {len(starts)} monitor(s) unreachable or degraded from some nodes\n")
+        lines.append(f"🟠 Partial outage: {len(starts)} monitor(s) unreachable from some nodes")
         for _, r, votes, _ in starts:
-            lines.append(f"• 🟠 `ID: {r['id']}` **{r.get('name') or r['url']}**\n  Target: `{r['url']}`\n  {format_votes(votes)}")
-        lines.append("\n_Not counted as downtime: most nodes still reach these targets._")
+            name = r.get("name") or r["url"]
+            lines.append(f"🟠 #{r['id']} {name}")
+            if name != r["url"]:
+                lines.append(f"  Target: {r['url']}")
+            lines.append(f"  {format_votes(votes)}")
+        lines.append("Not counted as downtime (most nodes reach them).")
     if ends:
         if lines:
             lines.append("")
-        lines.append(f"✅ **Partial Outage Resolved** — {len(ends)} monitor(s) reachable from all nodes again\n")
+        lines.append(f"✅ Partial outage resolved: {len(ends)} monitor(s) reachable from all nodes")
         for _, r, votes, started_at in ends:
-            dur = f" after `{format_duration(max(1, now - started_at))}`" if started_at else ""
-            lines.append(f"• 🟢 `ID: {r['id']}` **{r.get('name') or r['url']}**{dur}\n  {format_votes(votes)}")
+            dur = f" after {format_duration(max(1, now - started_at))}" if started_at else ""
+            name = r.get("name") or r["url"]
+            lines.append(f"🟢 #{r['id']} {name}{dur}")
+            if name != r["url"]:
+                lines.append(f"  Target: {r['url']}")
+            lines.append(f"  {format_votes(votes)}")
     return "\n".join(lines)
 
 
@@ -3431,84 +3439,60 @@ async def check_group_task(group, semaphore, session=None):
 def format_incident_message(incident_id: int, started_at: int, resources: list[dict], is_resolved: bool = False, resolved_at: int = None, dc_chat_id: int = None, total_chat_monitors: int = None) -> str:
     start_dt = datetime.datetime.fromtimestamp(started_at, tz=datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
     now = int(time.time())
-    
+
     total_monitors = total_chat_monitors if total_chat_monitors is not None else len(resources)
     down_resources = [r for r in resources if r.get("status") == "down" or r.get("resource_status") == "down" or r.get("went_up_at") is None]
     up_resources = [r for r in resources if (r.get("status") == "up" or r.get("resource_status") == "up") and r.get("went_up_at") is not None]
-    
+
+    def append_details(r):
+        name = r.get("name") or r.get("url")
+        if r.get("url") and name != r["url"]:
+            lines.append(f"  Target: {r['url']}")
+        votes = _votes_from_json(r.get("last_votes"))
+        if votes:
+            prefix = "🟠 still partial: " if r.get("alert_state") == "degraded" else "🛰️ "
+            lines.append(f"  {prefix}{format_votes(votes)}")
+
     if is_resolved:
         resolved_ts = resolved_at or now
         resolved_dt = datetime.datetime.fromtimestamp(resolved_ts, tz=datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
-        duration = max(1, resolved_ts - started_at)
-        duration_str = format_duration(duration)
-        
-        recovered_resources = [r for r in resources if r.get("name") or r.get("url")]
-        
-        if total_monitors > 0:
-            lines = [
-                f"✅ **Incident #{incident_id}** — `Resolved`",
-                f"⏱ **Duration:** `{duration_str}` (`{start_dt}` → `{resolved_dt} UTC`)",
-                f"📊 **All {total_monitors} monitors operational**"
-            ]
-            if recovered_resources:
-                lines.append("\n**Recovered Monitors:**")
-                for r in recovered_resources:
-                    r_name = r.get("name") or r.get("url")
-                    r_type = (r.get("type") or "HTTP").upper()
-                    uptime_val = database.get_resource_uptime_30d(r["id"])
-                    lines.append(f"• 🟢 `ID: {r['id']}` **{r_name}** ({r_type}) — Uptime 30d: `{uptime_val:.2f}%`")
-                    votes = _votes_from_json(r.get("last_votes"))
-                    if len(votes) > 1 and r.get("alert_state") == "degraded":
-                        lines.append(f"  🟠 Still unreachable from some nodes: {format_votes(votes)}")
-        else:
-            lines = [
-                f"✅ **Incident #{incident_id}** — `Resolved`",
-                f"⏱ **Duration:** `{duration_str}` (`{start_dt}` → `{resolved_dt} UTC`)",
-                f"📊 **All monitored resources removed or operational**"
-            ]
-        return "\n".join(lines)
-        
-    else:
-        duration = max(1, now - started_at)
-        duration_str = format_duration(duration)
-        down_count = len(down_resources)
-        
-        # Check if partially recovered
-        partially_recovered = len(up_resources) > 0 and down_count > 0
-        
-        if partially_recovered:
-            status_tag = "Ongoing (Partial Recovery)"
-            header_icon = "⚠️"
-        else:
-            status_tag = "Ongoing"
-            header_icon = "🚨"
-            
+        duration_str = format_duration(max(1, resolved_ts - started_at))
         lines = [
-            f"{header_icon} **Incident #{incident_id}** — `{status_tag}`",
-            f"⏱ **Started:** `{start_dt} UTC` (active for `{duration_str}`)",
-            f"📊 **Affected:** {down_count} / {total_monitors} monitors down\n",
-            "**Current Status:**"
+            f"✅ Incident #{incident_id} resolved · {duration_str} ({start_dt} → {resolved_dt} UTC)",
+            f"All {total_monitors} monitors operational" if total_monitors > 0 else "All monitored resources removed or operational"
         ]
-        
-        for r in down_resources:
-            r_name = r.get("name") or r.get("url")
+        for r in resources:
+            if not (r.get("name") or r.get("url")):
+                continue
+            name = r.get("name") or r.get("url")
             r_type = (r.get("type") or "HTTP").upper()
-            d_time = max(1, now - (r.get("last_changed") or r.get("went_down_at") or started_at))
-            d_str = format_duration(d_time)
             uptime_val = database.get_resource_uptime_30d(r["id"])
-            lines.append(f"• 🔴 `ID: {r['id']}` **{r_name}**\n  Target: `{r['url']}` ({r_type})\n  Status: `DOWN` (down for `{d_str}`) | Uptime 30d: `{uptime_val:.2f}%`{slowdown_note(r, now)}")
-            votes = _votes_from_json(r.get("last_votes"))
-            if len(votes) > 1:
-                lines.append(f"  🛰️ {format_votes(votes)}")
-            
-        for r in up_resources:
-            r_name = r.get("name") or r.get("url")
-            r_type = (r.get("type") or "HTTP").upper()
-            rec_dt = datetime.datetime.fromtimestamp(r.get("last_changed") or r.get("went_up_at") or now, tz=datetime.timezone.utc).strftime('%H:%M:%S')
-            uptime_val = database.get_resource_uptime_30d(r["id"])
-            lines.append(f"• 🟢 `ID: {r['id']}` **{r_name}**\n  Target: `{r['url']}` ({r_type})\n  Status: `UP` (recovered at `{rec_dt} UTC`) | Uptime 30d: `{uptime_val:.2f}%`")
-
+            lines.append(f"🟢 #{r['id']} {name} ({r_type}) · 30d {uptime_val:.2f}%")
+            append_details(r)
         return "\n".join(lines)
+
+    duration_str = format_duration(max(1, now - started_at))
+    lines = [
+        f"🚨 Incident #{incident_id} · Ongoing (started {start_dt} UTC, active {duration_str})",
+        f"Affected: {len(down_resources)} / {total_monitors} monitors down"
+    ]
+    for r in down_resources:
+        name = r.get("name") or r.get("url")
+        r_type = (r.get("type") or "HTTP").upper()
+        d_time = max(1, now - (r.get("last_changed") or r.get("went_down_at") or started_at))
+        uptime_val = database.get_resource_uptime_30d(r["id"])
+        lines.append(f"🔴 #{r['id']} {name} ({r_type}) · down {format_duration(d_time)} · 30d {uptime_val:.2f}%{slowdown_note(r, now)}")
+        append_details(r)
+
+    for r in up_resources:
+        name = r.get("name") or r.get("url")
+        r_type = (r.get("type") or "HTTP").upper()
+        rec_dt = datetime.datetime.fromtimestamp(r.get("last_changed") or r.get("went_up_at") or now, tz=datetime.timezone.utc).strftime('%H:%M:%S')
+        uptime_val = database.get_resource_uptime_30d(r["id"])
+        lines.append(f"🟢 #{r['id']} {name} ({r_type}) · recovered {rec_dt} UTC · 30d {uptime_val:.2f}%")
+        append_details(r)
+
+    return "\n".join(lines)
 
 _incident_sync_locks = {}
 _incident_sync_locks_thread_lock = threading.Lock()

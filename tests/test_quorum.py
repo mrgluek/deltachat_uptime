@@ -312,9 +312,9 @@ class TestQuorumTexts(unittest.TestCase):
         r2 = {"id": 2, "name": None, "url": "http://two.example.org", "dc_chat_id": CHAT}
         votes = json.loads(self._votes_json())
         text = bot.format_degraded_notice([("start", r1, votes, None), ("end", r2, votes, 1)])
-        self.assertIn("🟠 **Partial Outage** — 1 monitor(s)", text)
-        self.assertIn("**One**", text)
-        self.assertIn("✅ **Partial Outage Resolved**", text)
+        self.assertIn("🟠 Partial outage: 1 monitor(s)", text)
+        self.assertIn("🟠 #1 One", text)
+        self.assertIn("✅ Partial outage resolved:", text)
         self.assertIn("http://two.example.org", text)
         self.assertIn("Not counted as downtime", text)
 

@@ -65,11 +65,12 @@ from outbox import outbox as dc_outbox, PRIO_ALERT, PRIO_REPLY, PRIO_UPDATE, PRI
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "2.32.1"
+VERSION = "2.33.0"
 WEBXDC_APP_VERSION = 1  # Bump only for layout changes requiring a new app instance.
-# One day until Stage 3b (own trimming of user chats with exemptions for the status app and ongoing
-# incidents); then 30 days as a safety net. The status app is re-posted when its local message expires.
-DELETE_DEVICE_AFTER = 86400
+# Safety net; explicit trimming preserves app instances and ongoing incident messages.
+DELETE_DEVICE_AFTER = 30 * 86400
+USER_CHAT_KEEP_SECONDS = 86400
+USER_CHAT_TRIM_MAX = 2000
 
 # No "bot" in the name: some services (e.g. Hiddify subscription links) reply 400 to any User-Agent containing "bot".
 USER_AGENT = f"Delta Chat Uptime Monitor/{VERSION} (+https://git.gluek.info/gluek/deltachat_uptime)"
@@ -195,7 +196,7 @@ VOTE_HISTORY_WINDOW = 86400   # how far back a node's lone failures count agains
 _node_vote_history = {}       # node -> deque of (time.time(), alone_failing: bool) of its counted votes
 
 # /stats: counters since start and events of the last hour (in memory, reset on restart)
-_bot_stats = {"started": time.time(), "trimmed": 0}
+_bot_stats = {"started": time.time(), "trimmed": 0, "user_trimmed": 0}
 _stat_events = collections.defaultdict(collections.deque)  # name -> times of the last hour
 _cpu_samples = collections.deque(maxlen=4)  # (time.monotonic(), {name: cpu seconds}) once a minute
 _last_check_summary = {}
@@ -542,6 +543,63 @@ def trim_peer_chats(bot, accid) -> int:
     if deleted:
         logger.info(f"Deleted {deleted} old protocol messages from peer chats")
         _bot_stats["trimmed"] += deleted
+    return deleted
+
+
+def trim_user_chats(bot, accid) -> int:
+    """Locally trim non-peer chats, preserving live references and the newest 20."""
+    deleted = 0
+    examined = 0
+    try:
+        peers = {p.get("chat_id") for p in database.get_all_peers()}
+        protected = database.get_retained_message_ids()
+        cutoff = int(time.time()) - USER_CHAT_KEEP_SECONDS
+        # Include archived chats (flag 1) as well as the ordinary chat list.
+        chats = dict.fromkeys(bot.rpc.get_chatlist_entries(accid, 0, None, None)
+                              + bot.rpc.get_chatlist_entries(accid, 1, None, None))
+        for chat_id in chats:
+            if chat_id in peers or chat_id <= 9:
+                continue
+            try:
+                # The core returns oldest first (IDs need not be numerically ordered).
+                ids = bot.rpc.get_message_ids(accid, chat_id, False, False)[:-20]
+            except Exception as exc:
+                logger.warning("Cannot list user chat %s: %s", chat_id, exc)
+                continue
+            old = []
+            for msg_id in ids:
+                if examined >= USER_CHAT_TRIM_MAX:
+                    break
+                examined += 1
+                try:
+                    message = bot.rpc.get_message(accid, msg_id)
+                    timestamp = _field(message, "timestamp")
+                    if timestamp is None:
+                        continue
+                    if timestamp >= cutoff:
+                        break
+                    if msg_id not in protected:
+                        old.append(msg_id)
+                except Exception:
+                    continue  # A core expiry or concurrent deletion is harmless.
+            for i in range(0, len(old), PEER_CHAT_TRIM_CHUNK):
+                chunk = old[i:i + PEER_CHAT_TRIM_CHUNK]
+                try:
+                    bot.rpc.delete_messages(accid, chunk)
+                    deleted += len(chunk)
+                except Exception:
+                    for msg_id in chunk:
+                        try:
+                            bot.rpc.delete_messages(accid, [msg_id])
+                            deleted += 1
+                        except Exception:
+                            pass
+            if examined >= USER_CHAT_TRIM_MAX:
+                break
+    except Exception as exc:
+        logger.warning("Cannot trim user chats: %s", exc)
+    _bot_stats["user_trimmed"] += deleted
+    logger.info("Deleted %s old messages from user chats (%s examined)", deleted, examined)
     return deleted
 
 
@@ -3128,10 +3186,64 @@ def should_notify_resolved(start_sent: bool) -> bool:
 _silent_partial_outages: set = set()  # compatibility for diagnostics/tests
 
 
+def _journal_outage_text(resource, prefix, ending=None):
+    name = resource.get("name") or resource.get("url") or "Monitor"
+    if ending is not None:
+        return f"✅ {name} recovered after {format_duration(max(0, ending))}"
+    votes = _votes_from_json(resource.get("last_votes"))
+    nodes = [str(v.get("node", "?")) for v in votes if v.get("status") in ("down", "degraded")]
+    condition = "is down" if prefix == "🔴" else "is partially down"
+    return f"{prefix} {name} {condition}" + (f" (nodes: {', '.join(nodes)})" if nodes else "")
+
+
+def _journal_partial_events(chat_id=None):
+    now = int(time.time())
+    for r in database.get_partial_journal_rows():
+        chat = r["dc_chat_id"]
+        if chat_id is not None and chat != chat_id:
+            continue
+        minutes = database.get_chat_report_partial(chat)
+        if minutes == "off":
+            continue
+        identity = r["partial_id"]
+        key = f"journal:partial_start:{chat}:{identity}"
+        ended = r["partial_ended_at"]
+        if ended is None:
+            votes = _votes_from_json(r.get("last_votes"))
+            nodes = [v["node"] for v in votes if v.get("status") in ("down", "degraded")]
+            if (r.get("alert_state") == "degraded" and r.get("status") != "down"
+                    and r.get("notice_state") in (0, 1, 2)
+                    and should_notify_start(r["partial_started_at"], now, minutes)
+                    and not (nodes and all(is_node_unstable(n) for n in nodes))):
+                database.add_chat_event(chat, "partial_start", _journal_outage_text(r, "🟠", None),
+                                        once=identity)
+        elif (database.get_config(key) and r.get("notice_state") != 3
+              and r.get("status") != "down" and r.get("alert_state") != "down"):
+            database.add_chat_event(chat, "partial_end", _journal_outage_text(r, "", ended - r["partial_started_at"]),
+                                    once=identity)
+
+
+def _journal_incident_events(chat_id, events, resources, now):
+    minutes = database.get_chat_report_full(chat_id)
+    notices_after = int(database.get_config(f"report_app_notices_after:{chat_id}") or 0)
+    for event in events:
+        identity = event["id"]
+        resource = resources.get(event["resource_id"], event)
+        ended = event.get("went_up_at")
+        if ended is None:
+            if event["went_down_at"] > notices_after and should_notify_start(event["went_down_at"], now, minutes):
+                database.add_chat_event(chat_id, "incident_start", _journal_outage_text(resource, "🔴"),
+                                        once=identity)
+        elif database.get_config(f"journal:incident_start:{chat_id}:{identity}"):
+            database.add_chat_event(chat_id, "incident_end", _journal_outage_text(resource, "", ended - event["went_down_at"]),
+                                    once=identity)
+
+
 def _deliver_degraded_notices(chat_id: int):
     """Recheck persisted state when the outbox actually sends, including queued recoveries."""
     if not dc_bot_instance or dc_accid is None:
         return
+    _journal_partial_events(chat_id)
     minutes = database.get_chat_report_partial(chat_id)
     if database.get_chat_report_app(chat_id) == "only" or minutes == "off":
         return
@@ -3168,6 +3280,7 @@ def _deliver_degraded_notices(chat_id: int):
 
 
 async def _check_report_notices():
+    await run_db(_journal_partial_events)
     pending = await run_db(database.get_pending_partial_notices)
     settings = {}
     due_chats = set()
@@ -3623,6 +3736,7 @@ async def sync_chat_incident_state(dc_chat_id: int, force_update: bool = False):
                     await asyncio.to_thread(database.close_resource_downtime_events, ev["resource_id"], now)
                     ev["went_up_at"] = now
 
+            await run_db(_journal_incident_events, dc_chat_id, events, active_res_map, now)
             open_events = [ev for ev in events if ev.get("went_up_at") is None and ev["resource_id"] in active_res_map]
             
             if open_events:
@@ -4060,6 +4174,7 @@ async def monitoring_scheduler_loop():
                 if now - _last_peer_chat_trim >= PEER_CHAT_TRIM_INTERVAL and dc_bot_instance and dc_accid is not None:
                     _last_peer_chat_trim = now
                     asyncio.create_task(asyncio.to_thread(trim_peer_chats, dc_bot_instance, dc_accid))
+                    asyncio.create_task(asyncio.to_thread(trim_user_chats, dc_bot_instance, dc_accid))
 
                 # Periodic database cleanup (every 24 hours)
                 if now - _last_cleanup >= 86400:
@@ -5308,24 +5423,92 @@ def build_status_state(chat_id: int) -> dict:
                       for v in _votes_from_json(r.get("last_votes")) if isinstance(v, dict)],
         })
     monitors.sort(key=lambda m: ({"down": 0, "partial": 1, "up": 2, "paused": 3}[m["status"]], m["id"]))
+    journal = database.get_recent_chat_events(chat_id, 20)
     return {"v": WEBXDC_APP_VERSION, "chat": database.get_config(f"webxdc_chat_name:{chat_id}") or "Chat Monitor",
-            "generated_at": now, "counts": counts, "monitors": monitors}
+            "generated_at": now, "counts": counts, "monitors": monitors, "events": status_app_events(chat_id, journal),
+            "event_serial": journal[0]["id"] if journal else 0}
 
 
 def status_state_hash(state: dict) -> str:
     content = {key: value for key, value in state.items() if key != "generated_at"}
+    content["summary"] = status_app_summary(state)
     return hashlib.sha256(json.dumps(content, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
 
 
+def status_app_events(chat_id, rows=None):
+    if rows is None:
+        rows = database.get_recent_chat_events(chat_id, 20)
+    events = [{k: r[k] for k in ("ts", "kind", "text")} for r in rows]
+    # Budget is UTF-8 bytes, including JSON escaping and multibyte monitor names.
+    for event in events:
+        event["text"] = event["text"][:140]
+    while len(json.dumps(events, ensure_ascii=False, separators=(",", ":")).encode()) > 2048:
+        longest = max(events, key=lambda e: len(e["text"].encode()))
+        if not longest["text"]:
+            events.pop()
+        else:
+            longest["text"] = longest["text"][:-1]
+    return events
+
+
 def status_app_summary(state: dict) -> str:
-    c = state["counts"]
-    return f"🟢 {c['up']} up · 🟠 {c['partial']} partial · 🔴 {c['down']} down"
+    def shorten(name, size):
+        name = " ".join(str(name).split())
+        return name if len(name) <= size else name[:size - 1] + "…"
+    for size in range(20, 0, -1):
+        parts = []
+        for status, icon in (("down", "🔴"), ("partial", "🟠")):
+            count = state["counts"][status]
+            if count:
+                names = [shorten(m.get("name") or m.get("url") or "?", size)
+                         for m in state.get("monitors", []) if m["status"] == status][:3]
+                label = f"{icon} {count} {status}"
+                if names:
+                    label += ": " + ", ".join(names)
+                if count > 3:
+                    label += f" +{count - 3}"
+                parts.append(label)
+        parts.append(f"🟢 {state['counts']['up']} up")
+        summary = " · ".join(parts)
+        if len(summary) <= 120:
+            return summary
+    return summary[:119] + "…"
 
 
-def _status_update_json(state: dict, limit: int) -> str:
+def status_app_info(events):
+    lines = [" ".join(e["text"].split())[:140] for e in events[:3]]
+    if len(events) > 3:
+        lines.append(f"+{len(events) - 3} more")
+    return " | ".join(lines)
+
+
+def status_app_rotation_due(chat_id, now):
+    # Config keys are additive migration: legacy instances acquire an age on first audit.
+    posted = database.get_config(f"webxdc_posted_at:{chat_id}")
+    if posted is None:
+        posted = database.get_config(f"webxdc_reposted_at:{chat_id}") or str(now)
+        database.set_config(f"webxdc_posted_at:{chat_id}", posted)
+    count = int(database.get_config(f"webxdc_update_count:{chat_id}") or 0)
+    return now - int(posted) > 7 * 86400 or count > 500
+
+
+def status_app_dirty(chat_id):
+    return database.get_config(f"webxdc_dirty:{chat_id}") != database.get_config(f"webxdc_clean:{chat_id}")
+
+
+def status_app_urgent(chat_id):
+    revision = database.get_config(f"webxdc_dirty:{chat_id}")
+    return status_app_dirty(chat_id) and revision != database.get_config(f"webxdc_attempt_revision:{chat_id}")
+
+
+def _status_update_json(state: dict, limit: int, info_line=None) -> str:
     """Keep flags for every monitor if node detail would exceed the wire budget."""
     def encode():
-        return json.dumps({"payload": state, "summary": status_app_summary(state)}, ensure_ascii=False, separators=(",", ":"))
+        summary = status_app_summary(state)
+        update = {"payload": state, "summary": summary, "document": summary}
+        if info_line:
+            update["info"] = info_line
+        return json.dumps(update, ensure_ascii=False, separators=(",", ":"))
     encoded = encode()
     if len(encoded.encode()) > limit:
         state["details_omitted"] = True
@@ -5374,7 +5557,7 @@ def _deliver_status_app(chat_id, bot, accid, known_msg_id=None):
         # A just-posted and successfully pinned id is already known to exist; send its
         # first state next without another existence probe. Audits always probe again.
         exists = msg_id and (msg_id == known_msg_id or msg_id in bot.rpc.get_existing_msg_ids(accid, [msg_id]))
-        if not exists or version != str(WEBXDC_APP_VERSION):
+        if not exists or version != str(WEBXDC_APP_VERSION) or status_app_rotation_due(chat_id, now):
             last_post = database.get_config(f"webxdc_reposted_at:{chat_id}")
             if last_post is not None and now - int(last_post) < 3600:
                 return
@@ -5383,6 +5566,8 @@ def _deliver_status_app(chat_id, bot, accid, known_msg_id=None):
             msg_id = bot.rpc.send_msg(accid, chat_id, MsgData(file=build_status_xdc()))
             stat_event("mail_out")
             database.set_chat_webxdc(chat_id, msg_id)
+            database.set_config(f"webxdc_posted_at:{chat_id}", str(now))
+            database.set_config(f"webxdc_update_count:{chat_id}", "0")
             database.set_config(f"webxdc_app_version:{chat_id}", str(WEBXDC_APP_VERSION))
             database.set_config(f"webxdc_pin_pending:{chat_id}", str(msg_id))
             saved = database.get_chat_webxdc(chat_id)
@@ -5394,6 +5579,7 @@ def _deliver_status_app(chat_id, bot, accid, known_msg_id=None):
         chat = bot.rpc.get_basic_chat_info(accid, chat_id)
         name = chat.get("name") if isinstance(chat, dict) else chat.name
         database.set_config(f"webxdc_chat_name:{chat_id}", str(name))
+        revision = database.get_config(f"webxdc_dirty:{chat_id}")
         state = build_status_state(chat_id)
         info = bot.rpc.get_webxdc_info(accid, msg_id)
         def field(key, default):
@@ -5406,9 +5592,11 @@ def _deliver_status_app(chat_id, bot, accid, known_msg_id=None):
             return default
         limit = min(60000, int(field("sendUpdateMaxSize", 128000)))
         # The webxdc API expresses sendUpdateInterval in milliseconds.
-        interval = max(60, field("sendUpdateInterval", 10000) / 1000)
+        interval = max(0 if status_app_urgent(chat_id) else 60, field("sendUpdateInterval", 10000) / 1000)
         digest = status_state_hash(state)
-        update = _status_update_json(state, limit)
+        last_info = int(database.get_config(f"webxdc_last_info_event_id:{chat_id}") or 0)
+        info_events = database.get_recent_chat_events(chat_id, after_id=last_info)
+        update = _status_update_json(state, limit, status_app_info(info_events))
         if saved["webxdc_state_hash"] == digest or (saved["webxdc_last_sent_at"] is not None
                 and now - saved["webxdc_last_sent_at"] < interval):
             return
@@ -5418,9 +5606,15 @@ def _deliver_status_app(chat_id, bot, accid, known_msg_id=None):
             return
         # Count attempts durably too: retrying an uncertain RPC must not exceed the cap.
         database.set_config(f"webxdc_updates:{chat_id}", json.dumps(updates + [now]))
+        database.set_config(f"webxdc_attempt_revision:{chat_id}", revision)
         bot.rpc.send_webxdc_status_update(accid, msg_id, update, status_app_summary(state))
         stat_event("mail_out")
         database.set_chat_webxdc(chat_id, msg_id, digest, now)
+        count = int(database.get_config(f"webxdc_update_count:{chat_id}") or 0)
+        database.set_config(f"webxdc_update_count:{chat_id}", str(count + 1))
+        database.set_config(f"webxdc_clean:{chat_id}", revision)
+        if info_events:
+            database.set_config(f"webxdc_last_info_event_id:{chat_id}", str(max(e["id"] for e in info_events)))
     except Exception as exc:
         logger.warning("Cannot update status app in chat %s: %s", chat_id, exc)
 
@@ -5446,7 +5640,7 @@ async def push_status_apps():
             # Reads use the existing RPC executor; only actual mails need outbox tokens.
             exists = msg_id and msg_id in await run_rpc(dc_bot_instance.rpc.get_existing_msg_ids, dc_accid, [msg_id])
             version = await run_db(database.get_config, f"webxdc_app_version:{chat_id}")
-            if not exists or version != str(WEBXDC_APP_VERSION):
+            if not exists or version != str(WEBXDC_APP_VERSION) or await run_db(status_app_rotation_due, chat_id, now):
                 last_post = await run_db(database.get_config, f"webxdc_reposted_at:{chat_id}")
                 if last_post is not None and now - int(last_post) < 3600:
                     continue
@@ -5455,7 +5649,8 @@ async def push_status_apps():
                 name = str(chat.get("name") if isinstance(chat, dict) else chat.name)
                 if name != await run_db(database.get_config, f"webxdc_chat_name:{chat_id}"):
                     await run_db(database.set_config, f"webxdc_chat_name:{chat_id}", name)
-                if saved["webxdc_last_sent_at"] is not None and now - saved["webxdc_last_sent_at"] < 60:
+                if (saved["webxdc_last_sent_at"] is not None and now - saved["webxdc_last_sent_at"] < 60
+                        and not await run_db(status_app_urgent, chat_id)):
                     continue
                 state = await run_db(build_status_state, chat_id)
                 if status_state_hash(state) == saved["webxdc_state_hash"]:
@@ -7058,6 +7253,7 @@ def build_stats_report(bot, accid) -> str:
         + f"; votes ask up to {VOTE_SAMPLE_SIZE} peers",
         f"• Last hour: {stat_last_hour('vote', now)} votes sent to peers, {stat_last_hour('held', now)} reports held back",
         f"• Old protocol messages deleted since start: {_bot_stats['trimmed']}",
+        f"• Old user chat messages deleted since start: {_bot_stats['user_trimmed']}",
         "",
         "**Relays**",
         (f"• {len(relays)}: " + ", ".join(f"`{r}`" for r in relays)) if relays else "• n/a",
@@ -7623,8 +7819,7 @@ def on_start(bot, _args):
             # them. Not 1 byte: the core then defers every message, also plain text, to a
             # one-by-one "download later" instead of the normal batch, which delayed peer answers.
             bot.rpc.set_config(dc_accid, "download_limit", str(DOWNLOAD_LIMIT))
-            # Re-post the status app when its local message expires; peer chats are still
-            # trimmed independently by trim_peer_chats.
+            # Safety net alongside explicit peer and user chat trimming.
             bot.rpc.set_config(dc_accid, "delete_device_after", str(DELETE_DEVICE_AFTER))
             logger.info(f"Auto-download limit set to {DOWNLOAD_LIMIT // 1024} KB (larger attachments are not downloaded).")
         except Exception as e:

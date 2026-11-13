@@ -87,7 +87,7 @@ class TestWebxdcStatus(unittest.TestCase):
         self.assertEqual(state["monitors"][1]["nodes"], votes)
         self.assertEqual(state["monitors"][1]["since"], 9500)
         self.assertIsInstance(state["monitors"][0]["uptime30"], float)
-        self.assertEqual(bot.status_app_summary(state), "🟢 1 up · 🟠 1 partial · 🔴 1 down")
+        self.assertEqual(bot.status_app_summary(state), "🔴 1 down: Down · 🟠 1 partial: Partial · 🟢 1 up")
         later = copy.deepcopy(state)
         later["generated_at"] += 60
         self.assertEqual(bot.status_state_hash(state), bot.status_state_hash(later))

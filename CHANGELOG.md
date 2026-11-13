@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.33.0] - 2026-11-13
+
+### Added
+- Status app summaries name failing monitors in the bubble and pinned bar, with bounded text and paused monitors excluded from failures.
+- A 30-day chat event journal for monitor edits and delayed outage starts/recoveries, with the last 20 events shown in new apps. Both app modes send short system info lines for outage events.
+- Local user-chat trimming every ten minutes: keep one day, the newest 20 messages, the current app and ongoing incident messages; core device retention is a 30-day safety net.
+
+### Changed
+- Rotate apps after seven days or more than 500 updates, preserving the hourly re-post guard and rolling update cap. Old instances remain in the chat.
+- Monitor edits bypass the app's 60-second debounce while respecting the core interval and 30/hour cap.
+- Existing app instances receive event data but show their original layout until the next rotation. `/report app off` followed by `on` resumes the same instance and does not refresh its layout.
+
 ## [2.32.1] - 2026-11-13
 
 ### Fixed

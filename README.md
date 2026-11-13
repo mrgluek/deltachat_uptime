@@ -158,17 +158,19 @@ Relay selection and failover are handled by the Delta Chat core (2.61+): it keep
 
 ---
 
-### Status app prototype (`/report app`)
+### Status app (`/report app`)
 
-The optional webxdc app gives each chat a pinned, mobile-friendly status view inside Delta Chat, with light/dark themes, all monitors and their node results. It is off by default.
+The optional webxdc app gives each chat a pinned, mobile-friendly status view inside Delta Chat, with light/dark themes, all monitors, their node results and the last 20 journal events. The pinned bar names failing monitors: for example, `🔴 2 down: cm.dc09.xyz, mail.x · 🟠 1 partial: site · 🟢 80 up`. Paused monitors are excluded from failure counts; long names and lists are shortened. It is off by default.
 
 - `/report app on` posts and pins the app immediately, then updates it alongside normal chat notices (with the configured report delays).
-- `/report app only` uses the app for outage reporting and suppresses partial/full outage chat notices. Monitoring, incidents and uptime statistics continue. Pending notices from app-only time are dropped when chat notices resume, including still-open outages.
+- `/report app only` uses the app for outage reporting and suppresses partial/full outage chat notices. Short system info lines still announce outage starts and recoveries after the configured report delays, in both `only` and `on` modes. Up to three events are combined per update, with a count of any others; monitor edits do not produce info lines. Monitoring, incidents and uptime statistics continue. Pending notices from app-only time are dropped when chat notices resume, including still-open outages.
 - `/report app off` stops app updates and leaves the existing app message in place.
 
-`/report`, `/status` and `/help` show the setting or command. Updates carry complete snapshots, are sent only when state changes, wait at least 60 seconds between sends, and are capped at 30 per chat per rolling hour. Each update is mail to all chat members, and new devices replay the history. Large snapshots omit node details while retaining monitor status flags; the app shows when this happens.
+`/report`, `/status` and `/help` show the setting or command. Updates carry complete snapshots, are sent only when state changes, normally wait at least 60 seconds between sends, and are capped at 30 per chat per rolling hour. Monitor additions, removals, renames, target/type changes, pauses and maintenance changes bypass the 60-second debounce and are audited within 30 seconds; the core send interval and hourly cap still apply. Each update is mail to all chat members, and new devices replay the history. Large snapshots omit node details while retaining monitor status flags; the app shows when this happens.
 
-The bot retains local messages for seven days and re-posts/pins the app when its local copy expires or is missing, at most once per hour. Pinning does not prevent expiry. A layout version change also creates a fresh app; ordinary bot upgrades only update its state. Peer chats remain trimmed separately. The `webxdc/` assets are bundled into `status.xdc` in the data directory on demand and are included in Docker builds.
+Every ten minutes the bot locally deletes messages older than one day from non-peer chats, incoming and outgoing, while keeping the newest 20 messages, the current status app message and messages for ongoing incidents. Each run examines at most 2,000 older messages. The core's 30-day device retention remains a safety net. Peer chats are trimmed separately; these deletions do not delete messages for other members.
+
+The app is re-posted and pinned when it is older than seven days, has received more than 500 updates, or its local message is missing, at most once per hour. Rotation sends a fresh first state and resets the instance counter; the old app is left in place. A layout version change also creates a fresh app. Ordinary bot upgrades update the existing app's data, so existing instances gain the new event-list layout at their next rotation; toggling `/report app off` and `on` resumes the same instance and does not refresh its layout. Journal entries are retained for 30 days. The `webxdc/` assets are bundled into `status.xdc` in the data directory on demand and are included in Docker builds.
 
 ## Deployment
 

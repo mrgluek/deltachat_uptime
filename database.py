@@ -164,6 +164,26 @@ def init_db():
         if "degraded_since" not in columns:
             cursor.execute("ALTER TABLE resources ADD COLUMN degraded_since INTEGER DEFAULT 0")
 
+        cursor.execute("CREATE TABLE IF NOT EXISTS chat_events (id INTEGER PRIMARY KEY AUTOINCREMENT, dc_chat_id INTEGER NOT NULL, ts INTEGER NOT NULL, kind TEXT NOT NULL, text TEXT NOT NULL)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_chat_events_chat ON chat_events(dc_chat_id, id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_chat_events_ts ON chat_events(ts)")
+        # Track command and other local edits in the same locked transaction as the edit.
+        # Ordinary probe writes do not mark the chat dirty or produce journal entries.
+        for action, reference, condition, kind, text in (
+            ("INSERT", "NEW", "1", "monitor_added", "'➕ Added monitor ' || COALESCE(NEW.name, NEW.url)"),
+            ("DELETE", "OLD", "1", "monitor_removed", "'➖ Removed monitor ' || COALESCE(OLD.name, OLD.url)"),
+            ("UPDATE", "NEW", "OLD.name IS NOT NEW.name", "monitor_renamed", "'✏️ Renamed monitor ' || COALESCE(OLD.name, OLD.url) || ' to ' || COALESCE(NEW.name, NEW.url)"),
+            ("UPDATE", "NEW", "OLD.url IS NOT NEW.url OR OLD.type IS NOT NEW.type OR OLD.expected_keyword IS NOT NEW.expected_keyword", "monitor_changed", "'✏️ Changed monitor ' || COALESCE(NEW.name, NEW.url)"),
+            ("UPDATE", "NEW", "OLD.maintenance_until IS NOT NEW.maintenance_until OR (OLD.status IS NOT NEW.status AND (OLD.status = 'paused' OR NEW.status = 'paused'))", "monitor_pause", "CASE WHEN NEW.maintenance_until > CAST(strftime('%s','now') AS INTEGER) OR NEW.status = 'paused' THEN '⏸️ Paused monitor ' ELSE '▶️ Resumed monitor ' END || COALESCE(NEW.name, NEW.url)"),
+        ):
+            cursor.execute(f"""CREATE TRIGGER IF NOT EXISTS journal_{kind} AFTER {action} ON resources
+                WHEN {condition} BEGIN
+                INSERT INTO chat_events(dc_chat_id, ts, kind, text)
+                VALUES ({reference}.dc_chat_id, strftime('%s','now'), '{kind}', substr(replace(replace(replace({text}, char(10), ' '), char(13), ' '), char(9), ' '), 1, 140));
+                INSERT OR REPLACE INTO config(key, value) VALUES ('webxdc_dirty:' || {reference}.dc_chat_id,
+                    COALESCE((SELECT CAST(value AS INTEGER) FROM config WHERE key = 'webxdc_dirty:' || {reference}.dc_chat_id), 0) + 1);
+                END""")
+
         # Partial outages: periods a target was unreachable from a minority of nodes (not downtime)
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS partial_outages (
@@ -567,8 +587,10 @@ def delete_chat_data(dc_chat_id: int) -> int:
         cursor.execute("DELETE FROM config WHERE key = ?", (f"alert_mode:{dc_chat_id}",))
         for kind in ("partial", "full", "app", "app_notices_after"):
             cursor.execute("DELETE FROM config WHERE key = ?", (f"report_{kind}:{dc_chat_id}",))
-        for key in ("webxdc_app_version", "webxdc_reposted_at", "webxdc_updates", "webxdc_chat_name", "webxdc_pin_pending"):
+        for key in ("webxdc_app_version", "webxdc_reposted_at", "webxdc_updates", "webxdc_chat_name", "webxdc_pin_pending", "webxdc_posted_at", "webxdc_update_count", "webxdc_last_info_event_id", "webxdc_dirty", "webxdc_clean", "webxdc_attempt_revision"):
             cursor.execute("DELETE FROM config WHERE key = ?", (f"{key}:{dc_chat_id}",))
+        cursor.execute("DELETE FROM chat_events WHERE dc_chat_id = ?", (dc_chat_id,))
+        cursor.execute("DELETE FROM config WHERE key LIKE ?", (f"journal:%:{dc_chat_id}:%",))
         return len(ids)
 
 
@@ -1312,6 +1334,14 @@ def cleanup_old_records(retention_days: int = 90) -> dict[str, int]:
 
         cursor.execute("DELETE FROM partial_outages WHERE ended_at IS NOT NULL AND ended_at < ?", (cutoff,))
         cleaned["partial_outages"] = cursor.rowcount
+        cursor.execute("DELETE FROM chat_events WHERE ts < ?", (now - 30 * 86400,))
+        cleaned["chat_events"] = cursor.rowcount
+        cursor.execute("DELETE FROM config WHERE key LIKE 'journal:%' AND CAST(value AS INTEGER) < ? "
+                       "AND NOT EXISTS (SELECT 1 FROM downtime_events de JOIN resources r ON r.id = de.resource_id "
+                       "WHERE de.went_up_at IS NULL AND config.key = 'journal:incident_start:' || r.dc_chat_id || ':' || de.id) "
+                       "AND NOT EXISTS (SELECT 1 FROM partial_outages po JOIN resources r ON r.id = po.resource_id "
+                       "WHERE po.ended_at IS NULL AND config.key = 'journal:partial_start:' || r.dc_chat_id || ':' || po.id)",
+                       (now - 30 * 86400,))
     return cleaned
 
 # Peer management functions
@@ -2208,5 +2238,56 @@ def get_status_app_chats() -> list[int]:
     try:
         return [row[0] for row in conn.execute("SELECT c.dc_chat_id FROM chats c JOIN config cfg "
                 "ON cfg.key = 'report_app:' || c.dc_chat_id WHERE cfg.value IN ('on', 'only') AND c.abandoned_at IS NULL")]
+    finally:
+        conn.close()
+
+
+NOTIFY_EVENT_KINDS = ("incident_start", "incident_end", "partial_start", "partial_end")
+
+
+def touch_chat(dc_chat_id: int):
+    with _writer_transaction() as conn:
+        key = f"webxdc_dirty:{dc_chat_id}"
+        conn.execute("INSERT OR REPLACE INTO config(key, value) VALUES (?, COALESCE((SELECT CAST(value AS INTEGER) FROM config WHERE key = ?), 0) + 1)", (key, key))
+
+
+def add_chat_event(dc_chat_id: int, kind: str, text: str, ts=None, once=None):
+    """Append a journal entry; optional durable identity prevents repeated audit entries."""
+    now = int(time.time()) if ts is None else int(ts)
+    with _writer_transaction() as conn:
+        if once is not None:
+            key = f"journal:{kind}:{dc_chat_id}:{once}"
+            if conn.execute("SELECT 1 FROM config WHERE key = ?", (key,)).fetchone():
+                return None
+            conn.execute("INSERT INTO config(key, value) VALUES (?, ?)", (key, str(now)))
+        return conn.execute("INSERT INTO chat_events(dc_chat_id, ts, kind, text) VALUES (?, ?, ?, ?)",
+                            (dc_chat_id, now, kind, ' '.join(text.split())[:140])).lastrowid
+
+
+def get_recent_chat_events(dc_chat_id: int, limit: int = 20, after_id=None):
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    try:
+        if after_id is not None:
+            # Info needs every unacknowledged outage, even when monitor edits fill the journal view.
+            return [dict(r) for r in conn.execute("SELECT * FROM chat_events WHERE dc_chat_id = ? AND id > ? AND kind IN ('incident_start','incident_end','partial_start','partial_end') ORDER BY id", (dc_chat_id, after_id))]
+        return [dict(r) for r in conn.execute("SELECT * FROM chat_events WHERE dc_chat_id = ? ORDER BY id DESC LIMIT ?", (dc_chat_id, limit))]
+    finally:
+        conn.close()
+
+
+def get_retained_message_ids():
+    conn = _connect()
+    try:
+        return {r[0] for r in conn.execute("SELECT webxdc_msg_id FROM chats WHERE webxdc_msg_id IS NOT NULL UNION SELECT msg_id FROM incidents WHERE status = 'ongoing' AND msg_id IS NOT NULL")}
+    finally:
+        conn.close()
+
+
+def get_partial_journal_rows():
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    try:
+        return [dict(r) for r in conn.execute("SELECT r.*, po.id AS partial_id, po.started_at AS partial_started_at, po.ended_at AS partial_ended_at, po.nodes_down, po.notice_state FROM partial_outages po JOIN resources r ON r.id = po.resource_id WHERE po.ended_at IS NULL OR po.ended_at >= ?", (int(time.time()) - 30 * 86400,))]
     finally:
         conn.close()

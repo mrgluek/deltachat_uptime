@@ -40,6 +40,7 @@ class TestWebxdcStatus(unittest.TestCase):
         self.rpc.send_msg.side_effect = lambda *args: next(self.message_ids)
         self.message_ids = itertools.count(400)
         self.rpc.get_existing_msg_ids.side_effect = lambda acc, ids: ids
+        self.rpc.get_message.return_value = {"state": "OutDelivered"}
         self.rpc.get_basic_chat_info.return_value = {"name": "Test chat"}
         self.rpc.get_webxdc_info.return_value = {"sendUpdateMaxSize": 128000, "sendUpdateInterval": 10000}
         self.client = MagicMock(rpc=self.rpc)
@@ -67,6 +68,14 @@ class TestWebxdcStatus(unittest.TestCase):
 
     def push(self):
         asyncio.run(bot.push_status_apps())
+        # Lifecycle assertions below start after the delivery grace period. The gate
+        # itself is exercised with real post times in test_audit4_fixes.
+        posted = database.get_config("webxdc_line_posted_at:1")
+        now = int(bot.time.time())
+        if database.get_config("webxdc_pin_pending:1") and posted and int(posted) > now - 60:
+            database.set_config("webxdc_line_posted_at:1", str(now - 60))
+            saved = database.get_chat_webxdc(1)
+            bot._pin_status_line(1, self.client, 1, saved["status_line_msg_id"])
 
     def existing(self):
         database.set_chat_webxdc(1, 321)

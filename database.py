@@ -203,6 +203,9 @@ def init_db():
             # Existing outages have unknown delivery history: never repeat their start.
             cursor.execute("ALTER TABLE partial_outages ADD COLUMN notice_state INTEGER DEFAULT -1")
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_partial_outages_resource ON partial_outages(resource_id, ended_at)')
+        for field in ("start_attempts", "start_attempted_at", "end_attempts", "end_attempted_at"):
+            if field not in [r[1] for r in cursor.execute("PRAGMA table_info(partial_outages)")]:
+                cursor.execute(f"ALTER TABLE partial_outages ADD COLUMN {field} INTEGER DEFAULT 0")
 
         # Downtime events for uptime calculations
         cursor.execute('''
@@ -255,6 +258,9 @@ def init_db():
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_incidents_status ON incidents(status)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_incidents_chat_status ON incidents(dc_chat_id, status)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_incidents_resolved ON incidents(resolved_at)')
+        for field in ("message_attempts", "message_attempted_at"):
+            if field not in [r[1] for r in cursor.execute("PRAGMA table_info(incidents)")]:
+                cursor.execute(f"ALTER TABLE incidents ADD COLUMN {field} INTEGER DEFAULT 0")
 
         # Resources indexes for high-frequency queries
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_resources_chat_status ON resources(dc_chat_id, status)')
@@ -323,6 +329,17 @@ def init_db():
         ''')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_peer_measurements_url ON peer_measurements(url)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_peer_meas_checked ON peer_measurements(last_checked)')
+        meas_columns = [r[1] for r in cursor.execute("PRAGMA table_info(peer_measurements)")]
+        if "received_at" not in meas_columns:
+            cursor.execute("ALTER TABLE peer_measurements ADD COLUMN received_at INTEGER")
+            cursor.execute("UPDATE peer_measurements SET received_at = MIN(COALESCE(last_checked, ?), ?)",
+                           (int(time.time()), int(time.time())))
+        if "source_peer" not in meas_columns:
+            cursor.execute("ALTER TABLE peer_measurements ADD COLUMN source_peer TEXT")
+            cursor.execute("UPDATE peer_measurements SET source_peer = COALESCE("
+                           "(SELECT COALESCE(fingerprint, email) FROM peers WHERE peers.node_name = peer_measurements.node_name), node_name)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_peer_meas_received ON peer_measurements(received_at)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_peer_meas_source ON peer_measurements(source_peer, received_at)")
 
         # Remote probe targets mirrored from peer bots
         cursor.execute('''
@@ -607,7 +624,7 @@ def delete_chat_data(dc_chat_id: int) -> int:
         cursor.execute("DELETE FROM config WHERE key = ?", (f"alert_mode:{dc_chat_id}",))
         for kind in ("partial", "full", "app", "app_notices_after"):
             cursor.execute("DELETE FROM config WHERE key = ?", (f"report_{kind}:{dc_chat_id}",))
-        for key in ("webxdc_app_version", "webxdc_reposted_at", "webxdc_updates", "webxdc_chat_name", "webxdc_pin_pending", "webxdc_posted_at", "webxdc_update_count", "webxdc_last_info_event_id", "webxdc_dirty", "webxdc_clean", "webxdc_attempt_revision", "webxdc_unpin", "webxdc_line_reposted_at", "webxdc_line_post_attempt", "webxdc_full_state_hash", "webxdc_cap_warning_at"):
+        for key in ("webxdc_app_version", "webxdc_reposted_at", "webxdc_updates", "webxdc_chat_name", "webxdc_pin_pending", "webxdc_posted_at", "webxdc_update_count", "webxdc_last_info_event_id", "webxdc_dirty", "webxdc_clean", "webxdc_attempt_revision", "webxdc_unpin", "webxdc_line_reposted_at", "webxdc_line_post_attempt", "webxdc_line_posted_at", "webxdc_full_state_hash", "webxdc_cap_warning_at"):
             cursor.execute("DELETE FROM config WHERE key = ?", (f"{key}:{dc_chat_id}",))
         cursor.execute("DELETE FROM chat_events WHERE dc_chat_id = ?", (dc_chat_id,))
         cursor.execute("DELETE FROM config WHERE key LIKE ?", (f"journal:%:{dc_chat_id}:%",))
@@ -985,7 +1002,7 @@ def update_incident_msg_id(incident_id: int, msg_id: int | None):
             WHERE id = ?
         ''', (msg_id, incident_id))
 
-def resolve_incident(incident_id: int, resolved_at: int = None, summary: str = ""):
+def resolve_incident(incident_id: int, resolved_at: int = None, summary: str = "") -> bool:
     if resolved_at is None:
         resolved_at = int(time.time())
     with _writer_transaction() as conn:
@@ -993,8 +1010,10 @@ def resolve_incident(incident_id: int, resolved_at: int = None, summary: str = "
         cursor.execute('''
             UPDATE incidents 
             SET status = 'resolved', resolved_at = ?, summary = ? 
-            WHERE id = ?
+            WHERE id = ? AND status = 'ongoing'
+              AND NOT EXISTS (SELECT 1 FROM downtime_events WHERE incident_id = incidents.id AND went_up_at IS NULL)
         ''', (resolved_at, summary, incident_id))
+        return cursor.rowcount == 1
 
 def get_recent_incidents(dc_chat_id: int, limit: int = 10) -> list[dict]:
     conn = _connect()
@@ -1349,8 +1368,10 @@ def cleanup_old_records(retention_days: int = 90) -> dict[str, int]:
         
         # 3. Prune old peer measurements (older than 7 days)
         meas_cutoff = now - (7 * 86400)
-        cursor.execute("DELETE FROM peer_measurements WHERE last_checked < ?", (meas_cutoff,))
+        cursor.execute("DELETE FROM peer_measurements WHERE received_at < ?", (meas_cutoff,))
         cleaned["peer_measurements"] = cursor.rowcount
+        cursor.execute("DELETE FROM probe_targets WHERE last_seen < ?", (meas_cutoff,))
+        cleaned["probe_targets"] = cursor.rowcount
 
         cursor.execute("DELETE FROM partial_outages WHERE ended_at IS NOT NULL AND ended_at < ?", (cutoff,))
         cleaned["partial_outages"] = cursor.rowcount
@@ -1390,6 +1411,10 @@ def add_or_update_peer(email: str, node_name: str = None, chat_id: int = None, l
         cursor = conn.cursor()
         cursor.execute("SELECT node_name, chat_id, last_seen FROM peers WHERE email = ?", (email,))
         row = cursor.fetchone()
+        if node_name is not None:
+            node_name = str(node_name).strip()[:64]
+            if not node_name or _peer_name_taken(cursor, email, node_name):
+                node_name = None
         
         now = int(time.time())
         if row:
@@ -1402,8 +1427,14 @@ def add_or_update_peer(email: str, node_name: str = None, chat_id: int = None, l
                 "UPDATE peers SET node_name = ?, chat_id = ?, last_seen = ?, fingerprint = COALESCE(fingerprint, ?) WHERE email = ?",
                 (new_node, new_chat, new_seen, fingerprint, email)
             )
+            if fingerprint:
+                stored_fp = cursor.execute("SELECT fingerprint FROM peers WHERE email = ?", (email,)).fetchone()[0]
+                cursor.execute("UPDATE peer_measurements SET source_peer = ? WHERE source_peer = ?", (stored_fp, email))
+                _prune_peer_measurements(cursor, stored_fp)
         else:
             n_name = node_name or "Remote-Node"
+            while _peer_name_taken(cursor, email, n_name):
+                n_name = "Remote-" + secrets.token_hex(8)
             c_id = chat_id
             s_time = last_seen or now
             cursor.execute(
@@ -1489,6 +1520,8 @@ def bind_peer_identity(email: str, fingerprint: str = None, new_email: str = Non
             return None
         if fingerprint and not row["fingerprint"]:
             cursor.execute("UPDATE peers SET fingerprint = ? WHERE email = ?", (fingerprint, email))
+            cursor.execute("UPDATE peer_measurements SET source_peer = ? WHERE source_peer = ?", (fingerprint, email))
+            _prune_peer_measurements(cursor, fingerprint)
         if chat_id is not None and row["chat_id"] != chat_id:
             cursor.execute("UPDATE peers SET chat_id = ? WHERE email = ?", (chat_id, email))
         own_fp = row["fingerprint"] or fingerprint
@@ -1502,6 +1535,9 @@ def bind_peer_identity(email: str, fingerprint: str = None, new_email: str = Non
                     cursor.execute("DELETE FROM probe_targets WHERE source_peer = ?", (new_email,))
                 cursor.execute("UPDATE peers SET email = ? WHERE email = ?", (new_email, email))
                 cursor.execute("UPDATE probe_targets SET source_peer = ? WHERE source_peer = ?", (new_email, email))
+                if not own_fp:
+                    cursor.execute("UPDATE peer_measurements SET source_peer = ? WHERE source_peer = ?", (new_email, email))
+                    _prune_peer_measurements(cursor, new_email)
                 email = new_email
         updated = cursor.execute("SELECT * FROM peers WHERE email = ?", (email,)).fetchone()
         return dict(updated) if updated else None
@@ -1630,24 +1666,52 @@ def set_peer_share_scope(scope: str):
     set_config("peer_share_scope", scope)
 
 # Peer measurements (remote probe telemetry)
-def save_peer_measurement(url: str, node_name: str, status: str, latency_ms: int | None = None, error_msg: str = None, last_checked: int = None):
-    now = last_checked if last_checked is not None else int(time.time())
+def save_peer_measurement(url: str, node_name: str, status: str, latency_ms: int | None = None, error_msg: str = None, last_checked: int = None, source_peer: str = None):
+    now = int(time.time())
     with _writer_transaction() as conn:
-        _upsert_peer_measurement(conn.cursor(), url, node_name, status, latency_ms, error_msg, now)
+        cursor = conn.cursor()
+        source = _measurement_source(cursor, node_name, source_peer)
+        _upsert_peer_measurement(cursor, url, node_name, status, latency_ms, error_msg,
+                                 _clamp_measurement_time(last_checked, now), now, source)
+        _prune_peer_measurements(cursor, source)
 
 
-def _upsert_peer_measurement(cursor, url, node_name, status, latency_ms, error_msg, now):
+def _clamp_measurement_time(claimed, now):
+    try:
+        return min(now + 60, max(now - 7 * 86400, int(claimed))) if claimed is not None else now
+    except (ValueError, TypeError, OverflowError):
+        return now
+
+
+def _measurement_source(cursor, node_name, source_peer=None):
+    if source_peer:
+        return source_peer
+    row = cursor.execute("SELECT COALESCE(fingerprint, email) FROM peers WHERE node_name = ?", (node_name,)).fetchone()
+    return row[0] if row else node_name
+
+
+def _prune_peer_measurements(cursor, source):
+    cursor.execute("DELETE FROM peer_measurements WHERE rowid IN ("
+                   "SELECT rowid FROM peer_measurements WHERE source_peer = ? "
+                   "ORDER BY received_at DESC, rowid DESC LIMIT -1 OFFSET 1000)", (source,))
+
+
+def _upsert_peer_measurement(cursor, url, node_name, status, latency_ms, error_msg, now, received_at=None, source_peer=None):
+    received_at = int(time.time()) if received_at is None else received_at
+    source_peer = _measurement_source(cursor, node_name, source_peer)
     cursor.execute('''
-        INSERT INTO peer_measurements (url, node_name, status, latency_ms, error_msg, last_checked)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO peer_measurements (url, node_name, status, latency_ms, error_msg, last_checked, received_at, source_peer)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(url, node_name) DO UPDATE SET
             status = excluded.status,
             latency_ms = excluded.latency_ms,
             error_msg = excluded.error_msg,
-            last_checked = excluded.last_checked
-    ''', (url, node_name, status, latency_ms, error_msg, now))
+            last_checked = excluded.last_checked,
+            received_at = excluded.received_at,
+            source_peer = excluded.source_peer
+    ''', (url, node_name, status, latency_ms, error_msg, now, received_at, source_peer))
 
-def save_peer_measurements_batch(node_name: str, metrics_list: list[dict]):
+def save_peer_measurements_batch(node_name: str, metrics_list: list[dict], source_peer: str = None):
     if not metrics_list:
         return
     clean_node = (node_name or "Remote-Node").strip()[:64]
@@ -1676,11 +1740,7 @@ def save_peer_measurements_batch(node_name: str, metrics_list: list[dict]):
                 latency_ms = None
         err = item.get("error_msg")
         error_msg = str(err)[:500] if err else None
-        ts = item.get("last_checked")
-        try:
-            checked_ts = int(ts) if ts is not None else now
-        except (ValueError, TypeError):
-            checked_ts = now
+        checked_ts = _clamp_measurement_time(item.get("last_checked"), now)
         rows.append((url, clean_node, status, latency_ms, error_msg, checked_ts))
 
     if not rows:
@@ -1688,15 +1748,10 @@ def save_peer_measurements_batch(node_name: str, metrics_list: list[dict]):
 
     with _writer_transaction() as conn:
         cursor = conn.cursor()
-        cursor.executemany('''
-            INSERT INTO peer_measurements (url, node_name, status, latency_ms, error_msg, last_checked)
-            VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(url, node_name) DO UPDATE SET
-                status = excluded.status,
-                latency_ms = excluded.latency_ms,
-                error_msg = excluded.error_msg,
-                last_checked = excluded.last_checked
-        ''', rows)
+        source = _measurement_source(cursor, clean_node, source_peer)
+        for row in rows:
+            _upsert_peer_measurement(cursor, *row, now, source)
+        _prune_peer_measurements(cursor, source)
 
 def get_held_reports(newer_than: float) -> list[tuple]:
     """(url, node, until_ts, streak) of the holds that ended after newer_than; older rows are dropped."""
@@ -2068,8 +2123,17 @@ def claim_incident_message(incident_id: int) -> bool:
     """Claim before RPC; an interrupted send is dropped rather than repeated on restart."""
     with _writer_transaction() as conn:
         return conn.execute(
-            "UPDATE incidents SET message_claimed = 1 WHERE id = ? AND message_claimed = 0 AND msg_id IS NULL AND status = 'ongoing'",
-            (incident_id,)).rowcount == 1
+            "UPDATE incidents SET message_claimed = 1, message_attempts = message_attempts + 1, message_attempted_at = ? "
+            "WHERE id = ? AND message_claimed = 0 AND msg_id IS NULL AND status = 'ongoing' "
+            "AND message_attempts < 3 AND (message_attempts = 0 OR message_attempted_at <= ?)",
+            (int(time.time()), incident_id, int(time.time()) - 300)).rowcount == 1
+
+
+def release_rejected_incident_message(incident_id: int):
+    """Only a definite core rejection permits retry; exhausted claims stay consumed."""
+    with _writer_transaction() as conn:
+        conn.execute("UPDATE incidents SET message_claimed = 0 WHERE id = ? AND msg_id IS NULL "
+                     "AND message_claimed = 1 AND message_attempts < 3", (incident_id,))
 
 
 def get_pending_partial_notices() -> list[dict]:
@@ -2093,10 +2157,21 @@ def claim_partial_notice(partial_id: int, start: bool) -> bool:
     Claims survive crashes; neither an uncertain start nor an uncertain end is retried.
     """
     with _writer_transaction() as conn:
+        prefix = "start" if start else "end"
         return conn.execute(
-            "UPDATE partial_outages SET notice_state = ? WHERE id = ? AND notice_state = ? "
+            f"UPDATE partial_outages SET notice_state = ?, {prefix}_attempts = {prefix}_attempts + 1, {prefix}_attempted_at = ? "
+            f"WHERE id = ? AND notice_state = ? AND {prefix}_attempts < 3 "
+            f"AND ({prefix}_attempts = 0 OR {prefix}_attempted_at <= ?) "
             + ("AND ended_at IS NULL" if start else "AND ended_at IS NOT NULL"),
-            (1 if start else 3, partial_id, 0 if start else 2)).rowcount == 1
+            (1 if start else 3, int(time.time()), partial_id, 0 if start else 2, int(time.time()) - 300)).rowcount == 1
+
+
+def release_rejected_partial_notice(partial_id: int, start: bool):
+    prefix = "start" if start else "end"
+    with _writer_transaction() as conn:
+        conn.execute(f"UPDATE partial_outages SET notice_state = ? WHERE id = ? AND notice_state = ? "
+                     f"AND {prefix}_attempts < 3",
+                     (0 if start else 2, partial_id, 1 if start else 3))
 
 
 def mark_partial_notice_sent(partial_id: int):
@@ -2199,12 +2274,19 @@ def rename_measurement_node(old_name: str, new_name: str):
         conn.execute("UPDATE OR IGNORE peer_measurements SET node_name = ? WHERE node_name = ?", (new_name, old_name))
         conn.execute("DELETE FROM peer_measurements WHERE node_name = ?", (old_name,))
 
+def _peer_name_taken(cursor, email, name):
+    own = cursor.execute("SELECT value FROM config WHERE key = 'node_name'").fetchone()
+    taken = {((own[0] if own else None) or os.getenv("NODE_NAME", "Node-1")).casefold()}
+    taken.update((r[0] or "").casefold() for r in cursor.execute("SELECT node_name FROM peers WHERE email != ?", (email,)))
+    return name.casefold() in taken
+
+
 def rename_peer_node(email: str, new_name: str) -> bool:
     """Sets a peer's node name and moves its cached measurements to it."""
     email = email.lower().strip()
     with _writer_transaction() as conn:
         row = conn.execute("SELECT node_name FROM peers WHERE email = ?", (email,)).fetchone()
-        if not row:
+        if not row or _peer_name_taken(conn.cursor(), email, new_name):
             return False
         old_name = row[0]
         conn.execute("UPDATE peers SET node_name = ? WHERE email = ?", (new_name, email))

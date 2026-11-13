@@ -25,7 +25,7 @@ from monitor_names import short_monitor_name
 import aiohttp
 import aiohttp.abc
 from aiohttp import web
-from deltachat2 import events, MsgData
+from deltachat2 import events, MsgData, JsonRpcError, MessageState
 from deltabot_cli import BotCli
 
 try:
@@ -66,7 +66,7 @@ from outbox import outbox as dc_outbox, PRIO_ALERT, PRIO_REPLY, PRIO_UPDATE, PRI
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "2.34.2"
+VERSION = "2.35.0"
 SYNC_MAX_BYTES = 64 * 1024
 
 _SECRET_QUERY_NAMES = {"token", "key", "secret", "password", "pass", "pwd", "auth", "sig",
@@ -208,6 +208,101 @@ def current_telemetry_interval() -> int:
     return _telemetry_interval_now
 PEER_ANSWER_TTL = 20.0  # an answer to a peer's cross-check is dropped if the outbox could not send it by then
 PEER_BATCH_CHECK_CONCURRENCY = 20
+
+
+class InboundProbeAdmission:
+    """Reserve bounded work before creating tasks; shared by single and batch requests."""
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.slots = threading.BoundedSemaphore(PEER_BATCH_CHECK_CONCURRENCY)
+        self.outstanding = collections.Counter()
+        self.rates = {}
+        self.seen = collections.OrderedDict()
+        self.warned = {}
+
+    def acquire(self, peer, req_id, slots=1):
+        identity = peer.get("fingerprint") or peer["email"].lower()
+        now = time.monotonic()
+        with self.lock:
+            while self.seen and next(iter(self.seen.values())) <= now - 600:
+                self.seen.popitem(last=False)
+            for key in list(self.rates):
+                times = self.rates[key]
+                while times and times[0] <= now - 60:
+                    times.popleft()
+                if not times and not self.outstanding[key]:
+                    del self.rates[key]
+            self.warned = {key: ts for key, ts in self.warned.items() if ts > now - 600}
+            times = self.rates.get(identity, ())
+            valid = isinstance(req_id, str) and 0 < len(req_id) <= 64
+            rejected = (not valid or (identity, req_id) in self.seen or len(self.seen) >= 10000
+                        or self.outstanding[identity] + slots > 10 or len(times) >= 120)
+            reserved = 0
+            if not rejected:
+                for _ in range(slots):
+                    if not self.slots.acquire(blocking=False):
+                        rejected = True
+                        break
+                    reserved += 1
+            if rejected:
+                for _ in range(reserved):
+                    self.slots.release()
+                if identity not in self.warned:
+                    self.warned[identity] = now
+                    logger.warning("Dropping excess or duplicate probe requests from peer %s", identity)
+                return None
+            self.outstanding[identity] += slots
+            self.rates.setdefault(identity, collections.deque()).append(now)
+            self.seen[identity, req_id] = now
+            return identity, slots
+
+    def release(self, reservation):
+        identity, slots = reservation
+        with self.lock:
+            self.outstanding[identity] -= slots
+            if not self.outstanding[identity]:
+                del self.outstanding[identity]
+            for _ in range(slots):
+                self.slots.release()
+
+
+_inbound_probes = InboundProbeAdmission()
+
+
+def _submit_inbound_probe(peer, req_id, make_coro, slots=1):
+    reservation = _inbound_probes.acquire(peer, req_id, slots)
+    if reservation is None:
+        return False
+    admission = _inbound_probes
+    started = False
+
+    async def run():
+        nonlocal started
+        started = True
+        try:
+            await make_coro()
+        finally:
+            admission.release(reservation)
+
+    coro = run()
+    try:
+        if async_event_loop and async_event_loop.is_running():
+            asyncio.run_coroutine_threadsafe(coro, async_event_loop)
+        else:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                asyncio.run(coro)
+            else:
+                loop.create_task(coro)
+    except Exception:
+        coro.close()
+        if not started:
+            admission.release(reservation)
+        raise
+    return True
+
+
 _peer_caps = {}  # peer email (lower) -> set of capabilities it announced (in memory, re-sent every 2 min)
 _cross_check_queue = []  # (target_dict, future, reporting node or None) waiting for the next batch
 # A vote asks a sample of the most stable peers, not all: every peer asked is two mails, and a
@@ -239,7 +334,6 @@ def stat_last_hour(name: str, now: float = None) -> int:
     return len(q)
 _cross_check_flush_task = None
 pending_batch_checks = {}  # req_id -> (Future, chat_id, number of targets)
-_peer_batch_semaphore = None
 
 # Quorum alerting (/alertmode quorum, the default): this node and its live peers vote on whether a
 # failing target is reachable. Most nodes cannot reach it -> DOWN (incident). Some can't -> DEGRADED:
@@ -764,7 +858,7 @@ async def request_peer_cross_checks(target_dict: dict, timeout: float = 8.0, pee
     return responses + ignored_responses
 
 def _cross_check_key(t: dict) -> tuple:
-    return (t.get("type") or "http", t.get("url"), t.get("expected_keyword") or "", t.get("family") or 0)
+    return (t.get("type") or "http", t.get("url"), (t.get("expected_keyword") or "").strip(), t.get("family") or 0)
 
 
 def _peer_supports(peer: dict, cap: str) -> bool:
@@ -1006,7 +1100,8 @@ async def _batch_cross_check_peer(peer: dict, items: list, results: dict) -> Non
         results[key].append(answer)
         answered.append(answer)
     if answered:
-        await run_db(database.save_peer_measurements_batch, answered[0]["node_name"], answered)
+        await run_db(database.save_peer_measurements_batch, answered[0]["node_name"], answered,
+                     peer.get("fingerprint") or peer["email"])
 
 
 def _clean_peer_result(item, node_name: str, url: str) -> dict:
@@ -1023,11 +1118,8 @@ def _clean_peer_result(item, node_name: str, url: str) -> dict:
             "error_msg": str(error_msg)[:500] if error_msg else None, "node_name": node_name}
 
 
-async def _answer_batch_cross_check(bot, accid, chat_id: int, req_id: str, targets: list) -> None:
-    """Runs the checks a peer asked for (PEER_BATCH_CHECK_CONCURRENCY at a time) and answers once."""
-    global _peer_batch_semaphore
-    if _peer_batch_semaphore is None:
-        _peer_batch_semaphore = asyncio.Semaphore(PEER_BATCH_CHECK_CONCURRENCY)
+async def _answer_batch_cross_check(bot, accid, chat_id: int, req_id: str, targets: list, concurrency=1) -> None:
+    """Run only the workers reserved at admission, with no task per waiting target."""
 
     async def one(t):
         if t is None:
@@ -1035,14 +1127,21 @@ async def _answer_batch_cross_check(bot, accid, chat_id: int, req_id: str, targe
         if await asyncio.to_thread(database.is_probe_target_ignored, t["url"]):
             # /probeignore: e.g. blocked in this node's region. Abstain instead of voting "down".
             return {"status": "skip", "latency_ms": None, "error_msg": "Ignored on this node (/probeignore)"}
-        async with _peer_batch_semaphore:
-            is_up, error_msg, latency_ms = await run_single_check(t)
+        is_up, error_msg, latency_ms = await run_single_check(t)
         is_up = for_peers(is_up, error_msg)
         return {"status": check_status(is_up), "latency_ms": latency_ms, "error_msg": error_msg}
 
-    answers = await asyncio.gather(*[one(t) for t in targets], return_exceptions=True)
-    answers = [a if isinstance(a, dict) else {"status": "unknown", "latency_ms": None, "error_msg": str(a)[:200]}
-               for a in answers]
+    answers = [None] * len(targets)
+    waiting = iter(enumerate(targets))
+
+    async def worker():
+        for index, target in waiting:
+            try:
+                answers[index] = await one(target)
+            except Exception as exc:
+                answers[index] = {"status": "unknown", "latency_ms": None, "error_msg": str(exc)[:200]}
+
+    await asyncio.gather(*(worker() for _ in range(min(concurrency, len(targets)))))
     payload = {"req_id": req_id, "node_name": database.get_local_node_name(), "caps": OWN_PEER_CAPS, "results": answers}
     resp_msg = f"[UPTIME_PEER_CHECK_BATCH_RESP]\n{json.dumps(payload)}\n[/UPTIME_PEER_CHECK_BATCH_RESP]"
     # The requester waits CROSS_CHECK_BATCH_TIMEOUT from sending; a later answer is ignored there
@@ -3058,6 +3157,9 @@ def note_peer_reported_down(peer_node: str, metrics: list[dict]) -> int:
         if not u or database.is_node_target_ignored(peer_node, u):
             continue
         checked = m.get("last_checked")
+        received = m.get("received_at")
+        if isinstance(received, (int, float)) and now - received > PEER_SUSPECT_MAX_AGE:
+            continue
         if isinstance(checked, (int, float)) and not isinstance(checked, bool) and now - checked > PEER_SUSPECT_MAX_AGE:
             continue  # an old result (e.g. late in a >200 target rotation) is not evidence
         down_urls.add(u)
@@ -3320,7 +3422,12 @@ def _deliver_degraded_notices(chat_id: int):
             if start:
                 claimed_starts.append(r["partial_id"])
     if keep:
-        msg_id = dc_bot_instance.rpc.send_msg(dc_accid, chat_id, MsgData(text=format_degraded_notice(keep)))
+        try:
+            msg_id = dc_bot_instance.rpc.send_msg(dc_accid, chat_id, MsgData(text=format_degraded_notice(keep)))
+        except JsonRpcError:
+            for kind, r, _, _ in keep:
+                database.release_rejected_partial_notice(r["partial_id"], kind == "start")
+            raise
         stat_event("mail_out")
         for partial_id in claimed_starts:
             database.mark_partial_notice_sent(partial_id)
@@ -3393,6 +3500,13 @@ async def check_network_probe(target, semaphore, session=None):
 
 
 async def check_group_task(group, semaphore, session=None):
+    groups = collections.defaultdict(list)
+    for resource in group:
+        groups[_cross_check_key(resource)].append(resource)
+    if len(groups) > 1:
+        for same_assertion in groups.values():
+            await check_group_task(same_assertion, semaphore, session=session)
+        return
     rep = group[0]
     if rep.get("is_probe_only"):
         res = await check_network_probe(rep, semaphore, session=session)
@@ -3723,7 +3837,12 @@ def _deliver_incident_message(inc_id: int, dc_chat_id: int, msg_text: str, resol
         except Exception as e:
             logger.warning(f"Failed to edit Incident message {msg_id} (sending new message): {e}")
     # A first send was claimed above; edits retain the existing replacement fallback.
-    new_msg_id = dc_bot_instance.rpc.send_msg(dc_accid, dc_chat_id, MsgData(text=msg_text))
+    try:
+        new_msg_id = dc_bot_instance.rpc.send_msg(dc_accid, dc_chat_id, MsgData(text=msg_text))
+    except JsonRpcError:
+        if not msg_id:
+            database.release_rejected_incident_message(inc_id)
+        raise
     if isinstance(new_msg_id, int) and not resolved:
         database.update_incident_msg_id(inc_id, new_msg_id)
         current = database.get_incident_by_id(dc_chat_id, inc_id)
@@ -3774,6 +3893,7 @@ async def sync_chat_incident_state(dc_chat_id: int, force_update: bool = False):
         if not active_incidents:
             return
 
+        reloaded = set()
         for inc in active_incidents:
             inc_id = inc["id"]
             events = await asyncio.to_thread(database.get_incident_downtime_events, inc_id)
@@ -3859,7 +3979,17 @@ async def sync_chat_incident_state(dc_chat_id: int, force_update: bool = False):
                 else:
                     summary_str = f"All {total_chat_monitors} monitors operational" if total_chat_monitors > 0 else "All monitored resources removed or operational"
                 
-                await asyncio.to_thread(database.resolve_incident, inc_id, now, summary_str)
+                if not await asyncio.to_thread(database.resolve_incident, inc_id, now, summary_str):
+                    # A new failure may have linked after the recovery snapshot. Reload once,
+                    # then let the next audit retry if failures keep changing underneath us.
+                    current = await run_db(database.get_incident_by_id, dc_chat_id, inc_id)
+                    if current and current["status"] == "ongoing" and inc_id not in reloaded:
+                        resources = await run_db(database.get_resources, dc_chat_id)
+                        active_res_map = {r["id"]: r for r in resources}
+                        total_chat_monitors = len(resources)
+                        reloaded.add(inc_id)
+                        active_incidents.append(current)
+                    continue
                 
                 msg_text = format_incident_message(
                     inc_id,
@@ -4110,7 +4240,7 @@ async def monitoring_scheduler_loop():
                 resources = cache["resources"]
                 probe_targets = cache["probe_targets"]
                 
-                # Group due resources by (type, url)
+                # Group only identical effective assertions; peers use the same identity.
                 due_groups = collections.defaultdict(list)
                 seen_urls = set()
                 async with running_lock:
@@ -4134,7 +4264,7 @@ async def monitoring_scheduler_loop():
                         
                         if is_due:
                             running_resource_ids.add(r_id)
-                            target_key = (r["type"], r["url"])
+                            target_key = _cross_check_key(r)
                             due_groups[target_key].append(r)
                             seen_urls.add(r["url"])
                         else:
@@ -4163,7 +4293,7 @@ async def monitoring_scheduler_loop():
                                 "status": pt.get("last_status") or "unknown",
                                 "is_probe_only": True
                             }
-                            due_groups[(probe_rep["type"], pt_url)].append(probe_rep)
+                            due_groups[_cross_check_key(probe_rep)].append(probe_rep)
                 
                 tasks = []
                 for target_key, group in due_groups.items():
@@ -5663,6 +5793,19 @@ def _pin_status_line(chat_id, bot, accid, msg_id):
         saved = database.get_chat_webxdc(chat_id)
         if database.get_chat_report_app(chat_id) == "off" or saved["status_line_msg_id"] != msg_id:
             return
+        posted = database.get_config(f"webxdc_line_posted_at:{chat_id}")
+        if not posted:
+            database.set_config(f"webxdc_line_posted_at:{chat_id}", str(int(time.time())))
+            return
+        if time.time() - int(posted) < 60:
+            return
+        message = bot.rpc.get_message(accid, msg_id)
+        state = message.get("state") if isinstance(message, dict) else message.state
+        # JSON-RPC uses the core's enum spelling, e.g. "OutDelivered".
+        delivered = (state >= MessageState.OUT_DELIVERED if isinstance(state, int) and not isinstance(state, bool)
+                     else state in ("OutDelivered", "OutMdnRcvd"))
+        if not delivered:
+            return
         bot.rpc.set_pinned_message_state(accid, msg_id, True)
         stat_event("mail_out")
         database.set_config(f"webxdc_pin_pending:{chat_id}", "")
@@ -5689,6 +5832,7 @@ def _post_status_line(chat_id, bot, accid, text):
     msg_id = bot.rpc.send_msg(accid, chat_id, MsgData(text=text))
     stat_event("mail_out")
     database.set_chat_status_line(chat_id, msg_id, _status_line_hash(text))
+    database.set_config(f"webxdc_line_posted_at:{chat_id}", str(int(time.time())))
     database.set_config(f"webxdc_line_post_attempt:{chat_id}", "")
     database.set_config(f"webxdc_pin_pending:{chat_id}", str(msg_id))
     dc_outbox.submit(lambda: _pin_status_line(chat_id, bot, accid, msg_id), priority=PRIO_UPDATE,
@@ -8198,6 +8342,7 @@ def on_new_message(bot, accid, event):
                 fp = _get_peer_fingerprint(bot, accid, msg.from_id, sender_addr) if getattr(msg, "show_padlock", False) else None
                 database.add_or_update_peer(sender_addr, peer_node, msg.chat_id, int(time.time()), fingerprint=fp)
                 peer = database.get_peer(sender_addr)
+                peer_node = peer["node_name"]
                 if async_event_loop and async_event_loop.is_running():
                     asyncio.run_coroutine_threadsafe(send_admin_notification(
                         f"🔗 **New Monitoring Peer Linked**\n"
@@ -8205,7 +8350,8 @@ def on_new_message(bot, accid, event):
                         f"Linked using a `/invitepeer` token. Remove it with `/rmpeer {sender_addr}`."
                     ), async_event_loop)
             else:
-                database.add_or_update_peer(peer["email"], peer_node, msg.chat_id, int(time.time()))
+                peer = _note_peer_announcement(peer, hello_data)
+                database.add_or_update_peer(peer["email"], chat_id=msg.chat_id, last_seen=int(time.time()))
             _record_peer_activity(peer["email"] if peer else sender_addr)
             note_peer_version(peer["email"] if peer else sender_addr, hello_data.get("version"))
 
@@ -8234,7 +8380,8 @@ def on_new_message(bot, accid, event):
             if not peer or not is_private_chat:
                 logger.warning(f"Ignoring peer HELLO_ACK from unknown sender {sender_addr or msg.from_id}")
                 return
-            database.add_or_update_peer(peer["email"], peer_node, msg.chat_id, int(time.time()))
+            peer = _note_peer_announcement(peer, ack_data)
+            database.add_or_update_peer(peer["email"], chat_id=msg.chat_id, last_seen=int(time.time()))
             _record_peer_activity(peer["email"])
             note_peer_version(peer["email"], ack_data.get("version"))
         except Exception as e:
@@ -8257,14 +8404,6 @@ def on_new_message(bot, accid, event):
             if not _is_trusted_peer_msg(msg, peer, is_private_chat):
                 logger.warning(f"Dropping check request from untrusted sender {sender_addr or msg.from_id} in chat {msg.chat_id}")
                 return
-            _record_peer_activity(peer["email"])
-            peer = _note_peer_announcement(peer, req_data)
-
-            # Security: Validate target_url against SSRF (no localhost / private IPs)
-            if not is_safe_target_url(target_url, check_type):
-                logger.warning(redact_url(f"Dropping unsafe cross-check target: {target_url} ({check_type})"))
-                return
-
             if req_id and target_url:
                 synth_r = {
                     "id": 0,
@@ -8274,6 +8413,10 @@ def on_new_message(bot, accid, event):
                     "family": family,
                 }
                 async def _do_cross_check_reply():
+                    _record_peer_activity(peer["email"])
+                    _note_peer_announcement(peer, req_data)
+                    if not is_safe_target_url(target_url, check_type):
+                        return
                     if await asyncio.to_thread(database.is_probe_target_ignored, target_url):
                         res = (None, "Ignored on this node (/probeignore)", None)  # abstain, see batch answers
                     else:
@@ -8298,14 +8441,7 @@ def on_new_message(bot, accid, event):
                     _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=resp_msg),
                                             priority=PRIO_PEER, expires_in=PEER_ANSWER_TTL, label="cross-check answer")
 
-                if async_event_loop and async_event_loop.is_running():
-                    asyncio.run_coroutine_threadsafe(_do_cross_check_reply(), async_event_loop)
-                else:
-                    try:
-                        loop = asyncio.get_event_loop()
-                        loop.create_task(_do_cross_check_reply())
-                    except Exception:
-                        asyncio.run(_do_cross_check_reply())
+                _submit_inbound_probe(peer, req_id, _do_cross_check_reply)
         except Exception as e:
             logger.error(f"Error processing peer check request: {e}")
         return
@@ -8321,16 +8457,16 @@ def on_new_message(bot, accid, event):
             if not _is_trusted_peer_msg(msg, peer, is_private_chat):
                 logger.warning(f"Dropping batch check request from untrusted sender {sender_addr or msg.from_id} in chat {msg.chat_id}")
                 return
-            _record_peer_activity(peer["email"])
-            peer = _note_peer_announcement(peer, req_data)
             req_id = req_data.get("req_id")
-            targets = _parse_batch_targets(req_data.get("targets"))
-            if req_id and targets:
-                coro = _answer_batch_cross_check(bot, accid, msg.chat_id, str(req_id)[:64], targets)
-                if async_event_loop and async_event_loop.is_running():
-                    asyncio.run_coroutine_threadsafe(coro, async_event_loop)
-                else:
-                    asyncio.run(coro)
+            raw_targets = req_data.get("targets")
+            workers = min(10, max(1, len(raw_targets))) if isinstance(raw_targets, list) else 1
+            async def answer():
+                _record_peer_activity(peer["email"])
+                _note_peer_announcement(peer, req_data)
+                targets = _parse_batch_targets(req_data.get("targets"))
+                if targets:
+                    await _answer_batch_cross_check(bot, accid, msg.chat_id, req_id, targets, workers)
+            _submit_inbound_probe(peer, req_id, answer, workers)
         except Exception as e:
             logger.error(f"Error processing peer batch check request: {e}")
         return
@@ -8405,7 +8541,8 @@ def on_new_message(bot, accid, event):
             error_msg = str(error_msg)[:500] if error_msg else None
 
             if target_url and is_safe_target_url(target_url, target_type(target_url)):
-                database.save_peer_measurement(target_url, node_name, status, latency_ms, error_msg, int(time.time()))
+                database.save_peer_measurement(target_url, node_name, status, latency_ms, error_msg, int(time.time()),
+                                               peer.get("fingerprint") or peer["email"])
 
             resp_list.append({
                 "req_id": req_id,
@@ -8462,11 +8599,13 @@ def on_new_message(bot, accid, event):
             if metrics_list:
                 # Sanitize metrics targets before saving
                 safe_metrics = [
-                    m for m in metrics_list[:200]
+                    dict(m, received_at=int(time.time()),
+                         last_checked=database._clamp_measurement_time(m.get("last_checked"), int(time.time())))
+                    for m in metrics_list[:200]
                     if isinstance(m, dict) and is_safe_target_url(str(m.get("url", "")), str(m.get("type", "http")))
                 ]
                 if safe_metrics:
-                    database.save_peer_measurements_batch(peer_node, safe_metrics)
+                    database.save_peer_measurements_batch(peer_node, safe_metrics, peer.get("fingerprint") or peer["email"])
                     database.save_probe_targets_batch(safe_metrics, peer["email"])
                     _scheduler_cache["probe_targets"] = None
                     note_peer_reported_down(peer_node, safe_metrics)

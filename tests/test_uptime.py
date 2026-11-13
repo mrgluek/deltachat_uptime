@@ -2717,8 +2717,11 @@ class TestUptimeBot(unittest.TestCase):
         conn.close()
 
         # 2. Old and recent peer measurements
-        database.save_peer_measurement("https://peer.org", "Node-A", "up", 50, last_checked=old_ts)
-        database.save_peer_measurement("https://peer.org", "Node-B", "up", 50, last_checked=recent_ts)
+        # Retention follows our receive time, not a peer's claimed check time.
+        with patch("database.time.time", return_value=old_ts):
+            database.save_peer_measurement("https://peer.org", "Node-A", "up", 50, last_checked=old_ts)
+        with patch("database.time.time", return_value=recent_ts):
+            database.save_peer_measurement("https://peer.org", "Node-B", "up", 50, last_checked=recent_ts)
 
         # Run cleanup
         pruned = database.cleanup_old_records(retention_days=90)

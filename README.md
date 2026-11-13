@@ -114,7 +114,7 @@ A plain `/help` sent in a group chat is answered in a private 1:1 chat with the 
 - `/keyword <id|url> [keyword|none]` — Configure or remove expected keyword assertion.
 - `/list` — List monitored resources, status, latency, and SSL expiration in this chat.
 - `/status` — View monthly uptime statistics (online / degraded / offline, alert mode) and get the link to the chat's secure Web Status Page.
-- `/report [all|partial <N|off>|full <N>]` — Configure per-chat outage notification delays; see below.
+- `/report [all|partial <N|off>|full <N>|app off|on|only]` — Configure per-chat outage notices and the status app; see below.
 - `/alertmode [quorum|local]` — How this chat is alerted: `quorum` (default) — DOWN when most nodes cannot reach a target, DEGRADED notice when some cannot; `local` — this node's checks only.
 - `/events` — View recent incidents and active outages for this chat.
 - `/history [id]` — View downtime history for monitors.
@@ -157,6 +157,18 @@ These commands are only executable by the configured administrator.
 Relay selection and failover are handled by the Delta Chat core (2.61+): it keeps sending through the relay that last worked and moves to the next one only if it cannot connect, so the relay used for sending can differ from the account's main address. `/transports` shows which relay that is, the core's send queue, and per relay the incoming status, the last received message and mailbox storage. The former `/setprimary` and `/resilient` commands are deprecated and only reply with this explanation.
 
 ---
+
+### Status app prototype (`/report app`)
+
+The optional webxdc app gives each chat a pinned, mobile-friendly status view inside Delta Chat, with light/dark themes, all monitors and their node results. It is off by default.
+
+- `/report app on` posts and pins the app immediately, then updates it alongside normal chat notices (with the configured report delays).
+- `/report app only` uses the app for outage reporting and suppresses partial/full outage chat notices. Monitoring, incidents and uptime statistics continue. Pending notices from app-only time are dropped when chat notices resume, including still-open outages.
+- `/report app off` stops app updates and leaves the existing app message in place.
+
+`/report`, `/status` and `/help` show the setting or command. Updates carry complete snapshots, are sent only when state changes, wait at least 60 seconds between sends, and are capped at 30 per chat per rolling hour. Each update is mail to all chat members, and new devices replay the history. Large snapshots omit node details while retaining monitor status flags; the app shows when this happens.
+
+The bot retains local messages for seven days and re-posts/pins the app when its local copy expires or is missing, at most once per hour. Pinning does not prevent expiry. A layout version change also creates a fresh app; ordinary bot upgrades only update its state. Peer chats remain trimmed separately. The `webxdc/` assets are bundled into `status.xdc` in the data directory on demand and are included in Docker builds.
 
 ## Deployment
 

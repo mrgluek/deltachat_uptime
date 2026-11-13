@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.32.0] - 2026-11-12
+
+### Added
+- Opt-in pinned webxdc status app: `/report app on|only|off`, full monitor/node snapshots, light/dark themes, debounced updates and a rolling hourly cap. App-only mode suppresses outage chat notices while keeping detection, incidents and statistics active.
+
+### Changed
+- Keep local bot messages for seven days and re-post expired/missing status apps, with an hourly re-post guard. Peer chat trimming remains separate. Pending notices from app-only time are dropped when notices resume.
+
 ## [2.31.0] - 2026-11-12
 
 ### Changed

@@ -99,6 +99,12 @@ def init_db():
             # contact blocked): its monitors are paused, and deleted after a grace period
             cursor.execute("ALTER TABLE chats ADD COLUMN abandoned_at INTEGER")
 
+        chat_columns = {row[1] for row in cursor.execute("PRAGMA table_info(chats)")}
+        for column, kind in (("webxdc_msg_id", "INTEGER"), ("webxdc_state_hash", "TEXT"),
+                             ("webxdc_last_sent_at", "INTEGER")):
+            if column not in chat_columns:
+                cursor.execute(f"ALTER TABLE chats ADD COLUMN {column} {kind}")
+
         # Resources table storing monitored targets per chat
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS resources (
@@ -559,8 +565,10 @@ def delete_chat_data(dc_chat_id: int) -> int:
         cursor.execute("DELETE FROM incidents WHERE dc_chat_id = ?", (dc_chat_id,))
         cursor.execute("DELETE FROM chats WHERE dc_chat_id = ?", (dc_chat_id,))
         cursor.execute("DELETE FROM config WHERE key = ?", (f"alert_mode:{dc_chat_id}",))
-        for kind in ("partial", "full"):
+        for kind in ("partial", "full", "app", "app_notices_after"):
             cursor.execute("DELETE FROM config WHERE key = ?", (f"report_{kind}:{dc_chat_id}",))
+        for key in ("webxdc_app_version", "webxdc_reposted_at", "webxdc_updates", "webxdc_chat_name", "webxdc_pin_pending"):
+            cursor.execute("DELETE FROM config WHERE key = ?", (f"{key}:{dc_chat_id}",))
         return len(ids)
 
 
@@ -2154,3 +2162,51 @@ def rename_peer_node(email: str, new_name: str) -> bool:
             conn.execute("UPDATE OR IGNORE peer_measurements SET node_name = ? WHERE node_name = ?", (new_name, old_name))
             conn.execute("DELETE FROM peer_measurements WHERE node_name = ?", (old_name,))
         return True
+
+
+def get_chat_report_app(dc_chat_id: int) -> str:
+    value = get_config(f"report_app:{dc_chat_id}")
+    return value if value in ("off", "on", "only") else "off"
+
+
+def set_chat_report_app(dc_chat_id: int, mode: str):
+    if mode not in ("off", "on", "only"):
+        raise ValueError("app mode must be off, on or only")
+    get_or_create_chat_token(dc_chat_id)
+    with _writer_transaction() as conn:
+        previous = conn.execute("SELECT value FROM config WHERE key = ?", (f"report_app:{dc_chat_id}",)).fetchone()
+        if previous and previous[0] == "only" and mode != "only":
+            # Drop pending notices from app-only time, including open outages, rather than
+            # flooding the chat when notices resume. Incident/history tracking stays intact.
+            conn.execute("UPDATE partial_outages SET notice_state = 3 WHERE resource_id IN "
+                         "(SELECT id FROM resources WHERE dc_chat_id = ?) AND notice_state IN (0, 2)", (dc_chat_id,))
+            conn.execute("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
+                         (f"report_app_notices_after:{dc_chat_id}", str(int(time.time()))))
+        conn.execute("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)", (f"report_app:{dc_chat_id}", mode))
+
+
+def get_chat_webxdc(dc_chat_id: int) -> dict:
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute("SELECT webxdc_msg_id, webxdc_state_hash, webxdc_last_sent_at FROM chats WHERE dc_chat_id = ?",
+                           (dc_chat_id,)).fetchone()
+        return dict(row) if row else {"webxdc_msg_id": None, "webxdc_state_hash": None, "webxdc_last_sent_at": None}
+    finally:
+        conn.close()
+
+
+def set_chat_webxdc(dc_chat_id: int, msg_id: int, state_hash=None, last_sent_at=None):
+    get_or_create_chat_token(dc_chat_id)
+    with _writer_transaction() as conn:
+        conn.execute("UPDATE chats SET webxdc_msg_id = ?, webxdc_state_hash = ?, webxdc_last_sent_at = ? WHERE dc_chat_id = ?",
+                     (msg_id, state_hash, last_sent_at, dc_chat_id))
+
+
+def get_status_app_chats() -> list[int]:
+    conn = _connect()
+    try:
+        return [row[0] for row in conn.execute("SELECT c.dc_chat_id FROM chats c JOIN config cfg "
+                "ON cfg.key = 'report_app:' || c.dc_chat_id WHERE cfg.value IN ('on', 'only') AND c.abandoned_at IS NULL")]
+    finally:
+        conn.close()

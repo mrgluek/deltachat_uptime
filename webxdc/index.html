@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Uptime Status</title>
+<style>
+:root { color-scheme: light dark; font: 16px system-ui, sans-serif; background: #f4f6f8; color: #17212b; }
+body { max-width: 780px; margin: auto; padding: 16px; }
+h1 { font-size: 1.5rem; margin: 0 0 8px; overflow-wrap: anywhere; }
+#updated, .meta { color: #536171; font-size: .88rem; }
+article { background: white; border: 1px solid #dce2e8; border-radius: 12px; padding: 14px; margin: 12px 0; }
+h2 { font-size: 1.05rem; margin: 0 0 8px; overflow-wrap: anywhere; }
+.nodes { margin: 10px 0 0; padding: 0; list-style: none; }
+li { padding: 4px 0; overflow-wrap: anywhere; }
+#empty { padding: 32px 0; }
+@media (prefers-color-scheme: dark) {
+  :root { background: #141a21; color: #e5edf5; }
+  article { background: #202832; border-color: #384451; }
+  #updated, .meta { color: #afbfce; }
+}
+</style>
+<header><h1 id="chat">Uptime Status</h1><div id="counts"></div><p id="updated"></p></header>
+<p id="empty">Waiting for the first update. The bot will send this chat's monitor status soon.</p>
+<p id="note"></p><main id="monitors"></main>
+<script src="webxdc.js"></script>
+<script>
+"use strict";
+const icons = {up: "🟢", partial: "🟠", degraded: "🟠", down: "🔴", paused: "⏸️"};
+const order = {down: 0, partial: 1, up: 2, paused: 3};
+const date = ts => ts ? new Date(ts * 1000).toLocaleString() : "unknown";
+function element(tag, text, className) {
+  const el = document.createElement(tag);
+  el.textContent = text;
+  if (className) el.className = className;
+  return el;
+}
+function render(state) {
+  if (!state || !Array.isArray(state.monitors)) return;
+  document.getElementById("empty").hidden = true;
+  document.getElementById("chat").textContent = state.chat || "Uptime Status";
+  const counts = state.counts || {};
+  document.getElementById("counts").textContent = `🟢 ${counts.up || 0} up · 🟠 ${counts.partial || 0} partial · 🔴 ${counts.down || 0} down`;
+  document.getElementById("updated").textContent = `Updated ${date(state.generated_at)}`;
+  document.getElementById("note").textContent = state.details_omitted ? "Node details omitted to fit the update size limit." : "";
+  const list = document.getElementById("monitors");
+  list.replaceChildren();
+  const monitors = [...state.monitors].sort((a,b) => (order[a.status] ?? 4) - (order[b.status] ?? 4) || a.id - b.id);
+  for (const monitor of monitors) {
+    const row = element("article", "");
+    row.append(element("h2", `${icons[monitor.status] || "⚪"} ${monitor.name || monitor.url || "#" + monitor.id}`));
+    const uptime = Number.isFinite(monitor.uptime30) ? monitor.uptime30.toFixed(2) + "%" : "unknown";
+    row.append(element("div", `${monitor.type || ""} · ${monitor.status} since ${date(monitor.since)} · Uptime 30d: ${uptime}`, "meta"));
+    const nodes = element("ul", "", "nodes");
+    for (const node of monitor.nodes || []) {
+      const detail = node.error || (node.latency_ms != null ? `${node.latency_ms} ms` : "");
+      nodes.append(element("li", `${node.node || "Node"} ${icons[node.status] || "⚪"} ${node.status || "unknown"}${detail ? " · " + detail : ""}`));
+    }
+    row.append(nodes);
+    list.append(row);
+  }
+  if (!monitors.length) list.append(element("p", "No monitors in this chat yet."));
+}
+// Core replays history in serial order. Each payload is a complete replacement snapshot.
+if (window.webxdc) webxdc.setUpdateListener(update => render(update.payload), 0);
+</script>
+</html>

@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.34.1] - 2026-11-13
+
+### Fixed
+- Status apps update on significant changes; changing latency, node errors and uptime refresh only alongside another update or after 30 minutes when values changed.
+- Fresh app instances receive their first state even when the rolling hourly cap is full; later updates and status line edits still respect the shared cap.
+- Capped updates and status line edits log a warning at most once per chat per hour and appear in `/stats`.
+
 ## [2.34.0] - 2026-11-13
 
 ### Added

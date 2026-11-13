@@ -590,7 +590,7 @@ def delete_chat_data(dc_chat_id: int) -> int:
         cursor.execute("DELETE FROM config WHERE key = ?", (f"alert_mode:{dc_chat_id}",))
         for kind in ("partial", "full", "app", "app_notices_after"):
             cursor.execute("DELETE FROM config WHERE key = ?", (f"report_{kind}:{dc_chat_id}",))
-        for key in ("webxdc_app_version", "webxdc_reposted_at", "webxdc_updates", "webxdc_chat_name", "webxdc_pin_pending", "webxdc_posted_at", "webxdc_update_count", "webxdc_last_info_event_id", "webxdc_dirty", "webxdc_clean", "webxdc_attempt_revision", "webxdc_unpin", "webxdc_line_reposted_at", "webxdc_line_post_attempt"):
+        for key in ("webxdc_app_version", "webxdc_reposted_at", "webxdc_updates", "webxdc_chat_name", "webxdc_pin_pending", "webxdc_posted_at", "webxdc_update_count", "webxdc_last_info_event_id", "webxdc_dirty", "webxdc_clean", "webxdc_attempt_revision", "webxdc_unpin", "webxdc_line_reposted_at", "webxdc_line_post_attempt", "webxdc_full_state_hash", "webxdc_cap_warning_at"):
             cursor.execute("DELETE FROM config WHERE key = ?", (f"{key}:{dc_chat_id}",))
         cursor.execute("DELETE FROM chat_events WHERE dc_chat_id = ?", (dc_chat_id,))
         cursor.execute("DELETE FROM config WHERE key LIKE ?", (f"journal:%:{dc_chat_id}:%",))

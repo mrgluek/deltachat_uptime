@@ -66,7 +66,8 @@ from outbox import outbox as dc_outbox, PRIO_ALERT, PRIO_REPLY, PRIO_UPDATE, PRI
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "2.34.0"
+VERSION = "2.34.1"
+STATUS_REFRESH_SECONDS = 1800
 WEBXDC_APP_VERSION = 2  # Bump only for layout changes requiring a new app instance.
 # Safety net; explicit trimming preserves app instances and ongoing incident messages.
 DELETE_DEVICE_AFTER = 30 * 86400
@@ -5442,10 +5443,48 @@ def build_status_state(chat_id: int) -> dict:
             "event_serial": journal[0]["id"] if journal else 0, "incidents": incidents, "partial_outages": partials}
 
 
-def status_state_hash(state: dict) -> str:
-    content = {key: value for key, value in state.items() if key != "generated_at"}
-    content["summary"] = status_app_summary(state)
+def _status_content_hash(content: dict) -> str:
     return hashlib.sha256(json.dumps(content, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
+
+
+def status_state_hash(state: dict) -> str:
+    """Hash significant changes without per-check measurements."""
+    content = {key: value for key, value in state.items()
+               if key in ("v", "chat", "counts", "incidents", "partial_outages", "events", "event_serial")
+               or key.endswith("_omitted")}
+    content["summary"] = status_app_summary(state)
+    content["monitors"] = []
+    for monitor in state.get("monitors", []):
+        item = {key: value for key, value in monitor.items()
+                if key in ("id", "name", "url", "type", "status", "since") or key.endswith("_omitted")}
+        item["nodes"] = [{key: node.get(key) for key in ("node", "status")}
+                         for node in monitor.get("nodes", [])]
+        content["monitors"].append(item)
+    return _status_content_hash(content)
+
+
+def status_full_state_hash(state: dict) -> str:
+    # The snapshot timestamp alone must never trigger a refresh.
+    return _status_content_hash({key: value for key, value in state.items() if key != "generated_at"})
+
+
+def status_app_refresh_due(chat_id, saved, state, now):
+    return (saved["webxdc_last_sent_at"] is not None
+            and now - saved["webxdc_last_sent_at"] >= STATUS_REFRESH_SECONDS
+            and database.get_config(f"webxdc_full_state_hash:{chat_id}") != status_full_state_hash(state))
+
+
+def status_app_first_state(chat_id, saved):
+    return (not saved["webxdc_state_hash"]
+            or database.get_config(f"webxdc_update_count:{chat_id}") == "0")
+
+
+def _status_app_capped(chat_id, attempts, now):
+    stat_event("status_app_capped", now)
+    last_warning = database.get_config(f"webxdc_cap_warning_at:{chat_id}")
+    if last_warning is None or now - int(last_warning) >= 3600:
+        database.set_config(f"webxdc_cap_warning_at:{chat_id}", str(now))
+        logger.warning("Status app update capped in chat %s: %s attempts in the last hour", chat_id, attempts)
 
 
 def status_app_events(chat_id, rows=None):
@@ -5621,6 +5660,7 @@ def _update_status_line(chat_id, bot, accid):
     now = int(time.time())
     updates = [ts for ts in json.loads(database.get_config(f"webxdc_updates:{chat_id}") or "[]") if now - ts < 3600]
     if len(updates) >= 30:
+        _status_app_capped(chat_id, len(updates), now)
         return
     database.set_config(f"webxdc_updates:{chat_id}", json.dumps(updates + [now]))
     try:
@@ -5697,18 +5737,24 @@ def _deliver_status_app(chat_id, bot, accid, known_msg_id=None):
         # The webxdc API expresses sendUpdateInterval in milliseconds.
         interval = max(0 if status_app_urgent(chat_id) else 60, field("sendUpdateInterval", 10000) / 1000)
         digest = status_state_hash(state)
+        full_digest = status_full_state_hash(state)
+        refresh_due = status_app_refresh_due(chat_id, saved, state, now)
+        first_state = status_app_first_state(chat_id, saved)
         last_info = int(database.get_config(f"webxdc_last_info_event_id:{chat_id}") or 0)
         info_events = database.get_recent_chat_events(chat_id, after_id=last_info)
         update = _status_update_json(state, limit, status_app_info(info_events))
         line_changed = saved["status_line_hash"] != _status_line_hash(status_line_text(state))
-        if (saved["webxdc_state_hash"] == digest and not line_changed) or (saved["webxdc_last_sent_at"] is not None
+        if (saved["webxdc_state_hash"] == digest and not first_state and not refresh_due and not line_changed) or (saved["webxdc_last_sent_at"] is not None
                 and now - saved["webxdc_last_sent_at"] < interval):
             return
         updates = json.loads(database.get_config(f"webxdc_updates:{chat_id}") or "[]")
         updates = [ts for ts in updates if now - ts < 3600]
-        if len(updates) >= 30 or (updates and now - max(updates) < interval):
+        if len(updates) >= 30 and not first_state:
+            _status_app_capped(chat_id, len(updates), now)
             return
-        if saved["webxdc_state_hash"] == digest:
+        if updates and now - max(updates) < interval:
+            return
+        if saved["webxdc_state_hash"] == digest and not first_state and not refresh_due:
             if line_changed:
                 dc_outbox.submit(lambda: _update_status_line(chat_id, bot, accid), priority=PRIO_UPDATE,
                                  key=("status-line-edit", chat_id), label="edit status line")
@@ -5719,6 +5765,7 @@ def _deliver_status_app(chat_id, bot, accid, known_msg_id=None):
         bot.rpc.send_webxdc_status_update(accid, msg_id, update, status_app_summary(state))
         stat_event("mail_out")
         database.set_chat_webxdc(chat_id, msg_id, digest, now)
+        database.set_config(f"webxdc_full_state_hash:{chat_id}", full_digest)
         count = int(database.get_config(f"webxdc_update_count:{chat_id}") or 0)
         database.set_config(f"webxdc_update_count:{chat_id}", str(count + 1))
         database.set_config(f"webxdc_clean:{chat_id}", revision)
@@ -5766,10 +5813,14 @@ async def push_status_apps():
                     continue
                 state = await run_db(build_status_state, chat_id)
                 if (status_state_hash(state) == saved["webxdc_state_hash"]
+                        and not await run_db(status_app_first_state, chat_id, saved)
+                        and not await run_db(status_app_refresh_due, chat_id, saved, state, now)
                         and saved["status_line_msg_id"] and saved["status_line_hash"] == _status_line_hash(status_line_text(state))):
                     continue
                 updates = json.loads(await run_db(database.get_config, f"webxdc_updates:{chat_id}") or "[]")
-                if sum(now - ts < 3600 for ts in updates) >= 30:
+                attempts = sum(now - ts < 3600 for ts in updates)
+                if attempts >= 30 and not await run_db(status_app_first_state, chat_id, saved):
+                    await run_db(_status_app_capped, chat_id, attempts, now)
                     continue
             queue_status_app(chat_id, dc_bot_instance, dc_accid)
         except Exception as exc:
@@ -7356,6 +7407,7 @@ def build_stats_report(bot, accid) -> str:
         f"• Received {stat_last_hour('mail_in', now)}, sent {stat_last_hour('mail_out', now)}",
         f"• Outbox since start: {ob.get('sent', 0)} sent, {ob.get('failed', 0)} failed, {ob.get('merged', 0)} merged"
         + (f"; waiting now: " + ", ".join(f"{k} {v}" for k, v in waiting.items()) if waiting else "; nothing waiting"),
+        f"• Status app updates/edits capped: {stat_last_hour('status_app_capped', now)} skips in the last hour",
         "",
         "**Peers**",
         f"• {len(peers)} peers, {len(live)} online" + (f", unstable now: {', '.join(unstable)}" if unstable else ""),

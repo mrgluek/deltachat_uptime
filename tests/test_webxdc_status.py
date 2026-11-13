@@ -38,7 +38,7 @@ class TestWebxdcStatus(unittest.TestCase):
         self.rpc = MagicMock()
         self.rpc.send_msg.return_value = 321
         self.rpc.get_existing_msg_ids.side_effect = lambda acc, ids: ids
-        self.rpc.get_chat.return_value = {"name": "Test chat"}
+        self.rpc.get_basic_chat_info.return_value = {"name": "Test chat"}
         self.rpc.get_webxdc_info.return_value = {"sendUpdateMaxSize": 128000, "sendUpdateInterval": 10000}
         self.client = MagicMock(rpc=self.rpc)
         self.patches = [patch.object(bot, "dc_outbox", Outbox()),
@@ -93,7 +93,7 @@ class TestWebxdcStatus(unittest.TestCase):
         self.assertEqual(bot.status_state_hash(state), bot.status_state_hash(later))
         later["monitors"][0]["status"] = "up"
         self.assertNotEqual(bot.status_state_hash(state), bot.status_state_hash(later))
-        self.rpc.get_chat.assert_not_called()  # Snapshot builder is RPC-free.
+        self.rpc.get_basic_chat_info.assert_not_called()  # Snapshot builder is RPC-free.
 
     def test_posts_pins_then_sends_complete_state_and_does_not_repeat(self):
         self.push()
@@ -116,7 +116,7 @@ class TestWebxdcStatus(unittest.TestCase):
         with patch.object(bot, "dc_outbox", ob), patch("bot.time.time", return_value=10060):
             self.push()
             self.assertFalse(ob.waiting())
-        self.rpc.get_chat.return_value = {"name": "Renamed chat"}
+        self.rpc.get_basic_chat_info.return_value = {"name": "Renamed chat"}
         with patch("bot.time.time", return_value=10060):
             self.push()
         self.assertEqual(self.rpc.send_webxdc_status_update.call_count, 2)
@@ -162,7 +162,7 @@ class TestWebxdcStatus(unittest.TestCase):
         self.existing()
         self.push()
         self.rpc.send_msg.assert_not_called()
-        with patch.object(bot, "VERSION", "2.32.1"):
+        with patch.object(bot, "VERSION", "99.0.0"):
             self.push()
         self.rpc.send_msg.assert_not_called()
         with patch.object(bot, "WEBXDC_APP_VERSION", 2):
@@ -323,7 +323,7 @@ class TestWebxdcStatus(unittest.TestCase):
         self.assertEqual(bot.build_status_xdc(), str(path))
         self.assertEqual(path.stat().st_mtime_ns, modified)
         signature = path.with_suffix(".xdc.sha256").read_text()
-        with patch.object(bot, "VERSION", "2.32.1"):
+        with patch.object(bot, "VERSION", "99.0.0"):
             bot.build_status_xdc()
         self.assertNotEqual(path.with_suffix(".xdc.sha256").read_text(), signature)
 

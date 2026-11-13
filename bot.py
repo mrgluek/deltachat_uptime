@@ -65,7 +65,7 @@ from outbox import outbox as dc_outbox, PRIO_ALERT, PRIO_REPLY, PRIO_UPDATE, PRI
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "2.32.0"
+VERSION = "2.32.1"
 WEBXDC_APP_VERSION = 1  # Bump only for layout changes requiring a new app instance.
 # One day until Stage 3b (own trimming of user chats with exemptions for the status app and ongoing
 # incidents); then 30 days as a safety net. The status app is re-posted when its local message expires.
@@ -4723,7 +4723,7 @@ async def handle_status_page(request):
     chat_name = "Chat Monitor"
     if dc_bot_instance and dc_accid is not None:
         try:
-            chat = await run_rpc(dc_bot_instance.rpc.get_chat, dc_accid, chat_id)
+            chat = await run_rpc(dc_bot_instance.rpc.get_basic_chat_info, dc_accid, chat_id)
             chat_name = chat.name
         except Exception:
             pass
@@ -5391,7 +5391,7 @@ def _deliver_status_app(chat_id, bot, accid, known_msg_id=None):
             dc_outbox.submit(lambda: _pin_status_app(chat_id, bot, accid, msg_id), priority=PRIO_UPDATE,
                              key=("status-app-pin", chat_id), label="pin status app")
             return
-        chat = bot.rpc.get_chat(accid, chat_id)
+        chat = bot.rpc.get_basic_chat_info(accid, chat_id)
         name = chat.get("name") if isinstance(chat, dict) else chat.name
         database.set_config(f"webxdc_chat_name:{chat_id}", str(name))
         state = build_status_state(chat_id)
@@ -5451,7 +5451,7 @@ async def push_status_apps():
                 if last_post is not None and now - int(last_post) < 3600:
                     continue
             elif not await run_db(database.get_config, f"webxdc_pin_pending:{chat_id}"):
-                chat = await run_rpc(dc_bot_instance.rpc.get_chat, dc_accid, chat_id)
+                chat = await run_rpc(dc_bot_instance.rpc.get_basic_chat_info, dc_accid, chat_id)
                 name = str(chat.get("name") if isinstance(chat, dict) else chat.name)
                 if name != await run_db(database.get_config, f"webxdc_chat_name:{chat_id}"):
                     await run_db(database.set_config, f"webxdc_chat_name:{chat_id}", name)

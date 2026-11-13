@@ -1,5 +1,7 @@
 import asyncio
 import collections
+import functools
+import ipaddress
 import contextlib
 import io
 import logging
@@ -66,8 +68,14 @@ from outbox import outbox as dc_outbox, PRIO_ALERT, PRIO_REPLY, PRIO_UPDATE, PRI
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "2.35.0"
+VERSION = "2.36.0"
 SYNC_MAX_BYTES = 64 * 1024
+# 200 metrics / 100 cross-checks, including JSON's twelve-byte astral Unicode escaping at field limits.
+PEER_MAX_BYTES = 8 * 1024 * 1024
+DNS_DEADLINE = 5.0
+TITLE_DEADLINE = 5.0
+HTTP_REQUEST_TIMEOUT = 10.0
+HTTP_TOTAL_DEADLINE = min(45.0, 3 * HTTP_REQUEST_TIMEOUT)
 
 _SECRET_QUERY_NAMES = {"token", "key", "secret", "password", "pass", "pwd", "auth", "sig",
                        "signature", "api_key", "apikey", "access_token", "code"}
@@ -100,32 +108,129 @@ USER_AGENT = f"Delta Chat Uptime Monitor/{VERSION} (+https://git.gluek.info/glue
 db_executor = concurrent.futures.ThreadPoolExecutor(max_workers=10, thread_name_prefix="uptime_db")
 rpc_executor = concurrent.futures.ThreadPoolExecutor(max_workers=10, thread_name_prefix="uptime_rpc")
 
-# Sliding-window rate limiter per client IP and bucket
-_rate_limits: dict[str, list[float]] = {}
+# All external resolvers run in a fixed pool with bounded admission (including queued work).
+dns_executor = concurrent.futures.ThreadPoolExecutor(max_workers=8, thread_name_prefix="uptime_dns")
+_dns_slots = threading.BoundedSemaphore(16)
+title_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="uptime_title")
+_title_slots = threading.BoundedSemaphore(4)
+
+
+def _submit_bounded(executor, slots, func, *args):
+    if not slots.acquire(blocking=False):
+        raise TimeoutError("Worker capacity reached")
+    try:
+        future = executor.submit(func, *args)
+    except BaseException:
+        slots.release()
+        raise
+    future.add_done_callback(lambda _: slots.release())
+    return future
+
+
+async def _await_worker(future):
+    # Cancelling queued ThreadPoolExecutor futures leaves queue tombstones. Keep their admission
+    # slots until a worker actually completes them, so repeated deadlines cannot grow that queue.
+    wrapped = asyncio.wrap_future(future)
+    wrapped.add_done_callback(lambda done: done.exception() if not done.cancelled() else None)
+    return await asyncio.shield(wrapped)
+
+
+TRUSTED_PROXIES = tuple(ipaddress.ip_network(value.strip(), strict=False)
+                        for value in os.getenv("TRUSTED_PROXIES",
+                            "127.0.0.0/8,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16").split(",")
+                        if value.strip())
+RATE_LIMIT_MAX_KEYS = 10000
+_rate_limits = collections.OrderedDict()
 _rate_limit_lock = threading.Lock()
 
+
+def _trusted_proxy(value):
+    try:
+        ip = ipaddress.ip_address(value)
+        if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+            ip = ip.ipv4_mapped
+        return any(ip in net for net in TRUSTED_PROXIES)
+    except ValueError:
+        return False
+
+
 def get_client_ip(request) -> str:
-    """Extract client IP from request, taking into account reverse proxy headers."""
+    """Walk forwarding hops from the trusted socket peer towards the client."""
+    socket_peer = request.remote or "unknown"
+    peer = socket_peer
     forwarded = request.headers.get("X-Forwarded-For")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    return request.remote or "unknown"
+    if not _trusted_proxy(peer) or not isinstance(forwarded, str):
+        return peer
+    for hop in reversed(forwarded.split(",")):
+        hop = hop.strip()
+        try:
+            hop = str(ipaddress.ip_address(hop))
+        except ValueError:
+            return socket_peer  # malformed chains are not client identities
+        peer = hop
+        if not _trusted_proxy(hop):
+            break
+    return peer
+
 
 def check_rate_limit(request, bucket: str = "default", max_requests: int = 60, window_seconds: int = 60) -> bool:
-    """In-memory sliding window rate limiter per client IP and bucket.
-    Returns True if allowed, False if limit exceeded.
-    """
-    client_ip = get_client_ip(request) or "unknown"
-    key = f"{bucket}:{client_ip}"
-    now = time.time()
+    key = f"{bucket}:{get_client_ip(request)}"
+    now = time.monotonic()
     with _rate_limit_lock:
-        timestamps = [t for t in _rate_limits.get(key, []) if now - t < window_seconds]
-        if len(timestamps) >= max_requests:
-            _rate_limits[key] = timestamps
-            return False
-        timestamps.append(now)
-        _rate_limits[key] = timestamps
-        return True
+        # Each entry has its own expiry; remove old keys as well as old timestamps.
+        while _rate_limits:
+            oldest, (expiry, _) = next(iter(_rate_limits.items()))
+            if expiry > now and len(_rate_limits) < RATE_LIMIT_MAX_KEYS:
+                break
+            _rate_limits.pop(oldest)
+        _, timestamps = _rate_limits.pop(key, (0, []))
+        timestamps = [t for t in timestamps if now - t < window_seconds]
+        allowed = len(timestamps) < max_requests
+        if allowed:
+            timestamps.append(now)
+        _rate_limits[key] = (now + window_seconds, timestamps)
+        return allowed
+
+
+COMMANDS_PER_MINUTE = 30
+COMMAND_MAX_KEYS = 10000
+_command_windows = collections.OrderedDict()
+_command_warnings = collections.OrderedDict()
+_command_lock = threading.Lock()
+
+
+def command_budget(handler):
+    @functools.wraps(handler)
+    def guarded(bot, accid, event):
+        msg = event.msg
+        if _is_dc_admin(bot, accid, msg.from_id):
+            return handler(bot, accid, event)
+        now = time.monotonic()
+        key = (accid, msg.chat_id, msg.from_id)
+        chat = (accid, msg.chat_id)
+        with _command_lock:
+            for entries in (_command_windows, _command_warnings):
+                while entries:
+                    first, value = next(iter(entries.items()))
+                    stamp = value[-1] if isinstance(value, collections.deque) else value
+                    if now - stamp < 60 and len(entries) < COMMAND_MAX_KEYS:
+                        break
+                    entries.pop(first)
+            window = _command_windows.pop(key, collections.deque())
+            while window and now - window[0] >= 60:
+                window.popleft()
+            allowed = len(window) < COMMANDS_PER_MINUTE
+            if allowed:
+                window.append(now)
+            _command_windows[key] = window
+            warn = not allowed and now - _command_warnings.get(chat, float("-inf")) >= 60
+            if warn:
+                _command_warnings[chat] = now
+        if allowed:
+            return handler(bot, accid, event)
+        if warn:
+            _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text="Slow down: at most 30 commands per minute per sender in this chat."))
+    return guarded
 
 
 async def run_db(func, *args, **kwargs):
@@ -1149,11 +1254,19 @@ async def _answer_batch_cross_check(bot, accid, chat_id: int, req_id: str, targe
                             priority=PRIO_PEER, expires_in=PEER_ANSWER_TTL, label="batch cross-check answer")
 
 
+def _valid_peer_fields(item):
+    try:
+        database.validate_monitor_fields(url=item.get("url"), name=item.get("name"), keyword=item.get("expected_keyword"))
+        return True
+    except ValueError:
+        return False
+
+
 def _parse_batch_targets(raw) -> list:
     """Requested targets, each validated like a single request; None marks a refused one (keeps positions)."""
     targets = []
     for t in (raw if isinstance(raw, list) else [])[:CROSS_CHECK_BATCH_MAX]:
-        if not isinstance(t, dict):
+        if not isinstance(t, dict) or not _valid_peer_fields(t):
             targets.append(None)
             continue
         url, check_type = str(t.get("url") or ""), str(t.get("type") or "http")
@@ -2054,7 +2167,11 @@ def resolve_host_safe_sync(host: str) -> list[str]:
         return _validated_ips(host, [literal])
     cached = _dns_cache_get(host)
     if cached is None:
-        infos = socket.getaddrinfo(host, None)
+        future = _submit_bounded(dns_executor, _dns_slots, socket.getaddrinfo, host, None)
+        try:
+            infos = future.result(timeout=DNS_DEADLINE)
+        except concurrent.futures.TimeoutError:
+            raise TimeoutError("DNS deadline exceeded")
         cached = _dns_cache_put(host, [info[4][0] for info in infos], DNS_CACHE_DEFAULT_TTL)
     return _validated_ips(host, cached)
 
@@ -2107,7 +2224,7 @@ async def _query_with_ttl(host: str):
     return ips, DNS_CACHE_MIN_TTL if partial else min(ttls)
 
 
-async def resolve_host_safe(host: str) -> list[str]:
+async def _resolve_host_safe(host: str) -> list[str]:
     """Resolves a hostname for an outgoing probe connection.
 
     Uses the cached answer while its TTL is valid, otherwise queries DNS (aiodns, which reports the TTL)
@@ -2126,11 +2243,16 @@ async def resolve_host_safe(host: str) -> list[str]:
             except Exception as e:
                 logger.debug(f"aiodns lookup failed for {host} ({e}), using system resolver")
         if not ips:
-            loop = asyncio.get_running_loop()
-            infos = await loop.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+            future = _submit_bounded(dns_executor, _dns_slots, socket.getaddrinfo, host, None)
+            infos = await _await_worker(future)
             ips = [info[4][0] for info in infos]
         cached = _dns_cache_put(host, ips, ttl)
     return _validated_ips(host, cached)
+
+
+async def resolve_host_safe(host: str) -> list[str]:
+    async with asyncio.timeout(DNS_DEADLINE):
+        return await _resolve_host_safe(host)
 
 
 class SafeResolver(aiohttp.abc.AbstractResolver):
@@ -2180,7 +2302,7 @@ def _no_ipv6_note(url: str, check_type: str) -> str:
     return ""
 
 
-def is_safe_target_url(url: str, check_type: str = "http") -> bool:
+def is_safe_target_url(url: str, check_type: str = "http", *, resolve_dns: bool = True) -> bool:
     """Validates target format and blocks dangerous internal/private/metadata IP addresses (SSRF prevention)."""
     try:
         expected_type, validated = parse_target(url)
@@ -2212,6 +2334,9 @@ def is_safe_target_url(url: str, check_type: str = "http") -> bool:
             return True
         except ValueError:
             pass
+
+        if not resolve_dns:
+            return True
 
         # DNS resolution check through the shared pinning cache (the connection reuses this answer)
         try:
@@ -2498,8 +2623,10 @@ async def _prewarm_target_dns(url: str, check_type: str) -> bool:
             await resolve_host_safe(host)
     except BlockedAddressError:
         return False
+    except asyncio.TimeoutError:
+        raise
     except Exception:
-        pass  # unresolvable/invalid: is_safe_target_url decides
+        pass  # unresolved names fail at the pinned connection boundary
     return True
 
 async def _open_pinned_connection(host: str, port: int, family: int | None = None, **kwargs):
@@ -2601,10 +2728,14 @@ async def smtp_tls_handshake(url: str, family: int | None = None) -> dict:
         return cert
     finally:
         writer.close()
-        try:
-            await writer.wait_closed()
-        except Exception:
-            pass
+        if asyncio.current_task().cancelling():
+            # A TLS close handshake must not extend an already expired probe deadline.
+            writer.transport.abort()
+        else:
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
 
 def _cert_expiry_ts(cert: dict) -> int | None:
@@ -2635,7 +2766,7 @@ async def _safe_http_request(sess, method: str, url: str, **kwargs):
                 yield resp
                 return
             next_url = urljoin(str(resp.url) if getattr(resp, "url", None) else current_url, location)
-            if not await _prewarm_target_dns(next_url, "http") or not is_safe_target_url(next_url, "http"):
+            if not await _prewarm_target_dns(next_url, "http") or not is_safe_target_url(next_url, "http", resolve_dns=False):
                 raise aiohttp.ClientError(f"Redirect to blocked address: {next_url[:200]}")
             if resp.status == 303 and method.upper() != "HEAD":
                 method = "GET"
@@ -2643,14 +2774,24 @@ async def _safe_http_request(sess, method: str, url: str, **kwargs):
     raise aiohttp.ClientError("Too many redirects")
 
 async def run_single_check(resource, session=None) -> tuple[bool, str, int | None]:
+    # A single monotonic deadline includes DNS, all redirects, fallback, reads and cleanup.
+    started = time.monotonic()
+    try:
+        async with asyncio.timeout(HTTP_TOTAL_DEADLINE):
+            return await _run_single_check(resource, session)
+    except asyncio.TimeoutError:
+        return False, "Timeout", int((time.monotonic() - started) * 1000)
+
+
+async def _run_single_check(resource, session=None):
     import http
     rtype = resource["type"]
     url = resource["url"]
-    timeout = 10
+    timeout = HTTP_REQUEST_TIMEOUT
     # 4 / 6 = only that address family (/ping -4 / -6); None = any, IPv4 first
     family = resource.get("family") if resource.get("family") in (4, 6) else None
 
-    if not await _prewarm_target_dns(url, rtype) or not is_safe_target_url(url, rtype):
+    if not await _prewarm_target_dns(url, rtype) or not is_safe_target_url(url, rtype, resolve_dns=False):
         return False, BLOCKED_TARGET_MSG, None
 
     start_time = time.time()
@@ -5004,6 +5145,14 @@ def get_dashboard_html(chat_name, resources, overall_uptime, incidents=None, upt
 </html>
 """
 
+DASHBOARD_CONCURRENCY = 4
+DASHBOARD_CACHE_SECONDS = 15
+DASHBOARD_CACHE_MAX_KEYS = 1000
+_dashboard_slots = threading.BoundedSemaphore(DASHBOARD_CONCURRENCY)
+_dashboard_cache = collections.OrderedDict()
+_dashboard_cache_lock = threading.Lock()
+
+
 async def handle_status_page(request):
     headers = {"Cache-Control": "no-store", "Referrer-Policy": "no-referrer",
                "X-Content-Type-Options": "nosniff"}
@@ -5012,34 +5161,52 @@ async def handle_status_page(request):
                             headers={**headers, "Retry-After": "60"})
 
     token = request.match_info.get('token')
-    chat_id = await run_db(database.get_chat_id_by_token, token)
-    if not chat_id:
-        return web.Response(text="Status Page Not Found", status=404, headers=headers)
-        
-    chat_name = "Chat Monitor"
-    if dc_bot_instance and dc_accid is not None:
-        try:
-            chat = await run_rpc(dc_bot_instance.rpc.get_basic_chat_info, dc_accid, chat_id)
-            chat_name = chat.name
-        except Exception:
-            pass
-            
-    resources = await run_db(database.get_resources, chat_id)
-    incidents = await run_db(database.get_recent_incidents, chat_id, 5)
-    
-    # Calculate average uptime using single batch query
-    overall_uptime = 100.0
-    uptimes_map = {}
-    if resources:
-        r_ids = [r["id"] for r in resources]
-        uptimes_map = await run_db(database.get_resources_uptime_30d, r_ids)
-        uptimes = [uptimes_map.get(rid, 100.0) for rid in r_ids]
-        overall_uptime = sum(uptimes) / len(uptimes)
-        
-    partial_outages = await run_db(database.get_chat_partial_outages, chat_id, 10)
-    html_content = get_dashboard_html(chat_name, resources, overall_uptime, incidents, uptimes_map=uptimes_map,
-                                      partial_outages=partial_outages)
-    return web.Response(text=html_content, content_type="text/html", headers=headers)
+    with _dashboard_cache_lock:
+        cached = _dashboard_cache.get(token)
+        if cached and cached[0] > time.monotonic():
+            return web.Response(text=cached[1], content_type="text/html", headers=headers)
+    if not _dashboard_slots.acquire(blocking=False):
+        return web.Response(text="Dashboard busy. Try again shortly.", status=503,
+                            headers={**headers, "Retry-After": "15"})
+    try:
+        chat_id = await run_db(database.get_chat_id_by_token, token)
+        if not chat_id:
+            return web.Response(text="Status Page Not Found", status=404, headers=headers)
+
+        chat_name = "Chat Monitor"
+        if dc_bot_instance and dc_accid is not None:
+            try:
+                chat = await run_rpc(dc_bot_instance.rpc.get_basic_chat_info, dc_accid, chat_id)
+                chat_name = chat.name
+            except Exception:
+                pass
+
+        resources = await run_db(database.get_resources, chat_id)
+        incidents = await run_db(database.get_recent_incidents, chat_id, 5)
+
+        # Calculate average uptime using single batch query
+        overall_uptime = 100.0
+        uptimes_map = {}
+        if resources:
+            r_ids = [r["id"] for r in resources]
+            uptimes_map = await run_db(database.get_resources_uptime_30d, r_ids)
+            uptimes = [uptimes_map.get(rid, 100.0) for rid in r_ids]
+            overall_uptime = sum(uptimes) / len(uptimes)
+
+        partial_outages = await run_db(database.get_chat_partial_outages, chat_id, 10)
+        html_content = await run_db(get_dashboard_html, chat_name, resources, overall_uptime, incidents,
+                                    uptimes_map=uptimes_map, partial_outages=partial_outages)
+        with _dashboard_cache_lock:
+            now = time.monotonic()
+            for key, (expires, _) in list(_dashboard_cache.items()):
+                if expires <= now:
+                    del _dashboard_cache[key]
+            while len(_dashboard_cache) >= DASHBOARD_CACHE_MAX_KEYS:
+                _dashboard_cache.popitem(last=False)
+            _dashboard_cache[token] = (now + DASHBOARD_CACHE_SECONDS, html_content)
+        return web.Response(text=html_content, content_type="text/html", headers=headers)
+    finally:
+        _dashboard_slots.release()
 
 async def handle_health(request):
     """For monitors and other nodes: no database, no page, just alive and which version."""
@@ -6064,6 +6231,7 @@ def _get_help_chat_id(bot, accid, msg):
     return bot.rpc.create_chat_by_contact_id(accid, msg.from_id)
 
 @dc_cli.on(events.NewMessage(command="/help"))
+@command_budget
 def help_command(bot, accid, event):
     msg = event.msg
     is_actually_admin = _is_dc_admin(bot, accid, msg.from_id)
@@ -6134,6 +6302,7 @@ def help_command(bot, accid, event):
     _dc_send_msg_with_stats(bot, accid, chat_id, MsgData(text=help_text))
 
 @dc_cli.on(events.NewMessage(command="/donate"))
+@command_budget
 def donate_command(bot, accid, event):
     msg = event.msg
     _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(
@@ -6145,6 +6314,7 @@ def donate_command(bot, accid, event):
     ))
 
 @dc_cli.on(events.NewMessage(command="/initadmin"))
+@command_budget
 def initadmin_command(bot, accid, event):
     msg = event.msg
     if any(database.get_effective_admin()):
@@ -6167,6 +6337,7 @@ def initadmin_command(bot, accid, event):
         ))
 
 @dc_cli.on(events.NewMessage(command="/url"))
+@command_budget
 def url_command(bot, accid, event):
     msg = event.msg
     if not _is_dc_admin(bot, accid, msg.from_id):
@@ -6225,37 +6396,34 @@ def _safe_url_opener():
         urllib.request.ProxyHandler({}), _PinnedHTTPHandler, _PinnedHTTPSHandler, _SafeRedirectHandler
     )
 
-def fetch_html_title(url, timeout=3.0):
-    if not is_safe_target_url(url, "http"):
-        return None
-    import urllib.request
+async def _fetch_html_title(url, timeout=TITLE_DEADLINE):
     try:
-        req = urllib.request.Request(
-            url, 
-            headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)'}
-        )
-        with _safe_url_opener().open(req, timeout=timeout) as response:
-            html_bytes = response.read(16384)
-            charset = 'utf-8'
-            content_type = response.headers.get('Content-Type', '')
-            charset_match = re.search(r'charset=([\w-]+)', content_type, re.IGNORECASE)
-            if charset_match:
-                charset = charset_match.group(1)
-            try:
-                html_text = html_bytes.decode(charset, errors='ignore')
-            except Exception:
-                html_text = html_bytes.decode('utf-8', errors='ignore')
-                
-            match = re.search(r'<title>(.*?)</title>', html_text, re.IGNORECASE | re.DOTALL)
-            if match:
-                title = match.group(1).strip()
-                title = html.unescape(title)
-                title = re.sub(r'\s+', ' ', title)
-                if title:
-                    return title
-    except Exception as e:
-        logger.warning(redact_url(f"Could not fetch title for {url}: {e}"))
+        async with asyncio.timeout(timeout):
+            if not await _prewarm_target_dns(url, "http") or not is_safe_target_url(url, "http", resolve_dns=False):
+                return None
+            async with aiohttp.ClientSession(connector=_make_safe_connector(), headers={"User-Agent": USER_AGENT},
+                                             timeout=aiohttp.ClientTimeout(total=timeout)) as session:
+                async with _safe_http_request(session, "GET", url) as response:
+                    # readexactly waits for EOF or the byte cap; the enclosing timeout defeats slow drip.
+                    try:
+                        data = await response.content.readexactly(16384)
+                    except asyncio.IncompleteReadError as exc:
+                        data = exc.partial
+                    try:
+                        text = data.decode(response.charset or "utf-8", errors="ignore")
+                    except LookupError:
+                        text = data.decode("utf-8", errors="ignore")
+                    match = re.search(r"<title>(.*?)</title>", text, re.IGNORECASE | re.DOTALL)
+                    if match:
+                        return re.sub(r"\s+", " ", html.unescape(match.group(1))).strip()[:database.MAX_NAME_LENGTH] or None
+    except Exception as exc:
+        logger.warning(redact_url(f"Could not fetch title for {url}: {exc}"))
     return None
+
+
+def fetch_html_title(url, timeout=TITLE_DEADLINE):
+    """Synchronous compatibility entry point; /add calls this only in a title worker."""
+    return asyncio.run(_fetch_html_title(url, timeout))
 
 def parse_duration_string(s: str) -> int | None:
     if not s:
@@ -6280,8 +6448,25 @@ PING_COOLDOWN_SECONDS = 15
 @dc_cli.on(events.NewMessage(command="/ping"))
 @dc_cli.on(events.NewMessage(command="/check"))
 @dc_cli.on(events.NewMessage(command="/test"))
+@command_budget
 def ping_command(bot, accid, event):
     msg = event.msg
+    now = time.time()
+    is_admin_user = _is_dc_admin(bot, accid, msg.from_id)
+    if not is_admin_user:
+        last_ping = _chat_ping_anti_spam.get(msg.chat_id, 0.0)
+        if now - last_ping < PING_COOLDOWN_SECONDS:
+            remaining = int(PING_COOLDOWN_SECONDS - (now - last_ping)) + 1
+            _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(
+                text=f"⏳ Please wait {remaining}s before running another diagnostic check."
+            ))
+            return
+        _chat_ping_anti_spam[msg.chat_id] = now
+        if len(_chat_ping_anti_spam) > 1000:
+            expired = [k for k, v in _chat_ping_anti_spam.items() if now - v > 300]
+            for k in expired:
+                _chat_ping_anti_spam.pop(k, None)
+
     payload = (event.payload or "").strip()
     
     try:
@@ -6314,6 +6499,11 @@ def ping_command(bot, accid, event):
         
     target_input = tokens[0]
     keyword = tokens[1] if len(tokens) > 1 else None
+    try:
+        database.validate_monitor_fields(url=target_input, keyword=keyword)
+    except ValueError as exc:
+        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=f"❌ {exc}"))
+        return
 
     try:
         check_type, validated_url = parse_target(target_input)
@@ -6348,22 +6538,6 @@ def ping_command(bot, accid, event):
             text=f"❌ Keyword assertions are only supported for HTTP/HTTPS targets.\nTarget `{validated_url}` is type `{check_type.upper()}`."
         ))
         return
-
-    now = time.time()
-    is_admin_user = _is_dc_admin(bot, accid, msg.from_id)
-    if not is_admin_user:
-        last_ping = _chat_ping_anti_spam.get(msg.chat_id, 0.0)
-        if now - last_ping < PING_COOLDOWN_SECONDS:
-            remaining = int(PING_COOLDOWN_SECONDS - (now - last_ping)) + 1
-            _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(
-                text=f"⏳ Please wait {remaining}s before running another diagnostic check."
-            ))
-            return
-        _chat_ping_anti_spam[msg.chat_id] = now
-        if len(_chat_ping_anti_spam) > 1000:
-            expired = [k for k, v in _chat_ping_anti_spam.items() if now - v > 300]
-            for k in expired:
-                _chat_ping_anti_spam.pop(k, None)
 
     _react(bot, accid, getattr(msg, "id", None), "⏳")
 
@@ -6417,7 +6591,8 @@ def ping_command(bot, accid, event):
             page_title = None
             if check_type == "http" and is_up:
                 try:
-                    page_title = await asyncio.to_thread(fetch_html_title, validated_url)
+                    future = _submit_bounded(title_executor, _title_slots, fetch_html_title, validated_url)
+                    page_title = await _await_worker(future)
                 except Exception:
                     pass
 
@@ -6493,6 +6668,7 @@ def ping_command(bot, accid, event):
             asyncio.run(_do_ping())
 
 @dc_cli.on(events.NewMessage(command="/add"))
+@command_budget
 def add_command(bot, accid, event):
     msg = event.msg
     payload = event.payload.strip()
@@ -6530,44 +6706,58 @@ def add_command(bot, accid, event):
         _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=f"❌ {e}"))
         return
 
+    name = tokens[1] if len(tokens) > 1 else None
+    expected_keyword = tokens[2] if len(tokens) > 2 else None
+    try:
+        database.validate_monitor_fields(url, name, expected_keyword)
+    except ValueError as exc:
+        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=f"❌ {exc}"))
+        return
+
     if not is_safe_target_url(url, check_type):
         _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(
             text="❌ Cannot check internal, local, or private network targets."
         ))
         return
         
-    name = tokens[1] if len(tokens) > 1 else None
-    expected_keyword = tokens[2] if len(tokens) > 2 else None
-    
-    if not name:
-        if check_type == "http":
-            fetched_title = fetch_html_title(url)
-            name = fetched_title if fetched_title else target
-        else:
-            name = target
-        
-    res_id = database.add_resource(msg.chat_id, url, name, check_type, expected_keyword=expected_keyword)
-    if res_id is None:
-        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text="❌ This target is already being monitored in this chat."))
-        return
+    def finish_add(name):
+        try:
+            res_id = database.add_resource(msg.chat_id, url, name, check_type, expected_keyword=expected_keyword)
+        except ValueError as exc:
+            _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=f"❌ {exc}"))
+            return
+        if res_id is None:
+            _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text="❌ This target is already being monitored in this chat."))
+            return
 
-    _scheduler_cache["resources"] = None
-    if async_event_loop and async_event_loop.is_running():
-        asyncio.run_coroutine_threadsafe(broadcast_telemetry_to_peers(), async_event_loop)
-        
-    kw_line = f"\n🔍 Expected Keyword: `{expected_keyword}`" if expected_keyword else ""
-    _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(
-        text=f"✅ Added monitor (ID: `{res_id}`):\n"
-             f"🖥️ Name: **{name}**\n"
-             f"🔗 Target: `{url}`\n"
-             f"⚙️ Type: `{check_type.upper()}`{kw_line}\n"
-             f"🕒 Checking once a minute.{_no_ipv6_note(url, check_type)}"
-    ))
+        _scheduler_cache["resources"] = None
+        if async_event_loop and async_event_loop.is_running():
+            asyncio.run_coroutine_threadsafe(broadcast_telemetry_to_peers(), async_event_loop)
+
+        kw_line = f"\n🔍 Expected Keyword: `{expected_keyword}`" if expected_keyword else ""
+        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(
+            text=f"✅ Added monitor (ID: `{res_id}`):\n"
+                 f"🖥️ Name: **{name}**\n"
+                 f"🔗 Target: `{url}`\n"
+                 f"⚙️ Type: `{check_type.upper()}`{kw_line}\n"
+                 f"🕒 Checking once a minute.{_no_ipv6_note(url, check_type)}"
+        ))
+
+    if not name and check_type == "http":
+        def add_with_title():
+            finish_add(fetch_html_title(url) or target[:database.MAX_NAME_LENGTH])
+        try:
+            _submit_bounded(title_executor, _title_slots, add_with_title)
+        except TimeoutError:
+            finish_add(target[:database.MAX_NAME_LENGTH])
+    else:
+        finish_add(name or target[:database.MAX_NAME_LENGTH])
 
 @dc_cli.on(events.NewMessage(command="/rm"))
 @dc_cli.on(events.NewMessage(command="/del"))
 @dc_cli.on(events.NewMessage(command="/remove"))
 @dc_cli.on(events.NewMessage(command="/delete"))
+@command_budget
 def remove_command(bot, accid, event):
     msg = event.msg
     payload = (event.payload or "").strip()
@@ -6671,6 +6861,7 @@ def remove_command(bot, accid, event):
 @dc_cli.on(events.NewMessage(command="/pause"))
 @dc_cli.on(events.NewMessage(command="/mute"))
 @dc_cli.on(events.NewMessage(command="/maintenance"))
+@command_budget
 def pause_command(bot, accid, event):
     msg = event.msg
     payload = (event.payload or "").strip()
@@ -6772,6 +6963,7 @@ def pause_command(bot, accid, event):
 
 @dc_cli.on(events.NewMessage(command="/resume"))
 @dc_cli.on(events.NewMessage(command="/unpause"))
+@command_budget
 def resume_command(bot, accid, event):
     msg = event.msg
     payload = (event.payload or "").strip()
@@ -6844,6 +7036,7 @@ def resume_command(bot, accid, event):
 @dc_cli.on(events.NewMessage(command="/keyword"))
 @dc_cli.on(events.NewMessage(command="/assert"))
 @dc_cli.on(events.NewMessage(command="/kw"))
+@command_budget
 def keyword_command(bot, accid, event):
     msg = event.msg
     payload = (event.payload or "").strip()
@@ -6865,6 +7058,11 @@ def keyword_command(bot, accid, event):
         
     target_ident = tokens[0]
     keyword = tokens[1] if len(tokens) > 1 else None
+    try:
+        database.validate_monitor_fields(keyword=keyword)
+    except ValueError as exc:
+        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=f"❌ {exc}"))
+        return
     
     target_res = []
     if target_ident.isdigit():
@@ -6917,6 +7115,7 @@ def keyword_command(bot, accid, event):
         ))
 
 @dc_cli.on(events.NewMessage(command="/list"))
+@command_budget
 def list_command(bot, accid, event):
     msg = event.msg
     resources = database.get_resources(msg.chat_id)
@@ -6984,6 +7183,7 @@ def list_command(bot, accid, event):
     _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=reply))
 
 @dc_cli.on(events.NewMessage(command="/alertmode"))
+@command_budget
 def alertmode_command(bot, accid, event):
     """Per-chat alerting: quorum (default) or local. Any chat member may change it, like /pause."""
     msg = event.msg
@@ -7028,6 +7228,7 @@ def report_settings_text(chat_id: int) -> str:
 
 
 @dc_cli.on(events.NewMessage(command="/report"))
+@command_budget
 def report_command(bot, accid, event):
     """Any chat member may configure outage notices and the status app."""
     chat_id = event.msg.chat_id
@@ -7058,6 +7259,7 @@ def report_command(bot, accid, event):
 
 
 @dc_cli.on(events.NewMessage(command="/status"))
+@command_budget
 def status_command(bot, accid, event):
     msg = event.msg
     resources = database.get_resources(msg.chat_id)
@@ -7105,6 +7307,7 @@ def _format_partial_outage_line(po: dict, with_name: bool = False) -> str:
 
 @dc_cli.on(events.NewMessage(command="/events"))
 @dc_cli.on(events.NewMessage(command="/incidents"))
+@command_budget
 def events_command(bot, accid, event):
     msg = event.msg
     chat_id = msg.chat_id
@@ -7151,6 +7354,7 @@ def events_command(bot, accid, event):
     _dc_send_msg_with_stats(bot, accid, chat_id, MsgData(text="\n".join(lines)))
 
 @dc_cli.on(events.NewMessage(command="/history"))
+@command_budget
 def history_command(bot, accid, event):
     msg = event.msg
     chat_id = msg.chat_id
@@ -7228,6 +7432,7 @@ def history_command(bot, accid, event):
     _dc_send_msg_with_stats(bot, accid, chat_id, MsgData(text="\n".join(lines)))
 
 @dc_cli.on(events.NewMessage(command="/sync"))
+@command_budget
 def sync_command(bot, accid, event):
     msg = event.msg
     try:
@@ -7285,6 +7490,7 @@ def sync_command(bot, accid, event):
 
 # Admin-Only Account and Transport Command handlers (Standard across bots)
 @dc_cli.on(events.NewMessage(command="/accounts"))
+@command_budget
 def accounts_command(bot, accid, event):
     msg = event.msg
     if not _is_dc_admin(bot, accid, msg.from_id):
@@ -7302,6 +7508,7 @@ def accounts_command(bot, accid, event):
     _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=reply))
 
 @dc_cli.on(events.NewMessage(command="/rmaccount"))
+@command_budget
 def rmaccount_command(bot, accid, event):
     msg = event.msg
     if not _is_dc_admin(bot, accid, msg.from_id):
@@ -7323,6 +7530,7 @@ def rmaccount_command(bot, accid, event):
         _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text="❌ Failed to delete account. Check server logs for details."))
 
 @dc_cli.on(events.NewMessage(command="/transports"))
+@command_budget
 def transports_command(bot, accid, event):
     msg = event.msg
     if not _is_dc_admin(bot, accid, msg.from_id):
@@ -7340,6 +7548,7 @@ def transports_command(bot, accid, event):
     _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=reply))
 
 @dc_cli.on(events.NewMessage(command="/addtransport"))
+@command_budget
 def addtransport_command(bot, accid, event):
     msg = event.msg
     if not _is_dc_admin(bot, accid, msg.from_id):
@@ -7382,6 +7591,7 @@ def addtransport_command(bot, accid, event):
         _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text="❌ Failed to add transport. Check server logs for details."))
 
 @dc_cli.on(events.NewMessage(command="/rmtransport"))
+@command_budget
 def rmtransport_command(bot, accid, event):
     msg = event.msg
     if not _is_dc_admin(bot, accid, msg.from_id):
@@ -7417,6 +7627,7 @@ RELAY_SELECTION_NOTE = (
 
 
 @dc_cli.on(events.NewMessage(command="/setprimary"))
+@command_budget
 def setprimary_command(bot, accid, event):
     """Deprecated: the core no longer uses configured_addr to pick the SMTP relay."""
     msg = event.msg
@@ -7426,6 +7637,7 @@ def setprimary_command(bot, accid, event):
     _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=f"⚠️ /setprimary is deprecated and disabled. {RELAY_SELECTION_NOTE}"))
 
 @dc_cli.on(events.NewMessage(command="/resilient"))
+@command_budget
 def resilient_command(bot, accid, event):
     """Deprecated: relay failover is handled by the core."""
     msg = event.msg
@@ -7456,6 +7668,7 @@ def _node_display_name() -> str:
 
 
 @dc_cli.on(events.NewMessage(command="/nodename"))
+@command_budget
 def nodename_command(bot, accid, event):
     msg = event.msg
     if not _is_dc_admin(bot, accid, msg.from_id):
@@ -7463,6 +7676,11 @@ def nodename_command(bot, accid, event):
         return
     payload = (event.payload or "").strip()
     if payload:
+        try:
+            database.validate_monitor_fields(name=payload)
+        except ValueError as exc:
+            _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=f"❌ {exc}"))
+            return
         global last_peer_telemetry_broadcast
         old_name = database.get_local_node_name()
         database.set_local_node_name(payload)
@@ -7613,6 +7831,7 @@ def build_stats_report(bot, accid) -> str:
 
 
 @dc_cli.on(events.NewMessage(command="/stats"))
+@command_budget
 def stats_command(bot, accid, event):
     msg = event.msg
     if not _is_dc_admin(bot, accid, msg.from_id):
@@ -7628,6 +7847,7 @@ def stats_command(bot, accid, event):
 
 @dc_cli.on(events.NewMessage(command="/peers"))
 @dc_cli.on(events.NewMessage(command="/probes"))
+@command_budget
 def peers_command(bot, accid, event):
     msg = event.msg
     if not _is_dc_admin(bot, accid, msg.from_id):
@@ -7692,6 +7912,7 @@ def peers_command(bot, accid, event):
 
 @dc_cli.on(events.NewMessage(command="/invitepeer"))
 @dc_cli.on(events.NewMessage(command="/peerinvite"))
+@command_budget
 def invitepeer_command(bot, accid, event):
     msg = event.msg
     if not _is_dc_admin(bot, accid, msg.from_id):
@@ -7766,6 +7987,7 @@ def send_peer_hello_when_ready(bot, accid, chat_id: int, hello_text: str, node_n
 
 
 @dc_cli.on(events.NewMessage(command="/addpeer"))
+@command_budget
 def addpeer_command(bot, accid, event):
     msg = event.msg
     if not _is_dc_admin(bot, accid, msg.from_id):
@@ -7888,6 +8110,7 @@ def addpeer_command(bot, accid, event):
         _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text="❌ Failed to add peer. Check server logs for details."))
 
 @dc_cli.on(events.NewMessage(command="/peershare"))
+@command_budget
 def peershare_command(bot, accid, event):
     msg = event.msg
     if not _is_dc_admin(bot, accid, msg.from_id):
@@ -7913,6 +8136,7 @@ def peershare_command(bot, accid, event):
     ))
 
 @dc_cli.on(events.NewMessage(command="/rmpeer"))
+@command_budget
 def rmpeer_command(bot, accid, event):
     msg = event.msg
     if not _is_dc_admin(bot, accid, msg.from_id):
@@ -7930,6 +8154,7 @@ def rmpeer_command(bot, accid, event):
 
 @dc_cli.on(events.NewMessage(command="/probeignore"))
 @dc_cli.on(events.NewMessage(command="/ignoreprobe"))
+@command_budget
 def probeignore_command(bot, accid, event):
     msg = event.msg
     if not _is_dc_admin(bot, accid, msg.from_id):
@@ -7966,6 +8191,7 @@ def probeignore_command(bot, accid, event):
 
 @dc_cli.on(events.NewMessage(command="/probeunignore"))
 @dc_cli.on(events.NewMessage(command="/unignoreprobe"))
+@command_budget
 def probeunignore_command(bot, accid, event):
     msg = event.msg
     if not _is_dc_admin(bot, accid, msg.from_id):
@@ -7995,6 +8221,7 @@ def probeunignore_command(bot, accid, event):
 
 @dc_cli.on(events.NewMessage(command="/nodeignore"))
 @dc_cli.on(events.NewMessage(command="/ignorenode"))
+@command_budget
 def nodeignore_command(bot, accid, event):
     msg = event.msg
     if not _is_dc_admin(bot, accid, msg.from_id):
@@ -8051,6 +8278,7 @@ def nodeignore_command(bot, accid, event):
 
 @dc_cli.on(events.NewMessage(command="/nodeunignore"))
 @dc_cli.on(events.NewMessage(command="/unignorenode"))
+@command_budget
 def nodeunignore_command(bot, accid, event):
     msg = event.msg
     if not _is_dc_admin(bot, accid, msg.from_id):
@@ -8250,6 +8478,10 @@ def on_new_message(bot, accid, event):
     if msg.from_id == 1:
         return
 
+    if "[UPTIME_PEER_" in text and (len(text) > PEER_MAX_BYTES or len(text.encode("utf-8")) > PEER_MAX_BYTES):
+        logger.warning("Peer protocol payload exceeds byte limit; ignoring")
+        return
+
     if "[UPTIME_BOT_SYNC_DATA]" in text and "[/UPTIME_BOT_SYNC_DATA]" in text:
         try:
             start_idx = text.find("[UPTIME_BOT_SYNC_DATA]") + len("[UPTIME_BOT_SYNC_DATA]")
@@ -8273,6 +8505,7 @@ def on_new_message(bot, accid, event):
             
             added_count = 0
             added_resources = []
+            refused = set()
             for item in sync_list:
                 if not isinstance(item, dict):
                     continue
@@ -8291,17 +8524,21 @@ def on_new_message(bot, accid, event):
                 if url and check_type in ("http", "ping", "tcp", "smtp"):
                     # Security: validate URL format and expected type
                     try:
+                        keyword = item.get("expected_keyword")
+                        database.validate_monitor_fields(url, name, keyword)
                         expected_type, validated_url = parse_target(url)
                         if expected_type == check_type:
-                            res_id = database.add_resource(msg.chat_id, validated_url, name or validated_url, check_type, interval)
+                            res_id = database.add_resource(msg.chat_id, validated_url, name or validated_url[:database.MAX_NAME_LENGTH], check_type, interval, expected_keyword=keyword)
                             if res_id is not None:
                                 added_count += 1
                                 logger.info("[SYNC RECEIVE] Added resource id=%s", res_id)
                                 added_resources.append(f"• `{validated_url}` ({name or validated_url}) [{check_type.upper()}]")
-                    except ValueError:
-                        # Skip invalid URL
+                    except ValueError as exc:
+                        refused.add(str(exc))
                         continue
             
+            if refused:
+                _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text="Sync refused additions: " + " ".join(sorted(refused))))
             if added_count > 0:
                 reply = f"📥 **Sync Complete!**\nAdded {added_count} new resource(s) from the other bot:\n" + "\n".join(added_resources)
                 _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=reply))
@@ -8404,7 +8641,7 @@ def on_new_message(bot, accid, event):
             if not _is_trusted_peer_msg(msg, peer, is_private_chat):
                 logger.warning(f"Dropping check request from untrusted sender {sender_addr or msg.from_id} in chat {msg.chat_id}")
                 return
-            if req_id and target_url:
+            if req_id and target_url and _valid_peer_fields(req_data):
                 synth_r = {
                     "id": 0,
                     "url": target_url,
@@ -8415,7 +8652,7 @@ def on_new_message(bot, accid, event):
                 async def _do_cross_check_reply():
                     _record_peer_activity(peer["email"])
                     _note_peer_announcement(peer, req_data)
-                    if not is_safe_target_url(target_url, check_type):
+                    if not await _prewarm_target_dns(target_url, check_type) or not is_safe_target_url(target_url, check_type, resolve_dns=False):
                         return
                     if await asyncio.to_thread(database.is_probe_target_ignored, target_url):
                         res = (None, "Ignored on this node (/probeignore)", None)  # abstain, see batch answers
@@ -8463,7 +8700,7 @@ def on_new_message(bot, accid, event):
             async def answer():
                 _record_peer_activity(peer["email"])
                 _note_peer_announcement(peer, req_data)
-                targets = _parse_batch_targets(req_data.get("targets"))
+                targets = await run_db(_parse_batch_targets, req_data.get("targets"))
                 if targets:
                     await _answer_batch_cross_check(bot, accid, msg.chat_id, req_id, targets, workers)
             _submit_inbound_probe(peer, req_id, answer, workers)
@@ -8540,7 +8777,7 @@ def on_new_message(bot, accid, event):
                 latency_ms = None
             error_msg = str(error_msg)[:500] if error_msg else None
 
-            if target_url and is_safe_target_url(target_url, target_type(target_url)):
+            if target_url and _valid_peer_fields(resp_data) and is_safe_target_url(target_url, target_type(target_url)):
                 database.save_peer_measurement(target_url, node_name, status, latency_ms, error_msg, int(time.time()),
                                                peer.get("fingerprint") or peer["email"])
 
@@ -8602,7 +8839,7 @@ def on_new_message(bot, accid, event):
                     dict(m, received_at=int(time.time()),
                          last_checked=database._clamp_measurement_time(m.get("last_checked"), int(time.time())))
                     for m in metrics_list[:200]
-                    if isinstance(m, dict) and is_safe_target_url(str(m.get("url", "")), str(m.get("type", "http")))
+                    if isinstance(m, dict) and _valid_peer_fields(m) and is_safe_target_url(str(m.get("url", "")), str(m.get("type", "http")))
                 ]
                 if safe_metrics:
                     database.save_peer_measurements_batch(peer_node, safe_metrics, peer.get("fingerprint") or peer["email"])

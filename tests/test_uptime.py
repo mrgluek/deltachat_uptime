@@ -87,6 +87,8 @@ class TestUptimeBot(unittest.TestCase):
         database.DB_PATH = TEST_DB
         database.init_db()
         bot._chat_ping_anti_spam.clear()
+        bot._command_windows.clear()
+        bot._command_warnings.clear()
         database._transport_stats_buffer.clear()
         # Unit tests mock the network; give probe connections a public address without real DNS
         bot._dns_cache.clear()
@@ -2498,12 +2500,15 @@ class TestUptimeBot(unittest.TestCase):
         args, _ = mock_bot.rpc.send_msg.call_args
         self.assertIn("Usage: `/ping [-4|-6] <target> [\"keyword\"]`", args[2].text)
 
+        # Each validation case starts outside the cooldown, which is checked before validation.
+        bot._chat_ping_anti_spam.clear()
         # 2. SSRF blocked target
         mock_event.payload = "http://127.0.0.1:8080"
         bot.ping_command(mock_bot, 1, mock_event)
         args, _ = mock_bot.rpc.send_msg.call_args
         self.assertIn("Cannot check internal, local, or private network targets", args[2].text)
 
+        bot._chat_ping_anti_spam.clear()
         # 3. Non-HTTP target with keyword
         mock_event.payload = '1.1.1.1 "welcome"'
         bot.ping_command(mock_bot, 1, mock_event)
@@ -3009,22 +3014,17 @@ class TestUptimeBot(unittest.TestCase):
         self.assertEqual(read_args, [131072])  # Max 128 KB read
 
     def test_fetch_html_title_16kb_limit(self):
-        """fetch_html_title must read at most 16384 bytes."""
-        read_args = []
-        class MockHttpResponse:
-            headers = {"Content-Type": "text/html"}
-            def __enter__(self):
-                return self
-            def __exit__(self, *args):
-                pass
-            def read(self, n=None):
-                read_args.append(n)
-                return b"<html><head><title>My 16KB Site</title></head><body>Content</body></html>"
-
-        with patch('urllib.request.OpenerDirector.open', return_value=MockHttpResponse()):
+        """The async title fetch reads at most 16384 bytes, including short bodies."""
+        response = MagicMock()
+        response.charset = "utf-8"
+        response.content.readexactly = AsyncMock(side_effect=asyncio.IncompleteReadError(
+            b"<title>My 16KB Site</title>", 16384))
+        request = MagicMock()
+        request.__aenter__ = AsyncMock(return_value=response)
+        with patch('bot._safe_http_request', return_value=request):
             title = bot.fetch_html_title("https://title-test.org")
-            self.assertEqual(title, "My 16KB Site")
-            self.assertEqual(read_args, [16384])
+        self.assertEqual(title, "My 16KB Site")
+        response.content.readexactly.assert_awaited_once_with(16384)
 
     def test_run_single_check_ping_with_aioping(self):
         """Native ICMP ping via aioping returns latency directly without spawning subprocess."""

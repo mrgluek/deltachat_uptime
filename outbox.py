@@ -29,6 +29,7 @@ logger = logging.getLogger("uptime_bot")
 
 RATE_PER_MINUTE = 50
 BURST = 5
+MAX_PENDING = 2000
 
 PRIO_ALERT = 0      # new / resolved incidents, status changes, SSL, stale, DEGRADED, admin alerts
 PRIO_REPLY = 1      # command replies and reactions
@@ -51,7 +52,9 @@ class _Job:
 
 
 class Outbox:
-    def __init__(self, rate_per_minute: float = RATE_PER_MINUTE, burst: int = BURST, clock=time.monotonic):
+    def __init__(self, rate_per_minute: float = RATE_PER_MINUTE, burst: int = BURST, clock=time.monotonic, max_pending: int = MAX_PENDING):
+        self.max_pending = max(1, max_pending)
+        self._last_drop_warning = float("-inf")
         self.rate = rate_per_minute / 60.0
         self.burst = burst
         self.clock = clock
@@ -62,7 +65,7 @@ class Outbox:
         self._seq = itertools.count()
         self._cond = threading.Condition()
         self._thread = None
-        self.stats = {"sent": 0, "merged": 0, "expired": 0, "failed": 0}
+        self.stats = {"sent": 0, "merged": 0, "expired": 0, "failed": 0, "dropped": 0}
 
     # ---- submitting ----------------------------------------------------------
 
@@ -89,6 +92,30 @@ class Outbox:
                     self._push(job)
                 return old.future
             job = _Job(priority, next(self._seq), fn, key, expires_at, label)
+            # Compact tombstones and expire waiting items before enforcing the hard capacity.
+            self._heap = [entry for entry in self._heap if not entry[2].done]
+            for _, _, pending in self._heap:
+                if pending.expires_at is not None and now >= pending.expires_at:
+                    self._finish(pending)
+                    pending.future.set_result(None)
+                    self.stats["expired"] += 1
+            self._heap = [entry for entry in self._heap if not entry[2].done]
+            heapq.heapify(self._heap)
+            if len(self._heap) >= self.max_pending:
+                # Replies go first, then refreshes/telemetry; protect alerts and protocol traffic.
+                rank = {PRIO_REPLY: 4, PRIO_TELEMETRY: 3, PRIO_UPDATE: 2, PRIO_PEER: 1, PRIO_ALERT: 0}
+                victim = max([entry[2] for entry in self._heap] + [job],
+                             key=lambda j: (rank.get(j.priority, 4), -j.seq))
+                self._finish(victim)
+                victim.future.set_result(None)
+                self.stats["dropped"] += 1
+                if now - self._last_drop_warning >= 60:
+                    self._last_drop_warning = now
+                    logger.warning("Outbox capacity reached (%s); dropped %s item(s)", self.max_pending, self.stats["dropped"])
+                if victim is job:
+                    return job.future
+                self._heap = [entry for entry in self._heap if not entry[2].done]
+                heapq.heapify(self._heap)
             self._push(job)
             return job.future
 

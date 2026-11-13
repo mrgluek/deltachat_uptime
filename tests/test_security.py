@@ -238,7 +238,7 @@ class TestDnsPinning(unittest.TestCase):
         async def run():
             loop = asyncio.get_running_loop()
             with patch('bot._query_with_ttl', AsyncMock(side_effect=OSError("no dns"))), \
-                 patch.object(loop, 'getaddrinfo', AsyncMock(return_value=self.PUBLIC)):
+                 patch('socket.getaddrinfo', return_value=self.PUBLIC):
                 return await bot.resolve_host_safe("fallback.example.org")
         self.assertEqual(asyncio.run(run()), ["93.184.216.34"])
         self.assertAlmostEqual(self._ttl_left("fallback.example.org"), bot.DNS_CACHE_DEFAULT_TTL, delta=2)
@@ -473,9 +473,9 @@ class TestDnsPinning(unittest.TestCase):
         self.assertEqual(mock_aioping.ping.call_args.args[0], "93.184.216.34")
 
     def test_title_fetch_does_not_connect_to_rebound_address(self):
-        """The urllib opener connects to the pinned address; a private answer is refused."""
+        """The async title fetch refuses a private DNS answer before connecting."""
         with patch('bot.is_safe_target_url', return_value=True), \
-             patch('socket.getaddrinfo', return_value=self.LOOPBACK), \
+             patch('bot.resolve_host_safe', AsyncMock(side_effect=bot.BlockedAddressError("blocked"))), \
              patch('socket.create_connection') as mock_connect:
             self.assertIsNone(bot.fetch_html_title("http://title-rebind.example.org/"))
             mock_connect.assert_not_called()

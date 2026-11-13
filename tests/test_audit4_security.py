@@ -110,7 +110,8 @@ class TestAuditSecurity(unittest.TestCase):
                 self.assertIn("Admin is already set", client.rpc.send_msg.call_args.args[2].text)
                 self.assertFalse(database.claim_admin("attacker@example.org"))
                 self.assertIsNone(database.get_config("admin_dc_email"))
-        client.rpc.get_contact.assert_not_called()
+        # Command admission checks administrator identity before the bootstrap handler.
+        self.assertEqual(client.rpc.get_contact.call_count, 2)
 
     def test_f06_environment_owner_authorization(self):
         client, _ = self.sender()
@@ -248,7 +249,7 @@ class TestAuditSecurity(unittest.TestCase):
     def test_f15_title_error_redacts_url_and_exception(self):
         url = "https://user:password@example.org/health?token=title-secret"
         with patch("bot.is_safe_target_url", return_value=True), \
-             patch("bot._safe_url_opener", side_effect=OSError(url)), \
+             patch("bot._make_safe_connector", side_effect=OSError(url)), \
              self.assertLogs(bot.logger, level="WARNING") as logs:
             self.assertIsNone(bot.fetch_html_title(url))
         logged = "\n".join(logs.output)

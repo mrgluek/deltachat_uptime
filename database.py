@@ -9,6 +9,24 @@ import string
 from urllib.parse import urlparse
 from monitor_names import short_journal_text
 
+MAX_MONITORS_PER_CHAT = max(1, int(os.getenv("MAX_MONITORS_PER_CHAT", "300")))
+MAX_MONITORS_TOTAL = max(1, int(os.getenv("MAX_MONITORS_TOTAL", "3000")))
+MAX_URL_LENGTH = 2048
+MAX_NAME_LENGTH = 100
+MAX_KEYWORD_LENGTH = 200
+
+
+class MonitorLimitError(ValueError):
+    pass
+
+
+def validate_monitor_fields(url=None, name=None, keyword=None):
+    for label, value, limit in (("URL", url, MAX_URL_LENGTH), ("Name", name, MAX_NAME_LENGTH),
+                                ("Keyword", keyword, MAX_KEYWORD_LENGTH)):
+        if value is not None and (not isinstance(value, str) or len(value) > limit):
+            raise ValueError(f"{label} must be at most {limit} characters.")
+
+
 DB_PATH = os.getenv("DB_PATH", "uptime.db")
 _write_lock = threading.RLock()
 _lock = _write_lock  # Backwards compatibility
@@ -532,8 +550,18 @@ def get_chat_id_by_token(token: str) -> int:
 
 # Resource functions
 def add_resource(dc_chat_id: int, url: str, name: str, check_type: str, interval: int = 60, expected_keyword: str = None, http_method: str = None) -> int:
+    validate_monitor_fields(url, name, expected_keyword)
     with _writer_transaction() as conn:
+        # Serialize count + insertion across connections as well as threads. Existing rows are untouched.
+        conn.execute("BEGIN IMMEDIATE")
         cursor = conn.cursor()
+        if cursor.execute("SELECT 1 FROM resources WHERE dc_chat_id = ? AND url = ?", (dc_chat_id, url)).fetchone():
+            return None
+        count = cursor.execute("SELECT COUNT(*) FROM resources WHERE dc_chat_id = ?", (dc_chat_id,)).fetchone()[0]
+        if count >= MAX_MONITORS_PER_CHAT:
+            raise MonitorLimitError(f"Monitor limit reached: {MAX_MONITORS_PER_CHAT} monitors per chat.")
+        if cursor.execute("SELECT COUNT(*) FROM resources").fetchone()[0] >= MAX_MONITORS_TOTAL:
+            raise MonitorLimitError(f"Monitor limit reached: {MAX_MONITORS_TOTAL} monitors in total.")
         try:
             if not http_method and check_type == "http":
                 # Inherit learned http_method if this URL was already known in resources or probe_targets
@@ -572,6 +600,7 @@ def set_url_http_method(url: str, http_method: str | None) -> int:
         return count
 
 def set_resource_keyword(dc_chat_id: int, resource_id: int, keyword: str | None) -> bool:
+    validate_monitor_fields(keyword=keyword)
     with _writer_transaction() as conn:
         cursor = conn.cursor()
         cursor.execute("UPDATE resources SET expected_keyword = ? WHERE dc_chat_id = ? AND id = ?", (keyword, dc_chat_id, resource_id))
@@ -1393,6 +1422,7 @@ def get_local_node_name() -> str:
     return os.getenv("NODE_NAME", "Node-1")
 
 def set_local_node_name(name: str):
+    validate_monitor_fields(name=name)
     set_config("node_name", name.strip())
 
 _FINGERPRINT_RE = re.compile(r'[0-9A-F]{40}|[0-9A-F]{64}')
@@ -1721,7 +1751,11 @@ def save_peer_measurements_batch(node_name: str, metrics_list: list[dict], sourc
     for item in metrics_list[:200]:
         if not isinstance(item, dict):
             continue
-        url = str(item.get("url") or "").strip()[:500]
+        url = str(item.get("url") or "").strip()
+        try:
+            validate_monitor_fields(url=url, name=item.get("name"), keyword=item.get("expected_keyword"))
+        except ValueError:
+            continue
         if not url:
             continue
         if is_node_target_ignored(clean_node, url):
@@ -1839,7 +1873,11 @@ def save_probe_targets_batch(targets: list[dict], source_peer: str = None, max_p
         for item in targets[:200]:
             if not isinstance(item, dict):
                 continue
-            url = str(item.get("url") or "").strip()[:500]
+            url = str(item.get("url") or "").strip()
+            try:
+                validate_monitor_fields(url=url, name=item.get("name"), keyword=item.get("expected_keyword"))
+            except ValueError:
+                continue
             if not url or target_matches_ignore(url, ignore_patterns):
                 continue
             if new_slots is not None and url not in known_urls:
@@ -1847,7 +1885,7 @@ def save_probe_targets_batch(targets: list[dict], source_peer: str = None, max_p
                     continue
                 new_slots -= 1
                 known_urls.add(url)
-            name = str(item.get("name") or url).strip()[:200]
+            name = str(item.get("name") or url[:MAX_NAME_LENGTH]).strip()
             chk_type = str(item.get("type") or "http").strip().lower()
             if chk_type not in ("http", "tcp", "ping", "smtp"):
                 chk_type = "http"

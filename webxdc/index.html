@@ -7,21 +7,29 @@
 :root { color-scheme: light dark; font: 16px system-ui, sans-serif; background: #f4f6f8; color: #17212b; }
 body { max-width: 780px; margin: auto; padding: 16px; }
 h1 { font-size: 1.5rem; margin: 0 0 8px; overflow-wrap: anywhere; }
-#updated, .meta { color: #536171; font-size: .88rem; }
+#chat, #updated, .meta { color: #536171; font-size: .88rem; }
 article { background: white; border: 1px solid #dce2e8; border-radius: 12px; padding: 14px; margin: 12px 0; }
 h2 { font-size: 1.05rem; margin: 0 0 8px; overflow-wrap: anywhere; }
 .nodes { margin: 10px 0 0; padding: 0; list-style: none; }
+input { min-width: 0; flex: 1; padding: 10px; font: inherit; }
+.filter { display: flex; gap: 8px; margin: 16px 0 6px; }
+button { font: inherit; padding: 8px; }
+.url { overflow-wrap: anywhere; margin: 6px 0; }
 li { padding: 4px 0; overflow-wrap: anywhere; }
 #empty { padding: 32px 0; }
 @media (prefers-color-scheme: dark) {
   :root { background: #141a21; color: #e5edf5; }
   article { background: #202832; border-color: #384451; }
-  #updated, .meta { color: #afbfce; }
+  #chat, #updated, .meta { color: #afbfce; }
 }
 </style>
-<header><h1 id="chat">Uptime Status</h1><div id="counts"></div><p id="updated"></p></header>
+<header><h1>Uptime Status</h1><div id="counts"></div><div id="chat"></div><p id="updated"></p></header>
+<div class="filter"><input id="filter" type="search" placeholder="Filter monitors" aria-label="Filter monitors by name or URL"><button id="clear" type="button">Clear</button></div><div id="filtered" class="meta" aria-live="polite"></div>
 <p id="empty">Waiting for the first update. The bot will send this chat's monitor status soon.</p>
-<p id="note"></p><main id="monitors"></main><section id="journal"><h2>Recent events</h2><ul id="events"></ul></section>
+<p id="note"></p><main id="monitors"></main>
+<section id="incidents-section" hidden><h2>Incidents</h2><ul id="incidents"></ul></section>
+<section id="partials-section" hidden><h2>Partial outages</h2><ul id="partials"></ul></section>
+<section id="journal" hidden><h2>Recent events</h2><ul id="events"></ul></section>
 <script src="webxdc.js"></script>
 <script>
 "use strict";
@@ -34,20 +42,43 @@ function element(tag, text, className) {
   if (className) el.className = className;
   return el;
 }
+let currentState;
+const duration = seconds => {
+  seconds = Math.max(0, Math.floor(seconds));
+  if (seconds < 60) return `${seconds}s`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ${Math.floor(seconds % 3600 / 60)}m`;
+  return `${Math.floor(seconds / 86400)}d ${Math.floor(seconds % 86400 / 3600)}h`;
+};
+document.getElementById("filter").addEventListener("input", () => render(currentState));
+document.getElementById("clear").addEventListener("click", () => {
+  document.getElementById("filter").value = "";
+  render(currentState);
+});
 function render(state) {
   if (!state || !Array.isArray(state.monitors)) return;
+  currentState = state;
   document.getElementById("empty").hidden = true;
-  document.getElementById("chat").textContent = state.chat || "Uptime Status";
+  document.getElementById("chat").textContent = state.chat || "";
   const counts = state.counts || {};
   document.getElementById("counts").textContent = `🟢 ${counts.up || 0} up · 🟠 ${counts.partial || 0} partial · 🔴 ${counts.down || 0} down`;
   document.getElementById("updated").textContent = `Updated ${date(state.generated_at)}`;
-  document.getElementById("note").textContent = state.details_omitted ? "Node details omitted to fit the update size limit." : "";
+  const notes = [];
+  if (state.details_omitted || state.node_flags_omitted) notes.push("Node details omitted");
+  if (state.partial_outages_omitted) notes.push("Partial outages omitted");
+  if (state.incidents_omitted) notes.push("Older incidents omitted");
+  if (state.events_omitted) notes.push("Older events omitted");
+  document.getElementById("note").textContent = notes.length ? notes.join(" · ") + " to fit the update size limit." : "";
   const list = document.getElementById("monitors");
   list.replaceChildren();
   const monitors = [...state.monitors].sort((a,b) => (order[a.status] ?? 4) - (order[b.status] ?? 4) || a.id - b.id);
-  for (const monitor of monitors) {
+  const query = document.getElementById("filter").value.toLowerCase();
+  const visible = monitors.filter(m => [m.name, m.url].some(text => String(text || "").toLowerCase().includes(query)));
+  document.getElementById("filtered").textContent = query ? `${visible.length} of ${monitors.length}` : "";
+  for (const monitor of visible) {
     const row = element("article", "");
     row.append(element("h2", `${icons[monitor.status] || "⚪"} ${monitor.name || monitor.url || "#" + monitor.id}`));
+    if (monitor.url && monitor.url !== monitor.name) row.append(element("div", monitor.url, "meta url"));
     const uptime = Number.isFinite(monitor.uptime30) ? monitor.uptime30.toFixed(2) + "%" : "unknown";
     row.append(element("div", `${monitor.type || ""} · ${monitor.status} since ${date(monitor.since)} · Uptime 30d: ${uptime}`, "meta"));
     const nodes = element("ul", "", "nodes");
@@ -58,12 +89,27 @@ function render(state) {
     row.append(nodes);
     list.append(row);
   }
+  for (const [key, section, items, describe] of [
+    ["incidents", "incidents-section", state.incidents || [], incident => {
+      const names = (incident.names || []).join(", ");
+      const more = Math.max(0, (incident.count || 0) - (incident.names || []).length);
+      return `#${incident.id} · ${incident.status} · Started ${date(incident.started_at)} · ${duration((incident.resolved_at || state.generated_at) - incident.started_at)} · Affected monitors: ${names}${more ? " +" + more : ""}`;
+    }],
+    ["partials", "partials-section", state.partial_outages || [], outage =>
+      `${outage.monitor} · Started ${date(outage.started_at)} · ${outage.ended_at ? "Ended " + date(outage.ended_at) : "Ongoing"} · ${duration((outage.ended_at || state.generated_at) - outage.started_at)}`]
+  ]) {
+    const target = document.getElementById(key);
+    target.replaceChildren();
+    for (const item of items) target.append(element("li", describe(item)));
+    document.getElementById(section).hidden = !items.length;
+  }
   const journal = document.getElementById("events");
   journal.replaceChildren();
   for (const event of state.events || []) {
     journal.append(element("li", `${date(event.ts)} · ${event.text || ""}`));
   }
-  if (!monitors.length) list.append(element("p", "No monitors in this chat yet."));
+  document.getElementById("journal").hidden = !(state.events || []).length;
+  if (!visible.length) list.append(element("p", query ? "No matching monitors." : "No monitors in this chat yet."));
 }
 // Core replays history in serial order. Each payload is a complete replacement snapshot.
 if (window.webxdc) webxdc.setUpdateListener(update => render(update.payload), 0);

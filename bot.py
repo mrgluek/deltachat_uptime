@@ -21,6 +21,7 @@ import shlex
 import statistics
 import secrets
 from urllib.parse import urlparse, urljoin
+from monitor_names import short_monitor_name
 import aiohttp
 import aiohttp.abc
 from aiohttp import web
@@ -65,8 +66,8 @@ from outbox import outbox as dc_outbox, PRIO_ALERT, PRIO_REPLY, PRIO_UPDATE, PRI
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "2.33.0"
-WEBXDC_APP_VERSION = 1  # Bump only for layout changes requiring a new app instance.
+VERSION = "2.34.0"
+WEBXDC_APP_VERSION = 2  # Bump only for layout changes requiring a new app instance.
 # Safety net; explicit trimming preserves app instances and ongoing incident messages.
 DELETE_DEVICE_AFTER = 30 * 86400
 USER_CHAT_KEEP_SECONDS = 86400
@@ -3187,13 +3188,15 @@ _silent_partial_outages: set = set()  # compatibility for diagnostics/tests
 
 
 def _journal_outage_text(resource, prefix, ending=None):
-    name = resource.get("name") or resource.get("url") or "Monitor"
+    name = short_monitor_name(resource)
     if ending is not None:
-        return f"✅ {name} recovered after {format_duration(max(0, ending))}"
-    votes = _votes_from_json(resource.get("last_votes"))
-    nodes = [str(v.get("node", "?")) for v in votes if v.get("status") in ("down", "degraded")]
+        duration = re.sub(r" 0s$", "", format_duration(max(0, ending)))
+        return f"✅ {name} recovered after {duration}"
+    votes = [v for v in _votes_from_json(resource.get("last_votes"))
+             if isinstance(v, dict) and v.get("status") in VOTING_STATUSES]
+    nodes = [v for v in votes if v.get("status") in ("down", "degraded")]
     condition = "is down" if prefix == "🔴" else "is partially down"
-    return f"{prefix} {name} {condition}" + (f" (nodes: {', '.join(nodes)})" if nodes else "")
+    return f"{prefix} {name} {condition}" + (f" ({len(nodes)} of {len(votes)} nodes)" if votes else "")
 
 
 def _journal_partial_events(chat_id=None):
@@ -5424,9 +5427,19 @@ def build_status_state(chat_id: int) -> dict:
         })
     monitors.sort(key=lambda m: ({"down": 0, "partial": 1, "up": 2, "paused": 3}[m["status"]], m["id"]))
     journal = database.get_recent_chat_events(chat_id, 20)
+    incidents = []
+    for incident in database.get_recent_incidents(chat_id, 20):
+        if (incident.get("resolved_at") or now) < now - 30 * 86400:
+            continue
+        affected = {e["resource_id"]: short_monitor_name(e)
+                    for e in database.get_incident_downtime_events(incident["id"])}
+        incidents.append({**{k: incident[k] for k in ("id", "status", "started_at", "resolved_at")},
+                          "names": list(affected.values())[:5], "count": len(affected)})
+    partials = [{"monitor": short_monitor_name(p), "started_at": p["started_at"], "ended_at": p["ended_at"]}
+                for p in database.get_chat_partial_outages(chat_id, 10)]
     return {"v": WEBXDC_APP_VERSION, "chat": database.get_config(f"webxdc_chat_name:{chat_id}") or "Chat Monitor",
             "generated_at": now, "counts": counts, "monitors": monitors, "events": status_app_events(chat_id, journal),
-            "event_serial": journal[0]["id"] if journal else 0}
+            "event_serial": journal[0]["id"] if journal else 0, "incidents": incidents, "partial_outages": partials}
 
 
 def status_state_hash(state: dict) -> str:
@@ -5452,15 +5465,20 @@ def status_app_events(chat_id, rows=None):
 
 
 def status_app_summary(state: dict) -> str:
+    counts = state["counts"]
+    return f"🟢 {counts['up']} up · 🟠 {counts['partial']} partial · 🔴 {counts['down']} down"
+
+
+def status_line_text(state: dict) -> str:
     def shorten(name, size):
         name = " ".join(str(name).split())
         return name if len(name) <= size else name[:size - 1] + "…"
-    for size in range(20, 0, -1):
+    for size in range(30, 0, -1):
         parts = []
         for status, icon in (("down", "🔴"), ("partial", "🟠")):
             count = state["counts"][status]
             if count:
-                names = [shorten(m.get("name") or m.get("url") or "?", size)
+                names = [shorten(short_monitor_name(m), size)
                          for m in state.get("monitors", []) if m["status"] == status][:3]
                 label = f"{icon} {count} {status}"
                 if names:
@@ -5505,11 +5523,20 @@ def _status_update_json(state: dict, limit: int, info_line=None) -> str:
     """Keep flags for every monitor if node detail would exceed the wire budget."""
     def encode():
         summary = status_app_summary(state)
-        update = {"payload": state, "summary": summary, "document": summary}
+        update = {"payload": state, "summary": summary}
         if info_line:
             update["info"] = info_line
         return json.dumps(update, ensure_ascii=False, separators=(",", ":"))
     encoded = encode()
+    if len(encoded.encode()) > limit and state.get("partial_outages"):
+        state["partial_outages"] = []
+        state["partial_outages_omitted"] = True
+        encoded = encode()
+    for key in ("incidents", "events"):
+        while len(encoded.encode()) > limit and state.get(key):
+            state[key].pop()
+            state[key + "_omitted"] = True
+            encoded = encode()
     if len(encoded.encode()) > limit:
         state["details_omitted"] = True
         for monitor in state["monitors"]:
@@ -5532,17 +5559,86 @@ def _status_update_json(state: dict, limit: int, info_line=None) -> str:
     return encoded
 
 
-def _pin_status_app(chat_id, bot, accid, msg_id):
+def _status_line_hash(text):
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def _unpin_status_message(bot, accid, msg_id):
     try:
-        if (database.get_chat_report_app(chat_id) == "off"
-                or database.get_chat_webxdc(chat_id)["webxdc_msg_id"] != msg_id):
+        bot.rpc.set_pinned_message_state(accid, msg_id, False)
+        stat_event("mail_out")
+    except Exception:
+        pass
+
+
+def _pin_status_line(chat_id, bot, accid, msg_id):
+    """Pin the companion line, then resume the app's first update."""
+    try:
+        saved = database.get_chat_webxdc(chat_id)
+        if database.get_chat_report_app(chat_id) == "off" or saved["status_line_msg_id"] != msg_id:
             return
         bot.rpc.set_pinned_message_state(accid, msg_id, True)
         stat_event("mail_out")
         database.set_config(f"webxdc_pin_pending:{chat_id}", "")
-        queue_status_app(chat_id, bot, accid, known_msg_id=msg_id)
+        old_ids = json.loads(database.get_config(f"webxdc_unpin:{chat_id}") or "[]")
+        for old_id in old_ids:
+            if old_id != msg_id:
+                dc_outbox.submit(lambda old_id=old_id: _unpin_status_message(bot, accid, old_id),
+                                 priority=PRIO_UPDATE, label="unpin previous status message")
+        database.set_config(f"webxdc_unpin:{chat_id}", "[]")
+        queue_status_app(chat_id, bot, accid, known_msg_id=saved["webxdc_msg_id"])
     except Exception as exc:
-        logger.warning("Cannot pin status app in chat %s: %s", chat_id, exc)
+        logger.warning("Cannot pin status line in chat %s: %s", chat_id, exc)
+
+
+def _post_status_line(chat_id, bot, accid, text):
+    if database.get_chat_report_app(chat_id) == "off":
+        return
+    now = int(time.time())
+    last_attempt = database.get_config(f"webxdc_line_post_attempt:{chat_id}")
+    if last_attempt and now - int(last_attempt) < 3600:
+        return
+    database.set_config(f"webxdc_line_post_attempt:{chat_id}", str(now))
+    text = status_line_text(build_status_state(chat_id))
+    msg_id = bot.rpc.send_msg(accid, chat_id, MsgData(text=text))
+    stat_event("mail_out")
+    database.set_chat_status_line(chat_id, msg_id, _status_line_hash(text))
+    database.set_config(f"webxdc_line_post_attempt:{chat_id}", "")
+    database.set_config(f"webxdc_pin_pending:{chat_id}", str(msg_id))
+    dc_outbox.submit(lambda: _pin_status_line(chat_id, bot, accid, msg_id), priority=PRIO_UPDATE,
+                     key=("status-app-pin", chat_id), label="pin status line")
+
+
+def _update_status_line(chat_id, bot, accid):
+    """A separate outbox token and rolling-cap entry for each edit attempt."""
+    if database.get_chat_report_app(chat_id) == "off":
+        return
+    saved = database.get_chat_webxdc(chat_id)
+    text = status_line_text(build_status_state(chat_id))
+    digest = _status_line_hash(text)
+    if saved["status_line_hash"] == digest:
+        return
+    now = int(time.time())
+    updates = [ts for ts in json.loads(database.get_config(f"webxdc_updates:{chat_id}") or "[]") if now - ts < 3600]
+    if len(updates) >= 30:
+        return
+    database.set_config(f"webxdc_updates:{chat_id}", json.dumps(updates + [now]))
+    try:
+        bot.rpc.send_edit_request(accid, saved["status_line_msg_id"], text)
+        stat_event("mail_out")
+        database.set_chat_status_line(chat_id, saved["status_line_msg_id"], digest)
+    except Exception as exc:
+        # An offline/ambiguous edit must not create duplicate messages.
+        if saved["status_line_msg_id"] in bot.rpc.get_existing_msg_ids(accid, [saved["status_line_msg_id"]]):
+            logger.warning("Cannot edit status line in chat %s: %s", chat_id, exc)
+            return
+        last_post = database.get_config(f"webxdc_line_reposted_at:{chat_id}")
+        if last_post is not None and now - int(last_post) < 3600:
+            return
+        database.set_config(f"webxdc_line_reposted_at:{chat_id}", str(now))
+        dc_outbox.submit(lambda: _post_status_line(chat_id, bot, accid, text), priority=PRIO_UPDATE,
+                         key=("status-line-post", chat_id), label="replace missing status line")
+
 
 
 def _deliver_status_app(chat_id, bot, accid, known_msg_id=None):
@@ -5563,18 +5659,25 @@ def _deliver_status_app(chat_id, bot, accid, known_msg_id=None):
                 return
             # Persist before RPC: an ambiguous failure must not cause a re-post loop.
             database.set_config(f"webxdc_reposted_at:{chat_id}", str(now))
+            old_ids = [i for i in (msg_id, saved["status_line_msg_id"]) if i]
+            database.set_config(f"webxdc_unpin:{chat_id}", json.dumps(old_ids))
             msg_id = bot.rpc.send_msg(accid, chat_id, MsgData(file=build_status_xdc()))
             stat_event("mail_out")
             database.set_chat_webxdc(chat_id, msg_id)
             database.set_config(f"webxdc_posted_at:{chat_id}", str(now))
             database.set_config(f"webxdc_update_count:{chat_id}", "0")
             database.set_config(f"webxdc_app_version:{chat_id}", str(WEBXDC_APP_VERSION))
-            database.set_config(f"webxdc_pin_pending:{chat_id}", str(msg_id))
+            database.set_chat_status_line(chat_id, None, None)
             saved = database.get_chat_webxdc(chat_id)
+        if not saved["status_line_msg_id"]:
+            text = status_line_text(build_status_state(chat_id))
+            dc_outbox.submit(lambda: _post_status_line(chat_id, bot, accid, text), priority=PRIO_UPDATE,
+                             key=("status-line-post", chat_id), label="post status line")
+            return
         if database.get_config(f"webxdc_pin_pending:{chat_id}"):
-            # Pin and update are separate jobs: each can generate mail and needs a token.
-            dc_outbox.submit(lambda: _pin_status_app(chat_id, bot, accid, msg_id), priority=PRIO_UPDATE,
-                             key=("status-app-pin", chat_id), label="pin status app")
+            line_id = saved["status_line_msg_id"]
+            dc_outbox.submit(lambda: _pin_status_line(chat_id, bot, accid, line_id), priority=PRIO_UPDATE,
+                             key=("status-app-pin", chat_id), label="pin status line")
             return
         chat = bot.rpc.get_basic_chat_info(accid, chat_id)
         name = chat.get("name") if isinstance(chat, dict) else chat.name
@@ -5597,12 +5700,18 @@ def _deliver_status_app(chat_id, bot, accid, known_msg_id=None):
         last_info = int(database.get_config(f"webxdc_last_info_event_id:{chat_id}") or 0)
         info_events = database.get_recent_chat_events(chat_id, after_id=last_info)
         update = _status_update_json(state, limit, status_app_info(info_events))
-        if saved["webxdc_state_hash"] == digest or (saved["webxdc_last_sent_at"] is not None
+        line_changed = saved["status_line_hash"] != _status_line_hash(status_line_text(state))
+        if (saved["webxdc_state_hash"] == digest and not line_changed) or (saved["webxdc_last_sent_at"] is not None
                 and now - saved["webxdc_last_sent_at"] < interval):
             return
         updates = json.loads(database.get_config(f"webxdc_updates:{chat_id}") or "[]")
         updates = [ts for ts in updates if now - ts < 3600]
         if len(updates) >= 30 or (updates and now - max(updates) < interval):
+            return
+        if saved["webxdc_state_hash"] == digest:
+            if line_changed:
+                dc_outbox.submit(lambda: _update_status_line(chat_id, bot, accid), priority=PRIO_UPDATE,
+                                 key=("status-line-edit", chat_id), label="edit status line")
             return
         # Count attempts durably too: retrying an uncertain RPC must not exceed the cap.
         database.set_config(f"webxdc_updates:{chat_id}", json.dumps(updates + [now]))
@@ -5613,6 +5722,9 @@ def _deliver_status_app(chat_id, bot, accid, known_msg_id=None):
         count = int(database.get_config(f"webxdc_update_count:{chat_id}") or 0)
         database.set_config(f"webxdc_update_count:{chat_id}", str(count + 1))
         database.set_config(f"webxdc_clean:{chat_id}", revision)
+        if line_changed:
+            dc_outbox.submit(lambda: _update_status_line(chat_id, bot, accid), priority=PRIO_UPDATE,
+                             key=("status-line-edit", chat_id), label="edit status line")
         if info_events:
             database.set_config(f"webxdc_last_info_event_id:{chat_id}", str(max(e["id"] for e in info_events)))
     except Exception as exc:
@@ -5653,7 +5765,8 @@ async def push_status_apps():
                         and not await run_db(status_app_urgent, chat_id)):
                     continue
                 state = await run_db(build_status_state, chat_id)
-                if status_state_hash(state) == saved["webxdc_state_hash"]:
+                if (status_state_hash(state) == saved["webxdc_state_hash"]
+                        and saved["status_line_msg_id"] and saved["status_line_hash"] == _status_line_hash(status_line_text(state))):
                     continue
                 updates = json.loads(await run_db(database.get_config, f"webxdc_updates:{chat_id}") or "[]")
                 if sum(now - ts < 3600 for ts in updates) >= 30:

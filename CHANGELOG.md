@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.34.0] - 2026-11-13
+
+### Added
+- Pinned plain text status lines after each status app, with compact monitor names and in-place edits sharing the app update cap.
+- Live monitor name/URL filtering, full URLs, incidents and partial outage history in the app.
+
+### Changed
+- App bubble summaries show counts only; updates no longer contain a document title. Outage info and journal entries use short names and node counts.
+- Enabled chats receive a new app and pinned status line once on upgrade; the old pinned app is unpinned. Rotation replaces both messages and unpins the previous line.
+- Local chat trimming preserves the current status line as well as the app and ongoing incidents.
+
 ## [2.33.0] - 2026-11-13
 
 ### Added

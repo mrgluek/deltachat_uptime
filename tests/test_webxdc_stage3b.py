@@ -22,30 +22,30 @@ class TestStage3b(unittest.TestCase):
 
     def test_summary_categories_names_limits_and_paused(self):
         state = {'counts': {'up': 83, 'down': 0, 'partial': 0}, 'monitors': []}
-        self.assertEqual(bot.status_app_summary(state), '🟢 83 up')
+        self.assertEqual(bot.status_line_text(state), '🟢 83 up')
         state['counts'] = {'up': 80, 'down': 2, 'partial': 1}
         state['monitors'] = [dict(status='down', name=n) for n in ('cm.dc09.xyz', 'mail.x')]
         state['monitors'] += [dict(status='partial', name='site'), dict(status='paused', name='paused')]
-        self.assertEqual(bot.status_app_summary(state), '🔴 2 down: cm.dc09.xyz, mail.x · 🟠 1 partial: site · 🟢 80 up')
+        self.assertEqual(bot.status_line_text(state), '🔴 2 down: cm.dc09.xyz, mail.x · 🟠 1 partial: site · 🟢 80 up')
         state['counts']['down'] = 5
         state['monitors'] = [dict(status='down', name=n) for n in ('a', 'b', 'c', 'd', 'e')]
-        self.assertIn('5 down: a, b, c +2', bot.status_app_summary(state))
+        self.assertIn('5 down: a, b, c +2', bot.status_line_text(state))
         state['counts'] = dict(up=80, down=5, partial=5)
         state['monitors'] = [dict(status=status, name='longname' * 30) for status in ('down', 'partial') for _ in range(5)]
-        summary = bot.status_app_summary(state)
+        summary = bot.status_line_text(state)
         self.assertLessEqual(len(summary), 120)
         self.assertEqual(summary.count('+2'), 2)
         self.assertIn('…', summary)
         state['counts'] = dict(up=0, down=1, partial=0)
-        self.assertIn('longnamelongnamelon…', bot.status_app_summary(state))
+        self.assertIn('…', bot.status_line_text(state))
 
-    def test_summary_document_descr_and_hash(self):
+    def test_counts_summary_descr_and_hash(self):
         self.set_fields(self.rid, status='down')
         self.push()
         args = self.rpc.send_webxdc_status_update.call_args.args
         update = json.loads(args[2])
-        self.assertEqual(update['summary'], '🔴 1 down: Example · 🟢 0 up')
-        self.assertEqual(update['document'], update['summary'])
+        self.assertEqual(update['summary'], '🟢 0 up · 🟠 0 partial · 🔴 1 down')
+        self.assertNotIn('document', update)
         self.assertEqual(args[3], update['summary'])
         state = bot.build_status_state(1)
         original = bot.status_state_hash(state)
@@ -92,10 +92,10 @@ class TestStage3b(unittest.TestCase):
         database.set_config('webxdc_posted_at:1', '1')
         with patch('bot.time.time', return_value=8 * 86400):
             self.push()
-        self.rpc.send_msg.assert_called_once()
+        self.assertEqual(self.rpc.send_msg.call_count, 2)
         self.assertEqual(database.get_config('webxdc_update_count:1'), '1')
         self.assertEqual(database.get_config('webxdc_posted_at:1'), str(8 * 86400))
-        self.rpc.set_pinned_message_state.assert_called_once()
+        self.rpc.set_pinned_message_state.assert_any_call(1, 401, True)
         self.rpc.delete_messages.assert_not_called()
 
     def test_rotation_by_count_and_hourly_guard(self):
@@ -109,7 +109,7 @@ class TestStage3b(unittest.TestCase):
         self.rpc.send_msg.assert_not_called()
         with patch('bot.time.time', return_value=13600):
             self.push()
-        self.rpc.send_msg.assert_called_once()
+        self.assertEqual(self.rpc.send_msg.call_count, 2)
         self.assertEqual(database.get_config('webxdc_update_count:1'), '1')
 
     def test_dirty_skips_debounce_but_not_core_interval_or_cap(self):

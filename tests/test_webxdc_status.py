@@ -2,6 +2,7 @@
 import asyncio
 import copy
 import json
+import itertools
 import os
 from pathlib import Path
 import sys
@@ -36,7 +37,8 @@ class TestWebxdcStatus(unittest.TestCase):
         database.DB_PATH = os.path.join(self.tmp.name, "status.db")
         database.init_db()
         self.rpc = MagicMock()
-        self.rpc.send_msg.return_value = 321
+        self.rpc.send_msg.side_effect = lambda *args: next(self.message_ids)
+        self.message_ids = itertools.count(400)
         self.rpc.get_existing_msg_ids.side_effect = lambda acc, ids: ids
         self.rpc.get_basic_chat_info.return_value = {"name": "Test chat"}
         self.rpc.get_webxdc_info.return_value = {"sendUpdateMaxSize": 128000, "sendUpdateInterval": 10000}
@@ -68,6 +70,7 @@ class TestWebxdcStatus(unittest.TestCase):
 
     def existing(self):
         database.set_chat_webxdc(1, 321)
+        database.set_chat_status_line(1, 322, bot._status_line_hash(bot.status_line_text(bot.build_status_state(1))))
         database.set_config("webxdc_app_version:1", str(bot.WEBXDC_APP_VERSION))
 
     def test_snapshot_status_nodes_summary_and_timestamp_hash(self):
@@ -87,7 +90,7 @@ class TestWebxdcStatus(unittest.TestCase):
         self.assertEqual(state["monitors"][1]["nodes"], votes)
         self.assertEqual(state["monitors"][1]["since"], 9500)
         self.assertIsInstance(state["monitors"][0]["uptime30"], float)
-        self.assertEqual(bot.status_app_summary(state), "🔴 1 down: Down · 🟠 1 partial: Partial · 🟢 1 up")
+        self.assertEqual(bot.status_app_summary(state), "🟢 1 up · 🟠 1 partial · 🔴 1 down")
         later = copy.deepcopy(state)
         later["generated_at"] += 60
         self.assertEqual(bot.status_state_hash(state), bot.status_state_hash(later))
@@ -97,15 +100,15 @@ class TestWebxdcStatus(unittest.TestCase):
 
     def test_posts_pins_then_sends_complete_state_and_does_not_repeat(self):
         self.push()
-        self.rpc.send_msg.assert_called_once()
-        self.assertTrue(self.rpc.send_msg.call_args.args[2].file.endswith("status.xdc"))
-        self.rpc.set_pinned_message_state.assert_called_once_with(1, 321, True)
+        self.assertEqual(self.rpc.send_msg.call_count, 2)
+        self.assertTrue(self.rpc.send_msg.call_args_list[0].args[2].file.endswith("status.xdc"))
+        self.rpc.set_pinned_message_state.assert_any_call(1, 401, True)
         self.rpc.send_webxdc_status_update.assert_called_once()
         update = json.loads(self.rpc.send_webxdc_status_update.call_args.args[2])
         self.assertEqual(update["payload"]["chat"], "Test chat")
         self.assertEqual(len(update["payload"]["monitors"]), 1)
         self.push()
-        self.assertEqual(self.rpc.send_msg.call_count, 1)
+        self.assertEqual(self.rpc.send_msg.call_count, 2)
         self.assertEqual(self.rpc.send_webxdc_status_update.call_count, 1)
 
     def test_unchanged_state_uses_no_outbox_tokens_and_rename_is_updated(self):
@@ -148,15 +151,15 @@ class TestWebxdcStatus(unittest.TestCase):
         self.rpc.get_existing_msg_ids.return_value = []
         self.rpc.get_existing_msg_ids.side_effect = None
         self.push()
-        self.rpc.send_msg.assert_called_once()
-        self.rpc.set_pinned_message_state.assert_called_once_with(1, 321, True)
+        self.assertEqual(self.rpc.send_msg.call_count, 2)
+        self.rpc.set_pinned_message_state.assert_any_call(1, 401, True)
         self.rpc.send_webxdc_status_update.assert_called_once()
         self.push()
-        self.assertEqual(self.rpc.send_msg.call_count, 1)
+        self.assertEqual(self.rpc.send_msg.call_count, 2)
         self.assertEqual(self.rpc.send_webxdc_status_update.call_count, 1)
         with patch("bot.time.time", return_value=13600):
             self.push()
-        self.assertEqual(self.rpc.send_msg.call_count, 2)
+        self.assertEqual(self.rpc.send_msg.call_count, 4)
 
     def test_existing_instance_is_not_reposted_and_layout_version_is(self):
         self.existing()
@@ -165,10 +168,10 @@ class TestWebxdcStatus(unittest.TestCase):
         with patch.object(bot, "VERSION", "99.0.0"):
             self.push()
         self.rpc.send_msg.assert_not_called()
-        with patch.object(bot, "WEBXDC_APP_VERSION", 2):
+        with patch.object(bot, "WEBXDC_APP_VERSION", 3):
             self.push()
-        self.rpc.send_msg.assert_called_once()
-        self.rpc.set_pinned_message_state.assert_called_once()
+        self.assertEqual(self.rpc.send_msg.call_count, 2)
+        self.rpc.set_pinned_message_state.assert_any_call(1, 401, True)
 
     def test_off_and_missing_bot_do_nothing(self):
         database.set_chat_report_app(1, "off")
@@ -211,7 +214,7 @@ class TestWebxdcStatus(unittest.TestCase):
             self.push()
         self.rpc.send_webxdc_status_update.assert_not_called()
         self.push()
-        self.assertEqual(self.rpc.send_msg.call_count, 1)
+        self.assertEqual(self.rpc.send_msg.call_count, 2)
         self.assertEqual(self.rpc.set_pinned_message_state.call_count, 2)
         self.rpc.send_webxdc_status_update.assert_called_once()
 

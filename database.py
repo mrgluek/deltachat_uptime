@@ -7,6 +7,7 @@ import time
 import secrets
 import string
 from urllib.parse import urlparse
+from monitor_names import short_journal_text
 
 DB_PATH = os.getenv("DB_PATH", "uptime.db")
 _write_lock = threading.RLock()
@@ -101,7 +102,8 @@ def init_db():
 
         chat_columns = {row[1] for row in cursor.execute("PRAGMA table_info(chats)")}
         for column, kind in (("webxdc_msg_id", "INTEGER"), ("webxdc_state_hash", "TEXT"),
-                             ("webxdc_last_sent_at", "INTEGER")):
+                             ("webxdc_last_sent_at", "INTEGER"), ("status_line_msg_id", "INTEGER"),
+                             ("status_line_hash", "TEXT")):
             if column not in chat_columns:
                 cursor.execute(f"ALTER TABLE chats ADD COLUMN {column} {kind}")
 
@@ -170,16 +172,17 @@ def init_db():
         # Track command and other local edits in the same locked transaction as the edit.
         # Ordinary probe writes do not mark the chat dirty or produce journal entries.
         for action, reference, condition, kind, text in (
-            ("INSERT", "NEW", "1", "monitor_added", "'➕ Added monitor ' || COALESCE(NEW.name, NEW.url)"),
-            ("DELETE", "OLD", "1", "monitor_removed", "'➖ Removed monitor ' || COALESCE(OLD.name, OLD.url)"),
-            ("UPDATE", "NEW", "OLD.name IS NOT NEW.name", "monitor_renamed", "'✏️ Renamed monitor ' || COALESCE(OLD.name, OLD.url) || ' to ' || COALESCE(NEW.name, NEW.url)"),
-            ("UPDATE", "NEW", "OLD.url IS NOT NEW.url OR OLD.type IS NOT NEW.type OR OLD.expected_keyword IS NOT NEW.expected_keyword", "monitor_changed", "'✏️ Changed monitor ' || COALESCE(NEW.name, NEW.url)"),
-            ("UPDATE", "NEW", "OLD.maintenance_until IS NOT NEW.maintenance_until OR (OLD.status IS NOT NEW.status AND (OLD.status = 'paused' OR NEW.status = 'paused'))", "monitor_pause", "CASE WHEN NEW.maintenance_until > CAST(strftime('%s','now') AS INTEGER) OR NEW.status = 'paused' THEN '⏸️ Paused monitor ' ELSE '▶️ Resumed monitor ' END || COALESCE(NEW.name, NEW.url)"),
+            ("INSERT", "NEW", "1", "monitor_added", "'➕ Added monitor ' || COALESCE(NULLIF(trim(NEW.name), ''), NEW.url)"),
+            ("DELETE", "OLD", "1", "monitor_removed", "'➖ Removed monitor ' || COALESCE(NULLIF(trim(OLD.name), ''), OLD.url)"),
+            ("UPDATE", "NEW", "OLD.name IS NOT NEW.name", "monitor_renamed", "'✏️ Renamed monitor ' || COALESCE(NULLIF(trim(OLD.name), ''), OLD.url) || ' to ' || COALESCE(NULLIF(trim(NEW.name), ''), NEW.url)"),
+            ("UPDATE", "NEW", "OLD.url IS NOT NEW.url OR OLD.type IS NOT NEW.type OR OLD.expected_keyword IS NOT NEW.expected_keyword", "monitor_changed", "'✏️ Changed monitor ' || COALESCE(NULLIF(trim(NEW.name), ''), NEW.url)"),
+            ("UPDATE", "NEW", "OLD.maintenance_until IS NOT NEW.maintenance_until OR (OLD.status IS NOT NEW.status AND (OLD.status = 'paused' OR NEW.status = 'paused'))", "monitor_pause", "CASE WHEN NEW.maintenance_until > CAST(strftime('%s','now') AS INTEGER) OR NEW.status = 'paused' THEN '⏸️ Paused monitor ' ELSE '▶️ Resumed monitor ' END || COALESCE(NULLIF(trim(NEW.name), ''), NEW.url)"),
         ):
+            cursor.execute(f"DROP TRIGGER IF EXISTS journal_{kind}")
             cursor.execute(f"""CREATE TRIGGER IF NOT EXISTS journal_{kind} AFTER {action} ON resources
                 WHEN {condition} BEGIN
                 INSERT INTO chat_events(dc_chat_id, ts, kind, text)
-                VALUES ({reference}.dc_chat_id, strftime('%s','now'), '{kind}', substr(replace(replace(replace({text}, char(10), ' '), char(13), ' '), char(9), ' '), 1, 140));
+                VALUES ({reference}.dc_chat_id, strftime('%s','now'), '{kind}', replace(replace(replace({text}, char(10), ' '), char(13), ' '), char(9), ' '));
                 INSERT OR REPLACE INTO config(key, value) VALUES ('webxdc_dirty:' || {reference}.dc_chat_id,
                     COALESCE((SELECT CAST(value AS INTEGER) FROM config WHERE key = 'webxdc_dirty:' || {reference}.dc_chat_id), 0) + 1);
                 END""")
@@ -587,7 +590,7 @@ def delete_chat_data(dc_chat_id: int) -> int:
         cursor.execute("DELETE FROM config WHERE key = ?", (f"alert_mode:{dc_chat_id}",))
         for kind in ("partial", "full", "app", "app_notices_after"):
             cursor.execute("DELETE FROM config WHERE key = ?", (f"report_{kind}:{dc_chat_id}",))
-        for key in ("webxdc_app_version", "webxdc_reposted_at", "webxdc_updates", "webxdc_chat_name", "webxdc_pin_pending", "webxdc_posted_at", "webxdc_update_count", "webxdc_last_info_event_id", "webxdc_dirty", "webxdc_clean", "webxdc_attempt_revision"):
+        for key in ("webxdc_app_version", "webxdc_reposted_at", "webxdc_updates", "webxdc_chat_name", "webxdc_pin_pending", "webxdc_posted_at", "webxdc_update_count", "webxdc_last_info_event_id", "webxdc_dirty", "webxdc_clean", "webxdc_attempt_revision", "webxdc_unpin", "webxdc_line_reposted_at", "webxdc_line_post_attempt"):
             cursor.execute("DELETE FROM config WHERE key = ?", (f"{key}:{dc_chat_id}",))
         cursor.execute("DELETE FROM chat_events WHERE dc_chat_id = ?", (dc_chat_id,))
         cursor.execute("DELETE FROM config WHERE key LIKE ?", (f"journal:%:{dc_chat_id}:%",))
@@ -2219,9 +2222,9 @@ def get_chat_webxdc(dc_chat_id: int) -> dict:
     conn = _connect()
     conn.row_factory = sqlite3.Row
     try:
-        row = conn.execute("SELECT webxdc_msg_id, webxdc_state_hash, webxdc_last_sent_at FROM chats WHERE dc_chat_id = ?",
+        row = conn.execute("SELECT webxdc_msg_id, webxdc_state_hash, webxdc_last_sent_at, status_line_msg_id, status_line_hash FROM chats WHERE dc_chat_id = ?",
                            (dc_chat_id,)).fetchone()
-        return dict(row) if row else {"webxdc_msg_id": None, "webxdc_state_hash": None, "webxdc_last_sent_at": None}
+        return dict(row) if row else {"webxdc_msg_id": None, "webxdc_state_hash": None, "webxdc_last_sent_at": None, "status_line_msg_id": None, "status_line_hash": None}
     finally:
         conn.close()
 
@@ -2231,6 +2234,13 @@ def set_chat_webxdc(dc_chat_id: int, msg_id: int, state_hash=None, last_sent_at=
     with _writer_transaction() as conn:
         conn.execute("UPDATE chats SET webxdc_msg_id = ?, webxdc_state_hash = ?, webxdc_last_sent_at = ? WHERE dc_chat_id = ?",
                      (msg_id, state_hash, last_sent_at, dc_chat_id))
+
+
+def set_chat_status_line(dc_chat_id, msg_id, text_hash):
+    get_or_create_chat_token(dc_chat_id)
+    with _writer_transaction() as conn:
+        conn.execute("UPDATE chats SET status_line_msg_id = ?, status_line_hash = ? WHERE dc_chat_id = ?",
+                     (msg_id, text_hash, dc_chat_id))
 
 
 def get_status_app_chats() -> list[int]:
@@ -2270,8 +2280,11 @@ def get_recent_chat_events(dc_chat_id: int, limit: int = 20, after_id=None):
     try:
         if after_id is not None:
             # Info needs every unacknowledged outage, even when monitor edits fill the journal view.
-            return [dict(r) for r in conn.execute("SELECT * FROM chat_events WHERE dc_chat_id = ? AND id > ? AND kind IN ('incident_start','incident_end','partial_start','partial_end') ORDER BY id", (dc_chat_id, after_id))]
-        return [dict(r) for r in conn.execute("SELECT * FROM chat_events WHERE dc_chat_id = ? ORDER BY id DESC LIMIT ?", (dc_chat_id, limit))]
+            rows = conn.execute("SELECT * FROM chat_events WHERE dc_chat_id = ? AND id > ? AND kind IN ('incident_start','incident_end','partial_start','partial_end') ORDER BY id", (dc_chat_id, after_id)).fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM chat_events WHERE dc_chat_id = ? ORDER BY id DESC LIMIT ?", (dc_chat_id, limit)).fetchall()
+        resources = get_resources(dc_chat_id)
+        return [{**dict(r), "text": short_journal_text(r["text"], resources)} for r in rows]
     finally:
         conn.close()
 
@@ -2279,7 +2292,7 @@ def get_recent_chat_events(dc_chat_id: int, limit: int = 20, after_id=None):
 def get_retained_message_ids():
     conn = _connect()
     try:
-        return {r[0] for r in conn.execute("SELECT webxdc_msg_id FROM chats WHERE webxdc_msg_id IS NOT NULL UNION SELECT msg_id FROM incidents WHERE status = 'ongoing' AND msg_id IS NOT NULL")}
+        return {r[0] for r in conn.execute("SELECT webxdc_msg_id FROM chats WHERE webxdc_msg_id IS NOT NULL UNION SELECT status_line_msg_id FROM chats WHERE status_line_msg_id IS NOT NULL UNION SELECT msg_id FROM incidents WHERE status = 'ongoing' AND msg_id IS NOT NULL")}
     finally:
         conn.close()
 

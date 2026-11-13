@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.34.2] - 2026-11-13
+
+### Security
+- Reject all non-global probe destinations, including shared address space, except the supported Yggdrasil overlay.
+- Require an exact administrator fingerprint when configured; missing sender keys fail closed and log at most once per sender per hour.
+- Honor environment-configured owners consistently and claim initial ownership atomically.
+- Generate peer invitations only in an encrypted private chat with the administrator.
+- Prevent status page caching and referrer disclosure, including error responses.
+- Bound incoming monitor sync payloads to 64 KB, log only counts and resource IDs, and redact credentials and secret query values in monitor URL logs.
+- Hide non-global intermediate hop addresses in degraded-path diagnostics.
+
 ## [2.34.1] - 2026-11-13
 
 ### Fixed

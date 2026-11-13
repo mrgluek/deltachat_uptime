@@ -411,9 +411,11 @@ class TestPeerFederationSecurity(unittest.TestCase):
     @patch("bot._is_dc_admin", return_value=True)
     def test_invitepeer_and_addpeer_carry_one_time_token(self, mock_is_admin):
         mock_bot = MagicMock()
+        mock_bot.rpc.get_basic_chat_info.return_value = {"chat_type": "Single"}
         mock_bot.rpc.get_chat_securejoin_qr_code.return_value = "https://i.delta.chat/#invite"
         event = MagicMock()
         event.msg.chat_id = 1
+        event.msg.show_padlock = True
         event.payload = ""
 
         bot.invitepeer_command(mock_bot, 1, event)

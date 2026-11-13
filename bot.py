@@ -20,7 +20,7 @@ import struct
 import shlex
 import statistics
 import secrets
-from urllib.parse import urlparse, urljoin
+from urllib.parse import urlparse, urljoin, unquote_plus
 from monitor_names import short_monitor_name
 import aiohttp
 import aiohttp.abc
@@ -66,7 +66,26 @@ from outbox import outbox as dc_outbox, PRIO_ALERT, PRIO_REPLY, PRIO_UPDATE, PRI
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "2.34.1"
+VERSION = "2.34.2"
+SYNC_MAX_BYTES = 64 * 1024
+
+_SECRET_QUERY_NAMES = {"token", "key", "secret", "password", "pass", "pwd", "auth", "sig",
+                       "signature", "api_key", "apikey", "access_token", "code"}
+
+
+def redact_url(text_or_url) -> str:
+    """Remove URL credentials and secret query values from diagnostic text."""
+    text = str(text_or_url)
+    text = re.sub(r"([a-z][a-z0-9+.-]*://)[^/\s?#]*@", r"\1", text, flags=re.IGNORECASE)
+
+    def redact_query(match):
+        name = unquote_plus(match.group(2)).lower().replace("-", "_")
+        secret = name in _SECRET_QUERY_NAMES or any(p in _SECRET_QUERY_NAMES for p in name.split("_"))
+        return match.group(1) + match.group(2) + "=" + ("***" if secret else match.group(3))
+
+    return re.sub(r"([?&])([^?&=\s#]+)=([^&#\s]*)", redact_query, text)
+
+
 STATUS_REFRESH_SECONDS = 1800
 WEBXDC_APP_VERSION = 2  # Bump only for layout changes requiring a new app instance.
 # Safety net; explicit trimming preserves app instances and ongoing incident messages.
@@ -381,10 +400,9 @@ def _admin_contact_id(bot, accid):
     now = time.time()
     if _admin_contact_cache["id"] and now - _admin_contact_cache["at"] < ADMIN_CONTACT_TTL:
         return _admin_contact_cache["id"]
-    email = (database.get_admin_email() or "").lower()
+    email, fp = database.get_effective_admin()
     if not email or bot is None or accid is None:
         return None
-    fp = re.sub(r"[^0-9A-F]", "", (database.get_config("admin_dc_fingerprint") or "").upper())
     # Read once for the loops below; a substring search of the whole encryption info would also
     # match a contact who put the admin's fingerprint into their display name
     self_fp = dc_fingerprint.get_self_fingerprint(bot.rpc, accid) if fp else None
@@ -1472,15 +1490,11 @@ def _is_blocked_ip(ip) -> bool:
     global _YGGDRASIL_NET
     if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
         ip = ip.ipv4_mapped
-    if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_unspecified:
-        return True
-    if ip.is_reserved:
-        if _YGGDRASIL_NET is None:
-            _YGGDRASIL_NET = ipaddress.ip_network("200::/7")
-        if isinstance(ip, ipaddress.IPv6Address) and ip in _YGGDRASIL_NET:
-            return False
-        return True
-    return False
+    if _YGGDRASIL_NET is None:
+        _YGGDRASIL_NET = ipaddress.ip_network("200::/7")
+    if isinstance(ip, ipaddress.IPv6Address) and ip in _YGGDRASIL_NET:
+        return False
+    return not ip.is_global or ip.is_multicast or ip.is_reserved
 
 # DNS pinning: every hostname is resolved through one cache, and every address is checked against
 # _is_blocked_ip before it is connected to. Validation and the actual connection therefore use the
@@ -1807,7 +1821,22 @@ def note_ping_sample(ip: str, sample_ms: int, degraded: bool) -> None:
 
 
 _TRACE_HOP_RE = re.compile(r"^\s*(\d+)\s+(.*)$")
-_TRACE_ADDR_RE = re.compile(r"(?<![\w:.])(\d{1,3}(?:\.\d{1,3}){3}|[0-9a-fA-F]{0,4}(?::[0-9a-fA-F]{0,4}){2,7})(?![\w:.])")
+_TRACE_ADDR_RE = re.compile(r"(?<![\w:.])([0-9a-fA-F:]+:\d{1,3}(?:\.\d{1,3}){3}|\d{1,3}(?:\.\d{1,3}){3}|[0-9a-fA-F]{0,4}(?::[0-9a-fA-F]{0,4}){2,7})(?![\w:.])")
+
+
+def redact_private_hops(text: str) -> str:
+    """Keep only globally routable addresses in path diagnostics sent to chats or peers."""
+    import ipaddress
+
+    def replace(match):
+        try:
+            ip = ipaddress.ip_address(match.group(1))
+            ip = ip.ipv4_mapped if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped else ip
+            return match.group(1) if ip.is_global and not ip.is_multicast else "private hop"
+        except ValueError:
+            return "private hop"
+
+    return _TRACE_ADDR_RE.sub(replace, text)
 
 
 def summarize_traceroute(output: str) -> str:
@@ -1830,7 +1859,7 @@ def summarize_traceroute(output: str) -> str:
     if not best or best[0] < DEGRADED_RTT_MIN_EXTRA_MS / 2:
         return ""
     rise, n1, a1, n2, a2 = best
-    return f"trace: +{round(rise)} ms between hop {n1} {a1} and hop {n2} {a2}"
+    return redact_private_hops(f"trace: +{round(rise)} ms between hop {n1} {a1} and hop {n2} {a2}")
 
 
 async def _trace_path(ip: str) -> None:
@@ -1868,7 +1897,7 @@ def path_trace_hint(ip: str) -> str:
         task = _path_trace_tasks.get(ip)
         if task is None or task.done():
             _path_trace_tasks[ip] = asyncio.create_task(_trace_path(ip))
-    return cached[1] if cached else ""
+    return redact_private_hops(cached[1]) if cached else ""
 
 
 def check_status(is_up) -> str:
@@ -2184,6 +2213,21 @@ def _is_trusted_peer_msg(msg, peer: dict | None, is_private_chat: bool) -> bool:
     return True
 
 # Admin detection helper
+_admin_missing_fp_logged = {}
+_admin_missing_fp_lock = threading.Lock()
+
+
+def _log_missing_admin_fingerprint(accid, contact_id):
+    now = time.monotonic()
+    with _admin_missing_fp_lock:
+        key = (accid, contact_id)
+        last = _admin_missing_fp_logged.get(key)
+        if last is not None and now - last < 3600:
+            return
+        _admin_missing_fp_logged[key] = now
+    logger.warning("Admin command refused for contact %s: sender fingerprint unavailable", contact_id)
+
+
 def _get_contact_fingerprint(bot, accid, contact_id, contact=None):
     """The contact's key fingerprint, or None; see dc_fingerprint. `contact` is unused, kept for callers."""
     return dc_fingerprint.get_contact_fingerprint(bot.rpc, accid, contact_id)
@@ -2196,21 +2240,21 @@ def _is_dc_admin(bot, accid, contact_id, chat_id: int = None):
         except Exception:
             pass
         
-        admin_fp = database.get_admin_fingerprint()
+        admin_email, admin_fp = database.get_effective_admin()
         if admin_fp:
             c_fp = _get_contact_fingerprint(bot, accid, contact_id, contact=contact)
-            if c_fp:
-                if admin_fp.upper() in c_fp.upper().split(','):
-                    if chat_id:
-                        database.set_config("admin_chat_id", str(chat_id))
-                    return True
-            if c_fp:
-                 logger.warning(f"Admin fingerprint mismatch for contact {contact_id}")
-                 return False
+            if not c_fp:
+                _log_missing_admin_fingerprint(accid, contact_id)
+                return False
+            if admin_fp == c_fp.upper():
+                if chat_id:
+                    database.set_config("admin_chat_id", str(chat_id))
+                return True
+            logger.warning(f"Admin fingerprint mismatch for contact {contact_id}")
+            return False
         
         if contact:
             sender_email = contact.address
-            admin_email = database.get_config("admin_dc_email")
             if admin_email and admin_email.lower() == sender_email.lower():
                 if chat_id:
                     database.set_config("admin_chat_id", str(chat_id))
@@ -2541,7 +2585,7 @@ async def run_single_check(resource, session=None) -> tuple[bool, str, int | Non
                             except Exception:
                                 body_text = body_bytes.decode('utf-8', errors='ignore')
                         except Exception as read_ex:
-                            logger.warning(f"Failed to read body for {url}: {read_ex}")
+                            logger.warning(redact_url(f"Failed to read body for {url}: {read_ex}"))
                             body_text = ""
 
                         if expected_kw:
@@ -2569,7 +2613,7 @@ async def run_single_check(resource, session=None) -> tuple[bool, str, int | Non
                 try:
                     await run_db(database.set_url_http_method, url, "GET")
                 except Exception as db_err:
-                    logger.warning(f"Failed to persist http_method for {url}: {db_err}")
+                    logger.warning(redact_url(f"Failed to persist http_method for {url}: {db_err}"))
 
                 # Update in-memory scheduler cache if present
                 try:
@@ -2613,10 +2657,10 @@ async def run_single_check(resource, session=None) -> tuple[bool, str, int | Non
                         # for a hung target, hold a check slot for another full timeout
                         raise
                     except Exception as head_ex:
-                        logger.debug(f"HEAD check failed for {url} ({head_ex}), falling back to GET")
+                        logger.debug(redact_url(f"HEAD check failed for {url} ({head_ex}), falling back to GET"))
 
                     if head_405:
-                        logger.info(f"HEAD check returned 405 Method Not Allowed for {url}. Memorizing GET method for this monitor.")
+                        logger.info(redact_url(f"HEAD check returned 405 Method Not Allowed for {url}. Memorizing GET method for this monitor."))
                         await _memorize_get()
 
                     # If HEAD was not 2xx/3xx or threw an exception, fall back to GET (max 16KB)
@@ -2625,7 +2669,7 @@ async def run_single_check(resource, session=None) -> tuple[bool, str, int | Non
                         # HEAD answered 4xx/5xx but GET works (e.g. an app that only routes GET and
                         # crashes on HEAD): use GET from now on, so the server is not hit with a failing
                         # HEAD on every check
-                        logger.info(f"HEAD check returned {head_status} for {url} but GET succeeded. Memorizing GET method for this monitor.")
+                        logger.info(redact_url(f"HEAD check returned {head_status} for {url} but GET succeeded. Memorizing GET method for this monitor."))
                         await _memorize_get()
                     return result
                 elif not expected_kw:
@@ -2772,7 +2816,7 @@ def log_check_summary(running: int) -> None:
     st = _check_stats
     total = st["up"] + st["down"] + st["skipped"]
     avg = f"{st['lat_sum'] // st['lat_n']} ms" if st["lat_n"] else "n/a"
-    slowest = f", slowest {st['slowest'][1]} ({st['slowest'][0]} ms)" if st["slowest"][1] else ""
+    slowest = f", slowest {redact_url(st['slowest'][1])} ({st['slowest'][0]} ms)" if st["slowest"][1] else ""
     waiting = dc_outbox.waiting()
     queued = f", outbox waiting {sum(waiting.values())} ({', '.join(f'{k} {v}' for k, v in waiting.items())})" if waiting else ""
     logger.info(f"Checks in the last 60s: {total} ({st['up']} up, {st['down']} down, {st['skipped']} skipped), "
@@ -3082,7 +3126,7 @@ def note_lone_reporter(url: str, reporter: str, votes: list[dict], now: float = 
         for key in [k for k, (u, _) in held.items() if now - u > UNCONFIRMED_REPORT_HOLD_MAX]:
             del held[key]
     why = "is unstable" if status == "unstable" else "answers UP now"
-    logger.info(f"{url}: {reporter} {why}; ignoring its reports for this target for {hold // 60} min")
+    logger.info(redact_url(f"{url}: {reporter} {why}; ignoring its reports for this target for {hold // 60} min"))
     return True
 
 
@@ -3336,7 +3380,7 @@ async def apply_quorum_state(r: dict, votes: list[dict], votes_json: str) -> str
             _queue_degraded_notice("end", r, votes, started_at or degraded_since or None)
         degraded_since = 0  # to DOWN: the incident message takes over
     if new != prev:
-        logger.info(f"Quorum: {r.get('name') or r['url']} (id: {r['id']}) {prev.upper()} -> {new.upper()} ({format_votes(votes)})")
+        logger.info(redact_url(f"Quorum: {r.get('name') or r['url']} (id: {r['id']}) {prev.upper()} -> {new.upper()} ({format_votes(votes)})"))
     await run_db(database.update_resource_alert_state, r["id"], new, votes_json, degraded_since)
     r["alert_state"], r["last_votes"], r["degraded_since"] = new, votes_json, degraded_since
     return new
@@ -3380,7 +3424,7 @@ async def check_group_task(group, semaphore, session=None):
     if is_up is None:
         # IPv6-only target on a node without IPv6: not an outage, so no retries, alerts or status change
         _count_check(None, None, rep["url"])
-        logger.debug(f"Check skipped: {rep['name'] or rep['url']} (id: {rep['id']}) in chat {rep['dc_chat_id']} ({error_msg})")
+        logger.debug(redact_url(f"Check skipped: {rep['name'] or rep['url']} (id: {rep['id']}) in chat {rep['dc_chat_id']} ({error_msg})"))
         return
 
     def _in_alert(r):
@@ -3393,7 +3437,7 @@ async def check_group_task(group, semaphore, session=None):
         for retry in range(1, 3):
             for r in group:
                 if not _in_alert(r):
-                    logger.info(f"Retry {retry}/2 for resource {r['id']} ({r['name'] or r['url']}) in chat {r['dc_chat_id']}")
+                    logger.info(redact_url(f"Retry {retry}/2 for resource {r['id']} ({r['name'] or r['url']}) in chat {r['dc_chat_id']}"))
             await asyncio.sleep(30)
             res = await check_network_probe(rep, semaphore, session=session)
             if len(res) == 3:
@@ -3409,7 +3453,7 @@ async def check_group_task(group, semaphore, session=None):
         has_internet = await check_host_internet_connectivity()
         if not has_internet:
             logger.warning(
-                f"Host internet outage detected! Suppressing DOWN check result for {rep['name'] or rep['url']} in chat {rep['dc_chat_id']}"
+                redact_url(f"Host internet outage detected! Suppressing DOWN check result for {rep['name'] or rep['url']} in chat {rep['dc_chat_id']}")
             )
             return
 
@@ -3442,14 +3486,14 @@ async def check_group_task(group, semaphore, session=None):
             peer_results = await collect_peer_votes(
                 rep, is_up, revote_interval=QUORUM_REVOTE_INTERVAL_LONG if long_running else QUORUM_REVOTE_INTERVAL)
         elif reported_by and quorum_group:
-            logger.info(f"{rep.get('name') or rep['url']}: UP here but {reported_by} reports it DOWN; asking all peers")
+            logger.info(redact_url(f"{rep.get('name') or rep['url']}: UP here but {reported_by} reports it DOWN; asking all peers"))
             peer_results = await collect_peer_votes(rep, is_up, fresh=True, reporter=reported_by)
         elif locally_degraded and quorum_group:
             # Not fresh: answers are re-used for QUORUM_REVOTE_INTERVAL, so a path that stays bad
             # (e.g. this node's provider) does not ask the peers every minute
             peer_results = await collect_peer_votes(rep, is_up)
     except Exception as ex:
-        logger.warning(f"Error during peer cross-check: {ex}")
+        logger.warning(redact_url(f"Error during peer cross-check: {ex}"))
 
     votes = build_votes(local_node, is_up, latency_ms, error_msg, peer_results) if peer_results is not None else None
     if votes:
@@ -3519,8 +3563,8 @@ async def check_group_task(group, semaphore, session=None):
         changed = r.get("status") != ("up" if r_up else "down")
         shown, local_word = ("UP" if r_up else "DOWN"), check_status(is_up).upper()
         logger.log(logging.INFO if (changed or not r_up or not is_up or locally_degraded) else logging.DEBUG,
-                   f"Check result: {r['name'] or r['url']} (id: {r['id']}) in chat {r['dc_chat_id']} -> {shown}"
-                   f"{'' if shown == local_word else ' by quorum, locally ' + local_word} ({r_err})")
+                   redact_url(f"Check result: {r['name'] or r['url']} (id: {r['id']}) in chat {r['dc_chat_id']} -> {shown}"
+                   f"{'' if shown == local_word else ' by quorum, locally ' + local_word} ({r_err})"))
         await handle_check_result(r, r_up, r_err, latency_ms=latency_ms, status_written=True)
 
     # Check SSL Certificate Expiry for HTTPS and SMTP targets (at most once per hour)
@@ -3558,7 +3602,7 @@ async def check_group_task(group, semaphore, session=None):
 
                     await run_db(database.update_resource_ssl, r["id"], ssl_exp_ts, now, new_state)
                 else:
-                    logger.warning(f"SSL check for {rep['url']} failed: {ssl_err}")
+                    logger.warning(redact_url(f"SSL check for {rep['url']} failed: {ssl_err}"))
                     await run_db(database.update_resource_ssl, r["id"], r.get("ssl_expiry_date"), now, cur_state)
 
 def format_incident_message(incident_id: int, started_at: int, resources: list[dict], is_resolved: bool = False, resolved_at: int = None, dc_chat_id: int = None, total_chat_monitors: int = None) -> str:
@@ -3891,7 +3935,7 @@ async def check_stale_downtime_notifications(resource, now: int):
 
     if stale_level >= 14 and now - (res.get("stale_warning_at") or 0) >= STALE_CLEANUP_GRACE \
             and await asyncio.to_thread(_is_stale_for, res_id, 30, now):
-        logger.warning(f"Resource {res_id} ({res_name}) in chat {dc_chat_id} has been down for 30 days. Auto-removing from monitoring...")
+        logger.warning(redact_url(f"Resource {res_id} ({res_name}) in chat {dc_chat_id} has been down for 30 days. Auto-removing from monitoring..."))
         await asyncio.to_thread(database.delete_resource, dc_chat_id, res_id)
         await _send_stale_message(dc_chat_id, (
             f"🗑️ **Auto-Cleanup (30 Days Unreachable)**\n\n"
@@ -4831,13 +4875,16 @@ def get_dashboard_html(chat_name, resources, overall_uptime, incidents=None, upt
 """
 
 async def handle_status_page(request):
+    headers = {"Cache-Control": "no-store", "Referrer-Policy": "no-referrer",
+               "X-Content-Type-Options": "nosniff"}
     if not check_rate_limit(request, bucket="web_status", max_requests=120, window_seconds=60):
-        return web.Response(text="Rate limit exceeded. Try again later.", status=429, headers={"Retry-After": "60"})
+        return web.Response(text="Rate limit exceeded. Try again later.", status=429,
+                            headers={**headers, "Retry-After": "60"})
 
     token = request.match_info.get('token')
     chat_id = await run_db(database.get_chat_id_by_token, token)
     if not chat_id:
-        return web.Response(text="Status Page Not Found", status=404)
+        return web.Response(text="Status Page Not Found", status=404, headers=headers)
         
     chat_name = "Chat Monitor"
     if dc_bot_instance and dc_accid is not None:
@@ -4862,7 +4909,7 @@ async def handle_status_page(request):
     partial_outages = await run_db(database.get_chat_partial_outages, chat_id, 10)
     html_content = get_dashboard_html(chat_name, resources, overall_uptime, incidents, uptimes_map=uptimes_map,
                                       partial_outages=partial_outages)
-    return web.Response(text=html_content, content_type="text/html")
+    return web.Response(text=html_content, content_type="text/html", headers=headers)
 
 async def handle_health(request):
     """For monitors and other nodes: no database, no page, just alive and which version."""
@@ -5876,7 +5923,7 @@ def _get_help_chat_id(bot, accid, msg):
 def help_command(bot, accid, event):
     msg = event.msg
     is_actually_admin = _is_dc_admin(bot, accid, msg.from_id)
-    admin_email = database.get_config("admin_dc_email")
+    admin_email, admin_fp = database.get_effective_admin()
     
     help_text = (
         f"👋 Welcome to Delta Chat Uptime Bot {VERSION}!\n\n"
@@ -5905,13 +5952,12 @@ def help_command(bot, accid, event):
         f"/help — Show this help message\n\n"
     )
     
-    if not admin_email:
+    if not admin_email and not admin_fp:
         help_text += (
             f"**Setup Command:**\n"
             f"/initadmin — Claim bot ownership (admin setup)\n\n"
         )
     elif is_actually_admin:
-        admin_fp = database.get_admin_fingerprint()
         fp_suffix = f" ({admin_fp[-8:].upper()})" if admin_fp else ""
         help_text += f"👑 **Admin:** `{admin_email}`{fp_suffix}\n\n"
         help_text += (
@@ -5957,23 +6003,19 @@ def donate_command(bot, accid, event):
 @dc_cli.on(events.NewMessage(command="/initadmin"))
 def initadmin_command(bot, accid, event):
     msg = event.msg
-    admin_email = database.get_config("admin_dc_email")
-    admin_fp = database.get_admin_fingerprint()
-
-    if admin_email or admin_fp:
+    if any(database.get_effective_admin()):
         _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text="❌ Admin is already set. Use `set_admin.py` on the server to change."))
         return
 
     contact = bot.rpc.get_contact(accid, msg.from_id)
     email = contact.address
-    database.set_config("admin_dc_email", email)
-
     fp = _get_contact_fingerprint(bot, accid, msg.from_id, contact=contact)
+    if not database.claim_admin(email, fp):
+        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text="❌ Admin is already set. Use `set_admin.py` on the server to change."))
+        return
     if fp:
-        first_fp = fp.split(',')[0]
-        database.set_admin_fingerprint(first_fp)
         _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(
-            text=f"✅ You are now the admin!\n\nEmail: `{email}`\nFingerprint: `{first_fp[-8:]}`"
+            text=f"✅ You are now the admin!\n\nEmail: `{email}`\nFingerprint: `{fp[-8:]}`"
         ))
     else:
         _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(
@@ -6068,7 +6110,7 @@ def fetch_html_title(url, timeout=3.0):
                 if title:
                     return title
     except Exception as e:
-        logger.warning(f"Could not fetch title for {url}: {e}")
+        logger.warning(redact_url(f"Could not fetch title for {url}: {e}"))
     return None
 
 def parse_duration_string(s: str) -> int | None:
@@ -7512,6 +7554,15 @@ def invitepeer_command(bot, accid, event):
         _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text="❌ This command is only for the administrator."))
         return
     try:
+        chat_info = bot.rpc.get_basic_chat_info(accid, msg.chat_id)
+        if not chat_info or not is_single_chat(chat_info):
+            _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(
+                text="Use this command in a private chat with the bot."))
+            return
+        if not getattr(msg, "show_padlock", False):
+            _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(
+                text="Use this command in an encrypted private chat with the bot."))
+            return
         qr_link = bot.rpc.get_chat_securejoin_qr_code(accid, None)
         node_name = database.get_local_node_name()
         addr = dc_fingerprint.get_self_addr(bot.rpc, accid)
@@ -7990,8 +8041,7 @@ def on_start(bot, _args):
         except Exception as e:
             logger.error(f"Failed to set storage optimizations: {e}")
             
-        admin_email = database.get_config("admin_dc_email")
-        admin_fp = database.get_admin_fingerprint()
+        admin_email, admin_fp = database.get_effective_admin()
         if admin_email:
             fp_suffix = f" ({admin_fp[-8:].upper()})" if admin_fp else ""
             print(f"Bot Administrator: {admin_email}{fp_suffix}")
@@ -8053,26 +8103,28 @@ def on_new_message(bot, accid, event):
 
     text = (msg.text or "").strip()
     
-    if "[UPTIME_BOT_SYNC_DATA]" in text:
-        logger.info(f"[SYNC RECEIVE] Found payload. from_id={msg.from_id}, is_info={msg.is_info}")
-    
     if msg.from_id == 1:
         return
 
     if "[UPTIME_BOT_SYNC_DATA]" in text and "[/UPTIME_BOT_SYNC_DATA]" in text:
-        logger.info(f"[SYNC RECEIVE] Processing sync data payload...")
         try:
             start_idx = text.find("[UPTIME_BOT_SYNC_DATA]") + len("[UPTIME_BOT_SYNC_DATA]")
             end_idx = text.find("[/UPTIME_BOT_SYNC_DATA]")
+            if end_idx - start_idx > SYNC_MAX_BYTES:
+                logger.warning("[SYNC RECEIVE] Payload exceeds 64 KB. Ignoring.")
+                return
             json_str = text[start_idx:end_idx].strip()
+            if len(json_str.encode("utf-8")) > SYNC_MAX_BYTES:
+                logger.warning("[SYNC RECEIVE] Payload exceeds 64 KB. Ignoring.")
+                return
             sync_list = json.loads(json_str)
-            logger.info(f"[SYNC RECEIVE] Parsed json: {sync_list}")
             
             if not isinstance(sync_list, list):
                 logger.warning("[SYNC RECEIVE] Payload is not a list. Ignoring.")
                 return
             
             # Limit the sync payload to a maximum of 50 items to avoid DB spam
+            logger.info("[SYNC RECEIVE] Received %s item(s); processing at most 50", len(sync_list))
             sync_list = sync_list[:50]
             
             added_count = 0
@@ -8100,6 +8152,7 @@ def on_new_message(bot, accid, event):
                             res_id = database.add_resource(msg.chat_id, validated_url, name or validated_url, check_type, interval)
                             if res_id is not None:
                                 added_count += 1
+                                logger.info("[SYNC RECEIVE] Added resource id=%s", res_id)
                                 added_resources.append(f"• `{validated_url}` ({name or validated_url}) [{check_type.upper()}]")
                     except ValueError:
                         # Skip invalid URL
@@ -8111,7 +8164,7 @@ def on_new_message(bot, accid, event):
             else:
                 _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text="📥 **Sync Complete!**\nNo new resources to add (already up-to-date)."))
         except Exception as e:
-            logger.error(f"Error parsing sync data: {e}")
+            logger.error("Error processing sync data (%s)", type(e).__name__)
         return
 
     # Determine if chat is 1:1 private (Single) or group
@@ -8209,7 +8262,7 @@ def on_new_message(bot, accid, event):
 
             # Security: Validate target_url against SSRF (no localhost / private IPs)
             if not is_safe_target_url(target_url, check_type):
-                logger.warning(f"Dropping unsafe cross-check target: {target_url} ({check_type})")
+                logger.warning(redact_url(f"Dropping unsafe cross-check target: {target_url} ({check_type})"))
                 return
 
             if req_id and target_url:

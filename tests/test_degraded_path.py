@@ -101,9 +101,9 @@ class TestTraceroute(unittest.TestCase):
         self.assertEqual(bot.summarize_traceroute(flat), "")
 
     def test_ipv6_hops(self):
-        out = " 1  2001:db8::1  1.0 ms  1.0 ms  1.0 ms\n 2  2001:db8:1::2  300.0 ms  310.0 ms  305.0 ms\n"
+        out = " 1  2606:4700::1  1.0 ms  1.0 ms  1.0 ms\n 2  2606:4700:1::2  300.0 ms  310.0 ms  305.0 ms\n"
         self.assertEqual(bot.summarize_traceroute(out),
-                         "trace: +304 ms between hop 1 2001:db8::1 and hop 2 2001:db8:1::2")
+                         "trace: +304 ms between hop 1 2606:4700::1 and hop 2 2606:4700:1::2")
 
 
 class TestDegradedVotes(unittest.TestCase):

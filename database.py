@@ -409,12 +409,31 @@ def get_config(key: str) -> str:
     finally:
         conn.close()
 
+def _clean_admin_fingerprint(fp):
+    if fp:
+        cleaned = fp.strip().replace(" ", "").replace(":", "").upper()
+        if re.fullmatch(r"[0-9A-F]{32,64}", cleaned):
+            return cleaned
+    return None
+
+
+def get_effective_admin(conn=None):
+    """Stored owner with environment fallbacks, optionally within a writer transaction."""
+    if conn is None:
+        conn = _connect()
+        try:
+            return get_effective_admin(conn)
+        finally:
+            conn.close()
+    values = dict(conn.execute(
+        "SELECT key, value FROM config WHERE key IN ('admin_dc_email', 'admin_dc_fingerprint')"))
+    email = (values.get("admin_dc_email") or "").strip() or os.getenv("ADMIN_DC_EMAIL", "").strip()
+    fp = values.get("admin_dc_fingerprint") or os.getenv("ADMIN_DC_FINGERPRINT", "")
+    return email.lower() or None, _clean_admin_fingerprint(fp)
+
+
 def get_admin_email():
-    db_val = get_config("admin_dc_email")
-    if db_val and db_val.strip():
-        return db_val.strip().lower()
-    env_val = os.getenv("ADMIN_DC_EMAIL")
-    return env_val.strip().lower() if env_val else None
+    return get_effective_admin()[0]
 
 
 def set_admin_email(email: str):
@@ -424,30 +443,28 @@ def set_admin_email(email: str):
 
 
 def get_admin_fingerprint():
-    fp = get_config("admin_dc_fingerprint")
-    if not fp:
-        fp = os.getenv("ADMIN_DC_FINGERPRINT", "")
-    if fp:
-        cleaned = fp.strip().replace(" ", "").replace(":", "").upper()
-        if re.match(r"^[0-9A-F]{32,64}$", cleaned):
-            return cleaned
-    return None
+    return get_effective_admin()[1]
 
 
 def set_admin_fingerprint(fp: str):
-    if fp:
-        cleaned = fp.strip().replace(" ", "").replace(":", "").upper()
-        if re.match(r"^[0-9A-F]{32,64}$", cleaned):
-            set_config("admin_dc_fingerprint", cleaned)
-        else:
-            set_config("admin_dc_fingerprint", "")
-    else:
-        set_config("admin_dc_fingerprint", "")
+    set_config("admin_dc_fingerprint", _clean_admin_fingerprint(fp) or "")
+
+
+def claim_admin(email: str, fingerprint: str = None) -> bool:
+    """Claim an unconfigured owner once, including across database connections."""
+    with _writer_transaction() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        if any(get_effective_admin(conn)):
+            return False
+        conn.executemany("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)", (
+            ("admin_dc_email", email.strip().lower()),
+            ("admin_dc_fingerprint", _clean_admin_fingerprint(fingerprint) or ""),
+        ))
+        return True
 
 
 def is_authorized_sender(sender_addr: str, fingerprint: str = None) -> bool:
-    admin_email = get_admin_email()
-    admin_fp = get_admin_fingerprint()
+    admin_email, admin_fp = get_effective_admin()
 
     if not admin_email and not admin_fp:
         return False
@@ -458,7 +475,7 @@ def is_authorized_sender(sender_addr: str, fingerprint: str = None) -> bool:
         if admin_fp:
             if fingerprint:
                 fp_clean = fingerprint.strip().replace(" ", "").replace(":", "").upper()
-                return admin_fp in fp_clean
+                return admin_fp == fp_clean
             return False
         return True
 

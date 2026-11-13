@@ -6,7 +6,7 @@ Additionally, it automatically generates a secure, beautiful web status dashboar
 
 ## Features
 
-- 🛡️ **Secure Administration:** Claim ownership with `/initadmin` via private chat. Cryptographic fingerprint-based authentication protects administrative actions.
+- 🛡️ **Secure Administration:** Claim ownership with `/initadmin` via private chat when no owner is configured in the database or environment. Once an admin fingerprint is configured, commands require that exact key; an unavailable sender fingerprint is refused and logged at most once per sender per hour. Email-only matching applies while no fingerprint is configured.
 - 💬 **Per-Chat Isolation:** Each chat (private or group) maintains its own separate list of monitored resources.
 - 🚨 **Incident-Based Alerting & In-Place Dynamic Updates:**
   - Instead of flooding the chat with dozens of separate DOWN/UP messages, outages trigger a unified **Incident** per chat.
@@ -142,7 +142,7 @@ These commands are only executable by the configured administrator.
 - `/nodeignore [node_pattern] [target_pattern]` — Centrally exclude targets from being checked on remote peer nodes matching `node_pattern` (wildcards `*` supported, e.g. `/nodeignore RU* facebook.*`, `/nodeignore *home *:25`, `/nodeignore Node-1 https://site.org/`). Cross-check requests for matching targets are not sent to those nodes (saving network messages), their telemetry reports for them are ignored in quorum, and any matching stale peer measurements are cleared. Without arguments lists all rules; with `node_pattern` lists matching rules.
 - `/nodeunignore <node_pattern> [target_pattern]` — Remove a node ignore rule (e.g. `/nodeunignore RU* facebook.*`), or remove all rules for a node pattern (e.g. `/nodeunignore RU*`).
 - `/nodename [name]` — View or set the local probe node identifier (e.g. `/nodename Frankfurt-DE`). Peers (2.17.2+) pick up a new name from the next telemetry message; a name already used by another node is refused. Without `DISPLAY_NAME` the bot's display name follows it: `Uptime Bot (<node name>)`.
-- `/invitepeer` — Generate a SecureJoin E2E encrypted invite link (`https://i.delta.chat/#...`) with a single-use pairing token (valid 24h) for linking another bot.
+- `/invitepeer` — Generate a SecureJoin E2E encrypted invite link (`https://i.delta.chat/#...`) with a single-use pairing token (valid 24h) for linking another bot. Requires an encrypted private 1:1 chat with the administrator.
 - `/peers` (or `/probes`) — List distributed monitoring peers, node names, key fingerprints, the relay address each one last used, their bot version (⚠️ when older than this node) and last seen activity.
 - `/stats` — Bot statistics and diagnostics: version and uptime, CPU of the bot and the Delta Chat core (last minutes and average), database sizes, monitors by type and state, checks per minute, mail received/sent in the last hour, outbox counters and queue, peers (online, unstable, which run an older version), telemetry interval, votes and held reports in the last hour, relays.
 - `/addpeer <email|link> [token=<token>] [node_name]` — Link another Delta Chat Uptime bot as a remote probe using the command printed by its `/invitepeer` (e.g. `/addpeer https://i.delta.chat/#... token=... RU`). Without a token (e.g. `/addpeer ruptimebot@chat.gluek.info RU`) the other bot's admin must add this bot too.
@@ -200,6 +200,8 @@ Configure your admin email address and your cryptographic fingerprint on the ser
 docker compose run --rm uptime_bot python set_admin.py --email admin@yourdomain.com
 docker compose run --rm uptime_bot python set_admin.py --fingerprint 1234ABCD1234ABCD1234ABCD1234ABCD1234ABCD
 ```
+
+`ADMIN_DC_EMAIL` and `ADMIN_DC_FINGERPRINT` provide environment fallbacks. Either configured owner value prevents `/initadmin` from replacing ownership; if neither is set, only the first claim succeeds.
 
 ### 3. Run the Bot
 Start the bot daemon in background:

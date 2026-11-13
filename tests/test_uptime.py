@@ -2037,6 +2037,8 @@ class TestUptimeBot(unittest.TestCase):
         self.assertIn("ruptime@gluek.info", args[2].text)
 
         # 5. Invitepeer command
+        mock_bot.rpc.get_basic_chat_info.return_value = {"chat_type": "Single"}
+        mock_event.msg.show_padlock = True
         mock_bot.rpc.get_chat_securejoin_qr_code.return_value = "https://i.delta.chat/#testinvite123"
         bot.invitepeer_command(mock_bot, 1, mock_event)
         args, kwargs = mock_bot.rpc.send_msg.call_args
@@ -3170,7 +3172,7 @@ class TestHelpPrivateReply(unittest.TestCase):
     @patch("bot.is_single_chat", return_value=False)
     @patch("bot._dc_send_msg_with_stats")
     @patch("bot.MsgData", side_effect=lambda text: text)
-    @patch("bot.database.get_config", return_value=None)
+    @patch("bot.database.get_effective_admin", return_value=(None, None))
     @patch("bot._is_dc_admin", return_value=False)
     def test_help_command_in_group_sends_private_with_note(self, _mock_admin, _mock_cfg, _mock_msgdata, mock_send, _mock_chat):
         mock_bot = self._bot()

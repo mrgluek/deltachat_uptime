@@ -61,6 +61,7 @@ except Exception:
 
 import concurrent.futures
 import database
+import blockcheck
 import dc_fingerprint
 import transports_view
 from outbox import outbox as dc_outbox, PRIO_ALERT, PRIO_REPLY, PRIO_UPDATE, PRIO_PEER, PRIO_TELEMETRY
@@ -68,7 +69,7 @@ from outbox import outbox as dc_outbox, PRIO_ALERT, PRIO_REPLY, PRIO_UPDATE, PRI
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "2.36.0"
+VERSION = "2.37.0"
 SYNC_MAX_BYTES = 64 * 1024
 # 200 metrics / 100 cross-checks, including JSON's twelve-byte astral Unicode escaping at field limits.
 PEER_MAX_BYTES = 8 * 1024 * 1024
@@ -2773,14 +2774,43 @@ async def _safe_http_request(sess, method: str, url: str, **kwargs):
             current_url = next_url
     raise aiohttp.ClientError("Too many redirects")
 
+_HTTP_STATUS_ERROR_RE = re.compile(r"^\d{3}\b")
+
+
+async def _annotate_block(resource, result):
+    """Puts "SNI block?" / "DNS spoofing?" / "HTTP Host block?" before the error of a failed HTTP check
+    when a second probe from this node points at filtering (see blockcheck.py). Only the text changes."""
+    is_up, error, latency = result
+    if is_up is not False or resource.get("type") != "http" or not error:
+        return result
+    if (error in (BLOCKED_TARGET_MSG, NO_IPV6_MSG) or _HTTP_STATUS_ERROR_RE.match(error)
+            or "Missing keyword" in error or error.startswith("Redirect to blocked address")
+            or any(t in error for t in blockcheck.TAGS)):  # already diagnosed (the IPv4 re-check)
+        return result  # the server answered, or the target is not ours to probe
+    try:
+        parsed = urlparse(resource["url"])
+        host = parsed.hostname
+        if not host or _literal_ip(host):
+            return result
+        use_tls = parsed.scheme == "https"
+        port = parsed.port or (443 if use_tls else 80)
+        ips = await probe_addresses(host, resource.get("family") if resource.get("family") in (4, 6) else None)
+        tag = await blockcheck.diagnose_cached(host, port, use_tls, ips)
+    except Exception as e:
+        logger.debug(redact_url(f"Block diagnosis skipped for {resource.get('url')}: {e}"))
+        return result
+    return (is_up, blockcheck.with_tag(tag, error), latency) if tag else result
+
+
 async def run_single_check(resource, session=None) -> tuple[bool, str, int | None]:
     # A single monotonic deadline includes DNS, all redirects, fallback, reads and cleanup.
     started = time.monotonic()
     try:
         async with asyncio.timeout(HTTP_TOTAL_DEADLINE):
-            return await _run_single_check(resource, session)
+            result = await _run_single_check(resource, session)
     except asyncio.TimeoutError:
-        return False, "Timeout", int((time.monotonic() - started) * 1000)
+        result = (False, "Timeout", int((time.monotonic() - started) * 1000))
+    return await _annotate_block(resource, result)
 
 
 async def _run_single_check(resource, session=None):
@@ -3219,6 +3249,10 @@ def short_vote_error(error, limit: int = VOTE_ERROR_MAX) -> str | None:
     'SSL: self-signed certificate' instead of aiohttp's full 'Cannot connect to host ...' text."""
     if not error:
         return None
+    tag, error = blockcheck.split_tag(" ".join(str(error).split()))
+    if tag:  # keep the tag whole and shorten what follows it
+        rest = short_vote_error(error, max(limit - len(tag) - 1, 10))
+        return f"{tag} {rest}" if rest else tag
     text = " ".join(str(error).split())
     ssl_fail = re.search(r"certificate verify failed: ([^()'\]]+)", text)
     if ssl_fail:

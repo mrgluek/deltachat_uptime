@@ -3,6 +3,7 @@ import collections
 import functools
 import ipaddress
 import contextlib
+import contextvars
 import io
 import logging
 import json
@@ -69,7 +70,7 @@ from outbox import outbox as dc_outbox, PRIO_ALERT, PRIO_REPLY, PRIO_UPDATE, PRI
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "2.37.0"
+VERSION = "2.38.0"
 SYNC_MAX_BYTES = 64 * 1024
 # 200 metrics / 100 cross-checks, including JSON's twelve-byte astral Unicode escaping at field limits.
 PEER_MAX_BYTES = 8 * 1024 * 1024
@@ -2753,12 +2754,38 @@ def _cert_expiry_ts(cert: dict) -> int | None:
 _REDIRECT_STATUSES = (301, 302, 303, 307, 308)
 _MAX_SAFE_REDIRECTS = 10
 
+# The redirects of the last request of a check: [(status, next_url), ...]. A list per check, set by
+# run_single_check; the caller reads it after the check (a coroutine awaited in the same task shares the
+# context), so the (is_up, details, latency) result and the peer protocol stay as they are.
+_redirect_trail: contextvars.ContextVar = contextvars.ContextVar("redirect_trail", default=None)
+REDIRECT_URL_MAX = 120
+
+
+def last_redirect_trail() -> list[tuple[int, str]]:
+    return list(_redirect_trail.get() or [])
+
+
+def format_redirects(trail) -> str | None:
+    """'301 → https://example.com/' (one hop) or '301 → https://a/ → 302 → https://b/'; None without redirects."""
+    if not trail:
+        return None
+    parts = []
+    for status, url in trail:
+        shown = redact_url(url)
+        if len(shown) > REDIRECT_URL_MAX:
+            shown = shown[:REDIRECT_URL_MAX - 1] + "…"
+        parts.append(f"`{status}` → `{shown}`")
+    return " → ".join(parts)
+
 @contextlib.asynccontextmanager
 async def _safe_http_request(sess, method: str, url: str, **kwargs):
     """Performs an HTTP request following redirects manually, re-validating every hop
     against the SSRF filter so a public URL cannot redirect the probe into a private network."""
     kwargs["allow_redirects"] = False
     current_url = url
+    trail = _redirect_trail.get()
+    if trail is not None:
+        trail.clear()  # a HEAD followed by a GET: the trail is that of the request that decided
     for _ in range(_MAX_SAFE_REDIRECTS + 1):
         request_fn = getattr(sess, method.lower())
         async with request_fn(current_url, **kwargs) as resp:
@@ -2771,6 +2798,8 @@ async def _safe_http_request(sess, method: str, url: str, **kwargs):
                 raise aiohttp.ClientError(f"Redirect to blocked address: {next_url[:200]}")
             if resp.status == 303 and method.upper() != "HEAD":
                 method = "GET"
+            if trail is not None:
+                trail.append((resp.status, next_url))
             current_url = next_url
     raise aiohttp.ClientError("Too many redirects")
 
@@ -2805,6 +2834,7 @@ async def _annotate_block(resource, result):
 async def run_single_check(resource, session=None) -> tuple[bool, str, int | None]:
     # A single monotonic deadline includes DNS, all redirects, fallback, reads and cleanup.
     started = time.monotonic()
+    _redirect_trail.set([])
     try:
         async with asyncio.timeout(HTTP_TOTAL_DEADLINE):
             result = await _run_single_check(resource, session)
@@ -6667,6 +6697,9 @@ def ping_command(bot, accid, event):
 
             lat_str = f"`{latency_ms}ms`" if latency_ms is not None else "N/A"
             lines.append(f"⏱️ Response: {details} ({lat_str})")
+            redirects = format_redirects(last_redirect_trail()) if check_type == "http" else None
+            if redirects:
+                lines.append(f"↪️ Redirect: {redirects}")
 
             if ssl_info:
                 lines.append(f"🔒 SSL Cert: {ssl_info}")

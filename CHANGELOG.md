@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.38.0] - 2026-11-16
+
+### Added
+- `/ping` shows where redirects lead: `↪️ Redirect: `301` → `https://example.com/`` after the response line, with every hop of a chain (each URL cut to 120 characters, secret query values hidden). It shows what this node's own check saw; peers' lines and the peer protocol are unchanged.
+
 ## [2.37.0] - 2026-11-16
 
 ### Added

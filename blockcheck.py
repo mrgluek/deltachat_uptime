@@ -52,7 +52,8 @@ NOCONNECT = "noconnect"  # TCP did not connect (refused, unreachable, timeout)
 TAG_DNS = "DNS spoofing?"
 TAG_SNI = "SNI block?"
 TAG_HOST = "HTTP Host block?"
-TAGS = (TAG_DNS, TAG_SNI, TAG_HOST)
+TAG_FREEZE = "Freeze?"   # set by the check itself (bot._read_body_limited), not by diagnose()
+TAGS = (TAG_DNS, TAG_SNI, TAG_HOST, TAG_FREEZE)
 _TAG_RE = re.compile(r"^(" + "|".join(re.escape(t) for t in TAGS) + r") (.*)$", re.S)
 
 

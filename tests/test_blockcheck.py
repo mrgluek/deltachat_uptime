@@ -305,3 +305,37 @@ def tearDownModule():
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestDeadlineBudget(unittest.IsolatedAsyncioTestCase):
+    """The diagnosis never runs past the overall check deadline."""
+    async def run_check(self, deadline, check_takes, diagnose_takes):
+        async def slow_check(resource, session=None):
+            await asyncio.sleep(check_takes)
+            return False, "Timeout", 1
+
+        async def slow_annotate(resource, result):
+            await asyncio.sleep(diagnose_takes)
+            return False, "SNI block? Timeout", 1
+
+        with patch.object(bot, "_run_single_check", slow_check), patch.object(bot, "_annotate_block", slow_annotate), \
+             patch.object(bot, "HTTP_TOTAL_DEADLINE", deadline):
+            started = asyncio.get_running_loop().time()
+            result = await bot.run_single_check({"type": "http", "url": "https://x.example/"})
+            return result, asyncio.get_running_loop().time() - started
+
+    async def test_no_diagnosis_when_the_deadline_is_spent(self):
+        result, took = await self.run_check(deadline=0.1, check_takes=5, diagnose_takes=5)
+        self.assertEqual(result[:2], (False, "Timeout"))
+        self.assertLess(took, 0.5)
+
+    async def test_diagnosis_gets_what_is_left_and_no_more(self):
+        with patch.object(bot, "BLOCK_DIAGNOSIS_MIN_LEFT", 0.05):
+            result, took = await self.run_check(deadline=0.5, check_takes=0.1, diagnose_takes=5)
+        self.assertEqual(result[:2], (False, "Timeout"))      # the diagnosis was cut off, the result stands
+        self.assertLess(took, 0.8)
+
+    async def test_quick_diagnosis_is_used(self):
+        with patch.object(bot, "BLOCK_DIAGNOSIS_MIN_LEFT", 0.05):
+            result, _ = await self.run_check(deadline=2, check_takes=0.05, diagnose_takes=0.05)
+        self.assertEqual(result[:2], (False, "SNI block? Timeout"))

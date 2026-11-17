@@ -70,7 +70,7 @@ from outbox import outbox as dc_outbox, PRIO_ALERT, PRIO_REPLY, PRIO_UPDATE, PRI
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "2.38.0"
+VERSION = "2.39.0"
 SYNC_MAX_BYTES = 64 * 1024
 # 200 metrics / 100 cross-checks, including JSON's twelve-byte astral Unicode escaping at field limits.
 PEER_MAX_BYTES = 8 * 1024 * 1024
@@ -2751,6 +2751,54 @@ def _cert_expiry_ts(cert: dict) -> int | None:
         exp_date = email.utils.parsedate_to_datetime(not_after_str)
     return int(exp_date.replace(tzinfo=datetime.timezone.utc).timestamp())
 
+FREEZE_MAX_BYTES = 65536   # a body that stops below this is the TSPU "freeze"; above it, a slow link
+
+
+class BodyStalled(Exception):
+    """The body stopped (timeout, reset, early close) before the length the server announced."""
+    def __init__(self, received: int, expected: int):
+        super().__init__(f"body stopped after {received} of {expected} bytes")
+        self.received, self.expected = received, expected
+
+
+def _fmt_size(n: int) -> str:
+    if n < 1024:
+        return f"{n} B"
+    if n < 1024 * 1024:
+        return f"{n / 1024:.0f} KB"
+    return f"{n / 1024 / 1024:.1f} MB"
+
+
+def stalled_body_message(stall: BodyStalled) -> str:
+    """'Freeze? Stalled after 10 KB of 2.0 MB': the connection opened, a few KB came, then nothing."""
+    text = f"Stalled after {_fmt_size(stall.received)} of {_fmt_size(stall.expected)}"
+    return blockcheck.with_tag(blockcheck.TAG_FREEZE if stall.received < FREEZE_MAX_BYTES else None, text)
+
+
+async def _read_body_limited(resp, max_bytes: int) -> bytes:
+    """Up to max_bytes of the body. With a known Content-Length it reads until that many bytes (or the
+    announced length) have arrived and raises BodyStalled when the body stops earlier: a server that
+    announced a file and stops after a few KB is what a freeze looks like. Without a length it is one
+    read as before: a stream (events, long polling) may legitimately stay silent."""
+    length = getattr(resp, "content_length", None)
+    if not isinstance(length, int) or isinstance(length, bool) or length <= 0:
+        return await resp.content.read(max_bytes)
+    want = min(length, max_bytes)
+    chunks, got = [], 0
+    try:
+        while got < want:
+            chunk = await resp.content.read(min(want - got, 65536))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            got += len(chunk)
+    except (asyncio.TimeoutError, aiohttp.ClientError, ConnectionError) as e:
+        raise BodyStalled(got, length) from e
+    if got < want and not resp.headers.get("Content-Encoding"):
+        raise BodyStalled(got, length)   # closed early without an error
+    return b"".join(chunks)
+
+
 _REDIRECT_STATUSES = (301, 302, 303, 307, 308)
 _MAX_SAFE_REDIRECTS = 10
 
@@ -2803,6 +2851,8 @@ async def _safe_http_request(sess, method: str, url: str, **kwargs):
             current_url = next_url
     raise aiohttp.ClientError("Too many redirects")
 
+BLOCK_DIAGNOSIS_MIN_LEFT = 2.0   # seconds of the overall deadline that must be left to start a diagnosis
+
 _HTTP_STATUS_ERROR_RE = re.compile(r"^\d{3}\b")
 
 
@@ -2840,7 +2890,15 @@ async def run_single_check(resource, session=None) -> tuple[bool, str, int | Non
             result = await _run_single_check(resource, session)
     except asyncio.TimeoutError:
         result = (False, "Timeout", int((time.monotonic() - started) * 1000))
-    return await _annotate_block(resource, result)
+    # The diagnosis of a failure is part of the same overall deadline: it gets what is left of it
+    remaining = HTTP_TOTAL_DEADLINE - (time.monotonic() - started)
+    if remaining < BLOCK_DIAGNOSIS_MIN_LEFT:
+        return result
+    try:
+        async with asyncio.timeout(remaining):
+            return await _annotate_block(resource, result)
+    except asyncio.TimeoutError:
+        return result
 
 
 async def _run_single_check(resource, session=None):
@@ -2874,7 +2932,7 @@ async def _run_single_check(resource, session=None):
                     details = f"{resp.status} - {phrase}"
                     if 200 <= resp.status < 400:
                         try:
-                            body_bytes = await resp.content.read(max_bytes)
+                            body_bytes = await _read_body_limited(resp, max_bytes)
                             charset = 'utf-8'
                             content_type = resp.headers.get('Content-Type', '')
                             charset_match = re.search(r'charset=([\w-]+)', content_type, re.IGNORECASE)
@@ -2884,6 +2942,8 @@ async def _run_single_check(resource, session=None):
                                 body_text = body_bytes.decode(charset, errors='ignore')
                             except Exception:
                                 body_text = body_bytes.decode('utf-8', errors='ignore')
+                        except BodyStalled as stall:
+                            return False, stalled_body_message(stall), int((time.time() - start_time) * 1000)
                         except Exception as read_ex:
                             logger.warning(redact_url(f"Failed to read body for {url}: {read_ex}"))
                             body_text = ""

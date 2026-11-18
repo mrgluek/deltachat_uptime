@@ -328,6 +328,22 @@ def init_db():
                 PRIMARY KEY (day, kind, transport, dir)
             )
         ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS mail_kind (
+                day TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                n INTEGER NOT NULL,
+                PRIMARY KEY (day, kind)
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS mail_kind_recent (
+                ts INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                n INTEGER NOT NULL,
+                PRIMARY KEY (ts, kind)
+            ) WITHOUT ROWID
+        ''')
         # Daily totals alone cannot answer a rolling 24-hour query.
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS peer_traffic_recent (
@@ -1421,6 +1437,13 @@ def get_all_transport_stats() -> list[dict]:
 _peer_metrics_lock = threading.Lock()
 _peer_traffic_buffer: dict[tuple[int, str, str, str], tuple[int, int]] = {}
 _peer_rtt_buffer: list[tuple] = []
+_mail_kind_buffer: dict[tuple[int, str], int] = {}
+
+
+def record_mail_kind(kind: str):
+    key = (int(time.time()), kind)
+    with _peer_metrics_lock:
+        _mail_kind_buffer[key] = _mail_kind_buffer.get(key, 0) + 1
 
 
 def record_peer_traffic(kind: str, transport: str, direction: str, byte_count: int):
@@ -1438,14 +1461,16 @@ def record_peer_rtt(kind: str, transport: str, peer: str | None, ms: int, ok: bo
 
 def flush_peer_metrics():
     """Write pending traffic and RTT samples together, preserving them on failure."""
-    global _peer_traffic_buffer, _peer_rtt_buffer
+    global _peer_traffic_buffer, _peer_rtt_buffer, _mail_kind_buffer
     with _peer_metrics_lock:
         traffic, _peer_traffic_buffer = _peer_traffic_buffer, {}
         rtt, _peer_rtt_buffer = _peer_rtt_buffer, []
-    if not traffic and not rtt:
+        mail, _mail_kind_buffer = _mail_kind_buffer, {}
+    if not traffic and not rtt and not mail:
         return
 
     traffic_rows = [(*key, *counts) for key, counts in traffic.items()]
+    mail_rows = [(*key, n) for key, n in mail.items()]
     try:
         with _writer_transaction() as conn:
             if traffic_rows:
@@ -1461,13 +1486,34 @@ def flush_peer_metrics():
                 ''', traffic_rows)
             if rtt:
                 conn.executemany('INSERT INTO peer_rtt VALUES (?, ?, ?, ?, ?, ?)', rtt)
+            if mail_rows:
+                conn.executemany('''
+                    INSERT INTO mail_kind_recent VALUES (?, ?, ?)
+                    ON CONFLICT(ts, kind) DO UPDATE SET n = n + excluded.n
+                ''', mail_rows)
+                conn.executemany('''
+                    INSERT INTO mail_kind VALUES (date(?, 'unixepoch'), ?, ?)
+                    ON CONFLICT(day, kind) DO UPDATE SET n = n + excluded.n
+                ''', mail_rows)
     except Exception:
         with _peer_metrics_lock:
             for key, (n, size) in traffic.items():
                 current_n, current_size = _peer_traffic_buffer.get(key, (0, 0))
                 _peer_traffic_buffer[key] = (current_n + n, current_size + size)
             _peer_rtt_buffer.extend(rtt)
+            for key, n in mail.items():
+                _mail_kind_buffer[key] = _mail_kind_buffer.get(key, 0) + n
         raise
+
+
+def get_mail_kinds_24h(now: float) -> list[tuple[str, int]]:
+    now = int(now)
+    with contextlib.closing(_connect()) as conn:
+        return conn.execute('''
+            SELECT kind, SUM(n) AS total FROM mail_kind_recent
+            WHERE ts > ? AND ts <= ?
+            GROUP BY kind ORDER BY total DESC, kind
+        ''', (now - 86400, now)).fetchall()
 
 
 def get_peer_metrics_24h(now: float) -> tuple[list, list]:
@@ -1513,6 +1559,10 @@ def cleanup_old_records(retention_days: int = 90) -> dict[str, int]:
         cleaned["peer_traffic"] = cursor.rowcount
         cursor.execute("DELETE FROM peer_traffic_recent WHERE ts <= ?", (now - 86400,))
         cleaned["peer_traffic_recent"] = cursor.rowcount
+        cursor.execute("DELETE FROM mail_kind WHERE day < date(?, 'unixepoch', '-29 days')", (now,))
+        cleaned["mail_kind"] = cursor.rowcount
+        cursor.execute("DELETE FROM mail_kind_recent WHERE ts <= ?", (now - 86400,))
+        cleaned["mail_kind_recent"] = cursor.rowcount
         cursor.execute("DELETE FROM peer_rtt WHERE ts < ?", (meas_cutoff,))
         cleaned["peer_rtt"] = cursor.rowcount
 

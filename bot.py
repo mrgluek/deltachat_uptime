@@ -11,6 +11,7 @@ import json
 import math
 import os
 import shutil
+import sqlite3
 import ssl
 import stat
 import threading
@@ -71,11 +72,12 @@ import blockcheck
 import dc_fingerprint
 import transports_view
 from outbox import outbox as dc_outbox, PRIO_ALERT, PRIO_REPLY, PRIO_UPDATE, PRIO_PEER, PRIO_TELEMETRY
+from outbox import SKIP_SEND, record_sent_mail
 
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "2.43.2"
+VERSION = "2.44.0"
 SYNC_MAX_BYTES = 64 * 1024
 # 200 metrics / 100 cross-checks, including JSON's twelve-byte astral Unicode escaping at field limits.
 PEER_MAX_BYTES = 8 * 1024 * 1024
@@ -355,9 +357,14 @@ _telemetry_interval_now = TELEMETRY_INTERVAL  # this node's, set at each broadca
 # would keep sending every 2 minutes while the hub receives from all of them. So every node also
 # says how often it wants to receive (desired_interval, from its own peer count), and a sender
 # uses the longer of its own interval and the receiver's wish, per peer.
-TELEMETRY_TICK = 60           # the broadcast runs this often; each peer gets mail when its interval is due
+TELEMETRY_TICK = 5            # poll for status changes on the monitoring scheduler's cadence
+TELEMETRY_MIN_GAP = 20
+TELEMETRY_IDLE_INTERVAL = 300
 _peer_desired_interval = {}   # peer email (lower) -> how often it wants telemetry
 _telemetry_sent_at = {}       # peer email (lower) -> time.time() this node last queued telemetry to it
+_telemetry_queued_status = {}  # full status snapshot at the last enqueue
+_telemetry_delivered_at = {}   # last successful send, written by the outbox
+_telemetry_started_at = {}     # last RPC attempt, written by the outbox
 
 
 def interval_for_peer(email: str, own: int) -> int:
@@ -1134,7 +1141,8 @@ async def request_peer_cross_checks(target_dict: dict, timeout: float = 8.0, pee
     expected_chats = {chat_id for _, chat_id in valid_peers}
     pending_peer_checks[req_id] = (fut, len(valid_peers), responses, expected_chats)
     timings = _pending_peer_rtt[req_id] = {}
-    kind = "ping" if _peer_vote_round.get() is None else None
+    is_vote = _peer_vote_round.get() is not None
+    kind = None if is_vote else "ping"
     timed_out_at = None
     try:
         for p, chat_id in valid_peers:
@@ -1143,7 +1151,7 @@ async def request_peer_cross_checks(target_dict: dict, timeout: float = 8.0, pee
                 # A request still queued when the answer is no longer awaited is dropped
                 await asyncio.to_thread(_dc_send_msg_with_stats, dc_bot_instance, dc_accid, chat_id, MsgData(text=msg_text),
                                         priority=PRIO_PEER, expires_in=timeout, label="cross-check request",
-                                        before_send=timing.start)
+                                        kind="peer_vote" if is_vote else "peer_other", before_send=timing.start)
             except Exception as e:
                 logger.warning(f"Failed to send cross-check request to peer {p.get('email')}: {e}")
 
@@ -1451,7 +1459,7 @@ async def _batch_cross_check_peer(peer: dict, items: list, results: dict) -> Non
         msg_text = f"[UPTIME_PEER_CHECK_BATCH_REQ]\n{json.dumps(payload)}\n[/UPTIME_PEER_CHECK_BATCH_REQ]"
         timing = _PeerRtt("vote", peer)
         await asyncio.to_thread(_dc_send_msg_with_stats, dc_bot_instance, dc_accid, chat_id, MsgData(text=msg_text),
-                                priority=PRIO_PEER, expires_in=CROSS_CHECK_BATCH_TIMEOUT, label="batch cross-check request",
+                                priority=PRIO_PEER, expires_in=CROSS_CHECK_BATCH_TIMEOUT, label="batch cross-check request", kind="peer_vote",
                                 before_send=timing.start)
         answers = await asyncio.wait_for(fut, CROSS_CHECK_BATCH_TIMEOUT)
     except asyncio.TimeoutError:
@@ -1516,7 +1524,7 @@ async def _answer_batch_cross_check(bot, accid, chat_id: int, req_id: str, targe
     resp_msg = f"[UPTIME_PEER_CHECK_BATCH_RESP]\n{json.dumps(payload)}\n[/UPTIME_PEER_CHECK_BATCH_RESP]"
     # The requester waits CROSS_CHECK_BATCH_TIMEOUT from sending; a later answer is ignored there
     await asyncio.to_thread(_dc_send_msg_with_stats, bot, accid, chat_id, MsgData(text=resp_msg),
-                            priority=PRIO_PEER, expires_in=PEER_ANSWER_TTL, label="batch cross-check answer")
+                            priority=PRIO_PEER, expires_in=PEER_ANSWER_TTL, label="batch cross-check answer", kind="peer_other")
 
 
 def _valid_peer_fields(item):
@@ -1582,10 +1590,8 @@ async def broadcast_telemetry_to_peers():
 
     Each peer receives the local monitors allowed by the share scope plus the results for the
     probe targets it asked this node to scan. Targets mirrored from one peer are never relayed
-    to other peers. With more than 200 entries, each message carries the entries whose status
-    changed since the last one first, and fills the rest from a rotating per-peer offset: a
-    status change reaches the peer within 2 minutes even with 1000+ monitors, while the full
-    list is refreshed in turn (200 is what receivers accept per message)."""
+    to other peers. Send full snapshots up to the receiver's 200-entry limit. Larger sets
+    still rotate, with changes first. Latency and check timestamps do not trigger sends."""
     global _telemetry_interval_now
     if not dc_bot_instance or dc_accid is None:
         return
@@ -1644,14 +1650,39 @@ async def broadcast_telemetry_to_peers():
     for p in peers:
         email = (p.get("email") or "").lower()
         peer_interval = interval_for_peer(email, interval)
-        # A few seconds of slack: the loop ticks every TELEMETRY_TICK, not exactly on time
-        if time.time() - _telemetry_sent_at.get(email, 0) < peer_interval - 5:
-            continue
+        idle_gap = max(TELEMETRY_IDLE_INTERVAL, peer_interval)
+        desired = _peer_desired_interval.get(email, TELEMETRY_INTERVAL)
+        change_gap = TELEMETRY_MIN_GAP if desired == TELEMETRY_INTERVAL else peer_interval
         all_metrics = probe_by_source.get(email, []) + shared_metrics
         if not all_metrics:
             continue
-        _telemetry_sent_at[email] = time.time()
+        statuses = {m["url"]: m["status"] for m in all_metrics}
 
+        def due(at):
+            queued = _telemetry_sent_at.get(email)
+            if queued is None:
+                return True
+            delivered = _telemetry_delivered_at.get(email)
+            if delivered is None or queued > delivered:
+                # Refresh a waiting job even if the status reverted to the last delivered value.
+                if statuses != _telemetry_queued_status.get(email):
+                    return delivered is None or at - delivered >= change_gap
+                return at - queued >= (peer_interval if delivered is None else change_gap)
+            gap = change_gap if statuses != _telemetry_last_sent.get(email) else idle_gap
+            return at - delivered >= gap
+
+        if not due(time.time()):
+            continue
+        previous_queue_time = _telemetry_sent_at.get(email)
+        chat_id = await _resolve_peer_chat_id(p)
+        queued_at = time.time()
+        if not chat_id or _telemetry_sent_at.get(email) != previous_queue_time or not due(queued_at):
+            continue
+        if email not in _telemetry_sent_at:
+            _telemetry_delivered_at.pop(email, None)
+            _telemetry_started_at.pop(email, None)
+        _telemetry_sent_at[email] = queued_at
+        _telemetry_queued_status[email] = statuses
         metrics_batch = pick_telemetry_batch(email, all_metrics, batch_size)
 
         payload = {
@@ -1660,27 +1691,32 @@ async def broadcast_telemetry_to_peers():
             "timestamp": now,
             "msg_id": f"{now}_{secrets.token_hex(4)}",
             "caps": OWN_PEER_CAPS,
-            "telemetry_interval": peer_interval,  # to this peer: lets it judge when this node is offline
+            "telemetry_interval": idle_gap,  # next scheduled heartbeat, unless a status changes first
             "desired_interval": interval,  # how often this node wants telemetry (from its peer count)
             "version": VERSION,  # shown in the peer's /peers and /stats
             "metrics": metrics_batch
         }
         msg_text = f"[UPTIME_PEER_METRICS]\n{json.dumps(payload)}\n[/UPTIME_PEER_METRICS]"
 
-        chat_id = await _resolve_peer_chat_id(p)
-        if chat_id:
-            def _record_sent(email=email, batch=metrics_batch, all_metrics=all_metrics):
-                # Only what really went out counts as sent (a replaced or expired message did not)
-                sent = _telemetry_last_sent.setdefault(email, {})
-                sent.update({m["url"]: m["status"] for m in batch})
-                if len(sent) > 2 * len(all_metrics):  # forget removed monitors
-                    live = {m["url"] for m in all_metrics}
-                    _telemetry_last_sent[email] = {u: st for u, st in sent.items() if u in live}
+        def _start_send(email=email, gap=change_gap):
+            # A job can leave the queue between the scheduler's due check and its next enqueue.
+            at = time.time()
+            if at - _telemetry_started_at.get(email, float("-inf")) < gap:
+                return False
+            _telemetry_started_at[email] = at
+            return True
 
-            # One telemetry message per peer at a time: a newer one replaces a still queued one
-            _dc_send_msg_with_stats(dc_bot_instance, dc_accid, chat_id, MsgData(text=msg_text),
-                                    priority=PRIO_TELEMETRY, key=("telemetry", chat_id), expires_in=peer_interval,
-                                    label=f"telemetry to {email}", after_send=_record_sent)
+        def _record_sent(email=email, batch=metrics_batch, statuses=statuses):
+            # Keep statuses only for live URLs that have actually gone out, including rotated batches.
+            sent = {u: st for u, st in _telemetry_last_sent.get(email, {}).items() if u in statuses}
+            sent.update({m["url"]: m["status"] for m in batch})
+            _telemetry_last_sent[email] = sent
+            _telemetry_delivered_at[email] = time.time()
+
+        _dc_send_msg_with_stats(dc_bot_instance, dc_accid, chat_id, MsgData(text=msg_text),
+                                priority=PRIO_TELEMETRY, key=("telemetry", chat_id), expires_in=peer_interval,
+                                label=f"telemetry to {email}", kind="peer_metrics",
+                                should_send=_start_send, after_send=_record_sent)
 
 # Async event loop and task tracking for check scheduler
 async_event_loop = None
@@ -2779,7 +2815,7 @@ async def send_admin_notification(text: str):
     if chat_id:
         try:
             await asyncio.to_thread(_dc_send_msg_with_stats, dc_bot_instance, dc_accid, chat_id, MsgData(text=text),
-                                    priority=PRIO_ALERT, label="admin notification")
+                                    priority=PRIO_ALERT, label="admin notification", kind="alert")
         except Exception as e:
             logger.warning(f"Failed to send admin notification to chat {chat_id}: {e}")
 
@@ -2877,7 +2913,7 @@ async def notify_ssl_alert(resource, days_left: float, exp_date_str: str, alert_
 
     if dc_bot_instance and dc_accid is not None:
         _dc_send_msg_with_stats(dc_bot_instance, dc_accid, chat_id, MsgData(text=msg_text),
-                                priority=PRIO_ALERT, label="SSL alert")
+                                priority=PRIO_ALERT, label="SSL alert", kind="alert")
 
 async def _prewarm_target_dns(url: str, check_type: str) -> bool:
     """Resolves the target asynchronously (with the record TTL) before the synchronous SSRF check,
@@ -4026,6 +4062,7 @@ def _deliver_degraded_notices(chat_id: int):
             for kind, r, _, _ in keep:
                 database.release_rejected_partial_notice(r["partial_id"], kind == "start")
             raise
+        record_sent_mail("alert")
         stat_event("mail_out")
         for partial_id in claimed_starts:
             database.mark_partial_notice_sent(partial_id)
@@ -4051,7 +4088,7 @@ async def _check_report_notices():
             due_chats.add(chat_id)
     for chat_id in due_chats:
         dc_outbox.submit(lambda chat=chat_id: _deliver_degraded_notices(chat),
-                         priority=PRIO_ALERT, key=("partial", chat_id), label="partial outage notice")
+                         priority=PRIO_ALERT, key=("partial", chat_id), label="partial outage notice", kind=None)
 
 
 async def _flush_degraded_notices():
@@ -4420,7 +4457,7 @@ def get_incident_update_interval(duration_seconds: int) -> int:
     return 3600         # After that: once an hour
 
 
-def _deliver_incident_message(inc_id: int, dc_chat_id: int, msg_text: str, resolved: bool):
+def _deliver_incident_message(inc_id: int, dc_chat_id: int, msg_text: str, resolved: bool, *, kind="alert"):
     """Runs in the outbox: edits the incident's message, or sends it if it has none yet (or the edit fails).
 
     The message id is read here, at sending time: a first message still waiting in the outbox is
@@ -4445,6 +4482,7 @@ def _deliver_incident_message(inc_id: int, dc_chat_id: int, msg_text: str, resol
     if msg_id:
         try:
             dc_bot_instance.rpc.send_edit_request(dc_accid, msg_id, msg_text)
+            record_sent_mail(kind)
             logger.info(f"{'Resolved' if resolved else 'Edited'} Incident #{inc_id} message {msg_id} in chat {dc_chat_id}")
             return msg_id
         except Exception as e:
@@ -4456,6 +4494,7 @@ def _deliver_incident_message(inc_id: int, dc_chat_id: int, msg_text: str, resol
         if not msg_id:
             database.release_rejected_incident_message(inc_id)
         raise
+    record_sent_mail("alert")
     if isinstance(new_msg_id, int) and not resolved:
         database.update_incident_msg_id(inc_id, new_msg_id)
         current = database.get_incident_by_id(dc_chat_id, inc_id)
@@ -4477,8 +4516,9 @@ def _queue_incident_message(inc_id: int, dc_chat_id: int, msg_text: str, priorit
         return
     if database.get_chat_report_app(dc_chat_id) == "only":
         return
-    dc_outbox.submit(lambda: _deliver_incident_message(inc_id, dc_chat_id, msg_text, resolved),
-                     priority=priority, key=("incident", inc_id), label=f"incident #{inc_id} message")
+    kind = "alert" if priority == PRIO_ALERT else "incident_edit"
+    dc_outbox.submit(lambda: _deliver_incident_message(inc_id, dc_chat_id, msg_text, resolved, kind=kind),
+                     priority=priority, key=("incident", inc_id), label=f"incident #{inc_id} message", kind=None)
 
 async def sync_chat_incident_state(dc_chat_id: int, force_update: bool = False):
     chat_lock = get_chat_incident_lock(dc_chat_id)
@@ -4646,6 +4686,7 @@ async def _send_stale_message(dc_chat_id: int, text: str, what: str):
                 dc_chat_id,
                 MsgData(text=text),
                 priority=PRIO_ALERT,
+                kind="alert",
             )
     except Exception as ex:
         logger.error(f"Failed to send {what} message to chat {dc_chat_id}: {ex}")
@@ -4868,6 +4909,7 @@ async def monitoring_scheduler_loop():
     _last_peer_chat_trim = 0
     _last_transport_flush = 0
     _last_summary = int(time.time())
+    telemetry_task = None
     bootstrap_vote_tick = _vote_grid_tick(time.time(), QUORUM_REVOTE_INTERVAL)
     grid_vote_retry_at = {}
     grid_jitter = secrets.randbelow(3)
@@ -4998,11 +5040,12 @@ async def monitoring_scheduler_loop():
                     logger.debug(f"Triggering {len(tasks)} target checks (encompassing {sum(len(g) for g in due_groups.values())} resources)...")
                     asyncio.create_task(run_checks_parallel(tasks))
                     
-                # Periodically broadcast telemetry to configured peers (2-5 min, see telemetry_interval)
+                # Check for changed telemetry and idle heartbeats.
                 global last_peer_telemetry_broadcast
-                if now - last_peer_telemetry_broadcast >= TELEMETRY_TICK:  # each peer only when due
+                if (now - last_peer_telemetry_broadcast >= TELEMETRY_TICK
+                        and (telemetry_task is None or telemetry_task.done())):
                     last_peer_telemetry_broadcast = now
-                    asyncio.create_task(broadcast_telemetry_to_peers())
+                    telemetry_task = asyncio.create_task(broadcast_telemetry_to_peers())
 
                 # Audit incidents and peer liveness every 30 seconds (not every 5s)
                 if now - _last_incident_audit >= 30:
@@ -6531,6 +6574,7 @@ def _status_line_hash(text):
 def _unpin_status_message(bot, accid, msg_id):
     try:
         bot.rpc.set_pinned_message_state(accid, msg_id, False)
+        record_sent_mail("status_line")
         stat_event("mail_out")
     except Exception:
         pass
@@ -6556,13 +6600,14 @@ def _pin_status_line(chat_id, bot, accid, msg_id):
         if not delivered:
             return
         bot.rpc.set_pinned_message_state(accid, msg_id, True)
+        record_sent_mail("status_line")
         stat_event("mail_out")
         database.set_config(f"webxdc_pin_pending:{chat_id}", "")
         old_ids = json.loads(database.get_config(f"webxdc_unpin:{chat_id}") or "[]")
         for old_id in old_ids:
             if old_id != msg_id:
                 dc_outbox.submit(lambda old_id=old_id: _unpin_status_message(bot, accid, old_id),
-                                 priority=PRIO_UPDATE, label="unpin previous status message")
+                                 priority=PRIO_UPDATE, label="unpin previous status message", kind=None)
         database.set_config(f"webxdc_unpin:{chat_id}", "[]")
         queue_status_app(chat_id, bot, accid, known_msg_id=saved["webxdc_msg_id"])
     except Exception as exc:
@@ -6579,13 +6624,14 @@ def _post_status_line(chat_id, bot, accid, text):
     database.set_config(f"webxdc_line_post_attempt:{chat_id}", str(now))
     text = status_line_text(build_status_state(chat_id))
     msg_id = bot.rpc.send_msg(accid, chat_id, MsgData(text=text))
+    record_sent_mail("status_line")
     stat_event("mail_out")
     database.set_chat_status_line(chat_id, msg_id, _status_line_hash(text))
     database.set_config(f"webxdc_line_posted_at:{chat_id}", str(int(time.time())))
     database.set_config(f"webxdc_line_post_attempt:{chat_id}", "")
     database.set_config(f"webxdc_pin_pending:{chat_id}", str(msg_id))
     dc_outbox.submit(lambda: _pin_status_line(chat_id, bot, accid, msg_id), priority=PRIO_UPDATE,
-                     key=("status-app-pin", chat_id), label="pin status line")
+                     key=("status-app-pin", chat_id), label="pin status line", kind=None)
 
 
 def _update_status_line(chat_id, bot, accid, urgent=False):
@@ -6606,6 +6652,7 @@ def _update_status_line(chat_id, bot, accid, urgent=False):
     database.set_config(f"webxdc_updates:{chat_id}", json.dumps(updates + [now]))
     try:
         bot.rpc.send_edit_request(accid, saved["status_line_msg_id"], text)
+        record_sent_mail("status_line")
         stat_event("mail_out")
         database.set_chat_status_line(chat_id, saved["status_line_msg_id"], digest)
     except Exception as exc:
@@ -6618,7 +6665,7 @@ def _update_status_line(chat_id, bot, accid, urgent=False):
             return
         database.set_config(f"webxdc_line_reposted_at:{chat_id}", str(now))
         dc_outbox.submit(lambda: _post_status_line(chat_id, bot, accid, text), priority=PRIO_UPDATE,
-                         key=("status-line-post", chat_id), label="replace missing status line")
+                         key=("status-line-post", chat_id), label="replace missing status line", kind=None)
 
 
 
@@ -6643,6 +6690,7 @@ def _deliver_status_app(chat_id, bot, accid, known_msg_id=None):
             old_ids = [i for i in (msg_id, saved["status_line_msg_id"]) if i]
             database.set_config(f"webxdc_unpin:{chat_id}", json.dumps(old_ids))
             msg_id = bot.rpc.send_msg(accid, chat_id, MsgData(file=build_status_xdc()))
+            record_sent_mail("other")
             stat_event("mail_out")
             database.set_chat_webxdc(chat_id, msg_id)
             database.set_config(f"webxdc_posted_at:{chat_id}", str(now))
@@ -6653,12 +6701,12 @@ def _deliver_status_app(chat_id, bot, accid, known_msg_id=None):
         if not saved["status_line_msg_id"]:
             text = status_line_text(build_status_state(chat_id))
             dc_outbox.submit(lambda: _post_status_line(chat_id, bot, accid, text), priority=PRIO_UPDATE,
-                             key=("status-line-post", chat_id), label="post status line")
+                             key=("status-line-post", chat_id), label="post status line", kind=None)
             return
         if database.get_config(f"webxdc_pin_pending:{chat_id}"):
             line_id = saved["status_line_msg_id"]
             dc_outbox.submit(lambda: _pin_status_line(chat_id, bot, accid, line_id), priority=PRIO_UPDATE,
-                             key=("status-app-pin", chat_id), label="pin status line")
+                             key=("status-app-pin", chat_id), label="pin status line", kind=None)
             return
         chat = bot.rpc.get_basic_chat_info(accid, chat_id)
         name = chat.get("name") if isinstance(chat, dict) else chat.name
@@ -6707,12 +6755,13 @@ def _deliver_status_app(chat_id, bot, accid, known_msg_id=None):
         if saved["webxdc_state_hash"] == digest and not first_state and not refresh_due:
             if line_changed:
                 dc_outbox.submit(lambda: _update_status_line(chat_id, bot, accid, urgent=urgent), priority=PRIO_UPDATE,
-                                 key=("status-line-edit", chat_id), label="edit status line")
+                                 key=("status-line-edit", chat_id), label="edit status line", kind=None)
             return
         # Count attempts durably too: retrying an uncertain RPC must not exceed the cap.
         database.set_config(f"webxdc_updates:{chat_id}", json.dumps(updates + [now]))
         database.set_config(f"webxdc_attempt_revision:{chat_id}", revision)
         bot.rpc.send_webxdc_status_update(accid, msg_id, update, status_app_summary(state))
+        record_sent_mail("status_app")
         stat_event("mail_out")
         database.set_chat_webxdc(chat_id, msg_id, digest, now)
         database.set_config(f"webxdc_full_state_hash:{chat_id}", full_digest)
@@ -6721,7 +6770,7 @@ def _deliver_status_app(chat_id, bot, accid, known_msg_id=None):
         database.set_config(f"webxdc_clean:{chat_id}", revision)
         if line_changed:
             dc_outbox.submit(lambda: _update_status_line(chat_id, bot, accid, urgent=urgent), priority=PRIO_UPDATE,
-                             key=("status-line-edit", chat_id), label="edit status line")
+                             key=("status-line-edit", chat_id), label="edit status line", kind=None)
         if info_events:
             database.set_config(f"webxdc_last_info_event_id:{chat_id}", str(max(e["id"] for e in info_events)))
     except Exception as exc:
@@ -6730,7 +6779,7 @@ def _deliver_status_app(chat_id, bot, accid, known_msg_id=None):
 
 def queue_status_app(chat_id, bot, accid, known_msg_id=None):
     return dc_outbox.submit(lambda: _deliver_status_app(chat_id, bot, accid, known_msg_id), priority=PRIO_UPDATE,
-                            key=("status-app", chat_id), label="status app")
+                            key=("status-app", chat_id), label="status app", kind=None)
 
 
 async def push_status_apps():
@@ -6889,6 +6938,7 @@ def _realtime_join(bot, accid, msg_id, chat_id) -> None:
     try:
         # Joins the gossip topic; the core also mails a small hidden advertisement to the chat.
         bot.rpc.send_webxdc_realtime_advertisement(accid, msg_id)
+        record_sent_mail("peer_other")
         stat_event("mail_out")
         # The core owns the hidden payload and does not return its size.
         database.record_peer_traffic("rt_advert", "mail", "out", 0)
@@ -6967,7 +7017,7 @@ def _send_msg_with_peer_metrics(bot, accid, chat_id, msg_data, before_send=None)
 
 
 def _dc_send_msg_with_stats(bot, accid, chat_id, msg_data, priority=PRIO_REPLY, key=None, expires_in=None,
-                            label=None, after_send=None, before_send=None):
+                            label=None, after_send=None, before_send=None, *, kind="reply", should_send=None):
     """Sends a message through the paced outbox (see outbox.py). Default priority: a command reply.
 
     before_send() runs before the RPC, and after_send() runs after it succeeds.
@@ -6975,14 +7025,26 @@ def _dc_send_msg_with_stats(bot, accid, chat_id, msg_data, priority=PRIO_REPLY, 
     Returns the msg_id when it was sent right away (outbox not started, as in tests), else None:
     the message is queued and goes out when its turn and a send token come."""
     def send():
+        if should_send is not None and not should_send():
+            return SKIP_SEND
         msg_id = _send_msg_with_peer_metrics(bot, accid, chat_id, msg_data, before_send)
         stat_event("mail_out")
         if after_send:
-            after_send()
+            try:
+                after_send()
+            except Exception:
+                logger.exception("Post-send callback failed for chat %s", chat_id)
         return msg_id
 
+    if dc_outbox is None:
+        result = send()
+        if result is SKIP_SEND:
+            return None
+        record_sent_mail(kind)
+        return result
+
     fut = dc_outbox.submit(send, priority=priority, key=key, expires_in=expires_in,
-                           label=label or f"message to chat {chat_id}")
+                           label=label or f"message to chat {chat_id}", kind=kind)
     if fut.done() and not fut.exception():
         return fut.result()
     return None
@@ -6993,7 +7055,7 @@ def _react(bot, accid: int, msg_id: int | None, emoji: str):
         return
     # Keyed by message: a ⏳ still waiting in the outbox is replaced by the final ☑️ (one mail, not two)
     dc_outbox.submit(lambda: bot.rpc.send_reaction(accid, msg_id, [emoji] if emoji else []),
-                     priority=PRIO_REPLY, key=("reaction", msg_id), label=f"reaction {emoji} on {msg_id}")
+                     priority=PRIO_REPLY, key=("reaction", msg_id), label=f"reaction {emoji} on {msg_id}", kind="reply")
 
 HELP_PRIVATE_NOTE = "\n\n💬 Sent privately because you asked in a group. Use /help@uptime there to show it to everyone."
 
@@ -8909,6 +8971,13 @@ def build_stats_report(bot, accid) -> str:
         "**Load**",
         f"• CPU: {_cpu_report()}",
     ])
+    try:
+        mail_kinds = database.get_mail_kinds_24h(now)
+    except sqlite3.Error:
+        logger.debug("Could not read sent mail counts", exc_info=True)
+        mail_kinds = []
+    top_mail_kinds = set([kind for kind, _ in mail_kinds if kind != "other"][:8])
+    mail_kinds_text = ", ".join(f"{kind} {n}" for kind, n in mail_kinds if kind in top_mail_kinds or kind == "other")
     lines = [
         "**Monitors**",
         (f"• {len(resources)} monitors: " + ", ".join(f"{n} {t}" for t, n in by_type.most_common())) if resources else "• No monitors",
@@ -8917,6 +8986,7 @@ def build_stats_report(bot, accid) -> str:
         "",
         "**Mail (last hour)**",
         f"• Received {stat_last_hour('mail_in', now)}, sent {stat_last_hour('mail_out', now)}",
+        f"• Sent by kind (24 h): {mail_kinds_text}" if mail_kinds_text else None,
         f"• Outbox since start: {ob.get('sent', 0)} sent, {ob.get('failed', 0)} failed, {ob.get('merged', 0)} merged"
         + (f"; waiting now: " + ", ".join(f"{k} {v}" for k, v in waiting.items()) if waiting else "; nothing waiting"),
         f"• Status app updates/edits capped: {stat_last_hour('status_app_capped', now)} skips in the last hour",
@@ -9092,7 +9162,7 @@ def send_peer_hello_when_ready(bot, accid, chat_id: int, hello_text: str, node_n
     deadline = time.monotonic() + PEER_HELLO_RETRY_FOR
     while True:
         fut = dc_outbox.submit(lambda: _send_msg_with_peer_metrics(bot, accid, chat_id, MsgData(text=hello_text)),
-                               priority=PRIO_PEER, label="peer hello")
+                               priority=PRIO_PEER, label="peer hello", kind="peer_other")
         try:
             fut.result(timeout=60)
             return True
@@ -9224,7 +9294,7 @@ def addpeer_command(bot, accid, event):
         contact_id = bot.rpc.create_contact(accid, email, node_name)
         chat_id = bot.rpc.create_chat_by_contact_id(accid, contact_id)
         database.add_or_update_peer(email, node_name, chat_id)
-        _dc_send_msg_with_stats(bot, accid, chat_id, MsgData(text=_hello_text()), priority=PRIO_PEER, label="peer hello")
+        _dc_send_msg_with_stats(bot, accid, chat_id, MsgData(text=_hello_text()), priority=PRIO_PEER, label="peer hello", kind="peer_other")
 
         _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(
             text=f"✅ Peer `{email}` (**{node_name}**) added.\nSent peering handshake via private chat (Chat ID: `{chat_id}`).\n\n"
@@ -9729,7 +9799,7 @@ def on_new_message(bot, accid, event):
                 "version": VERSION
             }
             ack_msg = f"[UPTIME_PEER_HELLO_ACK]\n{json.dumps(ack_payload)}\n[/UPTIME_PEER_HELLO_ACK]"
-            _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=ack_msg), priority=PRIO_PEER, label="peer hello ack")
+            _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=ack_msg), priority=PRIO_PEER, label="peer hello ack", kind="peer_other")
         except Exception as e:
             logger.error(f"Error handling peer hello: {e}")
         return
@@ -9806,7 +9876,7 @@ def on_new_message(bot, accid, event):
                     }
                     resp_msg = f"[UPTIME_PEER_CHECK_RESP]\n{json.dumps(resp_payload)}\n[/UPTIME_PEER_CHECK_RESP]"
                     _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=resp_msg),
-                                            priority=PRIO_PEER, expires_in=PEER_ANSWER_TTL, label="cross-check answer")
+                                            priority=PRIO_PEER, expires_in=PEER_ANSWER_TTL, label="cross-check answer", kind="peer_other")
 
                 _submit_inbound_probe(peer, req_id, _do_cross_check_reply)
         except Exception as e:

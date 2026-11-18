@@ -25,6 +25,8 @@ import logging
 import threading
 import time
 
+import database
+
 logger = logging.getLogger("uptime_bot")
 
 RATE_PER_MINUTE = 50
@@ -40,13 +42,22 @@ PRIO_TELEMETRY = 4  # periodic peer telemetry
 PRIO_NAMES = {PRIO_ALERT: "alert", PRIO_REPLY: "reply", PRIO_UPDATE: "update",
               PRIO_PEER: "peer", PRIO_TELEMETRY: "telemetry"}
 
+SKIP_SEND = object()
+
+
+def record_sent_mail(kind: str):
+    try:
+        database.record_mail_kind(kind)
+    except Exception:
+        logger.debug("Could not count sent mail of kind %s", kind, exc_info=True)
+
 
 class _Job:
-    __slots__ = ("priority", "seq", "fn", "key", "expires_at", "label", "future", "done")
+    __slots__ = ("priority", "seq", "fn", "key", "expires_at", "label", "kind", "future", "done")
 
-    def __init__(self, priority, seq, fn, key, expires_at, label):
+    def __init__(self, priority, seq, fn, key, expires_at, label, kind):
         self.priority, self.seq, self.fn, self.key = priority, seq, fn, key
-        self.expires_at, self.label = expires_at, label
+        self.expires_at, self.label, self.kind = expires_at, label, kind
         self.future = concurrent.futures.Future()
         self.done = False  # popped (sent, dropped or replaced by a re-queued copy)
 
@@ -70,28 +81,28 @@ class Outbox:
     # ---- submitting ----------------------------------------------------------
 
     def submit(self, fn, priority: int = PRIO_REPLY, key=None, expires_in: float | None = None,
-               label: str = "") -> concurrent.futures.Future:
-        """Queue fn() (a blocking send returning e.g. a msg_id); returns a Future with its result."""
+               label: str = "", *, kind: str | None = "other") -> concurrent.futures.Future:
+        """Queue a send. Jobs that conditionally send and count at the RPC use kind=None."""
         now = self.clock()
         expires_at = now + expires_in if expires_in is not None else None
         if self._thread is None:  # not started (tests): send right away
-            job = _Job(priority, 0, fn, key, expires_at, label)
+            job = _Job(priority, 0, fn, key, expires_at, label, kind)
             self._run(job)
             return job.future
         with self._cond:
             old = self._by_key.get(key) if key is not None else None
             if old is not None and not old.done:
                 # Same message waiting already: newest content, its place in line, the more urgent priority
-                old.fn, old.label = fn, label or old.label
+                old.fn, old.label, old.kind = fn, label or old.label, kind
                 old.expires_at = None if (old.expires_at is None or expires_at is None) else max(old.expires_at, expires_at)
                 self.stats["merged"] += 1
                 if priority < old.priority:
                     old.done = True  # skip the old heap entry; a copy goes in at the new priority
-                    job = _Job(priority, old.seq, fn, key, old.expires_at, old.label)
+                    job = _Job(priority, old.seq, fn, key, old.expires_at, old.label, kind)
                     job.future = old.future
                     self._push(job)
                 return old.future
-            job = _Job(priority, next(self._seq), fn, key, expires_at, label)
+            job = _Job(priority, next(self._seq), fn, key, expires_at, label, kind)
             # Compact tombstones and expire waiting items before enforcing the hard capacity.
             self._heap = [entry for entry in self._heap if not entry[2].done]
             for _, _, pending in self._heap:
@@ -176,8 +187,14 @@ class Outbox:
 
     def _run(self, job):
         try:
-            job.future.set_result(job.fn())
+            result = job.fn()
+            if result is SKIP_SEND:
+                job.future.set_result(None)
+                return
+            if job.kind is not None:
+                record_sent_mail(job.kind)
             self.stats["sent"] += 1
+            job.future.set_result(result)
         except Exception as e:
             self.stats["failed"] += 1
             logger.error(f"Outbox: sending {job.label or 'message'} failed: {e}")

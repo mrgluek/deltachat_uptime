@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - Announce peer capability changes on the next telemetry tick, including when the realtime preview is enabled on idle peers. Limit changes to three attempts per peer in ten minutes and send the carrier offer after announcing `rt1`.
+- Recover deleted peer channel apps on the next telemetry tick, including after restart, and check once a minute for missed deletions, offer retries, and rotation. Replace an accepted app promptly after a reset or after re-enabling the preview.
 
 ## [2.44.2] - 2026-11-19
 

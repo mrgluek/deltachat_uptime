@@ -166,3 +166,27 @@ class TestPeerRTFlags(unittest.TestCase):
             self.assert_carrier("auto", False)
             self.assertEqual(database.get_peer(EMAIL)["node_name"], "Old Peer")
             self.assertEqual(database.get_peer(EMAIL)["chat_id"], CHAT_ID)
+
+    def test_carrier_migration_preserves_capability_and_hourly_budget(self):
+        now = CARRIER["created_at"]
+        retry, hourly_limit = bot.PEER_RT_OFFER_RETRY, bot.PEER_RT_OFFERS_PER_HOUR
+        database.set_peer_rt_flag("on")
+        self.assertTrue(database.reserve_peer_rt_offer(FINGERPRINT, now, retry, hourly_limit))
+        database.save_peer_rt_offer(FINGERPRINT, CARRIER["cid"], CARRIER["msg_id"], CARRIER["key_out"])
+        self.assertTrue(database.set_peer_rt(FINGERPRINT, **CARRIER))
+        database.close_db()
+        with closing(sqlite3.connect(database.DB_PATH)) as conn, conn:
+            conn.execute("ALTER TABLE peers DROP COLUMN rt_capable")
+            conn.execute("DROP TABLE peer_rt_offer_attempts")
+            conn.execute("CREATE TABLE peer_rt_offer_attempts (fingerprint TEXT NOT NULL, attempted_at INTEGER NOT NULL)")
+            conn.execute("INSERT INTO peer_rt_offer_attempts VALUES (?, ?)", (FINGERPRINT, now))
+        database.init_db()
+        self.assertTrue(database.get_peer(EMAIL)["rt_capable"])
+        database.set_peer_rt_flag("off")
+        database.set_peer_rt_flag("on")
+        self.assertTrue(database.reserve_peer_rt_offer(FINGERPRINT, now + 1, retry, hourly_limit))
+        database.set_peer_rt_flag("off")
+        database.set_peer_rt_flag("on")
+        self.assertFalse(database.reserve_peer_rt_offer(FINGERPRINT, now + 2, retry, hourly_limit))
+        self.assertTrue(database.reserve_peer_rt_offer(FINGERPRINT, now + retry + 1, retry, hourly_limit))
+        self.assertFalse(database.reserve_peer_rt_offer(FINGERPRINT, now + 2 * retry + 1, retry, hourly_limit))

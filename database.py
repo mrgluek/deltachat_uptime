@@ -391,6 +391,7 @@ def init_db():
             ("rt_key_in", "BLOB"),
             ("rt_created_at", "INTEGER"),
             ("rt_mode", "TEXT NOT NULL DEFAULT 'auto' CHECK (rt_mode IN ('auto', 'on', 'off'))"),
+            ("rt_capable", "INTEGER NOT NULL DEFAULT 0"),
             ("rt_offer_cid", "TEXT"),
             ("rt_offer_msg_id", "INTEGER"),
             ("rt_offer_key", "BLOB"),
@@ -404,11 +405,30 @@ def init_db():
         ):
             if column not in peer_cols:
                 cursor.execute(f"ALTER TABLE peers ADD COLUMN {column} {kind}")
+        if "rt_capable" not in peer_cols:
+            # Existing authenticated carrier mail already proves support for rt1.
+            cursor.execute("""
+                UPDATE peers SET rt_capable = 1 WHERE fingerprint IS NOT NULL
+                AND (rt_cid IS NOT NULL OR rt_offer_msg_id IS NOT NULL)
+            """)
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS peer_rt_offer_attempts (
-                fingerprint TEXT NOT NULL, attempted_at INTEGER NOT NULL
+                fingerprint TEXT NOT NULL, attempted_at INTEGER NOT NULL,
+                accepted INTEGER NOT NULL DEFAULT 0
             )
         """)
+        cursor.execute("PRAGMA table_info(peer_rt_offer_attempts)")
+        if "accepted" not in {column[1] for column in cursor.fetchall()}:
+            cursor.execute("ALTER TABLE peer_rt_offer_attempts ADD COLUMN accepted INTEGER NOT NULL DEFAULT 0")
+            cursor.execute("""
+                UPDATE peer_rt_offer_attempts SET accepted = 1 WHERE EXISTS (
+                    SELECT 1 FROM peers
+                    WHERE peers.fingerprint = peer_rt_offer_attempts.fingerprint
+                      AND peers.rt_offer_at = peer_rt_offer_attempts.attempted_at
+                      AND peers.rt_created_at >= peers.rt_offer_at
+                      AND peers.rt_msg_id IS NOT NULL AND peers.rt_offer_msg_id IS NULL
+                )
+            """)
 
         # Telemetry metrics reported from remote peer probes
         cursor.execute('''
@@ -1902,6 +1922,14 @@ def get_peer_rt_flag() -> str:
     return flag if flag in PEER_RT_FLAGS else "off"
 
 
+def set_peer_rt_capability(fingerprint: str, supported: bool):
+    """Remember a bound peer's last advertised rt1 capability across restarts."""
+    with _writer_transaction() as conn:
+        conn.execute("UPDATE peers SET rt_capable = ? WHERE fingerprint = ?", (supported, fingerprint))
+        if not supported:
+            conn.execute(_CLEAR_PEER_RT + " WHERE fingerprint = ?", (fingerprint,))
+
+
 def reserve_peer_caps_announcement(peer: dict, now: float, change_attempts: list[float] | None) -> bool:
     """Charge the attempt before calling the core, even if sending fails."""
     with _writer_transaction() as conn:
@@ -1962,14 +1990,22 @@ def get_peer_rt(fingerprint: str) -> dict | None:
 def set_peer_rt(fingerprint: str, *, cid: str, msg_id: int, key_out: bytes,
                 key_in: bytes, created_at: int, received_offer_at: int | None = None) -> bool:
     """Store the local carrier and both directional keys together."""
+    fingerprint = normalize_fingerprint(fingerprint)
     with _writer_transaction() as conn:
+        if received_offer_at is None:
+            conn.execute("""
+                UPDATE peer_rt_offer_attempts SET accepted = 1
+                WHERE fingerprint = ? AND attempted_at = (
+                    SELECT rt_offer_at FROM peers WHERE fingerprint = ?
+                    AND rt_offer_cid = ? AND rt_offer_msg_id = ?
+                )
+            """, (fingerprint, fingerprint, cid, msg_id))
         return conn.execute("""
             UPDATE peers SET rt_cid = ?, rt_msg_id = ?, rt_key_out = ?, rt_key_in = ?, rt_created_at = ?,
                              rt_offer_cid = NULL, rt_offer_msg_id = NULL, rt_offer_key = NULL,
                              rt_received_offer_at = ?, rt_lost = NULL
             WHERE email = (SELECT email FROM peers WHERE fingerprint = ? LIMIT 1)
-        """, (cid, msg_id, key_out, key_in, created_at, received_offer_at,
-              normalize_fingerprint(fingerprint))).rowcount > 0
+        """, (cid, msg_id, key_out, key_in, created_at, received_offer_at, fingerprint)).rowcount > 0
 
 
 def clear_peer_rt(fingerprint: str):
@@ -1981,15 +2017,19 @@ def reserve_peer_rt_offer(fingerprint: str, now: int, retry: int, hourly_limit: 
     """Charge the attempt before calling the core, even if sending fails."""
     with _writer_transaction() as conn:
         conn.execute("DELETE FROM peer_rt_offer_attempts WHERE attempted_at <= ?", (now - 3600,))
-        attempts = conn.execute("SELECT fingerprint, attempted_at FROM peer_rt_offer_attempts").fetchall()
-        if len(attempts) >= hourly_limit or any(fp == fingerprint and now - at < retry for fp, at in attempts):
+        attempts = conn.execute("SELECT fingerprint, attempted_at, accepted FROM peer_rt_offer_attempts").fetchall()
+        if len(attempts) >= hourly_limit or any(
+                fp == fingerprint and not accepted and now - at < retry for fp, at, accepted in attempts):
             return False
+        # The caller has checked the pending offer's lifetime. Retire it so a failed
+        # replacement starts the short retry window and cannot inherit a stale ACCEPT.
         if not conn.execute("""
-            UPDATE peers SET rt_offer_at = ? WHERE fingerprint = ?
+            UPDATE peers SET rt_offer_at = ?, rt_offer_cid = NULL,
+                             rt_offer_msg_id = NULL, rt_offer_key = NULL WHERE fingerprint = ?
             AND (rt_offer_at IS NULL OR rt_offer_at <= ?)
         """, (now, fingerprint, now - retry)).rowcount:
             return False
-        conn.execute("INSERT INTO peer_rt_offer_attempts VALUES (?, ?)", (fingerprint, now))
+        conn.execute("INSERT INTO peer_rt_offer_attempts (fingerprint, attempted_at) VALUES (?, ?)", (fingerprint, now))
         return True
 
 
@@ -2001,13 +2041,21 @@ def save_peer_rt_offer(fingerprint: str, cid: str, msg_id: int, key: bytes):
         """, (cid, msg_id, key, fingerprint))
 
 
-def mark_peer_rt_lost(msg_id: int):
+def mark_peer_rt_lost(msg_id: int, *, replace_confirmed: bool = False) -> bool:
     with _writer_transaction() as conn:
-        conn.execute("UPDATE peers SET rt_lost = 1 WHERE rt_msg_id = ?", (msg_id,))
-        conn.execute("""
+        # A trusted RESET can replace a confirmed carrier without waiting for the
+        # retry floor. A newer attempt (including a failed send) keeps its cooldown.
+        active = conn.execute("""
+            UPDATE peers SET rt_lost = 1, rt_offer_at = CASE
+                WHEN ? AND rt_offer_msg_id IS NULL AND rt_offer_at <= rt_created_at THEN NULL
+                ELSE rt_offer_at END
+            WHERE rt_msg_id = ?
+        """, (replace_confirmed, msg_id)).rowcount
+        pending = conn.execute("""
             UPDATE peers SET rt_offer_cid = NULL, rt_offer_msg_id = NULL, rt_offer_key = NULL
             WHERE rt_offer_msg_id = ?
-        """, (msg_id,))
+        """, (msg_id,)).rowcount
+        return active > 0 or pending > 0
 
 
 def reserve_peer_rt_reset(fingerprint: str, now: int) -> bool:

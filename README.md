@@ -188,12 +188,20 @@ during pairing and can announce them even when they have no monitor results to
 share. A capability change goes out on the next telemetry tick (within five
 seconds on an idle node), with up to three change attempts per peer in any ten
 minutes. Startup announcements and requests for unknown capabilities keep the
-ten-minute cooldown. The peer with the lower fingerprint sends the app and
-replaces it every 14 days. Cleanup preserves the
-current app until its replacement is accepted. If it disappears, the peers
-recover by mail. `/peers` shows whether the app is ready, an offer is pending, or
-the peer is mail only. Older peers continue to use the existing mail protocol.
-Monitoring requests and telemetry still travel by mail.
+ten-minute cooldown. The last verified `rt1` capability survives restarts.
+The peer with the lower fingerprint sends the app and
+replaces it every 14 days. Cleanup preserves the current app until its
+replacement is accepted. Deletion triggers a check on the next telemetry tick,
+and a periodic check runs once a minute. If the recipient loses the app, it
+sends a reset by mail at most once an hour. A reset for an accepted app allows
+the sender to offer a replacement on the next tick. Failed or deleted pending
+offers still have a ten-minute retry floor, and pending offers still in the chat
+can be accepted for up to 14 days before a new offer is due. Re-enabling the
+preview can also replace a previously accepted app immediately. All offers
+count toward a limit of three per node per hour. `/peers` shows whether the app
+is ready, an offer is pending, or the peer is mail only. Older peers continue
+to use the existing mail protocol. Monitoring requests and telemetry still
+travel by mail.
 
 ### Status app (`/report app`)
 

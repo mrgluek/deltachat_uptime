@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import threading
 from types import SimpleNamespace
 import unittest
 from unittest.mock import MagicMock, patch
@@ -39,9 +40,11 @@ class TestPeerRTCarrier(unittest.TestCase):
         self.enterContext(patch.object(bot, "_peer_caps", {}))
         self.enterContext(patch.object(bot, "dc_outbox", Outbox()))
         self.enterContext(patch.object(bot, "stat_event"))
+        self.enterContext(patch.multiple(bot, _last_peer_rt_audit=None, _peer_rt_audit_requested=threading.Event()))
         self.traffic = self.enterContext(patch.object(database, "record_peer_traffic"))
         self.now = 1_800_000_000
         self.enterContext(patch.object(bot.time, "time", side_effect=lambda: self.now))
+        self.enterContext(patch.object(bot.time, "monotonic", side_effect=lambda: self.now - 1_800_000_000))
         self.addCleanup(database.close_db)
         database.init_db()
         database.set_peer_rt_flag("on")
@@ -83,6 +86,11 @@ class TestPeerRTCarrier(unittest.TestCase):
     def audit(self, seconds=0):
         self.now += seconds
         bot.audit_peer_rt_carriers(self.bot, 1, self.now)
+
+    def tick(self, seconds=0):
+        self.now += seconds
+        with patch.object(bot, "_announce_peer_caps"):
+            bot._update_peer_caps_and_carriers(self.bot, 1)
 
     def receive(self, kind, *, text=None, msg_id=400, **overrides):
         params = dict(id=msg_id, from_id=CONTACT, chat_id=CHAT, is_info=False, show_padlock=True,
@@ -309,6 +317,103 @@ class TestPeerRTCarrier(unittest.TestCase):
         self.audit(1)
         self.assertEqual(len(self.sent("RESET")), 2)
         self.assertEqual(self.sent("OFFER"), [])
+
+    def test_recipient_deletion_requests_reset_on_next_tick(self):
+        self.self_fp = "CC" * 20
+        self.receive("OFFER")
+        self.tick()
+        self.assertFalse(bot._peer_rt_audit_requested.is_set())
+        bot.on_peer_rt_carrier_deleted(self.bot, 1, {"msgId": 999})
+        self.assertFalse(bot._peer_rt_audit_requested.is_set())
+        self.ids[CHAT].remove(400)
+        bot.on_peer_rt_carrier_deleted(self.bot, 1, {"msgId": 400})
+        self.assertTrue(self.row()["rt_lost"])
+        self.assertTrue(bot._peer_rt_audit_requested.is_set())
+        self.tick(bot.TELEMETRY_TICK)
+        self.assertEqual([msg.text for msg in self.sent("RESET")], [envelope("RESET")])
+        self.assertEqual(self.row()["rt_reset_at"], self.now)
+        self.tick(bot.PEER_RT_AUDIT_INTERVAL)
+        self.assertEqual(len(self.sent("RESET")), 1)
+
+    def test_pending_deletion_event_requests_an_audit_and_keeps_retry_floor(self):
+        self.tick()
+        first = self.row()["rt_offer_msg_id"]
+        bot.on_peer_rt_carrier_deleted(self.bot, 1, {"msgId": first})
+        self.assertTrue(bot._peer_rt_audit_requested.is_set())
+        self.tick(bot.TELEMETRY_TICK)
+        self.assertIsNone(self.row()["rt_offer_msg_id"])
+        self.assertEqual(len(self.sent("OFFER")), 1)
+
+    def test_periodic_audit_detects_missing_pending_offer_and_retries_after_ten_minutes(self):
+        self.tick()
+        first = self.row()["rt_offer_msg_id"]
+        self.ids[CHAT].remove(first)
+        self.tick(bot.PEER_RT_AUDIT_INTERVAL)
+        self.assertIsNone(self.row()["rt_offer_msg_id"])
+        self.tick(bot.PEER_RT_OFFER_RETRY - 2 * bot.PEER_RT_AUDIT_INTERVAL)
+        self.tick(bot.PEER_RT_AUDIT_INTERVAL - 1)
+        self.assertEqual(len(self.sent("OFFER")), 1)
+        self.tick(1)
+        self.assertEqual(len(self.sent("OFFER")), 2)
+        self.assertNotEqual(self.row()["rt_offer_msg_id"], first)
+
+    def test_failed_replacement_of_expired_pending_offer_retries_in_ten_minutes(self):
+        self.tick()
+        expired = self.row()
+        with patch.object(self.rpc, "send_msg", side_effect=RuntimeError("offline")) as failed:
+            self.tick(bot.PEER_RT_ROTATE)
+            failed.assert_called_once()
+        self.assertIsNone(self.row()["rt_offer_msg_id"])
+        self.receive("ACCEPT", text=envelope("ACCEPT", cid=expired["rt_offer_cid"]))
+        self.assertIsNone(self.row()["rt_msg_id"])
+        self.tick(bot.PEER_RT_OFFER_RETRY)
+        self.assertEqual(len(self.sent("OFFER")), 2)
+
+    def test_pending_reset_does_not_bypass_retry_floor(self):
+        self.tick()
+        cid = self.row()["rt_offer_cid"]
+        self.now += bot.TELEMETRY_TICK
+        self.receive("RESET", text=envelope("RESET", cid=cid))
+        self.assertTrue(bot._peer_rt_audit_requested.is_set())
+        self.tick()
+        self.assertEqual(len(self.sent("OFFER")), 1)
+        self.tick(bot.PEER_RT_OFFER_RETRY - bot.TELEMETRY_TICK)
+        self.assertEqual(len(self.sent("OFFER")), 2)
+
+    def test_periodic_audit_rotates_without_capability_event(self):
+        self.tick()
+        self.accept_pending()
+        first = self.row()
+        self.assertFalse(bot._peer_rt_audit_requested.is_set())
+        self.tick(bot.PEER_RT_ROTATE - bot.PEER_RT_AUDIT_INTERVAL)
+        self.assertEqual(len(self.sent("OFFER")), 1)
+        self.tick(bot.PEER_RT_AUDIT_INTERVAL)
+        self.assertEqual(len(self.sent("OFFER")), 2)
+        self.assertEqual(self.row()["rt_msg_id"], first["rt_msg_id"])
+        self.assertNotEqual(self.row()["rt_offer_cid"], first["rt_cid"])
+
+    def test_periodic_audit_has_no_rpc_for_ineligible_peers_without_carriers(self):
+        bot._note_peer_caps(EMAIL, ["batch_check"])
+        self.add_peer("unbound@example.org", None, CHAT + 1, CONTACT + 1)
+        self.add_peer("disabled@example.org", "DD" * 20, CHAT + 2, CONTACT + 2)
+        database.set_peer_rt_mode("disabled@example.org", "off")
+        self.tick()
+        self.tick(bot.PEER_RT_AUDIT_INTERVAL)
+        self.assertEqual(self.rpc.method_calls, [])
+
+    def test_periodic_audit_waits_sixty_seconds_between_rpc_scans(self):
+        self.self_fp = "CC" * 20
+        self.receive("OFFER")
+        self.tick()
+        self.rpc.reset_mock()
+        for _ in range(bot.PEER_RT_AUDIT_INTERVAL - 1):
+            self.tick(1)
+        self.assertEqual(self.rpc.method_calls, [])
+        self.tick(1)
+        self.rpc.get_message_ids.assert_called_once_with(1, CHAT, False, False)
+        self.assertEqual(len(self.rpc.method_calls), 2)  # Own fingerprint and one carrier scan.
+        self.tick()
+        self.assertEqual(len(self.rpc.method_calls), 2)
 
     def test_remote_reset_must_match_owner_carrier_or_pending_offer(self):
         self.audit()

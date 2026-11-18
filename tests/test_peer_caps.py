@@ -42,7 +42,7 @@ class PeerNode:
         self.state = dict(
             time=clock, dc_bot_instance=self.client, dc_accid=1, async_event_loop=None,
             dc_outbox=Outbox(clock=clock.monotonic), _peer_caps={}, _peer_caps_announcements={}, _peer_caps_requests=set(),
-            _peer_rt_audit_requested=threading.Event(), _peer_telemetry_interval={},
+            _peer_rt_audit_requested=threading.Event(), _last_peer_rt_audit=None, _peer_telemetry_interval={},
             _peer_desired_interval={}, _peer_versions={}, _scheduler_cache={},
             _processed_msg_ids=bot._ProcessedMessageIds(), _peer_metrics_timestamps=OrderedDict(), stat_event=MagicMock(),
         )
@@ -61,6 +61,7 @@ class PeerNode:
             try:
                 yield
             finally:
+                self.state["_last_peer_rt_audit"] = bot._last_peer_rt_audit
                 database.close_db()
 
     def connect(self, other):
@@ -68,8 +69,8 @@ class PeerNode:
             address=self.email if contact == 1 else other.email)
         self.rpc.get_contact_encryption_info.return_value = f"Self:\n{self.fp}\n\nPeer:\n{other.fp}"
 
-    def receive(self, text, *, encrypted=True, kind="Text"):
-        message = SimpleNamespace(id=400, from_id=21, chat_id=self.chat, text=text, is_info=False,
+    def receive(self, text, *, encrypted=True, kind="Text", msg_id=400):
+        message = SimpleNamespace(id=msg_id, from_id=21, chat_id=self.chat, text=text, is_info=False,
                                   show_padlock=encrypted, view_type=kind, file_bytes=500, timestamp=self.clock.now)
         bot.on_new_message(self.client, 1, SimpleNamespace(msg=message))
 
@@ -148,6 +149,106 @@ class TestPeerCapabilities(unittest.TestCase):
             self.assertEqual([c.args for c in self.left.mail_kinds.call_args_list], [("peer_metrics",)] * 2)
             bot.audit_peer_rt_carriers(self.left.client, 1, self.clock.now)
             self.assertEqual(self.left.sent("RT_OFFER"), [])
+
+    def test_recent_carrier_deletion_reenable_and_mixed_mesh(self):
+        started_at = self.clock.now
+        with self.left.active():
+            self.register_right()
+            bot._note_peer_announcement(database.get_peer(self.right.email), {"caps": ["rt1"]})
+            self.tick()
+            (_, first_offer), = self.left.sent("RT_OFFER")
+            self.left.rpc.get_message_ids.return_value = [database.get_peer(self.right.email)["rt_offer_msg_id"]]
+        with self.right.active():
+            database.add_or_update_peer(self.left.email, self.left.name, self.right.chat, fingerprint=self.left.fp)
+            bot._note_peer_announcement(database.get_peer(self.left.email), {"caps": ["rt1"]})
+            self.right.receive(first_offer, kind="Webxdc")
+            self.right.rpc.get_message_ids.return_value = [400]
+            (_, accept), = self.right.sent("RT_ACCEPT")
+            self.tick()
+        with self.left.active():
+            self.left.receive(accept)
+            first = database.get_peer(self.right.email)
+
+        # Restart both nodes, then delete the carrier while startup announcements are still on cooldown.
+        for node in (self.left, self.right):
+            node.state.update(_peer_caps={}, _peer_caps_announcements={}, _last_peer_rt_audit=None)
+        self.clock.now += 115
+        with self.right.active():
+            self.assertEqual(bot._peer_caps, {})
+            self.tick()
+            self.assertEqual(len(self.right.sent("METRICS")), 1)
+            self.right.rpc.get_message_ids.return_value = []
+            bot.on_peer_rt_carrier_deleted(self.right.client, 1, {"msgId": 400})
+            self.clock.now += bot.TELEMETRY_TICK
+            self.tick()
+            (_, reset), = self.right.sent("RT_RESET")
+        with self.left.active():
+            self.assertEqual(bot._peer_caps, {})
+            self.tick()
+            self.assertEqual(len(self.left.sent("METRICS")), 1)
+            self.left.receive(reset)
+            self.assertTrue(bot._peer_rt_audit_requested.is_set())
+            self.clock.now += bot.TELEMETRY_TICK
+            self.tick()
+            (_, _), (_, second_offer) = self.left.sent("RT_OFFER")
+            self.left.rpc.get_message_ids.return_value = [database.get_peer(self.right.email)["rt_offer_msg_id"]]
+        with self.right.active():
+            self.right.receive(second_offer, kind="Webxdc", msg_id=401)
+            self.right.rpc.get_message_ids.return_value = [401]
+            (_, _), (_, accept) = self.right.sent("RT_ACCEPT")
+            recipient = database.get_peer(self.left.email)
+        with self.left.active():
+            self.left.receive(accept)
+            replacement = database.get_peer(self.right.email)
+            self.assertLess(self.clock.now - started_at - 115, 180)
+            self.assertNotEqual(replacement["rt_cid"], first["rt_cid"])
+            self.assertEqual(replacement["rt_cid"], recipient["rt_cid"])
+            for direction, opposite in (("out", "in"), ("in", "out")):
+                key = f"rt_key_{direction}"
+                self.assertNotEqual(replacement[key], first[key])
+                self.assertEqual(replacement[key], recipient[f"rt_key_{opposite}"])
+            self.assertEqual(len(self.left.sent("RT_OFFER")), 2)
+            self.assertEqual(len(self.right.sent("RT_ACCEPT")), 2)
+            self.assertEqual(len(self.right.sent("RT_RESET")), 1)
+
+            self.left.command(bot.peerrt_command, "off")
+            self.clock.now += bot.TELEMETRY_TICK
+            self.tick()
+            _, disabled = self.left.sent("METRICS")[-1]
+            self.assertIsNone(database.get_peer(self.right.email)["rt_cid"])
+        with self.right.active():
+            self.right.receive(disabled)
+            self.assertIsNone(database.get_peer(self.left.email)["rt_cid"])
+            self.assertFalse(database.get_peer(self.left.email)["rt_capable"])
+
+        self.clock.now += 65
+        with self.left.active():
+            self.tick()
+            self.assertEqual(len(self.left.sent("RT_OFFER")), 2)
+            self.left.command(bot.peerrt_command, "on")
+            self.clock.now += bot.TELEMETRY_TICK
+            self.tick()
+            _, enabled = self.left.sent("METRICS")[-1]
+            self.assertEqual(len(self.left.sent("RT_OFFER")), 3)
+            _, third_offer = self.left.sent("RT_OFFER")[-1]
+            self.left.rpc.get_message_ids.return_value = [database.get_peer(self.right.email)["rt_offer_msg_id"]]
+        with self.right.active():
+            self.right.receive(enabled)
+            self.right.receive(third_offer, kind="Webxdc", msg_id=402)
+            self.assertEqual(len(self.right.sent("RT_ACCEPT")), 3)
+            _, accept = self.right.sent("RT_ACCEPT")[-1]
+            self.right.rpc.get_message_ids.return_value = [402]
+        with self.left.active():
+            self.left.receive(accept)
+            old_chat = 789
+            database.add_or_update_peer("old@example.org", "Old", old_chat, fingerprint="CC" * 20)
+            bot._note_peer_caps("old@example.org", ["batch_check"])
+            self.clock.now += bot.PEER_RT_AUDIT_INTERVAL
+            self.tick()
+            self.assertIn(old_chat, [chat for chat, _ in self.left.sent("METRICS")])
+            self.assertEqual([chat for chat, _ in self.left.sent("RT_OFFER")], [self.left.chat] * 3)
+            self.assertFalse(database.get_peer(self.right.email)["rt_lost"])
+            self.assertEqual(len(self.right.sent("RT_RESET")), 1)
 
     def test_empty_metrics_refresh_activity_without_touching_peer_target_data(self):
         url = "https://monitored.example.org"

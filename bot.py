@@ -351,6 +351,7 @@ OWN_PEER_CAPS = [PEER_CAP_BATCH_CHECK, PEER_CAP_SMTP_CHECK]
 PEER_CAP_RT = "rt1"
 PEER_CAPS_ANNOUNCE_INTERVAL = 600
 PEER_CAPS_CHANGE_LIMIT = 3
+PEER_RT_AUDIT_INTERVAL = 60
 PEER_RT_ROTATE = 14 * 86400
 PEER_RT_OFFER_RETRY = 600
 PEER_RT_OFFERS_PER_HOUR = 3
@@ -358,6 +359,7 @@ PEER_RT_MAIL_MAX_BYTES = 512
 PEER_RT_XDC_MAX_BYTES = 4096
 _peer_rt_lock = threading.RLock()
 _peer_rt_audit_requested = threading.Event()
+_last_peer_rt_audit = None
 
 
 def _own_peer_caps() -> list[str]:
@@ -1247,7 +1249,10 @@ def _cross_check_key(t: dict) -> tuple:
 
 
 def _peer_supports(peer: dict, cap: str) -> bool:
-    return cap in _peer_caps.get((peer.get("email") or "").lower(), ())
+    caps = _peer_caps.get((peer.get("email") or "").lower())
+    if caps is None:
+        return cap == PEER_CAP_RT and bool(peer.get("rt_capable"))
+    return cap in caps
 
 
 def _peer_can_check(peer: dict, target: dict) -> bool:
@@ -1334,8 +1339,10 @@ def _note_peer_announcement(peer: dict, data, *, allow_rename=True, telemetry=Fa
                 caps = [cap for cap in _peer_caps.get(peer["email"].lower(), ()) if cap != PEER_CAP_RT]
             if isinstance(caps, list):
                 _note_peer_caps(peer["email"], caps)
-                if had_rt and not _peer_supports(peer, PEER_CAP_RT) and peer.get("fingerprint"):
-                    database.clear_peer_rt(peer["fingerprint"])
+                supports_rt = _peer_supports(peer, PEER_CAP_RT)
+                if peer.get("fingerprint") and ((supports_rt and not peer.get("rt_capable"))
+                                                or (had_rt and not supports_rt)):
+                    database.set_peer_rt_capability(peer["fingerprint"], supports_rt)
     note_peer_version(peer["email"], data.get("version"))
     for field, store in (("telemetry_interval", _peer_telemetry_interval), ("desired_interval", _peer_desired_interval)):
         value = data.get(field)
@@ -1767,12 +1774,16 @@ def _announce_peer_caps(bot, accid):
 
 
 def _update_peer_caps_and_carriers(bot, accid):
+    global _last_peer_rt_audit
     _announce_peer_caps(bot, accid)
     with _peer_rt_lock:
-        audit_requested = _peer_rt_audit_requested.is_set()
+        now = time.monotonic()
+        if (not _peer_rt_audit_requested.is_set() and _last_peer_rt_audit is not None
+                and now - _last_peer_rt_audit < PEER_RT_AUDIT_INTERVAL):
+            return
         _peer_rt_audit_requested.clear()
-    if audit_requested:
-        audit_peer_rt_carriers(bot, accid, int(time.time()))
+        _last_peer_rt_audit = now
+    audit_peer_rt_carriers(bot, accid, int(time.time()))
 
 
 async def _broadcast_peer_updates():
@@ -5263,8 +5274,6 @@ async def monitoring_scheduler_loop():
 
                 if now - _last_peer_audit >= 30:
                     _last_peer_audit = now
-                    if dc_bot_instance and dc_accid is not None:
-                        await asyncio.to_thread(audit_peer_rt_carriers, dc_bot_instance, dc_accid, int(now))
                     for node, secs in pop_recovered_nodes():
                         logger.info(f"Node {node} is stable again after {format_duration(secs)}")
                         asyncio.create_task(send_admin_notification(
@@ -7217,7 +7226,8 @@ def on_peer_rt_carrier_deleted(bot, accid, event):
     msg_id = event.get("msg_id") or event.get("msgId")
     if msg_id and database.get_peer_rt_flag() != "off":
         with _peer_rt_lock:
-            database.mark_peer_rt_lost(msg_id)
+            if database.mark_peer_rt_lost(msg_id):
+                _peer_rt_audit_requested.set()
 
 
 async def realtime_status_tick():
@@ -7480,9 +7490,11 @@ def _handle_peer_rt_mail(bot, accid, msg, kind, text):
         elif kind == "RT_RESET":
             # A RESET can also refer to an OFFER whose ACCEPT was lost or delayed.
             if cid == peer["rt_cid"] and peer["rt_msg_id"]:
-                database.mark_peer_rt_lost(peer["rt_msg_id"])
+                if database.mark_peer_rt_lost(peer["rt_msg_id"], replace_confirmed=True):
+                    _peer_rt_audit_requested.set()
             if cid == peer["rt_offer_cid"] and peer["rt_offer_msg_id"]:
-                database.mark_peer_rt_lost(peer["rt_offer_msg_id"])
+                if database.mark_peer_rt_lost(peer["rt_offer_msg_id"]):
+                    _peer_rt_audit_requested.set()
 
 
 def audit_peer_rt_carriers(bot, accid, now):

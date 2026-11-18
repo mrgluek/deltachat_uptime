@@ -1118,7 +1118,6 @@ async def request_peer_cross_checks(target_dict: dict, timeout: float = 8.0, pee
     }
     if target_dict.get("family") in (4, 6):
         req_payload["family"] = target_dict["family"]  # older peers ignore it and check any family
-    msg_text = f"[UPTIME_PEER_CHECK_REQ]\n{json.dumps(req_payload)}\n[/UPTIME_PEER_CHECK_REQ]"
 
     try:
         loop = asyncio.get_running_loop()
@@ -1150,9 +1149,9 @@ async def request_peer_cross_checks(target_dict: dict, timeout: float = 8.0, pee
             timing = timings[chat_id] = _PeerRtt(kind, p)
             try:
                 # A request still queued when the answer is no longer awaited is dropped
-                await asyncio.to_thread(_dc_send_msg_with_stats, dc_bot_instance, dc_accid, chat_id, MsgData(text=msg_text),
+                await asyncio.to_thread(peer_send, _PeerDestination(dc_bot_instance, dc_accid, chat_id), "CHECK_REQ", req_payload,
                                         priority=PRIO_PEER, expires_in=timeout, label="cross-check request",
-                                        kind="peer_vote" if is_vote else "peer_other", before_send=timing.start)
+                                        mail_kind="peer_vote" if is_vote else "peer_other", before_send=timing.start)
             except Exception as e:
                 logger.warning(f"Failed to send cross-check request to peer {p.get('email')}: {e}")
 
@@ -1457,11 +1456,10 @@ async def _batch_cross_check_peer(peer: dict, items: list, results: dict) -> Non
     fut = asyncio.get_running_loop().create_future()
     pending_batch_checks[req_id] = (fut, chat_id, len(items))
     try:
-        msg_text = f"[UPTIME_PEER_CHECK_BATCH_REQ]\n{json.dumps(payload)}\n[/UPTIME_PEER_CHECK_BATCH_REQ]"
         timing = _PeerRtt("vote", peer)
-        await asyncio.to_thread(_dc_send_msg_with_stats, dc_bot_instance, dc_accid, chat_id, MsgData(text=msg_text),
-                                priority=PRIO_PEER, expires_in=CROSS_CHECK_BATCH_TIMEOUT, label="batch cross-check request", kind="peer_vote",
-                                before_send=timing.start)
+        await asyncio.to_thread(peer_send, _PeerDestination(dc_bot_instance, dc_accid, chat_id), "CHECK_BATCH_REQ", payload,
+                                priority=PRIO_PEER, expires_in=CROSS_CHECK_BATCH_TIMEOUT, label="batch cross-check request",
+                                mail_kind="peer_vote", before_send=timing.start)
         answers = await asyncio.wait_for(fut, CROSS_CHECK_BATCH_TIMEOUT)
     except asyncio.TimeoutError:
         timing.finish(False)
@@ -1522,10 +1520,9 @@ async def _answer_batch_cross_check(bot, accid, chat_id: int, req_id: str, targe
 
     await asyncio.gather(*(worker() for _ in range(min(concurrency, len(targets)))))
     payload = {"req_id": req_id, "node_name": database.get_local_node_name(), "caps": OWN_PEER_CAPS, "results": answers}
-    resp_msg = f"[UPTIME_PEER_CHECK_BATCH_RESP]\n{json.dumps(payload)}\n[/UPTIME_PEER_CHECK_BATCH_RESP]"
     # The requester waits CROSS_CHECK_BATCH_TIMEOUT from sending; a later answer is ignored there
-    await asyncio.to_thread(_dc_send_msg_with_stats, bot, accid, chat_id, MsgData(text=resp_msg),
-                            priority=PRIO_PEER, expires_in=PEER_ANSWER_TTL, label="batch cross-check answer", kind="peer_other")
+    await asyncio.to_thread(peer_send, _PeerDestination(bot, accid, chat_id), "CHECK_BATCH_RESP", payload,
+                            priority=PRIO_PEER, expires_in=PEER_ANSWER_TTL, label="batch cross-check answer")
 
 
 def _valid_peer_fields(item):
@@ -1697,7 +1694,6 @@ async def broadcast_telemetry_to_peers():
             "version": VERSION,  # shown in the peer's /peers and /stats
             "metrics": metrics_batch
         }
-        msg_text = f"[UPTIME_PEER_METRICS]\n{json.dumps(payload)}\n[/UPTIME_PEER_METRICS]"
 
         def _start_send(email=email, statuses=statuses):
             # While the job waited, its predecessor may have sent or the peer interval may have grown.
@@ -1720,10 +1716,11 @@ async def broadcast_telemetry_to_peers():
             kind = "peer_metrics_idle" if statuses == last_statuses else "peer_metrics_change"
             database.record_peer_traffic(kind, "mail", "out", 0)
 
-        _dc_send_msg_with_stats(dc_bot_instance, dc_accid, chat_id, MsgData(text=msg_text),
-                                priority=PRIO_TELEMETRY, key=("telemetry", chat_id), expires_in=change_gap,
-                                label=f"telemetry to {email}", kind="peer_metrics",
-                                should_send=_start_send, after_send=_record_sent)
+        # One telemetry message per peer at a time: a newer one replaces a still queued one.
+        peer_send(_PeerDestination(dc_bot_instance, dc_accid, chat_id), "METRICS", payload,
+                  priority=PRIO_TELEMETRY, key=("telemetry", chat_id), expires_in=change_gap,
+                  label=f"telemetry to {email}", mail_kind="peer_metrics",
+                  should_send=_start_send, after_send=_record_sent)
 
 # Async event loop and task tracking for check scheduler
 async_event_loop = None
@@ -7078,6 +7075,38 @@ def _dc_send_msg_with_stats(bot, accid, chat_id, msg_data, priority=PRIO_REPLY, 
         return fut.result()
     return None
 
+
+@dataclass(frozen=True)
+class _PeerDestination:
+    bot: object
+    accid: int
+    chat_id: int
+    securejoin_hello: bool = False
+
+
+def peer_send(peer, kind, payload, *, priority, expires_in, label, key=None, mail_kind="peer_other",
+              after_send=None, before_send=None, should_send=None):
+    """Send a peer payload through the mail outbox."""
+    if kind == "HELLO" and isinstance(payload, str):
+        # send_peer_hello_when_ready also accepts an already formatted HELLO.
+        text = payload
+    else:
+        marker = f"UPTIME_PEER_{kind}"
+        text = f"[{marker}]\n{json.dumps(payload)}\n[/{marker}]"
+    if peer.securejoin_hello:
+        # SecureJoin retries need the outbox future and only count peer traffic.
+        def send():
+            msg_id = _send_msg_with_peer_metrics(peer.bot, peer.accid, peer.chat_id, MsgData(text=text), before_send)
+            if after_send:
+                after_send()
+            return msg_id
+
+        return dc_outbox.submit(send, priority=priority, key=key, expires_in=expires_in, label=label, kind=mail_kind)
+    return _dc_send_msg_with_stats(peer.bot, peer.accid, peer.chat_id, MsgData(text=text), priority=priority, key=key,
+                                   expires_in=expires_in, label=label, kind=mail_kind, after_send=after_send,
+                                   before_send=before_send, should_send=should_send)
+
+
 def _react(bot, accid: int, msg_id: int | None, emoji: str):
     """Add or clear a reaction on a message."""
     if not bot or not hasattr(bot, "rpc") or not msg_id:
@@ -9306,15 +9335,15 @@ PEER_HELLO_RETRY_INTERVAL = 5
 PEER_HELLO_RETRY_FOR = 120
 
 
-def send_peer_hello_when_ready(bot, accid, chat_id: int, hello_text: str, node_name: str,
+def send_peer_hello_when_ready(bot, accid, chat_id: int, hello_text: str | dict, node_name: str,
                                sleep=time.sleep) -> bool:
     """Sends the peering HELLO, retrying every PEER_HELLO_RETRY_INTERVAL until SecureJoin has
     finished and the send succeeds, for up to PEER_HELLO_RETRY_FOR. Tells the admin if it never
     does. Runs in its own thread."""
     deadline = time.monotonic() + PEER_HELLO_RETRY_FOR
+    peer = _PeerDestination(bot, accid, chat_id, securejoin_hello=True)
     while True:
-        fut = dc_outbox.submit(lambda: _send_msg_with_peer_metrics(bot, accid, chat_id, MsgData(text=hello_text)),
-                               priority=PRIO_PEER, label="peer hello", kind="peer_other")
+        fut = peer_send(peer, "HELLO", hello_text, priority=PRIO_PEER, expires_in=None, label="peer hello")
         try:
             fut.result(timeout=60)
             return True
@@ -9363,7 +9392,7 @@ def addpeer_command(bot, accid, event):
             name_parts.append(part)
     node_name = " ".join(name_parts).strip()[:64] or "Remote-Node"
 
-    def _hello_text():
+    def _hello_payload():
         hello_payload = {
             "node_name": database.get_local_node_name(),
             "sender_email": _get_self_addr(bot, accid),
@@ -9371,7 +9400,7 @@ def addpeer_command(bot, accid, event):
         }
         if invite_token:
             hello_payload["invite_token"] = invite_token
-        return f"[UPTIME_PEER_HELLO]\n{json.dumps(hello_payload)}\n[/UPTIME_PEER_HELLO]"
+        return hello_payload
 
     mutual_note = (
         "" if invite_token else
@@ -9423,7 +9452,7 @@ def addpeer_command(bot, accid, event):
                 peer_email = existing["email"]
             database.add_or_update_peer(peer_email, node_name, chat_id, fingerprint=peer_fp)
             # Not right away: the handshake is still running (see send_peer_hello_when_ready)
-            threading.Thread(target=send_peer_hello_when_ready, args=(bot, accid, chat_id, _hello_text(), node_name),
+            threading.Thread(target=send_peer_hello_when_ready, args=(bot, accid, chat_id, _hello_payload(), node_name),
                              daemon=True, name="peer-hello").start()
 
             _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(
@@ -9446,7 +9475,8 @@ def addpeer_command(bot, accid, event):
         contact_id = bot.rpc.create_contact(accid, email, node_name)
         chat_id = bot.rpc.create_chat_by_contact_id(accid, contact_id)
         database.add_or_update_peer(email, node_name, chat_id)
-        _dc_send_msg_with_stats(bot, accid, chat_id, MsgData(text=_hello_text()), priority=PRIO_PEER, label="peer hello", kind="peer_other")
+        peer_send(_PeerDestination(bot, accid, chat_id), "HELLO", _hello_payload(),
+                  priority=PRIO_PEER, expires_in=None, label="peer hello")
 
         _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(
             text=f"✅ Peer `{email}` (**{node_name}**) added.\nSent peering handshake via private chat (Chat ID: `{chat_id}`).\n\n"
@@ -9813,6 +9843,189 @@ def _record_peer_activity(sender_addr: str):
         if async_event_loop and async_event_loop.is_running():
             asyncio.run_coroutine_threadsafe(send_admin_notification(rec_txt), async_event_loop)
 
+
+def handle_peer_check_req(bot, accid, peer, chat_id, data, via="mail"):
+    req_data = data
+    req_id = req_data.get("req_id")
+    target_url = req_data.get("url")
+    check_type = req_data.get("type", "http")
+    keyword = req_data.get("expected_keyword")
+    family = req_data.get("family") if req_data.get("family") in (4, 6) else None
+
+    if req_id and target_url and _valid_peer_fields(req_data):
+        synth_r = {
+            "id": 0,
+            "url": target_url,
+            "type": check_type,
+            "expected_keyword": keyword,
+            "family": family,
+        }
+        async def _do_cross_check_reply():
+            _record_peer_activity(peer["email"])
+            _note_peer_announcement(peer, req_data)
+            if not await _prewarm_target_dns(target_url, check_type) or not is_safe_target_url(target_url, check_type, resolve_dns=False):
+                return
+            if await asyncio.to_thread(database.is_probe_target_ignored, target_url):
+                res = (None, "Ignored on this node (/probeignore)", None)  # abstain, see batch answers
+            else:
+                res = await run_single_check(synth_r)
+            if len(res) == 3:
+                is_up, error_msg, latency_ms = res
+            else:
+                is_up, error_msg = res
+                latency_ms = None
+            is_up = for_peers(is_up, error_msg)
+            resp_payload = {
+                "req_id": req_id,
+                "url": target_url,
+                # "skip": not checked (no IPv6 here); the receiver files it as "unknown"
+                "status": check_status(is_up),
+                "latency_ms": latency_ms,
+                "error_msg": error_msg,
+                "node_name": database.get_local_node_name(),
+                "caps": OWN_PEER_CAPS,  # lets the requester switch to batched requests
+            }
+            peer_send(_PeerDestination(bot, accid, chat_id), "CHECK_RESP", resp_payload,
+                      priority=PRIO_PEER, expires_in=PEER_ANSWER_TTL, label="cross-check answer")
+
+        _submit_inbound_probe(peer, req_id, _do_cross_check_reply)
+
+
+def handle_peer_check_batch_req(bot, accid, peer, chat_id, data, via="mail"):
+    req_data = data
+    req_id = req_data.get("req_id")
+    raw_targets = req_data.get("targets")
+    workers = min(10, max(1, len(raw_targets))) if isinstance(raw_targets, list) else 1
+    async def answer():
+        _record_peer_activity(peer["email"])
+        _note_peer_announcement(peer, req_data)
+        targets = await run_db(_parse_batch_targets, req_data.get("targets"))
+        if targets:
+            await _answer_batch_cross_check(bot, accid, chat_id, req_id, targets, workers)
+    _submit_inbound_probe(peer, req_id, answer, workers)
+
+
+def handle_peer_check_batch_resp(bot, accid, peer, chat_id, data, via="mail", *, sender_addr=None):
+    resp_data = data
+    sender_addr = peer["email"] if sender_addr is None else sender_addr
+    _record_peer_activity(peer["email"])
+    peer = _note_peer_announcement(peer, resp_data)
+    # Only an answer to a batch this node sent, from the chat it was sent to
+    pending = pending_batch_checks.get(resp_data.get("req_id"))
+    if not pending:
+        return
+    fut, expected_chat, count = pending
+    if chat_id != expected_chat:
+        logger.warning(f"Dropping batch check response from unexpected peer {sender_addr} in chat {chat_id}")
+        return
+    raw = resp_data.get("results")
+    raw = raw if isinstance(raw, list) else []
+    node_name = peer.get("node_name") or "Remote-Node"
+    # URLs come from our own request (the future's owner knows them): only positions are trusted here
+    answers = [_clean_peer_result(raw[i] if i < len(raw) else None, node_name, None) for i in range(count)]
+    if not fut.done():
+        if async_event_loop and async_event_loop.is_running():
+            async_event_loop.call_soon_threadsafe(lambda: fut.done() or fut.set_result(answers))
+        else:
+            fut.set_result(answers)
+
+
+def handle_peer_check_resp(bot, accid, peer, chat_id, data, via="mail", *, sender_addr=None, arrived_at=None):
+    if arrived_at is None:
+        arrived_at = time.monotonic()
+    resp_data = data
+    req_id = resp_data.get("req_id")
+    target_url = resp_data.get("url")
+    status = resp_data.get("status", "unknown")
+    latency_ms = resp_data.get("latency_ms")
+    error_msg = resp_data.get("error_msg")
+
+    sender_addr = peer["email"] if sender_addr is None else sender_addr
+    _record_peer_activity(peer["email"])
+    peer = _note_peer_announcement(peer, resp_data)
+
+    # Only answers to a request this node sent to this very peer are accepted
+    pending = pending_peer_checks.get(req_id) if req_id else None
+    if not pending:
+        return
+    fut, expected_count, resp_list, expected_chats = pending
+    if chat_id not in expected_chats:
+        logger.warning(f"Dropping check response for req_id {req_id} from unexpected peer {sender_addr} in chat {chat_id}")
+        return
+    expected_chats.discard(chat_id)
+
+    node_name = peer.get("node_name") or "Remote-Node"
+    if status not in VOTING_STATUSES:
+        status = "unknown"
+    if not isinstance(latency_ms, int) or isinstance(latency_ms, bool):
+        latency_ms = None
+    error_msg = str(error_msg)[:500] if error_msg else None
+
+    if target_url and _valid_peer_fields(resp_data) and is_safe_target_url(target_url, target_type(target_url)):
+        database.save_peer_measurement(target_url, node_name, status, latency_ms, error_msg, int(time.time()),
+                                       peer.get("fingerprint") or peer["email"])
+
+    resp_list.append({
+        "req_id": req_id,
+        "url": target_url,
+        "status": status,
+        "latency_ms": latency_ms,
+        "error_msg": error_msg,
+        "node_name": node_name,
+    })
+    timings = _pending_peer_rtt.get(req_id)
+    timing = timings.get(chat_id) if timings is not None else None
+    if timing is not None:
+        timing.note_single_answer(arrived_at, node_name)
+    if len(resp_list) >= expected_count and not fut.done():
+        if async_event_loop and async_event_loop.is_running():
+            async_event_loop.call_soon_threadsafe(fut.set_result, resp_list)
+        else:
+            try:
+                fut.set_result(resp_list)
+            except Exception:
+                pass
+
+
+def handle_peer_metrics(bot, accid, peer, chat_id, data, via="mail"):
+    metrics_data = data
+    metrics_list = metrics_data.get("metrics", [])
+    msg_id = metrics_data.get("msg_id")
+
+    _record_peer_activity(peer["email"])
+    peer = _note_peer_announcement(peer, metrics_data)
+    if not isinstance(metrics_list, list):
+        return
+
+    # Deduplication by msg_id
+    if msg_id:
+        if msg_id in _processed_msg_ids:
+            logger.info(f"Ignoring duplicate telemetry batch msg_id={msg_id}")
+            return
+        _processed_msg_ids.add(msg_id)
+        if len(_processed_msg_ids) > _processed_msg_ids_max:
+            try:
+                _processed_msg_ids.pop()
+            except Exception:
+                pass
+
+    peer_node = peer.get("node_name") or "Remote-Node"
+
+    if metrics_list:
+        # Sanitize metrics targets before saving
+        safe_metrics = [
+            dict(m, received_at=int(time.time()),
+                 last_checked=database._clamp_measurement_time(m.get("last_checked"), int(time.time())))
+            for m in metrics_list[:200]
+            if isinstance(m, dict) and _valid_peer_fields(m) and is_safe_target_url(str(m.get("url", "")), str(m.get("type", "http")))
+        ]
+        if safe_metrics:
+            database.save_peer_measurements_batch(peer_node, safe_metrics, peer.get("fingerprint") or peer["email"])
+            database.save_probe_targets_batch(safe_metrics, peer["email"])
+            _scheduler_cache["probe_targets"] = None
+            note_peer_reported_down(peer_node, safe_metrics)
+
+
 @dc_cli.on(events.NewMessage(is_bot=None))
 def on_new_message(bot, accid, event):
     arrived_at = time.monotonic()
@@ -9950,8 +10163,8 @@ def on_new_message(bot, accid, event):
                 "sender_email": self_addr,
                 "version": VERSION
             }
-            ack_msg = f"[UPTIME_PEER_HELLO_ACK]\n{json.dumps(ack_payload)}\n[/UPTIME_PEER_HELLO_ACK]"
-            _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=ack_msg), priority=PRIO_PEER, label="peer hello ack", kind="peer_other")
+            peer_send(_PeerDestination(bot, accid, msg.chat_id), "HELLO_ACK", ack_payload,
+                      priority=PRIO_PEER, expires_in=None, label="peer hello ack")
         except Exception as e:
             logger.error(f"Error handling peer hello: {e}")
         return
@@ -9983,54 +10196,13 @@ def on_new_message(bot, accid, event):
             start_idx = text.find("[UPTIME_PEER_CHECK_REQ]") + len("[UPTIME_PEER_CHECK_REQ]")
             end_idx = text.find("[/UPTIME_PEER_CHECK_REQ]")
             req_data = json.loads(text[start_idx:end_idx].strip())
-            req_id = req_data.get("req_id")
-            target_url = req_data.get("url")
-            check_type = req_data.get("type", "http")
-            keyword = req_data.get("expected_keyword")
-            family = req_data.get("family") if req_data.get("family") in (4, 6) else None
+            req_data.get("req_id")  # Preserve the pre-verification error for non-object JSON.
 
             peer, sender_addr = _get_verified_peer_for_msg(bot, accid, msg, is_private_chat)
             if not _is_trusted_peer_msg(msg, peer, is_private_chat):
                 logger.warning(f"Dropping check request from untrusted sender {sender_addr or msg.from_id} in chat {msg.chat_id}")
                 return
-            if req_id and target_url and _valid_peer_fields(req_data):
-                synth_r = {
-                    "id": 0,
-                    "url": target_url,
-                    "type": check_type,
-                    "expected_keyword": keyword,
-                    "family": family,
-                }
-                async def _do_cross_check_reply():
-                    _record_peer_activity(peer["email"])
-                    _note_peer_announcement(peer, req_data)
-                    if not await _prewarm_target_dns(target_url, check_type) or not is_safe_target_url(target_url, check_type, resolve_dns=False):
-                        return
-                    if await asyncio.to_thread(database.is_probe_target_ignored, target_url):
-                        res = (None, "Ignored on this node (/probeignore)", None)  # abstain, see batch answers
-                    else:
-                        res = await run_single_check(synth_r)
-                    if len(res) == 3:
-                        is_up, error_msg, latency_ms = res
-                    else:
-                        is_up, error_msg = res
-                        latency_ms = None
-                    is_up = for_peers(is_up, error_msg)
-                    resp_payload = {
-                        "req_id": req_id,
-                        "url": target_url,
-                        # "skip": not checked (no IPv6 here); the receiver files it as "unknown"
-                        "status": check_status(is_up),
-                        "latency_ms": latency_ms,
-                        "error_msg": error_msg,
-                        "node_name": database.get_local_node_name(),
-                        "caps": OWN_PEER_CAPS,  # lets the requester switch to batched requests
-                    }
-                    resp_msg = f"[UPTIME_PEER_CHECK_RESP]\n{json.dumps(resp_payload)}\n[/UPTIME_PEER_CHECK_RESP]"
-                    _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=resp_msg),
-                                            priority=PRIO_PEER, expires_in=PEER_ANSWER_TTL, label="cross-check answer", kind="peer_other")
-
-                _submit_inbound_probe(peer, req_id, _do_cross_check_reply)
+            handle_peer_check_req(bot, accid, peer, msg.chat_id, req_data)
         except Exception as e:
             logger.error(f"Error processing peer check request: {e}")
         return
@@ -10046,16 +10218,7 @@ def on_new_message(bot, accid, event):
             if not _is_trusted_peer_msg(msg, peer, is_private_chat):
                 logger.warning(f"Dropping batch check request from untrusted sender {sender_addr or msg.from_id} in chat {msg.chat_id}")
                 return
-            req_id = req_data.get("req_id")
-            raw_targets = req_data.get("targets")
-            workers = min(10, max(1, len(raw_targets))) if isinstance(raw_targets, list) else 1
-            async def answer():
-                _record_peer_activity(peer["email"])
-                _note_peer_announcement(peer, req_data)
-                targets = await run_db(_parse_batch_targets, req_data.get("targets"))
-                if targets:
-                    await _answer_batch_cross_check(bot, accid, msg.chat_id, req_id, targets, workers)
-            _submit_inbound_probe(peer, req_id, answer, workers)
+            handle_peer_check_batch_req(bot, accid, peer, msg.chat_id, req_data)
         except Exception as e:
             logger.error(f"Error processing peer batch check request: {e}")
         return
@@ -10070,26 +10233,7 @@ def on_new_message(bot, accid, event):
             if not _is_trusted_peer_msg(msg, peer, is_private_chat):
                 logger.warning(f"Dropping batch check response from untrusted sender {sender_addr or msg.from_id}")
                 return
-            _record_peer_activity(peer["email"])
-            peer = _note_peer_announcement(peer, resp_data)
-            # Only an answer to a batch this node sent, from the chat it was sent to
-            pending = pending_batch_checks.get(resp_data.get("req_id"))
-            if not pending:
-                return
-            fut, expected_chat, count = pending
-            if msg.chat_id != expected_chat:
-                logger.warning(f"Dropping batch check response from unexpected peer {sender_addr} in chat {msg.chat_id}")
-                return
-            raw = resp_data.get("results")
-            raw = raw if isinstance(raw, list) else []
-            node_name = peer.get("node_name") or "Remote-Node"
-            # URLs come from our own request (the future's owner knows them): only positions are trusted here
-            answers = [_clean_peer_result(raw[i] if i < len(raw) else None, node_name, None) for i in range(count)]
-            if not fut.done():
-                if async_event_loop and async_event_loop.is_running():
-                    async_event_loop.call_soon_threadsafe(lambda: fut.done() or fut.set_result(answers))
-                else:
-                    fut.set_result(answers)
+            handle_peer_check_batch_resp(bot, accid, peer, msg.chat_id, resp_data, sender_addr=sender_addr)
         except Exception as e:
             logger.error(f"Error handling peer batch check response: {e}")
         return
@@ -10099,60 +10243,13 @@ def on_new_message(bot, accid, event):
             start_idx = text.find("[UPTIME_PEER_CHECK_RESP]") + len("[UPTIME_PEER_CHECK_RESP]")
             end_idx = text.find("[/UPTIME_PEER_CHECK_RESP]")
             resp_data = json.loads(text[start_idx:end_idx].strip())
-            req_id = resp_data.get("req_id")
-            target_url = resp_data.get("url")
-            status = resp_data.get("status", "unknown")
-            latency_ms = resp_data.get("latency_ms")
-            error_msg = resp_data.get("error_msg")
+            resp_data.get("req_id")  # Preserve the pre-verification error for non-object JSON.
 
             peer, sender_addr = _get_verified_peer_for_msg(bot, accid, msg, is_private_chat)
             if not _is_trusted_peer_msg(msg, peer, is_private_chat):
                 logger.warning(f"Dropping check response from untrusted sender {sender_addr or msg.from_id}")
                 return
-            _record_peer_activity(peer["email"])
-            peer = _note_peer_announcement(peer, resp_data)
-
-            # Only answers to a request this node sent to this very peer are accepted
-            pending = pending_peer_checks.get(req_id) if req_id else None
-            if not pending:
-                return
-            fut, expected_count, resp_list, expected_chats = pending
-            if msg.chat_id not in expected_chats:
-                logger.warning(f"Dropping check response for req_id {req_id} from unexpected peer {sender_addr} in chat {msg.chat_id}")
-                return
-            expected_chats.discard(msg.chat_id)
-
-            node_name = peer.get("node_name") or "Remote-Node"
-            if status not in VOTING_STATUSES:
-                status = "unknown"
-            if not isinstance(latency_ms, int) or isinstance(latency_ms, bool):
-                latency_ms = None
-            error_msg = str(error_msg)[:500] if error_msg else None
-
-            if target_url and _valid_peer_fields(resp_data) and is_safe_target_url(target_url, target_type(target_url)):
-                database.save_peer_measurement(target_url, node_name, status, latency_ms, error_msg, int(time.time()),
-                                               peer.get("fingerprint") or peer["email"])
-
-            resp_list.append({
-                "req_id": req_id,
-                "url": target_url,
-                "status": status,
-                "latency_ms": latency_ms,
-                "error_msg": error_msg,
-                "node_name": node_name,
-            })
-            timings = _pending_peer_rtt.get(req_id)
-            timing = timings.get(msg.chat_id) if timings is not None else None
-            if timing is not None:
-                timing.note_single_answer(arrived_at, node_name)
-            if len(resp_list) >= expected_count and not fut.done():
-                if async_event_loop and async_event_loop.is_running():
-                    async_event_loop.call_soon_threadsafe(fut.set_result, resp_list)
-                else:
-                    try:
-                        fut.set_result(resp_list)
-                    except Exception:
-                        pass
+            handle_peer_check_resp(bot, accid, peer, msg.chat_id, resp_data, sender_addr=sender_addr, arrived_at=arrived_at)
         except Exception as e:
             logger.error(f"Error handling peer check response: {e}")
         return
@@ -10163,45 +10260,13 @@ def on_new_message(bot, accid, event):
             start_idx = text.find("[UPTIME_PEER_METRICS]") + len("[UPTIME_PEER_METRICS]")
             end_idx = text.find("[/UPTIME_PEER_METRICS]")
             metrics_data = json.loads(text[start_idx:end_idx].strip())
-            metrics_list = metrics_data.get("metrics", [])
-            msg_id = metrics_data.get("msg_id")
+            metrics_data.get("metrics", [])  # Preserve the pre-verification error for non-object JSON.
 
             peer, sender_addr = _get_verified_peer_for_msg(bot, accid, msg, is_private_chat)
             if not _is_trusted_peer_msg(msg, peer, is_private_chat):
                 logger.warning(f"Dropping telemetry from untrusted sender {sender_addr or msg.from_id}")
                 return
-            _record_peer_activity(peer["email"])
-            peer = _note_peer_announcement(peer, metrics_data)
-            if not isinstance(metrics_list, list):
-                return
-
-            # Deduplication by msg_id
-            if msg_id:
-                if msg_id in _processed_msg_ids:
-                    logger.info(f"Ignoring duplicate telemetry batch msg_id={msg_id}")
-                    return
-                _processed_msg_ids.add(msg_id)
-                if len(_processed_msg_ids) > _processed_msg_ids_max:
-                    try:
-                        _processed_msg_ids.pop()
-                    except Exception:
-                        pass
-
-            peer_node = peer.get("node_name") or "Remote-Node"
-
-            if metrics_list:
-                # Sanitize metrics targets before saving
-                safe_metrics = [
-                    dict(m, received_at=int(time.time()),
-                         last_checked=database._clamp_measurement_time(m.get("last_checked"), int(time.time())))
-                    for m in metrics_list[:200]
-                    if isinstance(m, dict) and _valid_peer_fields(m) and is_safe_target_url(str(m.get("url", "")), str(m.get("type", "http")))
-                ]
-                if safe_metrics:
-                    database.save_peer_measurements_batch(peer_node, safe_metrics, peer.get("fingerprint") or peer["email"])
-                    database.save_probe_targets_batch(safe_metrics, peer["email"])
-                    _scheduler_cache["probe_targets"] = None
-                    note_peer_reported_down(peer_node, safe_metrics)
+            handle_peer_metrics(bot, accid, peer, msg.chat_id, metrics_data)
         except Exception as e:
             logger.error(f"Error handling peer metrics: {e}")
         return

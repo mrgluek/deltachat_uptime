@@ -5,15 +5,19 @@ import ipaddress
 import contextlib
 import contextvars
 import io
+import heapq
 import logging
 import json
 import os
+import shutil
 import ssl
+import stat
 import threading
 import weakref
 import hashlib
 import zipfile
 from pathlib import Path
+from dataclasses import dataclass, field
 import time
 import datetime
 import html
@@ -70,7 +74,7 @@ from outbox import outbox as dc_outbox, PRIO_ALERT, PRIO_REPLY, PRIO_UPDATE, PRI
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "2.42.0"
+VERSION = "2.43.0"
 SYNC_MAX_BYTES = 64 * 1024
 # 200 metrics / 100 cross-checks, including JSON's twelve-byte astral Unicode escaping at field limits.
 PEER_MAX_BYTES = 8 * 1024 * 1024
@@ -5960,12 +5964,20 @@ def start_web_server_thread():
 
 
 async def _flush_peer_metrics_periodically():
+    last_storage_check = float("-inf")
     while True:
         await asyncio.sleep(60)
         try:
             await run_db(database.flush_peer_metrics)
         except Exception:
             logger.exception("Could not flush peer metrics")
+        now = time.monotonic()
+        if os.getenv("STORAGE_WARN") != "0" and now - last_storage_check >= 600 and dc_accid is not None:
+            last_storage_check = now
+            try:
+                await _maybe_warn_low_storage(dc_bot_instance, dc_accid)
+            except Exception:
+                logger.exception("Could not check for low disk space")
 
 
 def start_monitoring_thread():
@@ -8223,12 +8235,292 @@ def _cpu_report() -> str:
     return ", ".join(parts)
 
 
-def _size(path) -> str:
+_STATS_MAX_BYTES = 4095
+_STORAGE_TOP = 5
+_storage_config_dir = None
+_storage_cache = collections.OrderedDict()
+_storage_cache_lock = threading.Lock()
+_storage_warned_at = float("-inf")
+
+
+@dataclass
+class _StorageTree:
+    total: int = 0
+    logs: int = 0
+    log_count: int = 0
+    database_bytes: int = 0
+    blob_bytes: int | None = None
+    files: list = field(default_factory=list)
+    directories: list = field(default_factory=list)
+    log_files: list = field(default_factory=list)
+    partial: bool = False
+
+
+@dataclass
+class _StorageStats:
+    disk: tuple | None
+    data: _StorageTree
+    app: _StorageTree
+    bot_bytes: int
+    core_bytes: int | None
+    blob_bytes: int | None
+    partial: bool
+
+
+def _format_storage_size(size):
+    if size is None:
+        return "n/a"
+    if size < 1024:
+        return f"{size} B"
+    for unit in ("KB", "MB", "GB", "TB", "PB"):
+        size /= 1024
+        if size < 1024 or unit == "PB":
+            return f"{size:.1f} {unit}"
+
+
+def _storage_top(items, size, path):
+    item = (size, path)
+    if len(items) < _STORAGE_TOP:
+        heapq.heappush(items, item)
+    else:
+        heapq.heappushpop(items, item)
+
+
+def _storage_id(info):
+    return info.st_dev, info.st_ino
+
+
+def _walk_storage(root, deadline, *, clock=time.monotonic, skip=None, databases=(), blobs=None):
+    """Sum regular file sizes. Directory rankings include only the first three levels."""
+    result = _StorageTree()
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+
+    def visit(directory, path="", inside_blobs=False):
+        total = 0
+        try:
+            with os.scandir(directory) as entries:
+                while True:
+                    if clock() >= deadline:
+                        result.partial = True
+                        break
+                    entry = next(entries, None)
+                    if entry is None:
+                        break
+                    relative = f"{path}/{entry.name}" if path else entry.name
+                    if relative == skip:
+                        continue
+                    try:
+                        info = entry.stat(follow_symlinks=False)
+                        if stat.S_ISDIR(info.st_mode):
+                            child = os.open(entry.name, flags, dir_fd=directory)
+                            try:
+                                is_blobs = blobs is not None and _storage_id(os.fstat(child)) == blobs
+                                size = visit(child, relative, inside_blobs or is_blobs)
+                            finally:
+                                os.close(child)
+                            total += size
+                            if relative.count("/") < 3:
+                                _storage_top(result.directories, size, relative)
+                            if is_blobs:
+                                result.blob_bytes = size
+                        elif stat.S_ISREG(info.st_mode):
+                            size = info.st_size
+                            total += size
+                            _storage_top(result.files, size, relative)
+                            if not inside_blobs and _storage_id(info) in databases:
+                                result.database_bytes += size
+                            if entry.name.endswith(".log"):
+                                result.logs += size
+                                result.log_count += 1
+                                _storage_top(result.log_files, size, relative)
+                    except OSError:
+                        continue
+                    except RecursionError:
+                        result.partial = True
+                    if result.partial:
+                        break
+        except OSError:
+            pass
+        return total
+
+    if clock() >= deadline:
+        result.partial = True
+        return result
     try:
-        n = os.path.getsize(path)
-    except (OSError, TypeError):
-        return "?"
-    return f"{n / 1048576:.1f} MB" if n >= 1048576 else f"{n // 1024} KB"
+        directory = os.open(root, flags)
+        try:
+            result.total = visit(directory)
+        finally:
+            os.close(directory)
+    except OSError:
+        pass
+    return result
+
+
+def _storage_stat(path, test_mode):
+    try:
+        info = path.lstat()
+        return info if test_mode(info.st_mode) else None
+    except OSError:
+        return None
+
+
+def _storage_root():
+    return Path(os.path.abspath(os.getenv("DC_DB_DIR") or _storage_config_dir or Path(database.DB_PATH).parent))
+
+
+def _storage_paths(info):
+    core_db = info.get("database_dir")
+    core_db = Path(os.path.abspath(core_db)) if isinstance(core_db, str) and core_db else None
+    blobs = info.get("blobdir")
+    blobs = (Path(os.path.abspath(blobs)) if isinstance(blobs, str) and blobs
+             else core_db.parent / "blobs" if core_db else None)
+    return (_storage_root(), Path(__file__).resolve().parent, Path(os.path.abspath(database.DB_PATH)), core_db, blobs)
+
+
+def _storage_disk_usage(root):
+    try:
+        return shutil.disk_usage(root)
+    except OSError:
+        return None
+
+
+def _collect_storage(data_dir, app_dir, bot_db, core_db, blobs):
+    deadline = time.monotonic() + 2
+    bot_files = [info for suffix in ("", "-wal", "-shm")
+                 if (info := _storage_stat(Path(f"{bot_db}{suffix}"), stat.S_ISREG)) is not None]
+    core_files = [info for suffix in ("", "-wal")
+                  if core_db and (info := _storage_stat(Path(f"{core_db}{suffix}"), stat.S_ISREG)) is not None]
+    blob_info = _storage_stat(blobs, stat.S_ISDIR) if blobs else None
+    disk = _storage_disk_usage(data_dir)
+    same_root = data_dir == app_dir
+    app_skip = data_dir.relative_to(app_dir).as_posix() if data_dir.is_relative_to(app_dir) else None
+    data_skip = app_dir.relative_to(data_dir).as_posix() if app_dir.is_relative_to(data_dir) else None
+    data = _walk_storage(data_dir, deadline, skip=data_skip,
+                         databases={_storage_id(info) for info in bot_files + core_files},
+                         blobs=_storage_id(blob_info) if blob_info else None)
+    app = data if same_root else _walk_storage(app_dir, deadline, skip=app_skip)
+    blob_bytes = data.blob_bytes
+    partial = data.partial or app.partial
+    if blob_bytes is None and blob_info and not blobs.is_relative_to(data_dir):
+        # Custom account directories can live outside the data root.
+        blob_tree = _walk_storage(blobs, deadline)
+        blob_bytes = blob_tree.total
+        partial = partial or blob_tree.partial
+    return _StorageStats(disk, data, app, sum(info.st_size for info in bot_files),
+                         sum(info.st_size for info in core_files) if core_db else None, blob_bytes, partial)
+
+
+def _get_storage_stats(*paths):
+    # A cold scan is shared by concurrent commands and the warning check.
+    with _storage_cache_lock:
+        cached = _storage_cache.get(paths)
+        if cached and time.monotonic() - cached[0] < 300:
+            return cached[1]
+        report = _collect_storage(*paths)
+        _storage_cache[paths] = (time.monotonic(), report)
+        _storage_cache.move_to_end(paths)
+        if len(_storage_cache) > 8:
+            _storage_cache.popitem(last=False)
+        return report
+
+
+def _storage_path_label(path):
+    clean = "".join(c if c.isprintable() and c != "`" else "?" for c in path)
+    raw = clean.encode()
+    if len(raw) > 68:
+        clean = (raw[:32].decode(errors="ignore") + "…" + raw[-32:].decode(errors="ignore"))
+    return f"`{clean}`"
+
+
+def _storage_report(stats, budget):
+    data, app = stats.data, stats.app
+    size = _format_storage_size
+    disk_summary = "n/a"
+    if stats.disk:
+        total, used, free = stats.disk
+        used_percent = 100 * used / total if total else 0
+        free_percent = 100 * free / total if total else 0
+        disk_summary = (f"{size(total)} total · {size(used)} used ({used_percent:.1f}%)"
+                        f" · {size(free)} free ({free_percent:.1f}%)")
+    roots = [("Data", data), ("App", app)] if data is not app else [("Data/app", data)]
+    log_count = sum(tree.log_count for _, tree in roots)
+    log_size = sum(tree.logs for _, tree in roots)
+    log_label = "file" if log_count == 1 else "files"
+    other_data = data.total - data.database_bytes - (data.blob_bytes or 0)
+    app_label = "App (shared data root)" if data is app else "App"
+    lines = [
+        "**Storage**" + (" (partial)" if stats.partial else ""),
+        f"• Disk: {disk_summary}",
+        f"• Bot DB (+ WAL/SHM): {size(stats.bot_bytes)} · Core DB (+ WAL): {size(stats.core_bytes)}",
+        f"• Account blobs: {size(stats.blob_bytes)} · Other data: {size(other_data)}",
+        f"• {app_label}: {size(app.total)} · Logs: {size(log_size)} ({log_count} {log_label})",
+    ]
+    groups = [(f"{label} {kind}", sorted(items, reverse=True)) for label, tree in roots
+              for kind, items in (("files", tree.files), ("dirs", tree.directories)) if items]
+    logs = sorted(((amount, label, path) for label, tree in roots for amount, path in tree.log_files),
+                  reverse=True)[:_STORAGE_TOP]
+    if logs:
+        groups.append(("Log files", [(amount, f"{label}/{path}") for amount, label, path in logs]))
+    remaining = budget - len("\n".join(lines).encode())
+    for i, (label, items) in enumerate(groups):
+        # Reserve an equal share for each remaining group and keep complete entries.
+        allowance = remaining // (len(groups) - i)
+        line = f"• {label}:"
+        for index, (amount, path) in enumerate(items):
+            candidate = f"{line}{',' if index else ''} {size(amount)} {_storage_path_label(path)}"
+            if len(("\n" + candidate).encode()) > allowance:
+                break
+            line = candidate
+        if not line.endswith(":"):
+            lines.append(line)
+            remaining -= len(("\n" + line).encode())
+    return "\n".join(lines)
+
+
+def _storage_is_low(disk):
+    return disk is not None and (disk.free < 30 * 1024**2 or disk.free * 10 < disk.total)
+
+
+def _storage_core_info(bot, accid):
+    try:
+        info = bot.rpc.get_info(accid)
+        return info if isinstance(info, dict) else {}
+    except Exception:
+        return {}
+
+
+async def _maybe_warn_low_storage(bot, accid):
+    global _storage_warned_at
+    if os.getenv("STORAGE_WARN") == "0":
+        return
+    disk = await asyncio.to_thread(_storage_disk_usage, _storage_root())
+    if not _storage_is_low(disk):
+        return
+    saved = await run_db(database.get_config, "storage_warned_at")
+    if time.time() - max(float(saved or "-inf"), _storage_warned_at) < 86400:
+        return
+    info = await run_rpc(_storage_core_info, bot, accid)
+    stats = await asyncio.to_thread(lambda: _get_storage_stats(*_storage_paths(info)))
+    roots = [("data", stats.data)]
+    if stats.data is not stats.app:
+        roots.append(("app", stats.app))
+    largest = heapq.nlargest(3, ((amount, label, path) for label, tree in roots
+                                 for amount, path in tree.files + tree.directories))
+    items = ", ".join(f"{_format_storage_size(amount)} {label}/{_storage_path_label(path)}"
+                      for amount, label, path in largest)
+    now = time.time()
+    if now - _storage_warned_at < 86400:
+        return
+    _storage_warned_at = now
+    try:
+        await run_db(database.set_config, "storage_warned_at", str(now))
+    except Exception:
+        logger.warning("Could not save low disk warning time", exc_info=True)
+    percent = 100 * disk.free / disk.total if disk.total else 0
+    await send_admin_notification(
+        f"⚠️ **Low disk space**\nData filesystem: {_format_storage_size(disk.free)} free ({percent:.1f}%)."
+        f"\nLargest items{' (partial scan)' if stats.partial else ''}: {items or 'none found'}")
 
 
 def _percentile(sorted_values, percent):
@@ -8282,10 +8574,7 @@ def build_stats_report(bot, accid) -> str:
     peers = database.get_all_peers() or []
     live = [p for p in peers if not p.get("is_offline")]
     unstable = [p["node_name"] for p in live if is_node_unstable(p.get("node_name") or "")]
-    try:
-        core_db = bot.rpc.get_info(accid).get("database_dir")
-    except Exception:
-        core_db = None
+    storage = _get_storage_stats(*_storage_paths(_storage_core_info(bot, accid)))
     try:
         relays = [t.get("addr") if isinstance(t, dict) else getattr(t, "addr", "?") for t in bot.rpc.list_transports(accid)]
     except Exception:
@@ -8295,14 +8584,14 @@ def build_stats_report(bot, accid) -> str:
     cs = _last_check_summary
     checks = (f"{cs['total']} in the last minute ({cs['up']} up, {cs['down']} down, {cs['skipped']} skipped), "
               f"avg latency {cs['avg']}") if cs else "no summary yet"
-    lines = [
+    load = "\n".join([
         f"📊 **Uptime Bot Statistics** — v{VERSION}, node **{database.get_local_node_name()}**",
         f"Running for `{format_duration(int(now - _bot_stats['started']))}`",
         "",
         "**Load**",
         f"• CPU: {_cpu_report()}",
-        f"• Core database: {_size(core_db)} · bot database: {_size(database.DB_PATH)}",
-        "",
+    ])
+    lines = [
         "**Monitors**",
         (f"• {len(resources)} monitors: " + ", ".join(f"{n} {t}" for t, n in by_type.most_common())) if resources else "• No monitors",
         ("• State: " + ", ".join(f"{n} {s}" for s, n in by_state.most_common())) if resources else None,
@@ -8329,7 +8618,22 @@ def build_stats_report(bot, accid) -> str:
         "**Relays**",
         (f"• {len(relays)}: " + ", ".join(f"`{r}`" for r in relays)) if relays else "• n/a",
     ]
-    return "\n".join(l for l in lines if l is not None)
+    remainder = "\n".join(line for line in lines if line is not None)
+    budget = _STATS_MAX_BYTES - len(load.encode()) - len(remainder.encode()) - 4
+    report = f"{load}\n\n{_storage_report(storage, budget)}\n\n{remainder}"
+    raw = report.encode()
+    if len(raw) > _STATS_MAX_BYTES:
+        return raw[:_STATS_MAX_BYTES - len("…".encode())].decode(errors="ignore").rstrip() + "…"
+    return report
+
+
+def _reply_with_stats(bot, accid, chat_id):
+    try:
+        reply = build_stats_report(bot, accid)
+    except Exception as e:
+        logger.error(f"Failed to build /stats: {e}")
+        reply = "❌ Failed to collect statistics. Check server logs for details."
+    _dc_send_msg_with_stats(bot, accid, chat_id, MsgData(text=reply))
 
 
 @dc_cli.on(events.NewMessage(command="/stats"))
@@ -8339,12 +8643,11 @@ def stats_command(bot, accid, event):
     if not _is_dc_admin(bot, accid, msg.from_id):
         _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text="❌ This command is only for the administrator."))
         return
-    try:
-        reply = build_stats_report(bot, accid)
-    except Exception as e:
-        logger.error(f"Failed to build /stats: {e}")
-        reply = "❌ Failed to collect statistics. Check server logs for details."
-    _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=reply))
+    if async_event_loop and async_event_loop.is_running():
+        asyncio.run_coroutine_threadsafe(
+            asyncio.to_thread(_reply_with_stats, bot, accid, msg.chat_id), async_event_loop)
+    else:
+        _reply_with_stats(bot, accid, msg.chat_id)
 
 
 @dc_cli.on(events.NewMessage(command="/peers"))
@@ -8841,8 +9144,9 @@ def on_init(bot, args):
     bot.logger.info(f"Initializing Uptime Bot v{VERSION}...")
     ensure_configured_account(bot, args)
 
-    global dc_bot_instance, dc_accid
+    global dc_bot_instance, dc_accid, _storage_config_dir
     dc_bot_instance = bot
+    _storage_config_dir = getattr(args, "config_dir", None)
 
     for accid in bot.rpc.get_all_account_ids():
         dc_accid = accid

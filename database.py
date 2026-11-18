@@ -1,4 +1,5 @@
 import contextlib
+import json
 import os
 import re
 import sqlite3
@@ -398,6 +399,8 @@ def init_db():
             ("rt_lost", "INTEGER"),
             ("rt_reset_at", "INTEGER"),
             ("caps_announce_attempt_at", "REAL"),
+            ("caps_announce_value", "TEXT"),
+            ("caps_change_attempts", "TEXT NOT NULL DEFAULT '[]'"),
         ):
             if column not in peer_cols:
                 cursor.execute(f"ALTER TABLE peers ADD COLUMN {column} {kind}")
@@ -1899,13 +1902,22 @@ def get_peer_rt_flag() -> str:
     return flag if flag in PEER_RT_FLAGS else "off"
 
 
-def reserve_peer_caps_announcement(email: str, chat_id: int, now: float, interval: int) -> bool:
+def reserve_peer_caps_announcement(peer: dict, now: float, change_attempts: list[float] | None) -> bool:
+    """Charge the attempt before calling the core, even if sending fails."""
     with _writer_transaction() as conn:
         return conn.execute("""
-            UPDATE peers SET caps_announce_attempt_at = ?
-            WHERE email = ? AND chat_id = ?
-              AND (caps_announce_attempt_at IS NULL OR caps_announce_attempt_at <= ?)
-        """, (now, email, chat_id, now - interval)).rowcount > 0
+            UPDATE peers SET caps_announce_attempt_at = ?, caps_change_attempts = COALESCE(?, caps_change_attempts)
+            WHERE email = ? AND chat_id = ? AND fingerprint IS ? AND caps_announce_attempt_at IS ?
+        """, (now, json.dumps(change_attempts) if change_attempts is not None else None,
+              peer["email"], peer["chat_id"], peer["fingerprint"], peer["caps_announce_attempt_at"])).rowcount > 0
+
+
+def record_peer_caps_announcement(chat_id: int, identity: str, at: float, caps: str) -> bool:
+    with _writer_transaction() as conn:
+        return conn.execute("""
+            UPDATE peers SET caps_announce_value = ?
+            WHERE chat_id = ? AND COALESCE(fingerprint, email) = ? AND caps_announce_attempt_at = ?
+        """, (caps, chat_id, identity, at)).rowcount > 0
 
 
 def _clear_disabled_peer_rt(conn):

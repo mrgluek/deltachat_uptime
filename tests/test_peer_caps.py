@@ -7,7 +7,7 @@ import tempfile
 import threading
 from types import SimpleNamespace
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import bot
 import database
@@ -171,7 +171,7 @@ class TestPeerCapabilities(unittest.TestCase):
             self.assertEqual(database.get_peer(self.right.email)["is_offline"], 0)
             report.assert_not_called()
 
-    def test_peerrt_capability_change_announces_once_per_peer_after_cooldown(self):
+    def test_peerrt_capability_change_announces_once_per_peer(self):
         with self.left.active():
             database.set_peer_rt_flag("off")
             self.register_right()
@@ -182,10 +182,7 @@ class TestPeerCapabilities(unittest.TestCase):
             self.assertCountEqual([chat for chat, _ in self.left.sent("METRICS")], [123, 789])
             self.left.rpc.send_msg.reset_mock()
             self.left.command(bot.peerrt_command, "on")
-            self.clock.now += 599
-            self.tick()
-            self.assertEqual(self.left.sent("METRICS"), [])
-            self.clock.now += 1
+            self.clock.now += bot.TELEMETRY_TICK
             self.tick()
             self.left.command(bot.peerrt_command, "on")
             self.clock.now += 600
@@ -193,6 +190,118 @@ class TestPeerCapabilities(unittest.TestCase):
             sent = self.left.sent("METRICS")
             self.assertCountEqual([chat for chat, _ in sent], [123, 789])
             self.assertTrue(all("rt1" in json.loads(text.splitlines()[1])["caps"] for _, text in sent))
+
+    def test_idle_pair_enabling_preview_after_startup_offers_on_next_tick(self):
+        started_at = self.clock.now
+        with self.right.active():
+            database.set_peer_rt_flag("off")
+            token = database.create_peer_invite_token()
+        with self.left.active():
+            database.set_peer_rt_flag("off")
+            self.left.command(bot.addpeer_command, f"{self.right.email} token={token} {self.right.name}")
+            (_, hello), = self.left.sent("HELLO")
+        with self.right.active():
+            self.right.receive(hello)
+            (_, ack), = self.right.sent("HELLO_ACK")
+            self.tick()
+            self.assertEqual(database.get_peer(self.left.email)["caps_announce_attempt_at"], started_at)
+            (_, startup_right), = self.right.sent("METRICS")
+        with self.left.active():
+            self.left.receive(ack)
+            self.left.receive(startup_right)
+            self.tick()
+            self.assertEqual(database.get_peer(self.right.email)["caps_announce_attempt_at"], started_at)
+            (_, startup_left), = self.left.sent("METRICS")
+        with self.right.active():
+            self.right.receive(startup_left)
+            self.assertNotIn("rt1", bot._peer_caps[self.left.email])
+            self.clock.now = started_at + 6
+            self.right.command(bot.peerrt_command, "canary")
+            self.right.command(bot.peerrt_command, f"{self.left.name} on")
+        with self.left.active():
+            self.assertNotIn("rt1", bot._peer_caps[self.right.email])
+            self.left.command(bot.peerrt_command, "on")
+
+        self.clock.now = started_at + 2 * bot.TELEMETRY_TICK
+        with self.right.active():
+            self.tick()
+            _, announce_right = self.right.sent("METRICS")[1]
+            self.assertEqual(json.loads(announce_right.splitlines()[1])["metrics"], [])
+            self.assertEqual(self.right.sent("RT_OFFER"), [])
+        with self.left.active():
+            bot._peer_rt_audit_requested.clear()  # Isolate the wakeup from the incoming announcement.
+            self.left.receive(announce_right)
+            self.assertIn("rt1", bot._peer_caps[self.right.email])
+            self.assertTrue(bot._peer_rt_audit_requested.is_set())
+            bot.audit_peer_rt_carriers(self.left.client, 1, self.clock.now)
+            self.assertEqual(self.left.sent("RT_OFFER"), [])
+            self.assertIsNone(database.get_peer(self.right.email)["rt_offer_at"])
+            self.tick()
+            _, announce_left = self.left.sent("METRICS")[1]
+            (_, offer), = self.left.sent("RT_OFFER")
+            self.assertEqual(self.left.rpc.send_msg.call_args_list[-2].args[2].text, announce_left)
+            self.assertEqual(self.left.rpc.send_msg.call_args_list[-1].args[2].text, offer)
+            self.assertEqual(database.get_peer(self.right.email)["rt_offer_at"], self.clock.now)
+        with self.right.active():
+            self.right.receive(announce_left)
+            self.assertIn("rt1", bot._peer_caps[self.left.email])
+            self.right.receive(offer, kind="Webxdc")
+            self.assertEqual(len(self.right.sent("RT_ACCEPT")), 1)
+
+    def test_caps_changes_use_persisted_rolling_budget(self):
+        started_at = self.clock.now
+        with self.left.active():
+            database.set_peer_rt_flag("off")
+            self.register_right()
+            bot._note_peer_caps(self.right.email, ["batch_check"])
+            self.tick()
+            for elapsed, flag in ((5, "on"), (10, "off"), (20, "on")):
+                self.clock.now = started_at + elapsed
+                self.left.command(bot.peerrt_command, flag)
+                self.tick()
+            self.assertEqual(len(self.left.sent("METRICS")), 4)
+        self.left.state["_peer_caps_announcements"] = {}
+        with self.left.active():
+            self.clock.now = started_at + 25
+            self.left.command(bot.peerrt_command, "off")
+            self.tick()
+            self.clock.now = started_at + 604
+            self.tick()
+            self.assertEqual(len(self.left.sent("METRICS")), 4)
+            self.clock.now = started_at + 605
+            self.tick()
+            self.assertEqual(len(self.left.sent("METRICS")), 5)
+            self.assertNotIn("rt1", json.loads(self.left.sent("METRICS")[-1][1].splitlines()[1])["caps"])
+            self.clock.now = started_at + 606
+            self.left.command(bot.peerrt_command, "on")
+            self.tick()
+            self.assertEqual(len(self.left.sent("METRICS")), 5)
+
+    def test_minute_boundary_does_not_delay_next_telemetry_tick(self):
+        self.clock.now += 56
+        started_at = self.clock.now
+        ticks = []
+        sleep = asyncio.sleep
+
+        async def advance(delay):
+            await sleep(0)
+            if len(ticks) == 2 or self.clock.now >= started_at + bot.TELEMETRY_TICK + 5:
+                raise asyncio.CancelledError
+            self.clock.now += delay
+
+        async def broadcast():
+            ticks.append(self.clock.now)
+
+        with self.left.active(), patch.multiple(
+                bot, dc_bot_instance=None, last_peer_telemetry_broadcast=0, _host_outage_active=False,
+                _scheduler_cache={"resources": [], "resources_ts": started_at, "probe_targets": [],
+                                  "probe_targets_ts": started_at, "ttl": 10}, pop_recovered_nodes=lambda: [],
+                _broadcast_peer_updates=broadcast, _check_report_notices=AsyncMock(),
+                push_status_apps=AsyncMock(), realtime_status_tick=AsyncMock(), audit_abandoned_chats=AsyncMock()), \
+                patch.object(bot.secrets, "randbelow", return_value=0), \
+                patch.object(bot.asyncio, "sleep", side_effect=advance), self.assertRaises(asyncio.CancelledError):
+            asyncio.run(bot.monitoring_scheduler_loop())
+        self.assertEqual(ticks, [started_at, started_at + bot.TELEMETRY_TICK])
 
     def test_caps_announcement_cooldown_survives_restart_and_key_binding(self):
         with self.left.active():

@@ -185,9 +185,11 @@ mode, only peers explicitly set to `on` are eligible. With the global setting
 Eligible peers that announce `rt1` and have a bound key exchange a small
 **Uptime peer link** app in their encrypted 1:1 chat. Nodes exchange capabilities
 during pairing and can announce them even when they have no monitor results to
-share. Standalone capability announcements are spaced at least ten minutes
-apart per peer. The peer with the lower fingerprint sends the app and replaces
-it every 14 days. Cleanup preserves the
+share. A capability change goes out on the next telemetry tick (within five
+seconds on an idle node), with up to three change attempts per peer in any ten
+minutes. Startup announcements and requests for unknown capabilities keep the
+ten-minute cooldown. The peer with the lower fingerprint sends the app and
+replaces it every 14 days. Cleanup preserves the
 current app until its replacement is accepted. If it disappears, the peers
 recover by mail. `/peers` shows whether the app is ready, an offer is pending, or
 the peer is mail only. Older peers continue to use the existing mail protocol.

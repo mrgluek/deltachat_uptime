@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Announce peer capability changes on the next telemetry tick, including when the realtime preview is enabled on idle peers. Limit changes to three attempts per peer in ten minutes and send the carrier offer after announcing `rt1`.
+
 ## [2.44.2] - 2026-11-19
 
 ### Fixed

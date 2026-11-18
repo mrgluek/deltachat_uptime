@@ -70,7 +70,7 @@ from outbox import outbox as dc_outbox, PRIO_ALERT, PRIO_REPLY, PRIO_UPDATE, PRI
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "2.40.1"
+VERSION = "2.41.0"
 SYNC_MAX_BYTES = 64 * 1024
 # 200 metrics / 100 cross-checks, including JSON's twelve-byte astral Unicode escaping at field limits.
 PEER_MAX_BYTES = 8 * 1024 * 1024
@@ -78,6 +78,10 @@ DNS_DEADLINE = 5.0
 TITLE_DEADLINE = 5.0
 HTTP_REQUEST_TIMEOUT = 10.0
 HTTP_TOTAL_DEADLINE = min(45.0, 3 * HTTP_REQUEST_TIMEOUT)
+VOTE_ERROR_STORAGE_MAX = 200
+KEYWORD_SNIPPET_MAX = 80
+MISSING_KEYWORD_PREFIX = '200 OK (Missing keyword: "'
+_PROTOCOL_MARKER = re.compile(r"\[(/?UPTIME_(?:PEER_[A-Z_]+|BOT_SYNC_DATA)\])")
 
 _SECRET_QUERY_NAMES = {"token", "key", "secret", "password", "pass", "pwd", "auth", "sig",
                        "signature", "api_key", "apikey", "access_token", "code"}
@@ -86,14 +90,37 @@ _SECRET_QUERY_NAMES = {"token", "key", "secret", "password", "pass", "pwd", "aut
 def redact_url(text_or_url) -> str:
     """Remove URL credentials and secret query values from diagnostic text."""
     text = str(text_or_url)
-    text = re.sub(r"([a-z][a-z0-9+.-]*://)[^/\s?#]*@", r"\1", text, flags=re.IGNORECASE)
+    text = re.sub(r"(?<=[a-z0-9+.-]://)[^/\s?#]*@", "", text, flags=re.IGNORECASE)
 
     def redact_query(match):
         name = unquote_plus(match.group(2)).lower().replace("-", "_")
         secret = name in _SECRET_QUERY_NAMES or any(p in _SECRET_QUERY_NAMES for p in name.split("_"))
         return match.group(1) + match.group(2) + "=" + ("***" if secret else match.group(3))
 
-    return re.sub(r"([?&])([^?&=\s#]+)=([^&#\s]*)", redact_query, text)
+    return re.sub(r"(\?|&(?:amp;)?)([^?&=\s#]+)=([^&#\s]*)", redact_query, text, flags=re.IGNORECASE)
+
+
+def _missing_keyword_error(keyword: str, body: bytes | None, max_length: int) -> str:
+    suffix = '")'
+    if body is not None:
+        decoded = body.decode("utf-8", errors="replace")
+        sample = decoded[:256]
+        printable = sum(c != "\ufffd" and (c.isprintable() or c.isspace()) for c in sample)
+        if printable * 2 < len(sample):
+            shown = f"<binary {len(body)} bytes>"
+        else:
+            text = " ".join("".join(c for c in decoded if c.isprintable() or c.isspace()).split())
+            # Redact before truncating, including URL credentials beyond the display limit.
+            text = redact_url(text)
+            if len(text) > KEYWORD_SNIPPET_MAX:
+                text = text[:KEYWORD_SNIPPET_MAX - 1].rstrip() + "…"
+            shown = f'"{text}"'
+        suffix = f'"; got: {shown})'
+    limit = max_length - len(MISSING_KEYWORD_PREFIX) - len(suffix)
+    if len(keyword) > limit:
+        keyword = keyword[:limit - 1].rstrip() + "…"
+    # Legacy peers also scan ordinary chat text for these delimiters.
+    return _PROTOCOL_MARKER.sub(r"［\1", MISSING_KEYWORD_PREFIX + keyword + suffix)
 
 
 STATUS_REFRESH_SECONDS = 1800
@@ -2881,13 +2908,13 @@ async def _annotate_block(resource, result):
     return (is_up, blockcheck.with_tag(tag, error), latency) if tag else result
 
 
-async def run_single_check(resource, session=None) -> tuple[bool, str, int | None]:
+async def run_single_check(resource, session=None, *, keyword_error_limit=VOTE_ERROR_STORAGE_MAX) -> tuple[bool, str, int | None]:
     # A single monotonic deadline includes DNS, all redirects, fallback, reads and cleanup.
     started = time.monotonic()
     _redirect_trail.set([])
     try:
         async with asyncio.timeout(HTTP_TOTAL_DEADLINE):
-            result = await _run_single_check(resource, session)
+            result = await _run_single_check(resource, session, keyword_error_limit)
     except asyncio.TimeoutError:
         result = (False, "Timeout", int((time.monotonic() - started) * 1000))
     # The diagnosis of a failure is part of the same overall deadline: it gets what is left of it
@@ -2901,7 +2928,7 @@ async def run_single_check(resource, session=None) -> tuple[bool, str, int | Non
         return result
 
 
-async def _run_single_check(resource, session=None):
+async def _run_single_check(resource, session, keyword_error_limit):
     import http
     rtype = resource["type"]
     url = resource["url"]
@@ -2931,6 +2958,7 @@ async def _run_single_check(resource, session=None):
                         phrase = "Unknown Status"
                     details = f"{resp.status} - {phrase}"
                     if 200 <= resp.status < 400:
+                        body_bytes = None
                         try:
                             body_bytes = await _read_body_limited(resp, max_bytes)
                             charset = 'utf-8'
@@ -2950,7 +2978,8 @@ async def _run_single_check(resource, session=None):
 
                         if expected_kw:
                             if expected_kw.lower() not in body_text.lower():
-                                return False, f"200 OK (Missing keyword: \"{expected_kw}\")", elapsed_ms
+                                error = _missing_keyword_error(expected_kw, body_bytes, keyword_error_limit)
+                                return False, error, elapsed_ms
                         else:
                             body_lower = body_text.lower()
                             if "error establishing a database connection" in body_lower:
@@ -3150,11 +3179,13 @@ async def _recheck_over_ipv4(resource: dict, ipv6_error: str):
             await probe_addresses(host, 4)
     except Exception:
         return False, ipv6_error, None  # IPv6-only host (or DNS gone): the IPv6 error is the answer
-    is_up, err4, latency = await run_single_check({**resource, "family": 4})
+    v6 = _CONNECT_ADDR_RE.sub("", short_vote_error(ipv6_error) or ipv6_error).strip()
+    prefix, suffix = "IPv4: ", f" · IPv6: {v6}"
+    is_up, err4, latency = await run_single_check(
+        {**resource, "family": 4}, keyword_error_limit=VOTE_ERROR_STORAGE_MAX - len(prefix) - len(suffix))
     if is_up:
         return is_up, err4, latency
-    v6 = _CONNECT_ADDR_RE.sub("", short_vote_error(ipv6_error) or ipv6_error).strip()
-    return False, f"IPv4: {short_vote_error(err4) or err4} · IPv6: {v6}", latency
+    return False, f"{prefix}{short_vote_error(err4) or err4}{suffix}", latency
 
 
 # Per-minute check summary (one INFO line instead of one per check; see log_check_summary)
@@ -3224,7 +3255,7 @@ def next_alert_state(resource_id: int, prev: str, raw: str) -> str:
 def _vote_entry(node: str, status: str, latency_ms=None, error_msg=None, local: bool = False) -> dict:
     v = {"node": str(node or "Peer")[:64], "status": status if status in VOTING_STATUSES else "unknown",
          "latency_ms": latency_ms if isinstance(latency_ms, int) and not isinstance(latency_ms, bool) else None,
-         "error": str(error_msg)[:200] if error_msg and status != "up" else None}
+         "error": str(error_msg)[:VOTE_ERROR_STORAGE_MAX] if error_msg and status != "up" else None}
     if local:
         v["local"] = True
     return v
@@ -3344,6 +3375,8 @@ def short_vote_error(error, limit: int = VOTE_ERROR_MAX) -> str | None:
         rest = short_vote_error(error, max(limit - len(tag) - 1, 10))
         return f"{tag} {rest}" if rest else tag
     text = " ".join(str(error).split())
+    if text.startswith((MISSING_KEYWORD_PREFIX, "IPv4: " + MISSING_KEYWORD_PREFIX)) and '"; got: ' in text:
+        return text[:VOTE_ERROR_STORAGE_MAX]
     ssl_fail = re.search(r"certificate verify failed: ([^()'\]]+)", text)
     if ssl_fail:
         text = "SSL: " + ssl_fail.group(1).strip()

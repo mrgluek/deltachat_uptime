@@ -1,6 +1,7 @@
 import os
 import sys
 import socket
+import json
 import unittest
 import time
 import datetime
@@ -1851,14 +1852,95 @@ class TestUptimeBot(unittest.TestCase):
             res = {"type": "http", "url": "https://test-kw.org", "expected_keyword": "Welcome to My Site"}
             is_up, details, lat = asyncio.run(bot.run_single_check(res))
             self.assertTrue(is_up)
-            self.assertIn("200 - OK", details)
+            self.assertEqual(details, "200 - OK")
             self.assertIsNotNone(lat)
 
             # 2. Missing keyword -> DOWN with details
             res["expected_keyword"] = "NonExistentString"
             is_up, details, lat = asyncio.run(bot.run_single_check(res))
             self.assertFalse(is_up)
-            self.assertIn("Missing keyword", details)
+            self.assertEqual(details, '200 OK (Missing keyword: "NonExistentString"; '
+                                      'got: "<html><body>Welcome to My Site</body></html>")')
+
+    def _check_keyword_body(self, body, keyword="16 EF 76…", status=200, read_error=None):
+        response = MagicMock(status=status, headers={"Content-Type": "text/html; charset=utf-8"})
+        response.content.read = AsyncMock(return_value=body, side_effect=read_error)
+        session = MagicMock(closed=False)
+        session.get.return_value.__aenter__.return_value = response
+        resource = {"type": "http", "url": "https://test-kw.org", "expected_keyword": keyword}
+        result = asyncio.run(bot.run_single_check(resource, session=session))
+        if status == 200:
+            response.content.read.assert_awaited_once_with(131072)
+        else:
+            response.content.read.assert_not_awaited()
+        return result
+
+    def test_keyword_miss_shows_html_as_text_on_status_page_and_notices(self):
+        is_up, error, latency = self._check_keyword_body(b"<!doctype html><title>Access\x00\r\n\tdenied</title>")
+        self.assertFalse(is_up)
+        self.assertEqual(error, '200 OK (Missing keyword: "16 EF 76…"; '
+                                'got: "<!doctype html><title>Access denied</title>")')
+        votes = bot.build_votes("Local", is_up, latency, error, [{"node_name": "Remote", "status": "up"}])
+        rid = database.add_resource(100, "https://test-kw.org", "Keyword monitor", "http")
+        database.update_resource_status(rid, "up", 0)
+        database.update_resource_alert_state(rid, "degraded", json.dumps(votes))
+        resources = database.get_resources(100)
+        page = bot.get_dashboard_html("Test Chat", resources, 100.0)
+        self.assertIn('got: &quot;&lt;!doctype html&gt;&lt;title&gt;Access denied&lt;/title&gt;&quot;', page)
+        self.assertNotIn("<title>Access denied</title>", page)
+        self.assertIn(error, bot.format_degraded_notice([("start", resources[0], votes, 0)]))
+        self.assertIn(error, bot.format_incident_message(1, int(time.time()), resources))
+        self.assertEqual(bot.build_status_state(100)["monitors"][0]["nodes"][0]["error"], error)
+
+    def test_keyword_miss_truncates_keyword_before_body(self):
+        is_up, error, latency = self._check_keyword_body(b"A" * 131072, keyword="K" * 200)
+        self.assertFalse(is_up)
+        self.assertEqual(len(error), 200)
+        self.assertTrue(error.endswith('…"; got: "' + "A" * 79 + '…")'))
+        self.assertEqual(bot._vote_entry("Local", "down", latency, error)["error"], error)
+        self.assertEqual(bot.short_vote_error(error), error)
+
+    def test_keyword_miss_handles_invalid_utf8_and_a_multibyte_cut(self):
+        body = b"start\xff " + ("🙂" * 79).encode()
+        is_up, error, _ = self._check_keyword_body(body)
+        self.assertFalse(is_up)
+        self.assertTrue(error.endswith('got: "start� ' + "🙂" * 72 + '…")'))
+
+    def test_keyword_miss_reports_binary_byte_count(self):
+        is_up, error, _ = self._check_keyword_body(bytes(range(256)) * 16)
+        self.assertFalse(is_up)
+        self.assertTrue(error.endswith("got: <binary 4096 bytes>)"))
+
+    def test_keyword_miss_redacts_before_truncating(self):
+        body = b"https://user:" + b"credential" * 10 + b"@site.org/?x=1&amp;access_token=private&v=2"
+        is_up, error, _ = self._check_keyword_body(body)
+        self.assertFalse(is_up)
+        self.assertTrue(error.endswith('got: "https://site.org/?x=1&amp;access_token=***&v=2")'))
+
+    def test_keyword_miss_keeps_protocol_markers_inert(self):
+        body = b"[UPTIME_PEER_CHECK_RESP] [/UPTIME_PEER_CHECK_RESP]"
+        is_up, error, _ = self._check_keyword_body(body)
+        self.assertFalse(is_up)
+        self.assertIn("［UPTIME_PEER_CHECK_RESP] ［/UPTIME_PEER_CHECK_RESP]", error)
+
+        target = {"type": "http", "url": "https://test-kw.org", "expected_keyword": "required"}
+        with patch.object(bot, "run_single_check", AsyncMock(return_value=(is_up, error, 15))), \
+             patch.object(bot, "_dc_send_msg_with_stats") as send:
+            asyncio.run(bot._answer_batch_cross_check(MagicMock(), 1, 2, "req", [target]))
+        opening, payload, closing = send.call_args.args[3].text.splitlines()
+        self.assertEqual(opening, "[UPTIME_PEER_CHECK_BATCH_RESP]")
+        self.assertEqual(closing, "[/UPTIME_PEER_CHECK_BATCH_RESP]")
+        vote = json.loads(payload)["results"][0]
+        self.assertNotIn("[UPTIME_PEER_CHECK_RESP]", payload)
+        self.assertEqual(vote, {"status": "down", "latency_ms": 15, "error_msg": error})
+
+    def test_keyword_check_does_not_show_a_snippet_on_status_error_or_read_timeout(self):
+        is_up, error, _ = self._check_keyword_body(b"Gateway error", status=502)
+        self.assertFalse(is_up)
+        self.assertEqual(error, "502 - Bad Gateway")
+        is_up, error, _ = self._check_keyword_body(b"", read_error=asyncio.TimeoutError)
+        self.assertFalse(is_up)
+        self.assertEqual(error, '200 OK (Missing keyword: "16 EF 76…")')
 
     def test_run_single_check_auto_error_detection(self):
         # Database connection error inside HTTP 200 -> DOWN
@@ -2488,6 +2570,24 @@ class TestUptimeBot(unittest.TestCase):
         reaction_calls = mock_bot.rpc.send_reaction.call_args_list
         self.assertTrue(any(c[0][2] == ["⏳"] for c in reaction_calls))
         self.assertEqual(reaction_calls[-1][0][2], ["☑️"])
+
+    def test_ping_command_shows_local_and_remote_keyword_excerpts(self):
+        database.set_local_node_name("Local")
+        database.set_peer_share_scope("all")
+        database.add_or_update_peer("remote@example.org", "Remote", 101)
+        client = MagicMock()
+        event = MagicMock()
+        event.msg.chat_id = 12345
+        event.payload = 'http://test-kw.org "marker"'
+        local = '200 OK (Missing keyword: "marker"; got: "<title>Local page</title>")'
+        remote = '200 OK (Missing keyword: "marker"; got: "<title>Remote page</title>")'
+        answer = {"node_name": "Remote", "status": "down", "latency_ms": 35, "error_msg": remote}
+        with patch.object(bot, "run_single_check", AsyncMock(return_value=(False, local, 25))), \
+             patch.object(bot, "request_peer_cross_checks", AsyncMock(return_value=[answer])):
+            bot.ping_command(client, 1, event)
+        message = client.rpc.send_msg.call_args.args[2].text
+        self.assertIn(f"Response: {local}", message)
+        self.assertIn(f"**Remote**: 🔴 `35ms` - {remote}", message)
 
     def test_ping_command_usage_and_errors(self):
         mock_bot = MagicMock()

@@ -16,6 +16,7 @@ Additionally, it automatically generates a secure, beautiful web status dashboar
 - 🔍 **Content & Keyword Assertion (Zero-Config + Custom Keywords):**
   - **Zero-Config Error Detection:** In the background, automatically scans HTTP responses for silent failure signatures wrapped in `200 OK` responses (e.g. database connection errors, 502/503 wrapped in HTML, Cloudflare error screens).
   - **Custom Keyword Matching:** Assert that response body contains specific text (e.g. `/add https://api.site.com Health "status:ok"` or `/keyword 1 "Welcome"`). Chats monitoring the same URL keep their own keyword requirements for local checks and peer votes.
+    When the keyword is missing, the error shows a short response excerpt with URL credentials and secret query values redacted, or a byte count for binary data.
 - ⏸️ **Smart Maintenance Windows & Alert Snoozing:**
   - Pause monitoring and mute outage alerts during planned maintenance without skewing 30-day uptime metrics: `/pause <id|url> [duration]` (e.g. `/pause 1 30m`, `/pause https://example.com 2h`).
   - Supports replying `/pause [duration]` directly to incident alerts.

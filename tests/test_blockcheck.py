@@ -310,7 +310,7 @@ if __name__ == "__main__":
 class TestDeadlineBudget(unittest.IsolatedAsyncioTestCase):
     """The diagnosis never runs past the overall check deadline."""
     async def run_check(self, deadline, check_takes, diagnose_takes):
-        async def slow_check(resource, session=None):
+        async def slow_check(resource, session, keyword_error_limit):
             await asyncio.sleep(check_takes)
             return False, "Timeout", 1
 

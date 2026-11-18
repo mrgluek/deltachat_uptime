@@ -768,6 +768,21 @@ class TestIPv4Recheck(unittest.TestCase):
         self.assertFalse(up)
         self.assertEqual(err, "IPv4: Timeout · IPv6: Connect call failed")
 
+    def test_ipv4_keyword_snippet_and_ipv6_error_fit_the_vote(self):
+        resource = {"type": "http", "url": "https://meet.jit.si/", "expected_keyword": "K" * 200}
+
+        async def check_ipv4(target, *, keyword_error_limit):
+            return False, bot._missing_keyword_error(target["expected_keyword"], b"A" * 90, keyword_error_limit), 20
+
+        with patch("bot.probe_addresses", AsyncMock(return_value=["172.64.150.250"])), \
+             patch("bot.run_single_check", side_effect=check_ipv4):
+            is_up, error, _ = asyncio.run(bot._recheck_over_ipv4(resource, self.ERR6))
+        self.assertFalse(is_up)
+        self.assertEqual(len(error), 200)
+        self.assertTrue(error.startswith("IPv4: 200 OK"))
+        self.assertTrue(error.endswith('…"; got: "' + "A" * 79 + '…") · IPv6: Connect call failed'))
+        self.assertEqual(bot.short_vote_error(error), error)
+
     def test_missing_ipv4_is_resolved_again(self):
         # The cached answer had only AAAA (the A query had failed); DNS now answers A as well
         res = {"type": "http", "url": "https://delta.chat/"}

@@ -139,10 +139,15 @@ function startLive() {
   channel.setListener(data => {
     let msg;
     try { msg = JSON.parse(new TextDecoder().decode(data)); } catch (e) { return; }
+    if (msg && msg.t === "pong" && lastLive) {
+      lastLive = Date.now();
+      liveStatus(`Live · checked ${new Date((msg.ts || 0) * 1000).toLocaleTimeString()}`);
+      return;
+    }
     if (!msg || msg.t !== "state" || !msg.u || !msg.u.payload) return;
     const first = !lastLive;
     lastLive = Date.now();
-    liveStatus("Live");
+    liveStatus(`Live · checked ${new Date().toLocaleTimeString()}`);
     if (first) { clearInterval(timer); timer = setInterval(liveTick, 60 * 1000); }
     if (newer(msg.u.payload)) render(msg.u.payload);
   });

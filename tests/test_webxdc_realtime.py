@@ -64,7 +64,12 @@ class TestWebxdcRealtime(unittest.TestCase):
         self.tmp.cleanup()
 
     def sent_states(self):
-        return [json.loads(bytes(c.args[2]).decode()) for c in self.rpc.send_webxdc_realtime_data.call_args_list]
+        sent = [json.loads(bytes(c.args[2]).decode()) for c in self.rpc.send_webxdc_realtime_data.call_args_list]
+        return [m for m in sent if m["t"] == "state"]
+
+    def pongs(self):
+        sent = [json.loads(bytes(c.args[2]).decode()) for c in self.rpc.send_webxdc_realtime_data.call_args_list]
+        return [m for m in sent if m["t"] == "pong"]
 
     def test_mail_interval_only_for_realtime_chats(self):
         self.assertEqual(bot.status_mail_interval(1), bot.REALTIME_EMAIL_INTERVAL)
@@ -92,7 +97,8 @@ class TestWebxdcRealtime(unittest.TestCase):
         bot.on_status_realtime(self.client, 1, Event(kind="WebxdcRealtimeData", msg_id=500, data=data({"t": "hello"})))
         self.assertEqual(len(self.sent_states()), 2)  # hello always answers, even when unchanged
         bot.on_status_realtime(self.client, 1, Event(kind="WebxdcRealtimeData", msg_id=500, data=data({"t": "ping"})))
-        self.assertEqual(len(self.sent_states()), 2)  # ping only keeps the channel
+        self.assertEqual(len(self.sent_states()), 2)  # ping keeps the channel and gets a pong, no state
+        self.assertEqual(self.pongs(), [{"t": "pong", "v": 1, "ts": 10000}])
 
     def test_other_chats_and_old_instances_are_ignored(self):
         bot.on_status_realtime(self.client, 1, Event(kind="WebxdcRealtimeAdvertisementReceived", msg_id=499))

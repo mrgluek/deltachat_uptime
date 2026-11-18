@@ -97,7 +97,7 @@ def redact_url(text_or_url) -> str:
 
 
 STATUS_REFRESH_SECONDS = 1800
-WEBXDC_APP_VERSION = 3  # Bump only for layout changes requiring a new app instance.
+WEBXDC_APP_VERSION = 4  # Bump only for layout changes requiring a new app instance.
 # Safety net; explicit trimming preserves app instances and ongoing incident messages.
 DELETE_DEVICE_AFTER = 30 * 86400
 USER_CHAT_KEEP_SECONDS = 86400
@@ -6421,6 +6421,14 @@ def on_status_realtime(bot, accid, event):
     _realtime_join(bot, accid, msg_id, chat_id)  # refreshes last_seen when already joined
     if msg["t"] == "hello":
         _send_realtime_state(bot, accid, msg_id, force=True)
+        return
+    # A state that does not change is not resent, so answer the heartbeat: the app shows the
+    # channel is alive ("Live · checked HH:MM:SS") instead of an "Updated" time that stands still.
+    try:
+        pong = json.dumps({"t": "pong", "v": REALTIME_PROTOCOL, "ts": int(time.time())}).encode()
+        bot.rpc.send_webxdc_realtime_data(accid, msg_id, list(pong))
+    except Exception as exc:
+        logger.debug("Realtime pong to chat %s failed: %s", chat_id, exc)
 
 
 async def realtime_status_tick():

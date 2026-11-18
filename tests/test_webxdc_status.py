@@ -82,20 +82,19 @@ class TestWebxdcStatus(unittest.TestCase):
         database.set_chat_status_line(1, 322, bot._status_line_hash(bot.status_line_text(bot.build_status_state(1))))
         database.set_config("webxdc_app_version:1", str(bot.WEBXDC_APP_VERSION))
 
-    def test_member_count_mail_policy_and_live_override(self):
-        for count, interval, cap in ((19, 60, 30), (20, 300, 12), (66, 300, 12)):
+    def test_member_count_mail_policy_with_live_off(self):
+        database.set_chat_report_live(1, "off")
+        for count, interval, cap in ((9, 60, 30), (10, 300, 12), (66, 300, 12)):
             with self.subTest(count=count):
                 self.assertEqual(bot.status_mail_interval(1, count), interval)
                 self.assertEqual(bot.status_mail_cap(1, count), cap)
                 self.assertEqual(bot.status_mail_cap(1, count, urgent=True), 30)
-        database.set_chat_report_live(1, "on")
-        self.assertEqual(bot.status_mail_interval(1, 66), 60)  # Idle live chats use normal pacing.
-        self.assertEqual(bot.status_mail_cap(1, 66), 30)
         self.rpc.get_chat_contacts.side_effect = RuntimeError("offline")
         self.assertEqual(bot._status_member_count(self.client, 1, 1), 0)
 
-    def test_large_chat_waits_five_minutes_in_audit_and_delivery(self):
-        self.rpc.get_chat_contacts.return_value = list(range(20))
+    def test_large_chat_with_idle_live_mode_waits_five_minutes_in_audit_and_delivery(self):
+        database.set_chat_report_live(1, "on")
+        self.rpc.get_chat_contacts.return_value = list(range(66))
         self.existing()
         self.push()
         self.rpc.send_webxdc_status_update.reset_mock()
@@ -110,6 +109,7 @@ class TestWebxdcStatus(unittest.TestCase):
         self.rpc.send_webxdc_status_update.assert_called_once()
 
     def test_large_chat_cap_and_urgent_incident_and_monitor_changes(self):
+        database.set_chat_report_live(1, "on")
         self.rpc.get_chat_contacts.return_value = list(range(66))
         self.existing()
         self.push()

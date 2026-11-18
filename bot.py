@@ -70,7 +70,7 @@ from outbox import outbox as dc_outbox, PRIO_ALERT, PRIO_REPLY, PRIO_UPDATE, PRI
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "2.40.0"
+VERSION = "2.40.1"
 SYNC_MAX_BYTES = 64 * 1024
 # 200 metrics / 100 cross-checks, including JSON's twelve-byte astral Unicode escaping at field limits.
 PEER_MAX_BYTES = 8 * 1024 * 1024
@@ -6332,6 +6332,7 @@ async def push_status_apps():
 STATUS_REALTIME_CHATS = {int(x) for x in os.environ.get("STATUS_REALTIME_CHATS", "").replace(" ", "").split(",")
                          if x.isdigit()}
 REALTIME_EMAIL_INTERVAL = 1800
+LARGE_STATUS_CHAT_MIN_MEMBERS = 10
 # The app sends a heartbeat every 60 s; after three missed ones the bot leaves the channel,
 # so it does not keep gossiping to nobody. The next app open advertises again.
 REALTIME_IDLE_LEAVE = 180
@@ -6347,20 +6348,26 @@ def realtime_chat(chat_id) -> bool:
     return chat_id in STATUS_REALTIME_CHATS or database.get_chat_report_live(chat_id) == "on"
 
 
+def _status_realtime_active(chat_id) -> bool:
+    if not realtime_chat(chat_id):
+        return False
+    msg_id = database.get_chat_webxdc(chat_id)["webxdc_msg_id"]
+    with _realtime_lock:
+        entry = _realtime_channels.get(msg_id)
+        return bool(entry and entry.get("received") and time.time() - entry["last_seen"] < REALTIME_IDLE_LEAVE)
+
+
 def status_mail_interval(chat_id, member_count=0) -> int:
     """Minimum seconds between non-urgent mail status updates in a chat."""
-    if realtime_chat(chat_id):
-        msg_id = database.get_chat_webxdc(chat_id)["webxdc_msg_id"]
-        with _realtime_lock:
-            entry = _realtime_channels.get(msg_id)
-            active = entry and entry.get("received") and time.time() - entry["last_seen"] < REALTIME_IDLE_LEAVE
-        if active:
-            return REALTIME_EMAIL_INTERVAL
-    return 300 if member_count >= 20 and not realtime_chat(chat_id) else 60
+    if _status_realtime_active(chat_id):
+        return REALTIME_EMAIL_INTERVAL
+    return 300 if member_count >= LARGE_STATUS_CHAT_MIN_MEMBERS else 60
 
 
 def status_mail_cap(chat_id, member_count=0, urgent=False):
-    return 12 if member_count >= 20 and not realtime_chat(chat_id) and not urgent else 30
+    if not urgent and member_count >= LARGE_STATUS_CHAT_MIN_MEMBERS and not _status_realtime_active(chat_id):
+        return 12
+    return 30
 
 
 def _status_member_count(bot, accid, chat_id):

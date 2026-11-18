@@ -71,17 +71,27 @@ class TestWebxdcRealtime(unittest.TestCase):
         sent = [json.loads(bytes(c.args[2]).decode()) for c in self.rpc.send_webxdc_realtime_data.call_args_list]
         return [m for m in sent if m["t"] == "pong"]
 
-    def test_mail_interval_only_for_realtime_chats(self):
-        self.assertEqual(bot.status_mail_interval(1), 60)
+    def test_large_chat_mail_policy_tracks_current_live_session(self):
+        database.set_chat_report_live(1, "on")
+        self.assertEqual(bot.status_mail_interval(1, 66), 300)
+        self.assertEqual(bot.status_mail_cap(1, 66), 12)
         bot.on_status_realtime(self.client, 1, Event(kind="WebxdcRealtimeAdvertisementReceived", msg_id=500))
-        self.assertEqual(bot.status_mail_interval(1), 60)  # An advertisement alone is not activity.
+        self.assertEqual(bot.status_mail_interval(1, 66), 300)
+        self.assertEqual(bot.status_mail_cap(1, 66), 12)
         bot.on_status_realtime(self.client, 1, Event(kind="WebxdcRealtimeData", msg_id=500, data=data({"t": "hello"})))
-        self.assertEqual(bot.status_mail_interval(1), bot.REALTIME_EMAIL_INTERVAL)
+        self.assertEqual(bot.status_mail_interval(1, 66), 1800)
+        self.assertEqual(bot.status_mail_cap(1, 66), 30)
         self.assertEqual(bot.status_mail_interval(2), 60)
         self.now += bot.REALTIME_IDLE_LEAVE
-        self.assertEqual(bot.status_mail_interval(1), 60)  # Before the next leave tick too.
+        self.assertEqual(bot.status_mail_interval(1, 66), 300)
+        self.assertEqual(bot.status_mail_cap(1, 66), 12)
+        bot.on_status_realtime(self.client, 1, Event(kind="WebxdcRealtimeData", msg_id=500, data=data({"t": "ping"})))
+        self.assertEqual(bot.status_mail_interval(1, 66), 1800)
+        database.set_chat_webxdc(1, 501)
+        self.assertEqual(bot.status_mail_interval(1, 66), 300)
+        self.assertEqual(bot.status_mail_cap(1, 66), 12)
         asyncio.run(bot.realtime_status_tick())
-        self.assertEqual(bot.status_mail_interval(1), 60)
+        self.rpc.leave_webxdc_realtime.assert_called_once_with(1, 500)
 
     def test_decode_rejects_garbage(self):
         self.assertEqual(bot._decode_realtime(data({"t": "hello", "v": 1}))["t"], "hello")

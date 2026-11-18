@@ -58,36 +58,42 @@ class AuditCase(unittest.TestCase):
 
 
 class TestProbeAdmission(AuditCase):
+    timeout = 20
+
+    def setUp(self):
+        super().setUp()
+        # Single requests prewarm DNS before calling the mocked URL validator.
+        self.stack.enter_context(patch.object(bot, '_prewarm_target_dns', return_value=True))
+
+    async def wait_for_probes(self, calls, expected):
+        try:
+            async with asyncio.timeout(self.timeout):
+                while len(calls) < expected:
+                    await asyncio.sleep(0.01)
+        except TimeoutError:
+            self.fail(f'Only {len(calls)} of {expected} probes started within {self.timeout}s')
+
     def flood(self, batch=False, repeated=False):
         async def scenario():
-            gate, started, done = asyncio.Event(), asyncio.Event(), asyncio.Event()
+            gate = asyncio.Event()
             active = collections.Counter()
             calls, peak = [], collections.Counter()
             expected = 1 if repeated else 20
-            finished = 0
 
             async def probe(target):
                 who = target['url']
                 calls.append(who)
                 active[who] += 1
                 peak[who] = max(peak[who], active[who])
-                if len(calls) == expected:
-                    started.set()
                 await gate.wait()
                 active[who] -= 1
                 return True, None, 1
-
-            def sent(*args, **kwargs):
-                nonlocal finished
-                finished += 1
-                if finished == expected:
-                    done.set()
 
             evil, honest = self.peer(), self.peer('Honest', 'honest@example.org', 702)
             tag = 'UPTIME_PEER_CHECK_BATCH_REQ' if batch else 'UPTIME_PEER_CHECK_REQ'
             with patch.object(bot, 'run_single_check', side_effect=probe), \
                  patch.object(bot, 'is_safe_target_url', return_value=True) as safe, \
-                 patch.object(bot, '_dc_send_msg_with_stats', side_effect=sent) as send:
+                 patch.object(bot, '_dc_send_msg_with_stats') as send:
                 for i in range(240 if repeated else 100):
                     target = dict(url='https://evil.example', type='http')
                     data = dict(req_id='replay' if repeated else str(i), **({'targets': [target]} if batch else target))
@@ -97,15 +103,16 @@ class TestProbeAdmission(AuditCase):
                     for i in range(10):
                         target = dict(url='https://honest.example', type='http')
                         self.receive(honest, tag, dict(req_id=str(i), **({'targets': [target]} if batch else target)))
-                await asyncio.wait_for(started.wait(), 3)
+                await self.wait_for_probes(calls, expected)
                 self.assertEqual(len(calls), expected)
                 self.assertLessEqual(peak['https://evil.example'], 10)
+                self.assertEqual(peak['https://honest.example'], 0 if repeated else 10)
                 self.assertEqual(sum(bot._inbound_probes.outstanding.values()), expected)
                 self.assertEqual(safe.call_count, expected)  # drops never validate targets
                 send.assert_not_called()
                 tasks = asyncio.all_tasks() - {asyncio.current_task()}
                 gate.set()
-                await asyncio.wait_for(asyncio.gather(*tasks), 3)
+                await asyncio.wait_for(asyncio.gather(*tasks), self.timeout)
                 self.assertEqual(sum(bot._inbound_probes.outstanding.values()), 0)
             return calls
         return asyncio.run(scenario())
@@ -121,13 +128,11 @@ class TestProbeAdmission(AuditCase):
 
     def test_large_batch_reserves_bounded_workers_and_leaves_room_for_another_peer(self):
         async def scenario():
-            gate, started = asyncio.Event(), asyncio.Event()
+            gate = asyncio.Event()
             calls = []
 
             async def probe(target):
                 calls.append(target['url'])
-                if len(calls) == 20:
-                    started.set()
                 await gate.wait()
                 return True, None, 1
 
@@ -140,13 +145,14 @@ class TestProbeAdmission(AuditCase):
                 self.receive(evil, 'UPTIME_PEER_CHECK_BATCH_REQ', dict(req_id='excess', targets=targets))
                 for i in range(10):
                     self.receive(honest, 'UPTIME_PEER_CHECK_REQ', dict(req_id=str(i), url='https://honest.example', type='http'))
-                await asyncio.wait_for(started.wait(), 3)
+                await self.wait_for_probes(calls, 20)
                 self.assertEqual(len(calls), 20)
+                self.assertEqual(calls.count('https://honest.example'), 10)
                 self.assertEqual(sum(bot._inbound_probes.outstanding.values()), 20)
                 tasks = asyncio.all_tasks() - {asyncio.current_task()}
                 self.assertLessEqual(len(tasks), 21)  # 20 workers and one batch coordinator
                 gate.set()
-                await asyncio.wait_for(asyncio.gather(*tasks), 3)
+                await asyncio.wait_for(asyncio.gather(*tasks), self.timeout)
                 self.assertEqual(len(calls), 110)
                 self.assertEqual(send.call_count, 11)
                 self.assertFalse(bot._inbound_probes.outstanding)

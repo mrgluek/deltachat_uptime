@@ -174,6 +174,14 @@ Relay selection and failover are handled by the Delta Chat core (2.61+): it keep
 
 ---
 
+### Peer channel (preview)
+
+The iroh peer channel preview is off by default. Use `/peerrt` to see the current
+setting, `/peerrt off|canary|on` to change it, or
+`/peerrt <peer name|email> on|off|auto` to set a peer's preview mode. Turning
+on the preview only advertises the `rt1` capability. All peer traffic still
+travels by mail.
+
 ### Status app (`/report app`)
 
 The optional webxdc app gives each chat a mobile-friendly status view inside Delta Chat, with light/dark themes, full monitor names and URLs, all node results, a live name/URL filter, incidents, partial outages and the last 20 journal events. The bot posts the app followed by a plain text status line and pins that line once it is delivered to the server and at least 60 seconds old. Pending pins retry every 30 seconds; the app receives its first state after pinning. The pinned line names failing monitors using short names: for example, `🔴 2 down: cm.dc09.xyz, mail.x · 🟠 1 partial: site · 🟢 80 up`. It is edited in place only when its text changes. Paused monitors are excluded from failure counts; each category shows at most three names, with a count of any others, within 120 characters. The app bubble shows counts only. It is off by default.

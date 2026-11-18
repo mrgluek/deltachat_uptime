@@ -345,6 +345,13 @@ PEER_CAP_BATCH_CHECK = "batch_check"
 # (they refuse the target and abstain, but a single /ping request would wait for the timeout)
 PEER_CAP_SMTP_CHECK = "smtp_check"
 OWN_PEER_CAPS = [PEER_CAP_BATCH_CHECK, PEER_CAP_SMTP_CHECK]
+PEER_CAP_RT = "rt1"
+
+
+def _own_peer_caps() -> list[str]:
+    if database.get_peer_rt_flag() == "off":
+        return OWN_PEER_CAPS
+    return [*OWN_PEER_CAPS, PEER_CAP_RT]
 CROSS_CHECK_BATCH_WINDOW = 5.0    # seconds to collect failing targets before sending
 CROSS_CHECK_BATCH_MAX = 100       # targets per batch message
 CROSS_CHECK_BATCH_TIMEOUT = 25.0  # a peer checks up to 100 targets (10 s timeouts) and mails back
@@ -1163,7 +1170,7 @@ async def request_peer_cross_checks(target_dict: dict, timeout: float = 8.0, pee
         "type": target_dict.get("type", "http"),
         "expected_keyword": target_dict.get("expected_keyword"),
         "node_name": database.get_local_node_name(),
-        "caps": OWN_PEER_CAPS,
+        "caps": _own_peer_caps(),
     }
     if target_dict.get("family") in (4, 6):
         req_payload["family"] = target_dict["family"]  # older peers ignore it and check any family
@@ -1501,7 +1508,7 @@ async def _batch_cross_check_peer(peer: dict, items: list, results: dict) -> Non
     payload = {
         "req_id": req_id,
         "node_name": database.get_local_node_name(),
-        "caps": OWN_PEER_CAPS,
+        "caps": _own_peer_caps(),
         "targets": [{k: t.get(k) for k in ("url", "type", "expected_keyword", "family")} for _, t in items],
     }
     fut = asyncio.get_running_loop().create_future()
@@ -1570,7 +1577,7 @@ async def _answer_batch_cross_check(bot, accid, chat_id: int, req_id: str, targe
                 answers[index] = {"status": "unknown", "latency_ms": None, "error_msg": str(exc)[:200]}
 
     await asyncio.gather(*(worker() for _ in range(min(concurrency, len(targets)))))
-    payload = {"req_id": req_id, "node_name": database.get_local_node_name(), "caps": OWN_PEER_CAPS, "results": answers}
+    payload = {"req_id": req_id, "node_name": database.get_local_node_name(), "caps": _own_peer_caps(), "results": answers}
     # The requester waits CROSS_CHECK_BATCH_TIMEOUT from sending; a later answer is ignored there
     await asyncio.to_thread(_send_peer_check_answer, _PeerDestination(bot, accid, chat_id), "CHECK_BATCH_RESP", payload)
 
@@ -1738,7 +1745,7 @@ async def broadcast_telemetry_to_peers():
             "sender_email": self_addr,
             "timestamp": now,
             "msg_id": f"{now}_{secrets.token_hex(4)}",
-            "caps": OWN_PEER_CAPS,
+            "caps": _own_peer_caps(),
             "telemetry_interval": idle_gap,  # next scheduled heartbeat, unless a status changes first
             "desired_interval": interval,  # how often this node wants telemetry (from its peer count)
             "version": VERSION,  # shown in the peer's /peers and /stats
@@ -7169,7 +7176,10 @@ def _resend_cached_probe_answer(bot, accid, chat_id, peer, req_id):
     answer = _inbound_probes.cached_answer(peer, req_id)
     if answer is None:
         return False
-    _send_peer_check_answer(_PeerDestination(bot, accid, chat_id), *answer, replay=True)
+    kind, payload = answer
+    if "caps" in payload:
+        payload = dict(payload, caps=_own_peer_caps())
+    _send_peer_check_answer(_PeerDestination(bot, accid, chat_id), kind, payload, replay=True)
     return True
 
 
@@ -7250,6 +7260,8 @@ def help_command(bot, accid, event):
             f"/addpeer <email|link> [node_name] — Add remote peer bot (via email or SecureJoin invite)\n"
             f"/rmpeer <email|key> — Remove remote peer bot\n"
             f"/peershare [admin|all|none] — Choose which local monitors are disclosed to peers\n"
+            f"/peerrt [off|canary|on] — Show or set the peer channel preview flag\n"
+            f"/peerrt <peer name|email> on|off|auto — Set a peer's preview mode\n"
             f"/nodeignore [node_pat] [target_pat] — Ignore targets on peer node(s) (e.g. `RU* facebook.*`)\n"
             f"/nodeunignore <node_pat> [target_pat] — Resume checks for node(s)\n"
             f"/accounts — List configured bot accounts\n"
@@ -9324,6 +9336,7 @@ def peers_command(bot, accid, event):
         reply += f"🔗 **Connected Probes ({len(peers)}):**\n"
         now = int(time.time())
         vote_pauses = _paused_vote_peers(peers)
+        rt_flag = database.get_peer_rt_flag()
         for p in peers:
             last_seen = p.get("last_seen")
             if not last_seen or last_seen == 0:
@@ -9349,9 +9362,43 @@ def peers_command(bot, accid, event):
             ver = p.get("version")
             ver_lbl = (f"`v{ver}`" + (" ⚠️ outdated" if version_tuple(ver) < version_tuple(VERSION) else "")) if ver else "`≤2.26.2` ⚠️ outdated"
             vote_mark = " ⏸ votes paused" if _vote_peer_key(p) in vote_pauses else ""
-            reply += f"• {status_icon} **{p_node}**{vote_mark} — `{p['email']}`\n  {key_lbl} | {chat_lbl} | Version: {ver_lbl} | Last seen: `{seen_str}` | Active metrics: `{node_meas_count}`\n\n"
+            rt_mode = p.get("rt_mode", "auto")
+            rt_enabled = rt_mode != "off" and (rt_flag == "on" or (rt_flag == "canary" and rt_mode == "on"))
+            rt_label = "iroh: mail only" if rt_enabled else "iroh: off"
+            if rt_mode != "auto":
+                rt_label += f" (mode: {rt_mode})"
+            reply += f"• {status_icon} **{p_node}**{vote_mark} — `{p['email']}`\n  {key_lbl} | {chat_lbl} | Version: {ver_lbl} | Last seen: `{seen_str}` | Active metrics: `{node_meas_count}` | {rt_label}\n\n"
         reply += "Commands:\n• `/invitepeer` — Generate E2EE invite link\n• `/addpeer <email|link> [node_name]`\n• `/rmpeer <email|key>`\n• `/peershare [admin|all|none]`\n• `/nodename <name>`\n• `/probeignore [url|host|pattern]` — Exclude targets on this node (e.g. `*:25`), or list them\n• `/probeunignore <entry>` — Resume probing on this node\n• `/nodeignore [node_pat] [target_pat]` — Exclude targets on peer node(s) (e.g. `RU* facebook.*`)\n• `/nodeunignore <node_pat> [target_pat]` — Resume checks on node(s)"
     _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=reply.strip()))
+
+@dc_cli.on(events.NewMessage(command="/peerrt"))
+@command_budget
+def peerrt_command(bot, accid, event):
+    msg = event.msg
+    if not _is_dc_admin(bot, accid, msg.from_id):
+        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text="❌ This command is only for the administrator."))
+        return
+
+    parts = (event.payload or "").strip().rsplit(None, 1)
+    value = parts[-1].lower() if parts else ""
+    if not parts:
+        reply = f"Peer channel preview: `{database.get_peer_rt_flag()}`."
+    elif len(parts) == 1 and value in database.PEER_RT_FLAGS:
+        database.set_peer_rt_flag(value)
+        reply = f"✅ Peer channel preview set to `{value}`."
+    elif len(parts) == 2 and value in database.PEER_RT_MODES:
+        identifier = parts[0]
+        peer = database.find_peer(identifier)
+        if not peer:
+            peer = next((p for p in database.get_all_peers()
+                         if (p["node_name"] or "").casefold() == identifier.casefold()), None)
+        if peer and database.set_peer_rt_mode(peer["email"], value):
+            reply = f"✅ Peer `{peer['email']}` preview mode set to `{value}`."
+        else:
+            reply = f"❌ Peer `{identifier}` not found."
+    else:
+        reply = "❌ Usage: `/peerrt [off|canary|on]` or `/peerrt <peer name|email> on|off|auto`"
+    _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=reply))
 
 @dc_cli.on(events.NewMessage(command="/invitepeer"))
 @dc_cli.on(events.NewMessage(command="/peerinvite"))
@@ -9957,7 +10004,7 @@ def handle_peer_check_req(bot, accid, peer, chat_id, data, via="mail"):
                 "latency_ms": latency_ms,
                 "error_msg": error_msg,
                 "node_name": database.get_local_node_name(),
-                "caps": OWN_PEER_CAPS,  # lets the requester switch to batched requests
+                "caps": _own_peer_caps(),  # lets the requester switch to batched requests
             }
             _send_peer_check_answer(_PeerDestination(bot, accid, chat_id), "CHECK_RESP", resp_payload)
 

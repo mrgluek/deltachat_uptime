@@ -383,6 +383,16 @@ def init_db():
         if "fingerprint" not in peer_cols:
             cursor.execute("ALTER TABLE peers ADD COLUMN fingerprint TEXT")
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_peers_fingerprint ON peers(fingerprint)')
+        for column, kind in (
+            ("rt_cid", "TEXT"),
+            ("rt_msg_id", "INTEGER"),
+            ("rt_key_out", "BLOB"),
+            ("rt_key_in", "BLOB"),
+            ("rt_created_at", "INTEGER"),
+            ("rt_mode", "TEXT NOT NULL DEFAULT 'auto' CHECK (rt_mode IN ('auto', 'on', 'off'))"),
+        ):
+            if column not in peer_cols:
+                cursor.execute(f"ALTER TABLE peers ADD COLUMN {column} {kind}")
 
         # Telemetry metrics reported from remote peer probes
         cursor.execute('''
@@ -708,6 +718,7 @@ def delete_chat_data(dc_chat_id: int) -> int:
             cursor.execute("DELETE FROM config WHERE key = ?", (f"{key}:{dc_chat_id}",))
         cursor.execute("DELETE FROM chat_events WHERE dc_chat_id = ?", (dc_chat_id,))
         cursor.execute("DELETE FROM config WHERE key LIKE ?", (f"journal:%:{dc_chat_id}:%",))
+        cursor.execute(_CLEAR_PEER_RT + " WHERE chat_id = ?", (dc_chat_id,))
         return len(ids)
 
 
@@ -1576,6 +1587,7 @@ def cleanup_old_records(retention_days: int = 90) -> dict[str, int]:
                        "AND NOT EXISTS (SELECT 1 FROM partial_outages po JOIN resources r ON r.id = po.resource_id "
                        "WHERE po.ended_at IS NULL AND config.key = 'journal:partial_start:' || r.dc_chat_id || ':' || po.id)",
                        (now - 30 * 86400,))
+        _clear_disabled_peer_rt(conn)
     return cleaned
 
 # Peer management functions
@@ -1858,6 +1870,71 @@ def set_peer_share_scope(scope: str):
     if scope not in PEER_SHARE_SCOPES:
         raise ValueError(f"Unknown peer share scope: {scope}")
     set_config("peer_share_scope", scope)
+
+PEER_RT_FLAGS = ("off", "canary", "on")
+PEER_RT_MODES = ("auto", "on", "off")
+_CLEAR_PEER_RT = """
+    UPDATE peers SET rt_cid = NULL, rt_msg_id = NULL, rt_key_out = NULL,
+                     rt_key_in = NULL, rt_created_at = NULL
+"""
+
+
+def get_peer_rt_flag() -> str:
+    flag = get_config("peer_rt")
+    return flag if flag in PEER_RT_FLAGS else "off"
+
+
+def _clear_disabled_peer_rt(conn):
+    conn.execute(_CLEAR_PEER_RT + """
+        WHERE (rt_cid IS NOT NULL OR rt_msg_id IS NOT NULL OR rt_key_out IS NOT NULL
+               OR rt_key_in IS NOT NULL OR rt_created_at IS NOT NULL)
+          AND (rt_mode = 'off' OR NOT EXISTS (
+              SELECT 1 FROM config WHERE key = 'peer_rt'
+              AND (value = 'on' OR (value = 'canary' AND peers.rt_mode = 'on'))
+          ))
+    """)
+
+
+def set_peer_rt_flag(flag: str):
+    flag = flag.strip().lower()
+    if flag not in PEER_RT_FLAGS:
+        raise ValueError(f"Unknown peer channel flag: {flag}")
+    with _writer_transaction() as conn:
+        conn.execute("INSERT OR REPLACE INTO config (key, value) VALUES ('peer_rt', ?)", (flag,))
+        _clear_disabled_peer_rt(conn)
+
+
+def set_peer_rt_mode(email: str, mode: str) -> bool:
+    mode = mode.strip().lower()
+    if mode not in PEER_RT_MODES:
+        raise ValueError(f"Unknown peer channel mode: {mode}")
+    with _writer_transaction() as conn:
+        changed = conn.execute("UPDATE peers SET rt_mode = ? WHERE email = ?",
+                               (mode, email.lower().strip())).rowcount > 0
+        if changed:
+            _clear_disabled_peer_rt(conn)
+        return changed
+
+
+def get_peer_rt(fingerprint: str) -> dict | None:
+    peer = get_peer_by_fingerprint(fingerprint)
+    return {key: value for key, value in peer.items() if key.startswith("rt_")} if peer else None
+
+
+def set_peer_rt(fingerprint: str, *, cid: str, msg_id: int, key_out: bytes,
+                key_in: bytes, created_at: int) -> bool:
+    """Store the local carrier and both directional keys together."""
+    with _writer_transaction() as conn:
+        return conn.execute("""
+            UPDATE peers SET rt_cid = ?, rt_msg_id = ?, rt_key_out = ?, rt_key_in = ?, rt_created_at = ?
+            WHERE email = (SELECT email FROM peers WHERE fingerprint = ? LIMIT 1)
+        """, (cid, msg_id, key_out, key_in, created_at, normalize_fingerprint(fingerprint))).rowcount > 0
+
+
+def clear_peer_rt(fingerprint: str):
+    with _writer_transaction() as conn:
+        conn.execute(_CLEAR_PEER_RT + " WHERE fingerprint = ?", (normalize_fingerprint(fingerprint),))
+
 
 # Peer measurements (remote probe telemetry)
 def save_peer_measurement(url: str, node_name: str, status: str, latency_ms: int | None = None, error_msg: str = None, last_checked: int = None, source_peer: str = None):

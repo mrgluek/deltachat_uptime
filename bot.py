@@ -70,7 +70,7 @@ from outbox import outbox as dc_outbox, PRIO_ALERT, PRIO_REPLY, PRIO_UPDATE, PRI
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "2.41.0"
+VERSION = "2.42.0"
 SYNC_MAX_BYTES = 64 * 1024
 # 200 metrics / 100 cross-checks, including JSON's twelve-byte astral Unicode escaping at field limits.
 PEER_MAX_BYTES = 8 * 1024 * 1024
@@ -82,6 +82,26 @@ VOTE_ERROR_STORAGE_MAX = 200
 KEYWORD_SNIPPET_MAX = 80
 MISSING_KEYWORD_PREFIX = '200 OK (Missing keyword: "'
 _PROTOCOL_MARKER = re.compile(r"\[(/?UPTIME_(?:PEER_[A-Z_]+|BOT_SYNC_DATA)\])")
+_PEER_MAIL_KINDS = frozenset((
+    "CHECK_REQ", "CHECK_RESP", "CHECK_BATCH_REQ", "CHECK_BATCH_RESP",
+    "METRICS", "HELLO", "HELLO_ACK", "BOT_SYNC_DATA",
+))
+
+
+def _peer_message_kind(text: str) -> str | None:
+    for match in _PROTOCOL_MARKER.finditer(text):
+        marker = match.group(1)
+        if marker.startswith("UPTIME_"):
+            kind = marker.removeprefix("UPTIME_").removeprefix("PEER_").removesuffix("]")
+            if kind in _PEER_MAIL_KINDS and text.find("[/" + marker, match.end()) != -1:
+                return kind
+    return None
+
+
+def _count_peer_text(text: str | None, direction: str):
+    if isinstance(text, str) and (kind := _peer_message_kind(text)):
+        database.record_peer_traffic(kind, "mail", direction, len(text.encode("utf-8", errors="replace")))
+
 
 _SECRET_QUERY_NAMES = {"token", "key", "secret", "password", "pass", "pwd", "auth", "sig",
                        "signature", "api_key", "apikey", "access_token", "code"}
@@ -302,6 +322,8 @@ async_event_loop = None
 
 # Peering globals
 pending_peer_checks = {} # req_id -> (Future, expected_count, list_of_responses, expected_chat_ids)
+_pending_peer_rtt = {}  # req_id -> {chat_id: _PeerRtt}
+_peer_vote_round = contextvars.ContextVar("peer_vote_round", default=None)
 last_peer_telemetry_broadcast = 0.0
 _telemetry_rotation_offsets = {}  # peer email -> rotation offset
 _telemetry_last_sent = {}  # peer email -> {url: status last sent}, so changes go out first
@@ -911,6 +933,48 @@ async def _resolve_peer_chat_id(p: dict):
             return None
     return chat_id
 
+
+def _record_peer_rtt(kind, peer, started_at, finished_at, ok):
+    database.record_peer_rtt(kind, "mail", peer, round((finished_at - started_at) * 1000), ok)
+
+
+class _PeerVoteRound:
+    def __init__(self):
+        self.samples = []
+
+    def finish(self):
+        # The individual attempts finish before their jobs return from gather.
+        if self.samples:
+            started_at = min(start for start, _, _ in self.samples)
+            finished_at = max(end for _, end, _ in self.samples)
+            ok = all(ok for _, _, ok in self.samples)
+            _record_peer_rtt("vote_round", None, started_at, finished_at, ok)
+
+
+class _PeerRtt:
+    def __init__(self, kind, peer):
+        self.kind = kind
+        self.peer = peer.get("node_name") or "Remote-Node"
+        self.vote_round = _peer_vote_round.get()
+        self.submitted_at = time.monotonic()
+        self.sent_at = None
+        self.answer = None
+
+    def start(self):
+        self.sent_at = time.monotonic()
+
+    def finish(self, ok, finished_at=None, peer=None):
+        if finished_at is None:
+            finished_at = time.monotonic()
+        # A request can expire in the outbox before it gets a send token.
+        sent_at = self.sent_at
+        started_at = sent_at if sent_at is not None and sent_at <= finished_at else self.submitted_at
+        if self.kind:
+            _record_peer_rtt(self.kind, peer or self.peer, started_at, finished_at, ok)
+        if self.vote_round is not None:
+            self.vote_round.samples.append((started_at, finished_at, ok))
+
+
 async def request_peer_cross_checks(target_dict: dict, timeout: float = 8.0, peers: list[dict] | None = None) -> list[dict]:
     """Broadcasts a cross-check request for one target to the peers (default: all) in 1:1 DMs
     and waits for responses. /ping uses it directly; monitors go through the batched variant."""
@@ -971,23 +1035,36 @@ async def request_peer_cross_checks(target_dict: dict, timeout: float = 8.0, pee
     # Chats rather than addresses: a peer may answer from another relay address than it used before.
     expected_chats = {chat_id for _, chat_id in valid_peers}
     pending_peer_checks[req_id] = (fut, len(valid_peers), responses, expected_chats)
-
-    for p, chat_id in valid_peers:
-        try:
-            # A request still queued when the answer is no longer awaited is dropped
-            await asyncio.to_thread(_dc_send_msg_with_stats, dc_bot_instance, dc_accid, chat_id, MsgData(text=msg_text),
-                                    priority=PRIO_PEER, expires_in=timeout, label="cross-check request")
-        except Exception as e:
-            logger.warning(f"Failed to send cross-check request to peer {p.get('email')}: {e}")
-
+    timings = _pending_peer_rtt[req_id] = {}
+    kind = "ping" if _peer_vote_round.get() is None else None
+    timed_out_at = None
     try:
+        for p, chat_id in valid_peers:
+            timing = timings[chat_id] = _PeerRtt(kind, p)
+            try:
+                # A request still queued when the answer is no longer awaited is dropped
+                await asyncio.to_thread(_dc_send_msg_with_stats, dc_bot_instance, dc_accid, chat_id, MsgData(text=msg_text),
+                                        priority=PRIO_PEER, expires_in=timeout, label="cross-check request",
+                                        before_send=timing.start)
+            except Exception as e:
+                logger.warning(f"Failed to send cross-check request to peer {p.get('email')}: {e}")
+
         await asyncio.wait_for(fut, timeout=timeout)
     except asyncio.TimeoutError:
+        timed_out_at = time.monotonic()
         logger.info(f"Cross-check req_id {req_id} timed out waiting for all peer responses (got {len(responses)}/{len(valid_peers)})")
     except Exception as e:
         logger.warning(f"Error during peer cross-check wait: {e}")
     finally:
         pending_peer_checks.pop(req_id, None)
+        _pending_peer_rtt.pop(req_id, None)
+
+    for timing in timings.values():
+        if (answer := timing.answer) is not None:
+            arrived_at, node_name = answer
+            timing.finish(True, arrived_at, node_name)
+        elif timed_out_at is not None:
+            timing.finish(False, timed_out_at)
 
     return responses + ignored_responses
 
@@ -1191,7 +1268,13 @@ async def _flush_cross_checks(batch: list) -> None:
             async def _legacy(key, target):
                 results[key].extend(await request_peer_cross_checks(target, timeout=8.0, peers=legacy_peers))
             jobs += [_legacy(key, target) for key, target in items]
-        await asyncio.gather(*jobs, return_exceptions=True)
+        vote_round = _PeerVoteRound()
+        token = _peer_vote_round.set(vote_round)
+        try:
+            await asyncio.gather(*jobs, return_exceptions=True)
+            vote_round.finish()
+        finally:
+            _peer_vote_round.reset(token)
     except Exception as e:
         logger.warning(f"Batched peer cross-check failed: {e}")
     finally:
@@ -1217,10 +1300,13 @@ async def _batch_cross_check_peer(peer: dict, items: list, results: dict) -> Non
     pending_batch_checks[req_id] = (fut, chat_id, len(items))
     try:
         msg_text = f"[UPTIME_PEER_CHECK_BATCH_REQ]\n{json.dumps(payload)}\n[/UPTIME_PEER_CHECK_BATCH_REQ]"
+        timing = _PeerRtt("vote", peer)
         await asyncio.to_thread(_dc_send_msg_with_stats, dc_bot_instance, dc_accid, chat_id, MsgData(text=msg_text),
-                                priority=PRIO_PEER, expires_in=CROSS_CHECK_BATCH_TIMEOUT, label="batch cross-check request")
+                                priority=PRIO_PEER, expires_in=CROSS_CHECK_BATCH_TIMEOUT, label="batch cross-check request",
+                                before_send=timing.start)
         answers = await asyncio.wait_for(fut, CROSS_CHECK_BATCH_TIMEOUT)
     except asyncio.TimeoutError:
+        timing.finish(False)
         logger.info(f"Batch cross-check {req_id} ({len(items)} targets) got no answer from {peer.get('email')} in time")
         return
     except Exception as e:
@@ -1228,6 +1314,7 @@ async def _batch_cross_check_peer(peer: dict, items: list, results: dict) -> Non
         return
     finally:
         pending_batch_checks.pop(req_id, None)
+    timing.finish(True, peer=answers[0]["node_name"] if answers else None)
     answered = []
     for (key, target), answer in zip(items, answers):
         answer["url"] = target.get("url")  # positions are what the peer answers; URLs are ours
@@ -5871,13 +5958,29 @@ def start_web_server_thread():
     asyncio.set_event_loop(loop)
     loop.run_until_complete(_run_web_server())
 
+
+async def _flush_peer_metrics_periodically():
+    while True:
+        await asyncio.sleep(60)
+        try:
+            await run_db(database.flush_peer_metrics)
+        except Exception:
+            logger.exception("Could not flush peer metrics")
+
+
 def start_monitoring_thread():
     global async_event_loop
     dc_outbox.start()  # from now on messages are queued and paced instead of sent inline
     loop = asyncio.new_event_loop()
     async_event_loop = loop
     asyncio.set_event_loop(loop)
-    loop.run_until_complete(monitoring_scheduler_loop())
+    metrics_task = loop.create_task(_flush_peer_metrics_periodically())
+    try:
+        loop.run_until_complete(monitoring_scheduler_loop())
+    finally:
+        metrics_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            loop.run_until_complete(metrics_task)
 
 # Full-state webxdc updates: no per-chat tasks; the scheduler queues paced outbox jobs.
 _status_xdc_lock = threading.Lock()
@@ -6466,6 +6569,8 @@ def _realtime_join(bot, accid, msg_id, chat_id) -> None:
         # Joins the gossip topic; the core also mails a small hidden advertisement to the chat.
         bot.rpc.send_webxdc_realtime_advertisement(accid, msg_id)
         stat_event("mail_out")
+        # The core owns the hidden payload and does not return its size.
+        database.record_peer_traffic("rt_advert", "mail", "out", 0)
         logger.info("Joined realtime status channel in chat %s", chat_id)
     except Exception as exc:
         with _realtime_lock:
@@ -6532,15 +6637,24 @@ async def realtime_status_tick():
 
 
 # Command Handlers
+def _send_msg_with_peer_metrics(bot, accid, chat_id, msg_data, before_send=None):
+    if before_send:
+        before_send()
+    msg_id = bot.rpc.send_msg(accid, chat_id, msg_data)
+    _count_peer_text(getattr(msg_data, "text", None), "out")
+    return msg_id
+
+
 def _dc_send_msg_with_stats(bot, accid, chat_id, msg_data, priority=PRIO_REPLY, key=None, expires_in=None,
-                            label=None, after_send=None):
+                            label=None, after_send=None, before_send=None):
     """Sends a message through the paced outbox (see outbox.py). Default priority: a command reply.
 
-    after_send() runs right after the message really went out (not if it was replaced or expired).
+    before_send() runs before the RPC, and after_send() runs after it succeeds.
+    Neither runs for a replaced or expired message.
     Returns the msg_id when it was sent right away (outbox not started, as in tests), else None:
     the message is queued and goes out when its turn and a send token come."""
     def send():
-        msg_id = bot.rpc.send_msg(accid, chat_id, msg_data)
+        msg_id = _send_msg_with_peer_metrics(bot, accid, chat_id, msg_data, before_send)
         stat_event("mail_out")
         if after_send:
             after_send()
@@ -8117,6 +8231,41 @@ def _size(path) -> str:
     return f"{n / 1048576:.1f} MB" if n >= 1048576 else f"{n // 1024} KB"
 
 
+def _percentile(sorted_values, percent):
+    if not sorted_values:
+        return None
+    rank = (len(sorted_values) - 1) * percent / 100
+    lower = int(rank)
+    upper = min(lower + 1, len(sorted_values) - 1)
+    return sorted_values[lower] + (rank - lower) * (sorted_values[upper] - sorted_values[lower])
+
+
+def _peer_metrics_report(now):
+    traffic, rtt = database.get_peer_metrics_24h(now)
+    counts = collections.defaultdict(collections.Counter)
+    for kind, direction, n in traffic:
+        counts[kind][direction] = n
+    mails = ", ".join(f"{kind} {counts[kind]['in']}/{counts[kind]['out']}"
+                      for kind in sorted(counts.keys() & (_PEER_MAIL_KINDS | {"rt_advert"})))
+    samples = collections.defaultdict(list)
+    timeouts = 0
+    for kind, ms, ok in rtt:
+        if ok:
+            samples[kind].append(ms)
+        else:
+            timeouts += 1
+    durations = []
+    for kind in ("ping", "vote", "vote_round"):
+        values = sorted(samples[kind])
+        p50, p95 = _percentile(values, 50), _percentile(values, 95)
+        durations.append(f"{kind} {p50:.0f}/{p95:.0f} ms" if values else f"{kind} n/a")
+    timeout_label = "timeout" if timeouts == 1 else "timeouts"
+    return (
+        f"• Peer mails (24 h): {mails or 'none'} (in/out)",
+        f"• Peer round trip (24 h): {', '.join(durations)} (p50/p95), {timeouts} {timeout_label}",
+    )
+
+
 def build_stats_report(bot, accid) -> str:
     now = time.time()
     resources = database.get_all_resources() or []
@@ -8173,6 +8322,7 @@ def build_stats_report(bot, accid) -> str:
             1 for p in peers if interval_for_peer(p["email"], current_telemetry_interval()) > current_telemetry_interval())) else "")
         + f"; votes ask up to {VOTE_SAMPLE_SIZE} peers",
         f"• Last hour: {stat_last_hour('vote', now)} votes sent to peers, {stat_last_hour('held', now)} reports held back",
+        *_peer_metrics_report(now),
         f"• Old protocol messages deleted since start: {_bot_stats['trimmed']}",
         f"• Old user chat messages deleted since start: {_bot_stats['user_trimmed']}",
         "",
@@ -8317,7 +8467,7 @@ def send_peer_hello_when_ready(bot, accid, chat_id: int, hello_text: str, node_n
     does. Runs in its own thread."""
     deadline = time.monotonic() + PEER_HELLO_RETRY_FOR
     while True:
-        fut = dc_outbox.submit(lambda: bot.rpc.send_msg(accid, chat_id, MsgData(text=hello_text)),
+        fut = dc_outbox.submit(lambda: _send_msg_with_peer_metrics(bot, accid, chat_id, MsgData(text=hello_text)),
                                priority=PRIO_PEER, label="peer hello")
         try:
             fut.result(timeout=60)
@@ -8818,17 +8968,20 @@ def _record_peer_activity(sender_addr: str):
 
 @dc_cli.on(events.NewMessage(is_bot=None))
 def on_new_message(bot, accid, event):
+    arrived_at = time.monotonic()
     msg = event.msg
     if msg.is_info:
         return
     if msg.from_id != 1:
         stat_event("mail_in")
-        
 
-    text = (msg.text or "").strip()
-    
+    raw_text = msg.text or ""
+    text = raw_text.strip()
+
     if msg.from_id == 1:
         return
+
+    _count_peer_text(raw_text, "in")
 
     if "[UPTIME_PEER_" in text and (len(text) > PEER_MAX_BYTES or len(text.encode("utf-8")) > PEER_MAX_BYTES):
         logger.warning("Peer protocol payload exceeds byte limit; ignoring")
@@ -9141,6 +9294,10 @@ def on_new_message(bot, accid, event):
                 "error_msg": error_msg,
                 "node_name": node_name,
             })
+            timings = _pending_peer_rtt.get(req_id)
+            timing = timings.get(msg.chat_id) if timings is not None else None
+            if timing is not None:
+                timing.answer = (arrived_at, node_name)
             if len(resp_list) >= expected_count and not fut.done():
                 if async_event_loop and async_event_loop.is_running():
                     async_event_loop.call_soon_threadsafe(fut.set_result, resp_list)

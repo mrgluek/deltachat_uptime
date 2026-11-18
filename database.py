@@ -317,6 +317,41 @@ def init_db():
         ''')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_peers_last_seen ON peers(last_seen)')
 
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS peer_traffic (
+                day TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                transport TEXT NOT NULL,
+                dir TEXT NOT NULL,
+                n INTEGER NOT NULL,
+                bytes INTEGER NOT NULL,
+                PRIMARY KEY (day, kind, transport, dir)
+            )
+        ''')
+        # Daily totals alone cannot answer a rolling 24-hour query.
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS peer_traffic_recent (
+                ts INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                transport TEXT NOT NULL,
+                dir TEXT NOT NULL,
+                n INTEGER NOT NULL,
+                bytes INTEGER NOT NULL,
+                PRIMARY KEY (ts, kind, transport, dir)
+            ) WITHOUT ROWID
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS peer_rtt (
+                ts INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                transport TEXT NOT NULL,
+                peer TEXT,
+                ms INTEGER NOT NULL,
+                ok INTEGER NOT NULL
+            )
+        ''')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_peer_rtt_ts ON peer_rtt(ts)')
+
         # Ensure columns exist in peers for existing DBs
         cursor.execute("PRAGMA table_info(peers)")
         peer_cols = [c[1] for c in cursor.fetchall()]
@@ -1382,8 +1417,77 @@ def get_all_transport_stats() -> list[dict]:
     finally:
         conn.close()
 
+
+_peer_metrics_lock = threading.Lock()
+_peer_traffic_buffer: dict[tuple[int, str, str, str], tuple[int, int]] = {}
+_peer_rtt_buffer: list[tuple] = []
+
+
+def record_peer_traffic(kind: str, transport: str, direction: str, byte_count: int):
+    key = (int(time.time()), kind, transport, direction)
+    with _peer_metrics_lock:
+        n, size = _peer_traffic_buffer.get(key, (0, 0))
+        _peer_traffic_buffer[key] = (n + 1, size + byte_count)
+
+
+def record_peer_rtt(kind: str, transport: str, peer: str | None, ms: int, ok: bool):
+    row = (int(time.time()), kind, transport, peer, ms, int(ok))
+    with _peer_metrics_lock:
+        _peer_rtt_buffer.append(row)
+
+
+def flush_peer_metrics():
+    """Write pending traffic and RTT samples together, preserving them on failure."""
+    global _peer_traffic_buffer, _peer_rtt_buffer
+    with _peer_metrics_lock:
+        traffic, _peer_traffic_buffer = _peer_traffic_buffer, {}
+        rtt, _peer_rtt_buffer = _peer_rtt_buffer, []
+    if not traffic and not rtt:
+        return
+
+    traffic_rows = [(*key, *counts) for key, counts in traffic.items()]
+    try:
+        with _writer_transaction() as conn:
+            if traffic_rows:
+                conn.executemany('''
+                    INSERT INTO peer_traffic_recent VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(ts, kind, transport, dir) DO UPDATE SET
+                        n = n + excluded.n, bytes = bytes + excluded.bytes
+                ''', traffic_rows)
+                conn.executemany('''
+                    INSERT INTO peer_traffic VALUES (date(?, 'unixepoch'), ?, ?, ?, ?, ?)
+                    ON CONFLICT(day, kind, transport, dir) DO UPDATE SET
+                        n = n + excluded.n, bytes = bytes + excluded.bytes
+                ''', traffic_rows)
+            if rtt:
+                conn.executemany('INSERT INTO peer_rtt VALUES (?, ?, ?, ?, ?, ?)', rtt)
+    except Exception:
+        with _peer_metrics_lock:
+            for key, (n, size) in traffic.items():
+                current_n, current_size = _peer_traffic_buffer.get(key, (0, 0))
+                _peer_traffic_buffer[key] = (current_n + n, current_size + size)
+            _peer_rtt_buffer.extend(rtt)
+        raise
+
+
+def get_peer_metrics_24h(now: float) -> tuple[list, list]:
+    cutoff = int(now) - 86400
+    with contextlib.closing(_connect()) as conn:
+        conn.execute('BEGIN')  # Both lines use the same snapshot during a concurrent flush.
+        traffic = conn.execute('''
+            SELECT kind, dir, SUM(n) FROM peer_traffic_recent
+            WHERE ts > ? AND ts <= ? AND transport = 'mail'
+            GROUP BY kind, dir ORDER BY kind, dir
+        ''', (cutoff, int(now))).fetchall()
+        rtt = conn.execute('''
+            SELECT kind, ms, ok FROM peer_rtt
+            WHERE ts > ? AND ts <= ? AND transport = 'mail'
+        ''', (cutoff, int(now))).fetchall()
+    return traffic, rtt
+
+
 def cleanup_old_records(retention_days: int = 90) -> dict[str, int]:
-    """Prune old downtime events, resolved incidents, and stale peer measurements."""
+    """Prune old events, resolved incidents, and stale peer measurements and metrics."""
     now = int(time.time())
     cutoff = now - (retention_days * 86400)
     cleaned = {}
@@ -1404,6 +1508,13 @@ def cleanup_old_records(retention_days: int = 90) -> dict[str, int]:
         cleaned["peer_measurements"] = cursor.rowcount
         cursor.execute("DELETE FROM probe_targets WHERE last_seen < ?", (meas_cutoff,))
         cleaned["probe_targets"] = cursor.rowcount
+
+        cursor.execute("DELETE FROM peer_traffic WHERE day < date(?, 'unixepoch', '-29 days')", (now,))
+        cleaned["peer_traffic"] = cursor.rowcount
+        cursor.execute("DELETE FROM peer_traffic_recent WHERE ts <= ?", (now - 86400,))
+        cleaned["peer_traffic_recent"] = cursor.rowcount
+        cursor.execute("DELETE FROM peer_rtt WHERE ts < ?", (meas_cutoff,))
+        cleaned["peer_rtt"] = cursor.rowcount
 
         cursor.execute("DELETE FROM partial_outages WHERE ended_at IS NOT NULL AND ended_at < ?", (cutoff,))
         cleaned["partial_outages"] = cursor.rowcount

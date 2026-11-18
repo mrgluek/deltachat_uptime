@@ -75,7 +75,7 @@ from outbox import outbox as dc_outbox, PRIO_ALERT, PRIO_REPLY, PRIO_UPDATE, PRI
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "2.43.1"
+VERSION = "2.43.2"
 SYNC_MAX_BYTES = 64 * 1024
 # 200 metrics / 100 cross-checks, including JSON's twelve-byte astral Unicode escaping at field limits.
 PEER_MAX_BYTES = 8 * 1024 * 1024
@@ -2057,6 +2057,7 @@ class NoAddressForFamilyError(OSError):
 
 NO_IPV6_MSG = "No IPv6 connectivity on this node"
 BLOCKED_TARGET_MSG = "Target blocked: internal or private network address"
+RATE_LIMITED_MSG = "429 - Too Many Requests (rate limited, not counted)"
 
 
 def for_peers(is_up, error_msg):
@@ -3193,6 +3194,10 @@ async def _run_single_check(resource, session, keyword_error_limit):
                     except ValueError:
                         phrase = "Unknown Status"
                     details = f"{resp.status} - {phrase}"
+                    if resp.status == 429:
+                        # The target limits request rates: it answers some nodes and refuses others, which says
+                        # nothing about whether it is up. Abstain, like a node that cannot check it.
+                        return None, RATE_LIMITED_MSG, elapsed_ms
                     if 200 <= resp.status < 400:
                         body_bytes = None
                         try:
@@ -4115,7 +4120,7 @@ async def check_group_task(group, semaphore, session=None):
         _count_check(is_up, latency_ms, rep["url"])
         is_up = for_peers(is_up, error_msg)
         if is_up is None:  # this node cannot check it (no IPv6, private address here)
-            if error_msg in (BLOCKED_TARGET_MSG, PING_UNRELIABLE_MSG, PING_UNAVAILABLE_MSG):
+            if error_msg in (BLOCKED_TARGET_MSG, RATE_LIMITED_MSG, PING_UNRELIABLE_MSG, PING_UNAVAILABLE_MSG):
                 # Not the last result: an earlier "down" would keep going to the peer in telemetry
                 await run_db(database.update_probe_target_result, rep["url"], "skip", None, error_msg)
             return

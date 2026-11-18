@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.43.2] - 2026-11-18
+
+### Fixed
+- A target that answers `429 Too Many Requests` is no longer counted as down. A site that limits request rates answers some nodes and refuses others, which made monitors flip between down and recovered every few minutes. The node now abstains for that check (like a node that cannot check the target): no vote, no alert, no status change. Real errors (5xx, timeouts, refused connections) are unaffected.
+
 ## [2.43.1] - 2026-11-18
 
 ### Changed

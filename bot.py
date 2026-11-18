@@ -7,6 +7,7 @@ import contextvars
 import io
 import heapq
 import logging
+import math
 import json
 import math
 import os
@@ -376,7 +377,13 @@ def interval_for_peer(email: str, own: int) -> int:
 def current_telemetry_interval() -> int:
     return _telemetry_interval_now
 PEER_ANSWER_TTL = 20.0  # an answer to a peer's cross-check is dropped if the outbox could not send it by then
+PEER_ANSWER_CACHE_TTL = 120
+PEER_ANSWER_CACHE_MAX = 2000
 PEER_BATCH_CHECK_CONCURRENCY = 20
+
+
+def _peer_identity(peer):
+    return peer.get("fingerprint") or peer["email"].lower()
 
 
 class InboundProbeAdmission:
@@ -387,24 +394,51 @@ class InboundProbeAdmission:
         self.outstanding = collections.Counter()
         self.rates = {}
         self.seen = collections.OrderedDict()
+        self.running = set()
+        self.answers = collections.OrderedDict()
         self.warned = {}
 
-    def acquire(self, peer, req_id, slots=1):
-        identity = peer.get("fingerprint") or peer["email"].lower()
-        now = time.monotonic()
+    def _expire_answers(self, now):
+        while self.answers and next(iter(self.answers.values()))[0] <= now - PEER_ANSWER_CACHE_TTL:
+            self.answers.popitem(last=False)
+
+    def cached_answer(self, peer, req_id):
+        if not isinstance(req_id, str):
+            return None
         with self.lock:
+            self._expire_answers(time.monotonic())
+            answer = self.answers.get((_peer_identity(peer), req_id))
+            return answer[1:] if answer else None
+
+    def remember_answer(self, key, kind, payload):
+        with self.lock:
+            now = time.monotonic()
+            self._expire_answers(now)
+            # A sent answer takes over replay protection from admission.
+            self.seen.pop(key, None)
+            self.answers[key] = (now, kind, payload)
+            self.answers.move_to_end(key)
+            if len(self.answers) > PEER_ANSWER_CACHE_MAX:
+                self.answers.popitem(last=False)
+
+    def acquire(self, peer, req_id, slots=1):
+        identity = _peer_identity(peer)
+        key = (identity, req_id)
+        with self.lock:
+            now = time.monotonic()
+            self._expire_answers(now)
             while self.seen and next(iter(self.seen.values())) <= now - 600:
                 self.seen.popitem(last=False)
-            for key in list(self.rates):
-                times = self.rates[key]
+            for rate_identity, times in list(self.rates.items()):
                 while times and times[0] <= now - 60:
                     times.popleft()
-                if not times and not self.outstanding[key]:
-                    del self.rates[key]
+                if not times and not self.outstanding[rate_identity]:
+                    del self.rates[rate_identity]
             self.warned = {key: ts for key, ts in self.warned.items() if ts > now - 600}
             times = self.rates.get(identity, ())
             valid = isinstance(req_id, str) and 0 < len(req_id) <= 64
-            rejected = (not valid or (identity, req_id) in self.seen or len(self.seen) >= 10000
+            rejected = (not valid or key in self.seen or key in self.running or key in self.answers
+                        or len(self.seen) + len(self.answers) >= 10000
                         or self.outstanding[identity] + slots > 10 or len(times) >= 120)
             reserved = 0
             if not rejected:
@@ -422,12 +456,15 @@ class InboundProbeAdmission:
                 return None
             self.outstanding[identity] += slots
             self.rates.setdefault(identity, collections.deque()).append(now)
-            self.seen[identity, req_id] = now
-            return identity, slots
+            self.seen[key] = now
+            self.running.add(key)
+            return key, slots
 
     def release(self, reservation):
-        identity, slots = reservation
+        key, slots = reservation
+        identity, _ = key
         with self.lock:
+            self.running.remove(key)
             self.outstanding[identity] -= slots
             if not self.outstanding[identity]:
                 del self.outstanding[identity]
@@ -436,6 +473,8 @@ class InboundProbeAdmission:
 
 
 _inbound_probes = InboundProbeAdmission()
+# Carry the verified request context through the async probe to its outbox callback.
+_inbound_probe_answer = contextvars.ContextVar("inbound_probe_answer", default=None)
 
 
 def _submit_inbound_probe(peer, req_id, make_coro, slots=1):
@@ -448,9 +487,11 @@ def _submit_inbound_probe(peer, req_id, make_coro, slots=1):
     async def run():
         nonlocal started
         started = True
+        token = _inbound_probe_answer.set(functools.partial(admission.remember_answer, reservation[0]))
         try:
             await make_coro()
         finally:
+            _inbound_probe_answer.reset(token)
             admission.release(reservation)
 
     coro = run()
@@ -583,9 +624,17 @@ _path_trace_tasks = {}        # ip -> running traceroute task
 _ping_baseline_cache = {}     # ip -> usual RTT in ms (persisted in database.ping_baselines)
 _local_degraded = {}          # url -> time.time() of this node's last degraded result (telemetry)
 
-# Protocol message deduplication cache (bounded set of recent msg_ids)
-_processed_msg_ids = set()
-_processed_msg_ids_max = 500
+class _ProcessedMessageIds(collections.OrderedDict):
+    def add(self, msg_id):
+        self[msg_id] = None
+        if len(self) > 2000:
+            self.popitem(last=False)
+
+
+_processed_msg_ids = _ProcessedMessageIds()
+_peer_metrics_lock = threading.Lock()
+_peer_metrics_timestamps = collections.OrderedDict()  # peer identity -> latest applied timestamp
+PEER_METRICS_TIMESTAMPS_MAX = 256
 
 # Scheduler DB cache (reduces repeated full-table scans)
 _scheduler_cache = {
@@ -1243,7 +1292,7 @@ def _note_peer_caps(email: str, caps) -> None:
         _peer_caps[email.lower()] = {str(c)[:40] for c in caps[:20]}
 
 
-def _note_peer_announcement(peer: dict, data) -> dict:
+def _note_peer_announcement(peer: dict, data, *, allow_rename=True) -> dict:
     """What a key-verified peer says about itself in protocol messages: its capabilities and its
     node name (changed with /nodename there). Returns the peer row, renamed if the name changed.
 
@@ -1257,6 +1306,8 @@ def _note_peer_announcement(peer: dict, data) -> dict:
         value = data.get(field)
         if isinstance(value, int) and not isinstance(value, bool):
             store[peer["email"].lower()] = min(900, max(60, value))
+    if not allow_rename:
+        return peer
     claimed = data.get("node_name")
     claimed = claimed.strip()[:64] if isinstance(claimed, str) else ""
     current = peer.get("node_name") or ""
@@ -1521,8 +1572,7 @@ async def _answer_batch_cross_check(bot, accid, chat_id: int, req_id: str, targe
     await asyncio.gather(*(worker() for _ in range(min(concurrency, len(targets)))))
     payload = {"req_id": req_id, "node_name": database.get_local_node_name(), "caps": OWN_PEER_CAPS, "results": answers}
     # The requester waits CROSS_CHECK_BATCH_TIMEOUT from sending; a later answer is ignored there
-    await asyncio.to_thread(peer_send, _PeerDestination(bot, accid, chat_id), "CHECK_BATCH_RESP", payload,
-                            priority=PRIO_PEER, expires_in=PEER_ANSWER_TTL, label="batch cross-check answer")
+    await asyncio.to_thread(_send_peer_check_answer, _PeerDestination(bot, accid, chat_id), "CHECK_BATCH_RESP", payload)
 
 
 def _valid_peer_fields(item):
@@ -7107,6 +7157,22 @@ def peer_send(peer, kind, payload, *, priority, expires_in, label, key=None, mai
                                    before_send=before_send, should_send=should_send)
 
 
+def _send_peer_check_answer(destination, kind, payload, *, replay=False):
+    remember = None if replay else _inbound_probe_answer.get()
+    after_send = functools.partial(remember, kind, payload) if remember else None
+    label = "batch cross-check answer" if kind == "CHECK_BATCH_RESP" else "cross-check answer"
+    peer_send(destination, kind, payload, priority=PRIO_PEER, expires_in=PEER_ANSWER_TTL,
+              label=label, after_send=after_send)
+
+
+def _resend_cached_probe_answer(bot, accid, chat_id, peer, req_id):
+    answer = _inbound_probes.cached_answer(peer, req_id)
+    if answer is None:
+        return False
+    _send_peer_check_answer(_PeerDestination(bot, accid, chat_id), *answer, replay=True)
+    return True
+
+
 def _react(bot, accid: int, msg_id: int | None, emoji: str):
     """Add or clear a reaction on a message."""
     if not bot or not hasattr(bot, "rpc") or not msg_id:
@@ -9525,7 +9591,13 @@ def rmpeer_command(bot, accid, event):
         _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text="Usage: `/rmpeer <email|key>` (key: fingerprint or its first 8+ hex digits, see `/peers`)"))
         return
     peer = database.find_peer(ident)
-    if peer and database.remove_peer(peer["email"]):
+    with _peer_metrics_lock:
+        removed = peer and database.remove_peer(peer["email"])
+        if removed:
+            _peer_metrics_timestamps.pop(peer["email"].lower(), None)
+            if peer.get("fingerprint"):
+                _peer_metrics_timestamps.pop(peer["fingerprint"], None)
+    if removed:
         _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=f"✅ Peer **{peer.get('node_name') or 'Remote'}** (`{peer['email']}`) removed."))
     else:
         _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=f"❌ Peer `{ident}` not found in database (or the key prefix matches several peers)."))
@@ -9847,6 +9919,8 @@ def _record_peer_activity(sender_addr: str):
 def handle_peer_check_req(bot, accid, peer, chat_id, data, via="mail"):
     req_data = data
     req_id = req_data.get("req_id")
+    if _resend_cached_probe_answer(bot, accid, chat_id, peer, req_id):
+        return
     target_url = req_data.get("url")
     check_type = req_data.get("type", "http")
     keyword = req_data.get("expected_keyword")
@@ -9885,8 +9959,7 @@ def handle_peer_check_req(bot, accid, peer, chat_id, data, via="mail"):
                 "node_name": database.get_local_node_name(),
                 "caps": OWN_PEER_CAPS,  # lets the requester switch to batched requests
             }
-            peer_send(_PeerDestination(bot, accid, chat_id), "CHECK_RESP", resp_payload,
-                      priority=PRIO_PEER, expires_in=PEER_ANSWER_TTL, label="cross-check answer")
+            _send_peer_check_answer(_PeerDestination(bot, accid, chat_id), "CHECK_RESP", resp_payload)
 
         _submit_inbound_probe(peer, req_id, _do_cross_check_reply)
 
@@ -9894,6 +9967,8 @@ def handle_peer_check_req(bot, accid, peer, chat_id, data, via="mail"):
 def handle_peer_check_batch_req(bot, accid, peer, chat_id, data, via="mail"):
     req_data = data
     req_id = req_data.get("req_id")
+    if _resend_cached_probe_answer(bot, accid, chat_id, peer, req_id):
+        return
     raw_targets = req_data.get("targets")
     workers = min(10, max(1, len(raw_targets))) if isinstance(raw_targets, list) else 1
     async def answer():
@@ -9991,27 +10066,27 @@ def handle_peer_metrics(bot, accid, peer, chat_id, data, via="mail"):
     metrics_data = data
     metrics_list = metrics_data.get("metrics", [])
     msg_id = metrics_data.get("msg_id")
+    timestamp = metrics_data.get("timestamp")
+    if type(timestamp) not in (int, float) or (isinstance(timestamp, float) and not math.isfinite(timestamp)):
+        timestamp = None
 
     _record_peer_activity(peer["email"])
-    peer = _note_peer_announcement(peer, metrics_data)
-    if not isinstance(metrics_list, list):
-        return
-
-    # Deduplication by msg_id
-    if msg_id:
-        if msg_id in _processed_msg_ids:
-            logger.info(f"Ignoring duplicate telemetry batch msg_id={msg_id}")
+    identity = _peer_identity(peer)
+    with _peer_metrics_lock:
+        last_timestamp = _peer_metrics_timestamps.get(identity)
+        stale = timestamp is not None and last_timestamp is not None and timestamp < last_timestamp
+        peer = _note_peer_announcement(peer, metrics_data, allow_rename=not stale)
+        if not isinstance(metrics_list, list):
             return
-        _processed_msg_ids.add(msg_id)
-        if len(_processed_msg_ids) > _processed_msg_ids_max:
-            try:
-                _processed_msg_ids.pop()
-            except Exception:
-                pass
 
-    peer_node = peer.get("node_name") or "Remote-Node"
+        if msg_id:
+            if msg_id in _processed_msg_ids:
+                logger.info(f"Ignoring duplicate telemetry batch msg_id={msg_id}")
+                return
+            _processed_msg_ids.add(msg_id)
+        if stale or not metrics_list:
+            return
 
-    if metrics_list:
         # Sanitize metrics targets before saving
         safe_metrics = [
             dict(m, received_at=int(time.time()),
@@ -10019,11 +10094,18 @@ def handle_peer_metrics(bot, accid, peer, chat_id, data, via="mail"):
             for m in metrics_list[:200]
             if isinstance(m, dict) and _valid_peer_fields(m) and is_safe_target_url(str(m.get("url", "")), str(m.get("type", "http")))
         ]
-        if safe_metrics:
-            database.save_peer_measurements_batch(peer_node, safe_metrics, peer.get("fingerprint") or peer["email"])
-            database.save_probe_targets_batch(safe_metrics, peer["email"])
-            _scheduler_cache["probe_targets"] = None
-            note_peer_reported_down(peer_node, safe_metrics)
+        if not safe_metrics:
+            return
+        peer_node = peer.get("node_name") or "Remote-Node"
+        database.save_peer_measurements_batch(peer_node, safe_metrics, peer.get("fingerprint") or peer["email"])
+        database.save_probe_targets_batch(safe_metrics, peer["email"])
+        if timestamp is not None:
+            _peer_metrics_timestamps[identity] = timestamp
+            _peer_metrics_timestamps.move_to_end(identity)
+            if len(_peer_metrics_timestamps) > PEER_METRICS_TIMESTAMPS_MAX:
+                _peer_metrics_timestamps.popitem(last=False)
+        _scheduler_cache["probe_targets"] = None
+        note_peer_reported_down(peer_node, safe_metrics)
 
 
 @dc_cli.on(events.NewMessage(is_bot=None))

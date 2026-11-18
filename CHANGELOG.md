@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.44.1] - 2026-11-18
+
+### Fixed
+- Disable core dumps for the bot and its Delta Chat RPC server on supported systems.
+
+### Added
+- Notify the admin about existing core dumps, show them in `/stats`, and let the admin remove them with `/rmcore`.
+
 ## [2.44.0] - 2026-11-18
 
 ### Added

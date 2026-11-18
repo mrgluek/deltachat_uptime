@@ -157,7 +157,10 @@ These commands are only executable by the configured administrator.
 
   The **Storage** section shows free disk space, database and blob sizes, and the largest files and directories under the data and application folders. Results are cached for five minutes. The bot warns the admin at most once per day when free space drops below 10% or 30 MB. Set `STORAGE_WARN=0` to disable these alerts.
 
+  On supported systems the bot disables core dumps for itself and its Delta Chat RPC server. At startup and every ten minutes, it checks the top level of the application, working, and data directories for existing dumps. New dumps are reported once to the admin and listed in `/stats`. Set `CORE_DUMP_WARN=0` to disable core dump notices.
+
   The peer section shows incoming and outgoing mail counts by message kind over the last 24 hours, plus median and 95th-percentile round-trip times for peer pings, vote replies, and full vote rounds. Timeouts are counted separately. Peer metrics refresh once a minute.
+- `/rmcore` — Delete detected core dump files and report how much space was freed. Send in a private chat with the bot.
 - `/addpeer <email|link> [token=<token>] [node_name]` — Link another Delta Chat Uptime bot as a remote probe using the command printed by its `/invitepeer` (e.g. `/addpeer https://i.delta.chat/#... token=... RU`). Without a token (e.g. `/addpeer ruptimebot@chat.gluek.info RU`) the other bot's admin must add this bot too.
 - `/rmpeer <email|key>` — Remove a remote peer probe by its current address or key fingerprint (the first 8+ hex digits shown by `/peers` are enough). Also stops probing targets it mirrored to this node.
 - `/peershare [admin|all|none]` — Choose which local monitors are disclosed to peers (default `admin`: only chats the administrator is a member of).

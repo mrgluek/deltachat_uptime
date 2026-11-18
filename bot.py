@@ -77,7 +77,7 @@ from outbox import SKIP_SEND, record_sent_mail
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "2.44.0"
+VERSION = "2.44.1"
 SYNC_MAX_BYTES = 64 * 1024
 # 200 metrics / 100 cross-checks, including JSON's twelve-byte astral Unicode escaping at field limits.
 PEER_MAX_BYTES = 8 * 1024 * 1024
@@ -2790,10 +2790,10 @@ def _is_dc_admin(bot, accid, contact_id, chat_id: int = None):
         logger.error(f"Error during admin verification: {e}")
     return False
 
-async def send_admin_notification(text: str):
+async def send_admin_notification(text: str, *, wait_for_send=False) -> bool:
     """Sends high-priority system and probe health alerts to the configured administrator via DM."""
     if not dc_bot_instance or dc_accid is None:
-        return
+        return False
     admin_chat_id_str = await asyncio.to_thread(database.get_config, "admin_chat_id")
     chat_id = int(admin_chat_id_str) if admin_chat_id_str and admin_chat_id_str.isdigit() else None
 
@@ -2810,14 +2810,20 @@ async def send_admin_notification(text: str):
         except Exception as e:
             logger.warning(f"Failed to resolve admin chat: {e}")
     if not chat_id:
-        return
+        return False
 
-    if chat_id:
-        try:
-            await asyncio.to_thread(_dc_send_msg_with_stats, dc_bot_instance, dc_accid, chat_id, MsgData(text=text),
-                                    priority=PRIO_ALERT, label="admin notification", kind="alert")
-        except Exception as e:
-            logger.warning(f"Failed to send admin notification to chat {chat_id}: {e}")
+    try:
+        result = await asyncio.to_thread(
+            _dc_send_msg_with_stats, dc_bot_instance, dc_accid, chat_id, MsgData(text=text),
+            priority=PRIO_ALERT, label="admin notification", kind="alert", return_future=wait_for_send)
+        if wait_for_send:
+            if isinstance(result, concurrent.futures.Future):
+                result = await asyncio.shield(asyncio.wrap_future(result))
+            return result is not None
+        return True
+    except Exception as e:
+        logger.warning(f"Failed to send admin notification to chat {chat_id}: {e}")
+        return False
 
 # Uptime checks execution logic
 async def check_ssl_expiry(url: str, timeout: float = 10.0) -> tuple[int | None, str | None]:
@@ -6316,8 +6322,16 @@ def start_web_server_thread():
 
 
 async def _flush_peer_metrics_periodically():
+    last_core_dump_check = float("-inf")
     last_storage_check = float("-inf")
     while True:
+        now = time.monotonic()
+        if dc_accid is not None and now - last_core_dump_check >= 600:
+            last_core_dump_check = now
+            try:
+                await _maybe_warn_core_dumps()
+            except Exception:
+                logger.exception("Could not check for core dumps")
         await asyncio.sleep(60)
         try:
             await run_db(database.flush_peer_metrics)
@@ -7017,13 +7031,15 @@ def _send_msg_with_peer_metrics(bot, accid, chat_id, msg_data, before_send=None)
 
 
 def _dc_send_msg_with_stats(bot, accid, chat_id, msg_data, priority=PRIO_REPLY, key=None, expires_in=None,
-                            label=None, after_send=None, before_send=None, *, kind="reply", should_send=None):
+                            label=None, after_send=None, before_send=None, *, kind="reply", should_send=None,
+                            return_future=False):
     """Sends a message through the paced outbox (see outbox.py). Default priority: a command reply.
 
     before_send() runs before the RPC, and after_send() runs after it succeeds.
     Neither runs for a replaced or expired message.
     Returns the msg_id when it was sent right away (outbox not started, as in tests), else None:
-    the message is queued and goes out when its turn and a send token come."""
+    the message is queued and goes out when its turn and a send token come.
+    With return_future=True, returns the outbox future when an outbox is available."""
     def send():
         if should_send is not None and not should_send():
             return SKIP_SEND
@@ -7045,6 +7061,8 @@ def _dc_send_msg_with_stats(bot, accid, chat_id, msg_data, priority=PRIO_REPLY, 
 
     fut = dc_outbox.submit(send, priority=priority, key=key, expires_in=expires_in,
                            label=label or f"message to chat {chat_id}", kind=kind)
+    if return_future:
+        return fut
     if fut.done() and not fut.exception():
         return fut.result()
     return None
@@ -7122,6 +7140,7 @@ def help_command(bot, accid, event):
             f"/invitepeer — Generate SecureJoin E2EE invite link for pairing with other bots\n"
             f"/peers (or /probes) — List distributed peer bots and their status\n"
             f"/stats — Bot load, mail, peer traffic and relays\n"
+            f"/rmcore — Delete core dump files in a private chat\n"
             f"/addpeer <email|link> [node_name] — Add remote peer bot (via email or SecureJoin invite)\n"
             f"/rmpeer <email|key> — Remove remote peer bot\n"
             f"/peershare [admin|all|none] — Choose which local monitors are disclosed to peers\n"
@@ -8612,6 +8631,8 @@ _storage_config_dir = None
 _storage_cache = collections.OrderedDict()
 _storage_cache_lock = threading.Lock()
 _storage_warned_at = float("-inf")
+_CORE_DUMP_NAME = re.compile(r"core(?:\.[0-9]+|-.*)?|.*\.core|vgcore\..*", re.DOTALL)
+_core_dump_warned = set()
 
 
 @dataclass
@@ -8756,6 +8777,95 @@ def _storage_disk_usage(root):
         return None
 
 
+def _core_dump_entries():
+    """Yield top-level regular dumps with their directory open where supported."""
+    roots = (Path(__file__).resolve().parent, Path.cwd(), _storage_root())
+    use_dir_fd = os.scandir in os.supports_fd and os.unlink in os.supports_dir_fd
+    seen_dirs = set()
+    for root in dict.fromkeys(roots):
+        try:
+            with contextlib.ExitStack() as stack:
+                if use_dir_fd:
+                    directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                    stack.callback(os.close, directory)
+                    root_info = os.fstat(directory)
+                else:
+                    directory = root
+                    root_info = root.lstat()
+                    if not stat.S_ISDIR(root_info.st_mode):
+                        continue
+                identity = _storage_id(root_info)
+                if identity in seen_dirs:
+                    continue
+                seen_dirs.add(identity)
+                for entry in stack.enter_context(os.scandir(directory)):
+                    if not _CORE_DUMP_NAME.fullmatch(entry.name):
+                        continue
+                    try:
+                        info = entry.stat(follow_symlinks=False)
+                    except OSError:
+                        continue
+                    if stat.S_ISREG(info.st_mode) and info.st_size > 0:
+                        yield directory, entry.name, info
+        except OSError:
+            continue
+
+
+def _scan_core_dumps():
+    return sorted(((name, info) for _, name, info in _core_dump_entries()), key=lambda dump: dump[0])
+
+
+def _remove_core_dumps():
+    removed, skipped = [], []
+    for directory, name, info in _core_dump_entries():
+        # Recheck the entry before unlinking. On Unix, keep the parent pinned by its descriptor.
+        path, kwargs = (name, {"dir_fd": directory}) if isinstance(directory, int) else (directory / name, {})
+        try:
+            current = os.stat(path, follow_symlinks=False, **kwargs)
+            if (stat.S_ISREG(current.st_mode) and _storage_id(current) == _storage_id(info)
+                    and (current.st_size, current.st_mtime_ns) == (info.st_size, info.st_mtime_ns)):
+                os.unlink(path, **kwargs)
+                removed.append((name, info.st_size))
+            else:
+                skipped.append(name)
+        except OSError:
+            skipped.append(name)
+    return removed, skipped
+
+
+async def _maybe_warn_core_dumps():
+    if os.getenv("CORE_DUMP_WARN") == "0":
+        return
+    new = {}
+    for name, info in await asyncio.to_thread(_scan_core_dumps):
+        encoded = json.dumps((name, info.st_size, info.st_mtime_ns)).encode()
+        key = "core_dump_warned:" + hashlib.sha256(encoded).hexdigest()
+        if key not in new and key not in _core_dump_warned and not await run_db(database.get_config, key):
+            new[key] = name, info
+    if not new:
+        return
+    lines = []
+    for name, info in new.values():
+        modified = datetime.datetime.fromtimestamp(info.st_mtime, datetime.timezone.utc)
+        crash = ("A process crashed just now" if info.st_mtime > _bot_stats["started"] - 60
+                 else "A process of the bot crashed earlier")
+        lines.append(f"Core dump found: {_storage_path_text(name)}, {_format_storage_size(info.st_size)}, "
+                     f"modified {modified:%Y-%m-%d %H:%M:%S} UTC. {crash} (the bot now disables core dumps).")
+    text = ("\n".join(lines) + " It is no longer needed after a crash analysis and takes up disk quota. "
+            "Send /rmcore to delete core dump files.")
+    disk = await asyncio.to_thread(_storage_disk_usage, _storage_root())
+    if disk:
+        percent = 100 * disk.free / disk.total if disk.total else 0
+        text += f"\nData filesystem: {_format_storage_size(disk.free)} free ({percent:.1f}%)."
+    if await send_admin_notification(text, wait_for_send=True):
+        _core_dump_warned.update(new)
+        for key in new:
+            try:
+                await run_db(database.set_config, key, "1")
+            except sqlite3.Error:
+                logger.warning("Could not save core dump warning", exc_info=True)
+
+
 def _collect_storage(data_dir, app_dir, bot_db, core_db, blobs):
     deadline = time.monotonic() + 2
     bot_files = [info for suffix in ("", "-wal", "-shm")
@@ -8796,15 +8906,19 @@ def _get_storage_stats(*paths):
         return report
 
 
-def _storage_path_label(path):
+def _storage_path_text(path):
     clean = "".join(c if c.isprintable() and c != "`" else "?" for c in path)
     raw = clean.encode()
     if len(raw) > 68:
         clean = (raw[:32].decode(errors="ignore") + "…" + raw[-32:].decode(errors="ignore"))
-    return f"`{clean}`"
+    return clean
 
 
-def _storage_report(stats, budget):
+def _storage_path_label(path):
+    return f"`{_storage_path_text(path)}`"
+
+
+def _storage_report(stats, budget, core_dumps=()):
     data, app = stats.data, stats.app
     size = _format_storage_size
     disk_summary = "n/a"
@@ -8827,6 +8941,11 @@ def _storage_report(stats, budget):
         f"• Account blobs: {size(stats.blob_bytes)} · Other data: {size(other_data)}",
         f"• {app_label}: {size(app.total)} · Logs: {size(log_size)} ({log_count} {log_label})",
     ]
+    if core_dumps:
+        items = [f"{_storage_path_text(name)} {size(info.st_size)}" for name, info in core_dumps[:_STORAGE_TOP]]
+        if len(core_dumps) > _STORAGE_TOP:
+            items.append(f"{len(core_dumps) - _STORAGE_TOP} more")
+        lines.append(f"• Core dumps: {', '.join(items)} (send /rmcore to delete)")
     groups = [(f"{label} {kind}", sorted(items, reverse=True)) for label, tree in roots
               for kind, items in (("files", tree.files), ("dirs", tree.directories)) if items]
     logs = sorted(((amount, label, path) for label, tree in roots for amount, path in tree.log_files),
@@ -9009,7 +9128,7 @@ def build_stats_report(bot, accid) -> str:
     ]
     remainder = "\n".join(line for line in lines if line is not None)
     budget = _STATS_MAX_BYTES - len(load.encode()) - len(remainder.encode()) - 4
-    report = f"{load}\n\n{_storage_report(storage, budget)}\n\n{remainder}"
+    report = f"{load}\n\n{_storage_report(storage, budget, _scan_core_dumps())}\n\n{remainder}"
     raw = report.encode()
     if len(raw) > _STATS_MAX_BYTES:
         return raw[:_STATS_MAX_BYTES - len("…".encode())].decode(errors="ignore").rstrip() + "…"
@@ -9037,6 +9156,27 @@ def stats_command(bot, accid, event):
             asyncio.to_thread(_reply_with_stats, bot, accid, msg.chat_id), async_event_loop)
     else:
         _reply_with_stats(bot, accid, msg.chat_id)
+
+
+@dc_cli.on(events.NewMessage(command="/rmcore"))
+@command_budget
+def rmcore_command(bot, accid, event):
+    msg = event.msg
+    if not _is_dc_admin(bot, accid, msg.from_id):
+        reply = "❌ This command is only for the administrator."
+    elif not (chat := bot.rpc.get_basic_chat_info(accid, msg.chat_id)) or not is_single_chat(chat):
+        reply = "Use this command in a private chat with the bot."
+    else:
+        removed, skipped = _remove_core_dumps()
+        lines = []
+        if removed:
+            names = ", ".join(_storage_path_text(name) for name, _ in sorted(removed))
+            freed_mb = sum(size for _, size in removed) / 1024**2
+            lines.append(f"Deleted core dump files: {names}. Freed {freed_mb:.1f} MB.")
+        if skipped:
+            lines.append(f"Could not delete: {', '.join(map(_storage_path_text, sorted(skipped)))}.")
+        reply = "\n".join(lines) or "No core dump files found"
+    _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=reply))
 
 
 @dc_cli.on(events.NewMessage(command="/peers"))
@@ -10071,7 +10211,18 @@ def on_new_message(bot, accid, event):
     except Exception as e:
         logger.error(f"Error in greeting check: {e}")
 
-if __name__ == "__main__":
+
+def _disable_core_dumps():
+    try:
+        import resource
+
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    except (ImportError, AttributeError, OSError, ValueError) as exc:
+        logger.info("Could not disable core dumps: %s", exc)
+
+
+def main():
+    _disable_core_dumps()
     import sys
     if len(sys.argv) > 2 and sys.argv[1] == "init" and sys.argv[2] == "transport":
         if len(sys.argv) < 4:
@@ -10114,3 +10265,7 @@ if __name__ == "__main__":
     if len(sys.argv) == 1:
         sys.argv.append("serve")
     dc_cli.start()
+
+
+if __name__ == "__main__":
+    main()

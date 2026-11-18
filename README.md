@@ -183,8 +183,11 @@ mode, only peers explicitly set to `on` are eligible. With the global setting
 `on`, peers set to `auto` are eligible too.
 
 Eligible peers that announce `rt1` and have a bound key exchange a small
-**Uptime peer link** app in their encrypted 1:1 chat. The peer with the lower
-fingerprint sends the app and replaces it every 14 days. Cleanup preserves the
+**Uptime peer link** app in their encrypted 1:1 chat. Nodes exchange capabilities
+during pairing and can announce them even when they have no monitor results to
+share. Standalone capability announcements are spaced at least ten minutes
+apart per peer. The peer with the lower fingerprint sends the app and replaces
+it every 14 days. Cleanup preserves the
 current app until its replacement is accepted. If it disappears, the peers
 recover by mail. `/peers` shows whether the app is ready, an offer is pending, or
 the peer is mail only. Older peers continue to use the existing mail protocol.

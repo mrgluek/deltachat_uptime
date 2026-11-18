@@ -238,8 +238,9 @@ class TestPeerRTCarrier(unittest.TestCase):
         with patch.object(bot.dc_outbox, "submit") as submit:
             self.audit()
             send = submit.call_args.args[0]
+            self.assertEqual(submit.call_args.kwargs["kind"], "peer_other")
         bot.handle_peer_metrics(self.bot, 1, self.row(), CHAT, {"caps": ["batch_check"]})
-        send()
+        self.assertIs(send(), bot.SKIP_SEND)
         self.rpc.send_msg.assert_not_called()
 
     def test_rotation_keeps_old_message_until_accept(self):

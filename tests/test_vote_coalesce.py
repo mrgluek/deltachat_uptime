@@ -52,6 +52,7 @@ class VoteTests(unittest.IsolatedAsyncioTestCase):
                      note_vote_outliers=MagicMock(return_value=[]), mask_unstable_votes=lambda votes: votes,
                      _queue_degraded_notice=MagicMock(), note_lone_reporter=MagicMock())
         self.install(database, get_all_peers=lambda: self.peers, get_local_node_name=lambda: "Local",
+                     get_peer_rt_flag=lambda: "off",
                      is_node_target_ignored=lambda node, url: False, record_peer_traffic=MagicMock())
 
     def install(self, module, **values):

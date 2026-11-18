@@ -66,7 +66,8 @@ class TestPeerAnswerCache(_PeerCase):
                     acquire.assert_called_once_with(self.peer, kind, 1)
                     self.assertEqual(self.admission.outstanding, {})
                     self.assertEqual([c.kwargs for c in submit.call_args_list], [
-                        dict(priority=bot.PRIO_PEER, expires_in=bot.PEER_ANSWER_TTL, label=label, key=None)
+                        dict(priority=bot.PRIO_PEER, expires_in=bot.PEER_ANSWER_TTL, label=label, key=None,
+                             kind="peer_other")
                     ] * 3)
 
     def test_repeat_during_probe_is_ignored(self):

@@ -397,6 +397,7 @@ def init_db():
             ("rt_received_offer_at", "INTEGER"),
             ("rt_lost", "INTEGER"),
             ("rt_reset_at", "INTEGER"),
+            ("caps_announce_attempt_at", "REAL"),
         ):
             if column not in peer_cols:
                 cursor.execute(f"ALTER TABLE peers ADD COLUMN {column} {kind}")
@@ -1896,6 +1897,15 @@ _CLEAR_PEER_RT = """
 def get_peer_rt_flag() -> str:
     flag = get_config("peer_rt")
     return flag if flag in PEER_RT_FLAGS else "off"
+
+
+def reserve_peer_caps_announcement(email: str, chat_id: int, now: float, interval: int) -> bool:
+    with _writer_transaction() as conn:
+        return conn.execute("""
+            UPDATE peers SET caps_announce_attempt_at = ?
+            WHERE email = ? AND chat_id = ?
+              AND (caps_announce_attempt_at IS NULL OR caps_announce_attempt_at <= ?)
+        """, (now, email, chat_id, now - interval)).rowcount > 0
 
 
 def _clear_disabled_peer_rt(conn):

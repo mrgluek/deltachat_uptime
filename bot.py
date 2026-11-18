@@ -21,6 +21,7 @@ import zipfile
 from pathlib import Path
 from dataclasses import dataclass, field
 import time
+from time import monotonic
 import datetime
 import html
 import re
@@ -77,7 +78,7 @@ from outbox import SKIP_SEND, record_sent_mail
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "2.44.1"
+VERSION = "2.44.2"
 SYNC_MAX_BYTES = 64 * 1024
 # 200 metrics / 100 cross-checks, including JSON's twelve-byte astral Unicode escaping at field limits.
 PEER_MAX_BYTES = 8 * 1024 * 1024
@@ -357,13 +358,13 @@ _telemetry_interval_now = TELEMETRY_INTERVAL  # this node's, set at each broadca
 # would keep sending every 2 minutes while the hub receives from all of them. So every node also
 # says how often it wants to receive (desired_interval, from its own peer count), and a sender
 # uses the longer of its own interval and the receiver's wish, per peer.
-TELEMETRY_TICK = 5            # poll for status changes on the monitoring scheduler's cadence
-TELEMETRY_MIN_GAP = 20
+TELEMETRY_TICK = 30
+TELEMETRY_MIN_GAP = 120
 TELEMETRY_IDLE_INTERVAL = 300
 _peer_desired_interval = {}   # peer email (lower) -> how often it wants telemetry
-_telemetry_sent_at = {}       # peer email (lower) -> time.time() this node last queued telemetry to it
+_telemetry_sent_at = {}       # peer email (lower) -> monotonic time of the last enqueue
 _telemetry_queued_status = {}  # full status snapshot at the last enqueue
-_telemetry_delivered_at = {}   # last successful send, written by the outbox
+_telemetry_delivered = {}     # (monotonic time, full status snapshot) at the last successful send
 _telemetry_started_at = {}     # last RPC attempt, written by the outbox
 
 
@@ -1649,10 +1650,8 @@ async def broadcast_telemetry_to_peers():
 
     for p in peers:
         email = (p.get("email") or "").lower()
-        peer_interval = interval_for_peer(email, interval)
-        idle_gap = max(TELEMETRY_IDLE_INTERVAL, peer_interval)
-        desired = _peer_desired_interval.get(email, TELEMETRY_INTERVAL)
-        change_gap = TELEMETRY_MIN_GAP if desired == TELEMETRY_INTERVAL else peer_interval
+        change_gap = max(TELEMETRY_MIN_GAP, interval_for_peer(email, interval))
+        idle_gap = max(TELEMETRY_IDLE_INTERVAL, change_gap)
         all_metrics = probe_by_source.get(email, []) + shared_metrics
         if not all_metrics:
             continue
@@ -1662,24 +1661,26 @@ async def broadcast_telemetry_to_peers():
             queued = _telemetry_sent_at.get(email)
             if queued is None:
                 return True
-            delivered = _telemetry_delivered_at.get(email)
-            if delivered is None or queued > delivered:
-                # Refresh a waiting job even if the status reverted to the last delivered value.
+            delivered, last_statuses = _telemetry_delivered.get(email, (float("-inf"), None))
+            gap = idle_gap if statuses == last_statuses else change_gap
+            if queued > delivered:
+                # Replace a waiting job on a revert as well. The outbox checks if the result is due.
                 if statuses != _telemetry_queued_status.get(email):
-                    return delivered is None or at - delivered >= change_gap
-                return at - queued >= (peer_interval if delivered is None else change_gap)
-            gap = change_gap if statuses != _telemetry_last_sent.get(email) else idle_gap
+                    return at - delivered >= change_gap
+                # A replacement queued before the idle deadline must leave that deadline intact.
+                if queued - delivered >= gap and at - queued < change_gap:
+                    return False
             return at - delivered >= gap
 
-        if not due(time.time()):
+        if not due(monotonic()):
             continue
         previous_queue_time = _telemetry_sent_at.get(email)
         chat_id = await _resolve_peer_chat_id(p)
-        queued_at = time.time()
+        queued_at = monotonic()
         if not chat_id or _telemetry_sent_at.get(email) != previous_queue_time or not due(queued_at):
             continue
         if email not in _telemetry_sent_at:
-            _telemetry_delivered_at.pop(email, None)
+            _telemetry_delivered.pop(email, None)
             _telemetry_started_at.pop(email, None)
         _telemetry_sent_at[email] = queued_at
         _telemetry_queued_status[email] = statuses
@@ -1698,10 +1699,13 @@ async def broadcast_telemetry_to_peers():
         }
         msg_text = f"[UPTIME_PEER_METRICS]\n{json.dumps(payload)}\n[/UPTIME_PEER_METRICS]"
 
-        def _start_send(email=email, gap=change_gap):
-            # A job can leave the queue between the scheduler's due check and its next enqueue.
-            at = time.time()
-            if at - _telemetry_started_at.get(email, float("-inf")) < gap:
+        def _start_send(email=email, statuses=statuses):
+            # While the job waited, its predecessor may have sent or the peer interval may have grown.
+            at = monotonic()
+            gap = max(TELEMETRY_MIN_GAP, interval_for_peer(email, current_telemetry_interval()))
+            delivered, last_statuses = _telemetry_delivered.get(email, (float("-inf"), None))
+            delivery_gap = max(TELEMETRY_IDLE_INTERVAL, gap) if statuses == last_statuses else gap
+            if at - delivered < delivery_gap or at - _telemetry_started_at.get(email, float("-inf")) < gap:
                 return False
             _telemetry_started_at[email] = at
             return True
@@ -1711,10 +1715,13 @@ async def broadcast_telemetry_to_peers():
             sent = {u: st for u, st in _telemetry_last_sent.get(email, {}).items() if u in statuses}
             sent.update({m["url"]: m["status"] for m in batch})
             _telemetry_last_sent[email] = sent
-            _telemetry_delivered_at[email] = time.time()
+            _, last_statuses = _telemetry_delivered.get(email, (None, None))
+            _telemetry_delivered[email] = (monotonic(), statuses)
+            kind = "peer_metrics_idle" if statuses == last_statuses else "peer_metrics_change"
+            database.record_peer_traffic(kind, "mail", "out", 0)
 
         _dc_send_msg_with_stats(dc_bot_instance, dc_accid, chat_id, MsgData(text=msg_text),
-                                priority=PRIO_TELEMETRY, key=("telemetry", chat_id), expires_in=peer_interval,
+                                priority=PRIO_TELEMETRY, key=("telemetry", chat_id), expires_in=change_gap,
                                 label=f"telemetry to {email}", kind="peer_metrics",
                                 should_send=_start_send, after_send=_record_sent)
 
@@ -4926,6 +4933,7 @@ async def monitoring_scheduler_loop():
     connector = _make_safe_connector(limit=CHECK_CONCURRENCY + 50)
     async with aiohttp.ClientSession(connector=connector, headers={"User-Agent": USER_AGENT}) as shared_session:
         while True:
+            until_telemetry = 5
             try:
                 # If host network outage was detected, verify connectivity before launching checks
                 if _host_outage_active:
@@ -5119,12 +5127,15 @@ async def monitoring_scheduler_loop():
 
             except Exception as e:
                 logger.error(f"Error in monitoring scheduler loop: {e}")
-                
+            else:
+                if telemetry_task is None or telemetry_task.done():
+                    until_telemetry = max(0, last_peer_telemetry_broadcast + TELEMETRY_TICK - time.time())
+
             # Every vote interval is a multiple of a minute. Wake for its wall clock boundary
             # even when the normal scheduler poll would land a few seconds later.
             wall = time.time() - grid_jitter
             until_minute = 60 - wall % 60
-            await asyncio.sleep(min(5, until_minute))
+            await asyncio.sleep(min(5, until_minute, until_telemetry))
 
 # Web Server handling and dashboard HTML templates
 def _votes_html(r: dict) -> str:
@@ -9044,6 +9055,7 @@ def _peer_metrics_report(now):
     timeout_label = "timeout" if timeouts == 1 else "timeouts"
     lines = (
         f"• Peer mails (24 h): {mails or 'none'} (in/out)",
+        f"• METRICS sent (24 h): idle {counts['peer_metrics_idle']['out']}, on change {counts['peer_metrics_change']['out']}",
         f"• Peer round trip (24 h): {', '.join(durations)} (p50/p95), {timeouts} {timeout_label}",
     )
     if skipped := counts["vote_skipped_paused"]["out"]:
@@ -9114,7 +9126,7 @@ def build_stats_report(bot, accid) -> str:
         f"• {len(peers)} peers, {len(live)} online" + (f", unstable now: {', '.join(unstable)}" if unstable else ""),
         f"• Votes paused for: {paused_votes}" if paused_votes else None,
         ("• Outdated (older than this node): " + ", ".join(old)) if (old := outdated_peers(peers)) else "• All peers run this version or newer",
-        f"• Telemetry every `{format_duration(current_telemetry_interval())}`"
+        f"• Changed telemetry at most every `{format_duration(current_telemetry_interval())}`"
         + (f" (less often to {slower} peers that asked for it)" if (slower := sum(
             1 for p in peers if interval_for_peer(p["email"], current_telemetry_interval()) > current_telemetry_interval())) else "")
         + f"; votes ask up to {VOTE_SAMPLE_SIZE} peers",

@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.44.2] - 2026-11-19
+
+### Fixed
+- Fix the METRICS mail volume regression in 2.44.0. Status changes now wait for the peer’s normal interval of at least two minutes, and idle snapshots still go out every five minutes or longer if the peer requests it. `/stats` shows how many METRICS messages were sent on change and while idle.
+
 ## [2.44.1] - 2026-11-18
 
 ### Fixed

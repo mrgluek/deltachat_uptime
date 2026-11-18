@@ -151,6 +151,8 @@ class TestPeerMetrics(unittest.TestCase):
         database.record_peer_traffic("METRICS", "mail", "in", 35)
         database.record_peer_traffic("METRICS", "mail", "out", 20)
         database.record_peer_traffic("METRICS", "mail", "out", 20)
+        database.record_peer_traffic("peer_metrics_idle", "mail", "out", 0)
+        database.record_peer_traffic("peer_metrics_change", "mail", "out", 0)
         for kind in ("CHECK_REQ", "CHECK_RESP", "CHECK_BATCH_REQ", "CHECK_BATCH_RESP",
                      "HELLO", "HELLO_ACK", "BOT_SYNC_DATA", "rt_advert"):
             database.record_peer_traffic(kind, "mail", "out", 0)
@@ -168,11 +170,13 @@ class TestPeerMetrics(unittest.TestCase):
         self.assertIn("Peer mails (24 h): BOT_SYNC_DATA 0/1, CHECK_BATCH_REQ 0/1, CHECK_BATCH_RESP 0/1, "
                       "CHECK_REQ 0/1, CHECK_RESP 0/1, HELLO 0/1, HELLO_ACK 0/1, METRICS 1/2, "
                       "rt_advert 0/1 (in/out)", report)
+        self.assertIn("METRICS sent (24 h): idle 1, on change 1", report.split("**Peers**", 1)[1])
         self.assertIn("Peer round trip (24 h): ping 200/290 ms, vote 2010/2010 ms, "
                       "vote_round 2150/2150 ms (p50/p95), 1 timeout", report)
         self.assertLess(len(report.encode()), 4096)
         self.assertEqual(bot._peer_metrics_report(time.time() + 86401),
                          ("• Peer mails (24 h): none (in/out)",
+                          "• METRICS sent (24 h): idle 0, on change 0",
                           "• Peer round trip (24 h): ping n/a, vote n/a, vote_round n/a (p50/p95), 0 timeouts"))
 
     def test_ping_batch_and_round_rtt(self):

@@ -311,8 +311,30 @@ class TestReportMode(unittest.TestCase):
         bot.dc_bot_instance.rpc.send_edit_request.assert_called_once()
         self.assertIn("resolved ·", bot.dc_bot_instance.rpc.send_edit_request.call_args.args[2])
 
+    def test_live_setting_validation_isolation_cleanup_and_override(self):
+        self.assertEqual(database.get_chat_report_live(1), "off")
+        for mode in ("on", "off"):
+            database.set_chat_report_live(1, mode)
+            self.assertEqual(database.get_chat_report_live(1), mode)
+        for invalid in ("only", "ON", "", None, True):
+            with self.assertRaises(ValueError):
+                database.set_chat_report_live(1, invalid)
+        database.set_chat_report_live(1, "on")
+        self.assertEqual(database.get_chat_report_live(2), "off")
+        database.close_db()
+        database.init_db()
+        self.assertEqual(database.get_chat_report_live(1), "on")
+        database.delete_chat_data(1)
+        self.assertIsNone(database.get_config("report_live:1"))
+        with patch.object(bot, "STATUS_REALTIME_CHATS", {1}):
+            database.set_chat_report_live(1, "off")
+            self.assertTrue(bot.realtime_chat(1))
+            self.assertIn("live: on", bot.report_settings_text(1))
+
     def test_report_command(self):
-        for payload, expected in (("", "10 min"), ("all", "full: 0 min"),
+        for payload, expected in (("", "live: off"), ("live on", "live: on"),
+                                  ("live off", "live: off"), ("live only", "❌ Usage:"),
+                                  ("all", "full: 0 min"),
                                   ("partial off", "partial: off"), ("full 1440", "1440 min"),
                                   ("full off", "❌ Usage:"), ("partial -1", "❌ Usage:"),
                                   ("partial 1441", "❌ Usage:"), ("all extra", "❌ Usage:")):

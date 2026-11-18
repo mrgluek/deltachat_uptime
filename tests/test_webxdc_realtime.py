@@ -72,8 +72,16 @@ class TestWebxdcRealtime(unittest.TestCase):
         return [m for m in sent if m["t"] == "pong"]
 
     def test_mail_interval_only_for_realtime_chats(self):
+        self.assertEqual(bot.status_mail_interval(1), 60)
+        bot.on_status_realtime(self.client, 1, Event(kind="WebxdcRealtimeAdvertisementReceived", msg_id=500))
+        self.assertEqual(bot.status_mail_interval(1), 60)  # An advertisement alone is not activity.
+        bot.on_status_realtime(self.client, 1, Event(kind="WebxdcRealtimeData", msg_id=500, data=data({"t": "hello"})))
         self.assertEqual(bot.status_mail_interval(1), bot.REALTIME_EMAIL_INTERVAL)
         self.assertEqual(bot.status_mail_interval(2), 60)
+        self.now += bot.REALTIME_IDLE_LEAVE
+        self.assertEqual(bot.status_mail_interval(1), 60)  # Before the next leave tick too.
+        asyncio.run(bot.realtime_status_tick())
+        self.assertEqual(bot.status_mail_interval(1), 60)
 
     def test_decode_rejects_garbage(self):
         self.assertEqual(bot._decode_realtime(data({"t": "hello", "v": 1}))["t"], "hello")
@@ -134,6 +142,7 @@ class TestWebxdcRealtime(unittest.TestCase):
         with patch.object(bot, "dc_outbox", MagicMock()):
             bot._deliver_status_app(1, self.client, 1, known_msg_id=500)
         self.rpc.send_webxdc_status_update.assert_called_once()
+        bot.on_status_realtime(self.client, 1, Event(kind="WebxdcRealtimeData", msg_id=500, data=data({"t": "hello"})))
         # The next, non-urgent change waits for the realtime mail interval
         self.rpc.send_webxdc_status_update.reset_mock()
         with database._writer_transaction() as conn:
@@ -143,6 +152,39 @@ class TestWebxdcRealtime(unittest.TestCase):
         with patch.object(bot, "dc_outbox", MagicMock()):
             bot._deliver_status_app(1, self.client, 1, known_msg_id=500)
         self.rpc.send_webxdc_status_update.assert_not_called()
+
+    def test_chat_setting_enables_channel_without_env_and_off_leaves(self):
+        database.set_chat_report_app(1, "on")
+        database.set_chat_report_live(1, "on")
+        with patch.object(bot, "STATUS_REALTIME_CHATS", set()):
+            bot.on_status_realtime(self.client, 1, Event(kind="WebxdcRealtimeData", msg_id=500, data=data({"t": "hello"})))
+            self.assertEqual(len(self.sent_states()), 1)
+            self.assertEqual(bot.status_mail_interval(1), bot.REALTIME_EMAIL_INTERVAL)
+            database.set_chat_report_live(1, "off")
+            self.assertEqual(bot.status_mail_interval(1), 60)
+            asyncio.run(bot.realtime_status_tick())
+            self.rpc.leave_webxdc_realtime.assert_called_once_with(1, 500)
+
+    def test_silent_channel_resumes_snapshot_and_status_line(self):
+        database.set_chat_report_app(1, "on")
+        database.set_chat_status_line(1, 501, "old-line")
+        database.set_chat_webxdc(1, 500, "old-state", int(self.now))
+        for key, value in (("webxdc_app_version:1", str(bot.WEBXDC_APP_VERSION)),
+                           ("webxdc_posted_at:1", str(int(self.now))),
+                           ("webxdc_dirty:1", "same"), ("webxdc_clean:1", "same")):
+            database.set_config(key, value)
+        self.rpc.get_existing_msg_ids.side_effect = lambda acc, ids: ids
+        self.rpc.get_basic_chat_info.return_value = {"name": "Test"}
+        self.rpc.get_webxdc_info.return_value = {"sendUpdateInterval": 10000}
+        bot.on_status_realtime(self.client, 1, Event(kind="WebxdcRealtimeData", msg_id=500, data=data({"t": "hello"})))
+        self.now += 120
+        with patch.object(bot, "dc_outbox", MagicMock()) as outbox:
+            bot._deliver_status_app(1, self.client, 1, known_msg_id=500)
+            self.rpc.send_webxdc_status_update.assert_not_called()
+            self.now += 60
+            bot._deliver_status_app(1, self.client, 1, known_msg_id=500)
+            self.rpc.send_webxdc_status_update.assert_called_once()
+            self.assertIn(("status-line-edit", 1), [c.kwargs.get("key") for c in outbox.submit.call_args_list])
 
     def test_failed_join_can_retry(self):
         self.rpc.send_webxdc_realtime_advertisement.side_effect = [RuntimeError("offline"), None]

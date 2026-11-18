@@ -651,7 +651,7 @@ def delete_chat_data(dc_chat_id: int) -> int:
         cursor.execute("DELETE FROM incidents WHERE dc_chat_id = ?", (dc_chat_id,))
         cursor.execute("DELETE FROM chats WHERE dc_chat_id = ?", (dc_chat_id,))
         cursor.execute("DELETE FROM config WHERE key = ?", (f"alert_mode:{dc_chat_id}",))
-        for kind in ("partial", "full", "app", "app_notices_after"):
+        for kind in ("partial", "full", "app", "app_notices_after", "live"):
             cursor.execute("DELETE FROM config WHERE key = ?", (f"report_{kind}:{dc_chat_id}",))
         for key in ("webxdc_app_version", "webxdc_reposted_at", "webxdc_updates", "webxdc_chat_name", "webxdc_pin_pending", "webxdc_posted_at", "webxdc_update_count", "webxdc_last_info_event_id", "webxdc_dirty", "webxdc_clean", "webxdc_attempt_revision", "webxdc_unpin", "webxdc_line_reposted_at", "webxdc_line_post_attempt", "webxdc_line_posted_at", "webxdc_full_state_hash", "webxdc_cap_warning_at"):
             cursor.execute("DELETE FROM config WHERE key = ?", (f"{key}:{dc_chat_id}",))
@@ -2332,6 +2332,17 @@ def rename_peer_node(email: str, new_name: str) -> bool:
             conn.execute("UPDATE OR IGNORE peer_measurements SET node_name = ? WHERE node_name = ?", (new_name, old_name))
             conn.execute("DELETE FROM peer_measurements WHERE node_name = ?", (old_name,))
         return True
+
+
+def get_chat_report_live(dc_chat_id: int) -> str:
+    return "on" if get_config(f"report_live:{dc_chat_id}") == "on" else "off"
+
+
+def set_chat_report_live(dc_chat_id: int, mode: str):
+    if mode not in ("off", "on"):
+        raise ValueError("live mode must be off or on")
+    get_or_create_chat_token(dc_chat_id)
+    set_config(f"report_live:{dc_chat_id}", mode)
 
 
 def get_chat_report_app(dc_chat_id: int) -> str:

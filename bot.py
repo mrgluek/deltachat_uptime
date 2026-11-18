@@ -6322,7 +6322,7 @@ async def push_status_apps():
 # on, the bot sends the state over the webxdc realtime channel (iroh gossip) instead of mail.
 # Mail status updates in these chats drop to one per REALTIME_EMAIL_INTERVAL, except urgent ones
 # (incidents, monitor edits), so clients without realtime still get the state.
-# Only chats listed in STATUS_REALTIME_CHATS (comma-separated chat ids) take part.
+# /report live enables each chat; STATUS_REALTIME_CHATS overrides the setting.
 STATUS_REALTIME_CHATS = {int(x) for x in os.environ.get("STATUS_REALTIME_CHATS", "").replace(" ", "").split(",")
                          if x.isdigit()}
 REALTIME_EMAIL_INTERVAL = 1800
@@ -6338,18 +6338,25 @@ _realtime_lock = threading.Lock()
 
 
 def realtime_chat(chat_id) -> bool:
-    return chat_id in STATUS_REALTIME_CHATS
+    return chat_id in STATUS_REALTIME_CHATS or database.get_chat_report_live(chat_id) == "on"
 
 
 def status_mail_interval(chat_id) -> int:
     """Minimum seconds between non-urgent mail status updates in a chat."""
-    return REALTIME_EMAIL_INTERVAL if realtime_chat(chat_id) else 60
+    if realtime_chat(chat_id):
+        msg_id = database.get_chat_webxdc(chat_id)["webxdc_msg_id"]
+        with _realtime_lock:
+            entry = _realtime_channels.get(msg_id)
+            active = entry and entry.get("received") and time.time() - entry["last_seen"] < REALTIME_IDLE_LEAVE
+        if active:
+            return REALTIME_EMAIL_INTERVAL
+    return 60
 
 
 def _realtime_chat_for_msg(msg_id):
     """The realtime-enabled chat whose current status app instance is msg_id, else None."""
-    for chat_id in STATUS_REALTIME_CHATS:
-        if database.get_chat_webxdc(chat_id)["webxdc_msg_id"] == msg_id:
+    for chat_id in set(database.get_status_app_chats()) | STATUS_REALTIME_CHATS:
+        if realtime_chat(chat_id) and database.get_chat_webxdc(chat_id)["webxdc_msg_id"] == msg_id:
             return chat_id
     return None
 
@@ -6395,9 +6402,8 @@ def _realtime_join(bot, accid, msg_id, chat_id) -> None:
     with _realtime_lock:
         entry = _realtime_channels.get(msg_id)
         if entry:
-            entry["last_seen"] = now
             return
-        _realtime_channels[msg_id] = {"chat_id": chat_id, "joined_at": now, "last_seen": now, "last_hash": None}
+        _realtime_channels[msg_id] = {"chat_id": chat_id, "joined_at": now, "last_seen": now, "last_hash": None, "received": False}
     try:
         # Joins the gossip topic; the core also mails a small hidden advertisement to the chat.
         bot.rpc.send_webxdc_realtime_advertisement(accid, msg_id)
@@ -6412,7 +6418,7 @@ def _realtime_join(bot, accid, msg_id, chat_id) -> None:
 @dc_cli.on(events.RawEvent(func=lambda e: e.kind in ("WebxdcRealtimeAdvertisementReceived", "WebxdcRealtimeData")))
 def on_status_realtime(bot, accid, event):
     msg_id = event.get("msg_id") or event.get("msgId")
-    if not STATUS_REALTIME_CHATS or not msg_id:
+    if not msg_id:
         return
     chat_id = _realtime_chat_for_msg(msg_id)
     if chat_id is None:
@@ -6425,6 +6431,11 @@ def on_status_realtime(bot, accid, event):
     if not msg or msg["t"] not in ("hello", "ping"):
         return
     _realtime_join(bot, accid, msg_id, chat_id)  # refreshes last_seen when already joined
+    with _realtime_lock:
+        entry = _realtime_channels.get(msg_id)
+        if entry:
+            entry["received"] = True
+            entry["last_seen"] = time.time()
     if msg["t"] == "hello":
         _send_realtime_state(bot, accid, msg_id, force=True)
         return
@@ -6445,7 +6456,9 @@ async def realtime_status_tick():
     with _realtime_lock:
         channels = list(_realtime_channels.items())
     for msg_id, entry in channels:
-        if now - entry["last_seen"] > REALTIME_IDLE_LEAVE:
+        if (now - entry["last_seen"] >= REALTIME_IDLE_LEAVE
+                or not await run_db(realtime_chat, entry["chat_id"])
+                or (await run_db(database.get_chat_webxdc, entry["chat_id"]))["webxdc_msg_id"] != msg_id):
             with _realtime_lock:
                 _realtime_channels.pop(msg_id, None)
             try:
@@ -6530,7 +6543,7 @@ def help_command(bot, accid, event):
         f"/keyword <id|url> [keyword|none] — Set or remove required keyword assertion\n"
         f"/list — List all monitors in this chat with uptime, latency & SSL\n"
         f"/status — Show monthly uptime statistics & web link\n"
-        f"/report [all|partial <N|off>|full <N>|app off|on|only] — Outage notices and status app\n"
+        f"/report [all|partial <N|off>|full <N>|app off|on|only|live on|off] — Outage notices and status app\n"
         f"/alertmode [quorum|local] — Alert when most nodes cannot reach a target (default), or on this node's checks only\n"
         f"/events — View incident history and active outages\n"
         f"/history [id] — View downtime history for monitors\n"
@@ -7502,7 +7515,7 @@ def alertmode_command(bot, accid, event):
 def report_settings_text(chat_id: int) -> str:
     partial = database.get_chat_report_partial(chat_id)
     full = database.get_chat_report_full(chat_id)
-    return f"partial: {'off' if partial == 'off' else str(partial) + ' min'}, full: {full} min, app: {database.get_chat_report_app(chat_id)}"
+    return f"partial: {'off' if partial == 'off' else str(partial) + ' min'}, full: {full} min, app: {database.get_chat_report_app(chat_id)}, live: {'on' if realtime_chat(chat_id) else 'off'}"
 
 
 @dc_cli.on(events.NewMessage(command="/report"))
@@ -7511,11 +7524,13 @@ def report_command(bot, accid, event):
     """Any chat member may configure outage notices and the status app."""
     chat_id = event.msg.chat_id
     args = (event.payload or "").strip().lower().split()
-    usage = "Usage: `/report`, `/report all`, `/report partial <0..1440|off>`, `/report full <0..1440>`, `/report app off|on|only`."
+    usage = "Usage: `/report`, `/report all`, `/report partial <0..1440|off>`, `/report full <0..1440>`, `/report app off|on|only`, `/report live on|off`."
     try:
         if args == ["all"]:
             database.set_chat_report_partial(chat_id, 0)
             database.set_chat_report_full(chat_id, 0)
+        elif len(args) == 2 and args[0] == "live":
+            database.set_chat_report_live(chat_id, args[1])
         elif len(args) == 2 and args[0] == "app":
             database.set_chat_report_app(chat_id, args[1])
             if args[1] != "off":
@@ -7530,6 +7545,7 @@ def report_command(bot, accid, event):
         _dc_send_msg_with_stats(bot, accid, chat_id, MsgData(text=f"❌ {usage}"))
         return
     text = ("✅ " if args else "") + f"🔔 **Report settings:** {report_settings_text(chat_id)}\n\n"
+    text += "Live on allows optional realtime updates in the app (shares IP addresses with live members).\n"
     text += "App on keeps chat notices; app only suppresses outage chat notices. App off stops app updates.\n"
     text += "Only chat notifications are delayed; monitoring and uptime statistics stay immediate.\n"
     text += "Resolved notices follow only an announced outage. Zero means immediate; partial off disables partial notices.\n\n" + usage

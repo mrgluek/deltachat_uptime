@@ -748,6 +748,9 @@ def _apply_status_updates(cursor, updates: list[dict], now: int):
 
         old_status = row[0]
         if old_status != status:
+            if status == "down" or old_status == "down":
+                cursor.execute("SELECT dc_chat_id FROM resources WHERE id = ?", (resource_id,))
+                _touch_chat_locked(cursor, cursor.fetchone()[0])
             invalidate_uptime_cache(resource_id)
             cursor.execute('''
                 UPDATE resources 
@@ -2403,10 +2406,14 @@ def get_status_app_chats() -> list[int]:
 NOTIFY_EVENT_KINDS = ("incident_start", "incident_end", "partial_start", "partial_end")
 
 
+def _touch_chat_locked(cursor, dc_chat_id):
+    key = f"webxdc_dirty:{dc_chat_id}"
+    cursor.execute("INSERT OR REPLACE INTO config(key, value) VALUES (?, COALESCE((SELECT CAST(value AS INTEGER) FROM config WHERE key = ?), 0) + 1)", (key, key))
+
+
 def touch_chat(dc_chat_id: int):
     with _writer_transaction() as conn:
-        key = f"webxdc_dirty:{dc_chat_id}"
-        conn.execute("INSERT OR REPLACE INTO config(key, value) VALUES (?, COALESCE((SELECT CAST(value AS INTEGER) FROM config WHERE key = ?), 0) + 1)", (key, key))
+        _touch_chat_locked(conn, dc_chat_id)
 
 
 def add_chat_event(dc_chat_id: int, kind: str, text: str, ts=None, once=None):
@@ -2418,6 +2425,8 @@ def add_chat_event(dc_chat_id: int, kind: str, text: str, ts=None, once=None):
             if conn.execute("SELECT 1 FROM config WHERE key = ?", (key,)).fetchone():
                 return None
             conn.execute("INSERT INTO config(key, value) VALUES (?, ?)", (key, str(now)))
+        if kind in NOTIFY_EVENT_KINDS:
+            _touch_chat_locked(conn, dc_chat_id)
         return conn.execute("INSERT INTO chat_events(dc_chat_id, ts, kind, text) VALUES (?, ?, ?, ?)",
                             (dc_chat_id, now, kind, ' '.join(text.split())[:140])).lastrowid
 

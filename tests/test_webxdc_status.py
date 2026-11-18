@@ -82,6 +82,69 @@ class TestWebxdcStatus(unittest.TestCase):
         database.set_chat_status_line(1, 322, bot._status_line_hash(bot.status_line_text(bot.build_status_state(1))))
         database.set_config("webxdc_app_version:1", str(bot.WEBXDC_APP_VERSION))
 
+    def test_member_count_mail_policy_and_live_override(self):
+        for count, interval, cap in ((19, 60, 30), (20, 300, 12), (66, 300, 12)):
+            with self.subTest(count=count):
+                self.assertEqual(bot.status_mail_interval(1, count), interval)
+                self.assertEqual(bot.status_mail_cap(1, count), cap)
+                self.assertEqual(bot.status_mail_cap(1, count, urgent=True), 30)
+        database.set_chat_report_live(1, "on")
+        self.assertEqual(bot.status_mail_interval(1, 66), 60)  # Idle live chats use normal pacing.
+        self.assertEqual(bot.status_mail_cap(1, 66), 30)
+        self.rpc.get_chat_contacts.side_effect = RuntimeError("offline")
+        self.assertEqual(bot._status_member_count(self.client, 1, 1), 0)
+
+    def test_large_chat_waits_five_minutes_in_audit_and_delivery(self):
+        self.rpc.get_chat_contacts.return_value = list(range(20))
+        self.existing()
+        self.push()
+        self.rpc.send_webxdc_status_update.reset_mock()
+        self.set_fields(self.rid, name="Changed")
+        database.set_config("webxdc_clean:1", database.get_config("webxdc_dirty:1"))
+        with patch("bot.time.time", return_value=10299):
+            self.push()
+            bot._deliver_status_app(1, self.client, 1, known_msg_id=321)
+            self.rpc.send_webxdc_status_update.assert_not_called()
+        with patch("bot.time.time", return_value=10300):
+            self.push()
+        self.rpc.send_webxdc_status_update.assert_called_once()
+
+    def test_large_chat_cap_and_urgent_incident_and_monitor_changes(self):
+        self.rpc.get_chat_contacts.return_value = list(range(66))
+        self.existing()
+        self.push()
+        self.rpc.send_webxdc_status_update.reset_mock()
+        database.set_chat_status_line(1, 322, "old-line")
+        self.set_fields(self.rid, name="Ordinary change")
+        database.set_config("webxdc_clean:1", database.get_config("webxdc_dirty:1"))
+        database.set_config("webxdc_updates:1", json.dumps([9500] * 12))
+        with patch("bot.time.time", return_value=10400):
+            self.push()
+            bot._deliver_status_app(1, self.client, 1, known_msg_id=321)
+            bot._update_status_line(1, self.client, 1)
+            self.rpc.send_webxdc_status_update.assert_not_called()
+            self.rpc.send_edit_request.assert_not_called()
+            self.set_fields(self.rid, name="Urgent monitor edit")
+            self.push()
+            self.rpc.send_webxdc_status_update.assert_called_once()
+            self.rpc.send_edit_request.assert_called_once()
+        # Incident transitions are urgent before the delayed chat notice exists.
+        with patch("bot.time.time", return_value=10410):
+            database.update_resource_status(self.rid, "down", 1, "Timeout")
+            self.push()
+        self.assertEqual(self.rpc.send_webxdc_status_update.call_count, 2)
+        # Incident journal revisions are urgent too, even inside the five-minute interval.
+        database.add_chat_event(1, "incident_start", "Example is down", ts=10420)
+        with patch("bot.time.time", return_value=10420):
+            self.push()
+        self.assertEqual(self.rpc.send_webxdc_status_update.call_count, 3)
+        # The original safety cap still applies to urgent sends.
+        database.set_config("webxdc_updates:1", json.dumps([10420] * 30))
+        self.set_fields(self.rid, name="Another edit")
+        with patch("bot.time.time", return_value=10440):
+            self.push()
+        self.assertEqual(self.rpc.send_webxdc_status_update.call_count, 3)
+
     def test_snapshot_status_nodes_summary_and_timestamp_hash(self):
         partial = database.add_resource(1, "https://partial.example", "Partial", "http")
         down = database.add_resource(1, "https://down.example", "Down", "http")

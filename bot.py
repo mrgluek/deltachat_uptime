@@ -6131,7 +6131,7 @@ def _post_status_line(chat_id, bot, accid, text):
                      key=("status-app-pin", chat_id), label="pin status line")
 
 
-def _update_status_line(chat_id, bot, accid):
+def _update_status_line(chat_id, bot, accid, urgent=False):
     """A separate outbox token and rolling-cap entry for each edit attempt."""
     if database.get_chat_report_app(chat_id) == "off":
         return
@@ -6142,7 +6142,8 @@ def _update_status_line(chat_id, bot, accid):
         return
     now = int(time.time())
     updates = [ts for ts in json.loads(database.get_config(f"webxdc_updates:{chat_id}") or "[]") if now - ts < 3600]
-    if len(updates) >= 30:
+    cap = status_mail_cap(chat_id, _status_member_count(bot, accid, chat_id), urgent or status_app_urgent(chat_id))
+    if len(updates) >= cap:
         _status_app_capped(chat_id, len(updates), now)
         return
     database.set_config(f"webxdc_updates:{chat_id}", json.dumps(updates + [now]))
@@ -6218,7 +6219,9 @@ def _deliver_status_app(chat_id, bot, accid, known_msg_id=None):
             return default
         limit = min(60000, int(field("sendUpdateMaxSize", 128000)))
         # The webxdc API expresses sendUpdateInterval in milliseconds.
-        interval = max(0 if status_app_urgent(chat_id) else status_mail_interval(chat_id),
+        urgent = status_app_urgent(chat_id)
+        members = _status_member_count(bot, accid, chat_id)
+        interval = max(0 if urgent else status_mail_interval(chat_id, members),
                        field("sendUpdateInterval", 10000) / 1000)
         digest = status_state_hash(state)
         full_digest = status_full_state_hash(state)
@@ -6233,7 +6236,7 @@ def _deliver_status_app(chat_id, bot, accid, known_msg_id=None):
             return
         updates = json.loads(database.get_config(f"webxdc_updates:{chat_id}") or "[]")
         updates = [ts for ts in updates if now - ts < 3600]
-        if len(updates) >= 30 and not first_state:
+        if len(updates) >= status_mail_cap(chat_id, members, urgent) and not first_state:
             _status_app_capped(chat_id, len(updates), now)
             return
         # The attempts list survives a re-post: a fresh instance must not wait out the previous
@@ -6246,7 +6249,7 @@ def _deliver_status_app(chat_id, bot, accid, known_msg_id=None):
             return
         if saved["webxdc_state_hash"] == digest and not first_state and not refresh_due:
             if line_changed:
-                dc_outbox.submit(lambda: _update_status_line(chat_id, bot, accid), priority=PRIO_UPDATE,
+                dc_outbox.submit(lambda: _update_status_line(chat_id, bot, accid, urgent=urgent), priority=PRIO_UPDATE,
                                  key=("status-line-edit", chat_id), label="edit status line")
             return
         # Count attempts durably too: retrying an uncertain RPC must not exceed the cap.
@@ -6260,7 +6263,7 @@ def _deliver_status_app(chat_id, bot, accid, known_msg_id=None):
         database.set_config(f"webxdc_update_count:{chat_id}", str(count + 1))
         database.set_config(f"webxdc_clean:{chat_id}", revision)
         if line_changed:
-            dc_outbox.submit(lambda: _update_status_line(chat_id, bot, accid), priority=PRIO_UPDATE,
+            dc_outbox.submit(lambda: _update_status_line(chat_id, bot, accid, urgent=urgent), priority=PRIO_UPDATE,
                              key=("status-line-edit", chat_id), label="edit status line")
         if info_events:
             database.set_config(f"webxdc_last_info_event_id:{chat_id}", str(max(e["id"] for e in info_events)))
@@ -6298,9 +6301,11 @@ async def push_status_apps():
                 name = str(chat.get("name") if isinstance(chat, dict) else chat.name)
                 if name != await run_db(database.get_config, f"webxdc_chat_name:{chat_id}"):
                     await run_db(database.set_config, f"webxdc_chat_name:{chat_id}", name)
+                members = await run_rpc(_status_member_count, dc_bot_instance, dc_accid, chat_id)
+                urgent = await run_db(status_app_urgent, chat_id)
                 if (saved["webxdc_last_sent_at"] is not None
-                        and now - saved["webxdc_last_sent_at"] < status_mail_interval(chat_id)
-                        and not await run_db(status_app_urgent, chat_id)):
+                        and now - saved["webxdc_last_sent_at"] < await run_db(status_mail_interval, chat_id, members)
+                        and not urgent):
                     continue
                 state = await run_db(build_status_state, chat_id)
                 if (status_state_hash(state) == saved["webxdc_state_hash"]
@@ -6310,7 +6315,8 @@ async def push_status_apps():
                     continue
                 updates = json.loads(await run_db(database.get_config, f"webxdc_updates:{chat_id}") or "[]")
                 attempts = sum(now - ts < 3600 for ts in updates)
-                if attempts >= 30 and not await run_db(status_app_first_state, chat_id, saved):
+                cap = await run_db(status_mail_cap, chat_id, members, urgent)
+                if attempts >= cap and not await run_db(status_app_first_state, chat_id, saved):
                     await run_db(_status_app_capped, chat_id, attempts, now)
                     continue
             queue_status_app(chat_id, dc_bot_instance, dc_accid)
@@ -6333,7 +6339,7 @@ REALTIME_IDLE_LEAVE = 180
 # and failures are logged with the size that was tried.
 REALTIME_MAX_BYTES = int(os.environ.get("STATUS_REALTIME_MAX_BYTES", "60000"))
 REALTIME_PROTOCOL = 1
-_realtime_channels = {}  # webxdc msg_id -> {"chat_id", "joined_at", "last_seen", "last_hash"}
+_realtime_channels = {}  # webxdc msg_id -> channel activity and last state hash
 _realtime_lock = threading.Lock()
 
 
@@ -6341,7 +6347,7 @@ def realtime_chat(chat_id) -> bool:
     return chat_id in STATUS_REALTIME_CHATS or database.get_chat_report_live(chat_id) == "on"
 
 
-def status_mail_interval(chat_id) -> int:
+def status_mail_interval(chat_id, member_count=0) -> int:
     """Minimum seconds between non-urgent mail status updates in a chat."""
     if realtime_chat(chat_id):
         msg_id = database.get_chat_webxdc(chat_id)["webxdc_msg_id"]
@@ -6350,7 +6356,19 @@ def status_mail_interval(chat_id) -> int:
             active = entry and entry.get("received") and time.time() - entry["last_seen"] < REALTIME_IDLE_LEAVE
         if active:
             return REALTIME_EMAIL_INTERVAL
-    return 60
+    return 300 if member_count >= 20 and not realtime_chat(chat_id) else 60
+
+
+def status_mail_cap(chat_id, member_count=0, urgent=False):
+    return 12 if member_count >= 20 and not realtime_chat(chat_id) and not urgent else 30
+
+
+def _status_member_count(bot, accid, chat_id):
+    try:
+        return len(bot.rpc.get_chat_contacts(accid, chat_id))
+    except Exception as exc:
+        logger.debug("Cannot count status chat %s members: %s", chat_id, exc)
+        return 0
 
 
 def _realtime_chat_for_msg(msg_id):
@@ -6430,7 +6448,7 @@ def on_status_realtime(bot, accid, event):
     msg = _decode_realtime(event.get("data") or [])
     if not msg or msg["t"] not in ("hello", "ping"):
         return
-    _realtime_join(bot, accid, msg_id, chat_id)  # refreshes last_seen when already joined
+    _realtime_join(bot, accid, msg_id, chat_id)
     with _realtime_lock:
         entry = _realtime_channels.get(msg_id)
         if entry:

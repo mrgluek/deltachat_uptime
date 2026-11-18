@@ -198,10 +198,19 @@ the sender to offer a replacement on the next tick. Failed or deleted pending
 offers still have a ten-minute retry floor, and pending offers still in the chat
 can be accepted for up to 14 days before a new offer is due. Re-enabling the
 preview can also replace a previously accepted app immediately. All offers
-count toward a limit of three per node per hour. `/peers` shows whether the app
-is ready, an offer is pending, or the peer is mail only. Older peers continue
-to use the existing mail protocol. Monitoring requests and telemetry still
-travel by mail.
+count toward a limit of three per node per hour.
+
+The bots join through Delta Chat Core without opening the app. Each side mails
+one hidden address advertisement after accepting the app and on restart, with
+up to 60 seconds of jitter and at least 60 seconds between attempts per carrier.
+An advertisement triggers an authenticated `hello` on the channel. Idle peers
+send a `ping` after 30 seconds. Both frames receive a `pong` that echoes the
+sender's epoch and sequence number for round-trip timing. `/peers` shows the
+carrier age while waiting to join, `UP` with the measured RTT when available,
+or `DOWN` after 90 seconds without a valid frame. `/stats` totals these channels.
+If the peer is still active by mail, the bot tries to rejoin after five minutes
+down, then after 15 minutes and hourly. Realtime currently carries channel health
+checks. Monitoring requests, answers, votes and telemetry travel by mail.
 
 ### Status app (`/report app`)
 

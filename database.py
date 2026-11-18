@@ -399,6 +399,9 @@ def init_db():
             ("rt_received_offer_at", "INTEGER"),
             ("rt_lost", "INTEGER"),
             ("rt_reset_at", "INTEGER"),
+            ("rt_advert_at", "REAL"),
+            ("rt_rejoin_at", "REAL"),
+            ("rt_rejoin_step", "INTEGER"),
             ("caps_announce_attempt_at", "REAL"),
             ("caps_announce_value", "TEXT"),
             ("caps_change_attempts", "TEXT NOT NULL DEFAULT '[]'"),
@@ -1913,7 +1916,8 @@ _CLEAR_PEER_RT = """
     UPDATE peers SET rt_cid = NULL, rt_msg_id = NULL, rt_key_out = NULL,
                      rt_key_in = NULL, rt_created_at = NULL, rt_offer_cid = NULL,
                      rt_offer_msg_id = NULL, rt_offer_key = NULL, rt_offer_at = NULL,
-                     rt_received_offer_at = NULL, rt_lost = NULL, rt_reset_at = NULL
+                     rt_received_offer_at = NULL, rt_lost = NULL, rt_reset_at = NULL,
+                     rt_advert_at = NULL, rt_rejoin_at = NULL, rt_rejoin_step = NULL
 """
 
 
@@ -1952,7 +1956,7 @@ def _clear_disabled_peer_rt(conn):
     conn.execute(_CLEAR_PEER_RT + """
         WHERE COALESCE(rt_cid, rt_msg_id, rt_key_out, rt_key_in, rt_created_at, rt_offer_cid,
                        rt_offer_msg_id, rt_offer_key, rt_offer_at, rt_received_offer_at,
-                       rt_lost, rt_reset_at) IS NOT NULL
+                       rt_lost, rt_reset_at, rt_advert_at, rt_rejoin_at, rt_rejoin_step) IS NOT NULL
           AND (rt_mode = 'off' OR NOT EXISTS (
               SELECT 1 FROM config WHERE key = 'peer_rt'
               AND (value = 'on' OR (value = 'canary' AND peers.rt_mode = 'on'))
@@ -2003,7 +2007,8 @@ def set_peer_rt(fingerprint: str, *, cid: str, msg_id: int, key_out: bytes,
         return conn.execute("""
             UPDATE peers SET rt_cid = ?, rt_msg_id = ?, rt_key_out = ?, rt_key_in = ?, rt_created_at = ?,
                              rt_offer_cid = NULL, rt_offer_msg_id = NULL, rt_offer_key = NULL,
-                             rt_received_offer_at = ?, rt_lost = NULL
+                             rt_received_offer_at = ?, rt_lost = NULL,
+                             rt_advert_at = NULL, rt_rejoin_at = NULL, rt_rejoin_step = NULL
             WHERE email = (SELECT email FROM peers WHERE fingerprint = ? LIMIT 1)
         """, (cid, msg_id, key_out, key_in, created_at, received_offer_at, fingerprint)).rowcount > 0
 
@@ -2011,6 +2016,24 @@ def set_peer_rt(fingerprint: str, *, cid: str, msg_id: int, key_out: bytes,
 def clear_peer_rt(fingerprint: str):
     with _writer_transaction() as conn:
         conn.execute(_CLEAR_PEER_RT + " WHERE fingerprint = ?", (normalize_fingerprint(fingerprint),))
+
+
+def reserve_peer_rt_advert(fingerprint, msg_id, cid, now, cooldown, rejoin_at, rejoin_step):
+    """Charge before calling the core, including failed or interrupted attempts."""
+    with _writer_transaction() as conn:
+        return conn.execute("""
+            UPDATE peers SET rt_advert_at = ?, rt_rejoin_at = ?, rt_rejoin_step = ?
+            WHERE fingerprint = ? AND rt_msg_id = ? AND rt_cid = ? AND COALESCE(rt_lost, 0) = 0
+              AND (rt_advert_at IS NULL OR rt_advert_at <= ?)
+        """, (now, rejoin_at, rejoin_step, fingerprint, msg_id, cid, now - cooldown)).rowcount > 0
+
+
+def reset_peer_rt_rejoin(fingerprint, msg_id, cid):
+    with _writer_transaction() as conn:
+        conn.execute("""
+            UPDATE peers SET rt_rejoin_at = NULL, rt_rejoin_step = NULL
+            WHERE fingerprint = ? AND rt_msg_id = ? AND rt_cid = ?
+        """, (fingerprint, msg_id, cid))
 
 
 def reserve_peer_rt_offer(fingerprint: str, now: int, retry: int, hourly_limit: int) -> bool:

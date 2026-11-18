@@ -22,7 +22,8 @@ RT_ACK_FAILURES = 2
 RT_CHANNEL_TIMEOUT = 90
 
 _MAIL_KINDS = frozenset({"req", "resp", "breq", "bresp", "metrics"})
-RT_KINDS = _MAIL_KINDS | {"hello", "ping", "ack"}
+RT_HEALTH_KINDS = frozenset({"hello", "ping", "pong"})
+RT_KINDS = _MAIL_KINDS | RT_HEALTH_KINDS | {"ack"}
 _FRAME_FIELDS = {"v", "k", "e", "s", "ts", "a", "b", "h"}
 _EPOCH = re.compile(r"[0-9a-fA-F]{8}")
 _HMAC_HEX = re.compile(r"[0-9a-f]{64}")
@@ -68,6 +69,12 @@ def _validate_frame(frame: dict):
         or not isinstance(body["s"], list) or not all(map(_is_seq, body["s"]))
     ):
         raise FrameError("Invalid ack payload")
+    if kind == "pong" and (
+        not isinstance(body, dict) or body.keys() != {"e", "s"}
+        or not isinstance(body["e"], str) or not _EPOCH.fullmatch(body["e"])
+        or not _is_seq(body["s"])
+    ):
+        raise FrameError("Invalid pong payload")
 
 
 def encode(kind: str, epoch: str, seq: int, body, key: bytes, *, ack: int = 0,
@@ -238,8 +245,12 @@ class PeerChannelState:
                 and self._clock() - self._last_frame_at < RT_CHANNEL_TIMEOUT
                 and self._ack_failures < RT_ACK_FAILURES)
 
-    def on_frame(self):
-        self._last_frame_at = self._clock()
+    @property
+    def last_frame_at(self) -> float | None:
+        return self._last_frame_at
+
+    def on_frame(self, received_at=None):
+        self._last_frame_at = self._clock() if received_at is None else received_at
         if self._ack_failures >= RT_ACK_FAILURES:
             # Fresh traffic can restore the channel even while sends are using mail.
             self._ack_failures = 0

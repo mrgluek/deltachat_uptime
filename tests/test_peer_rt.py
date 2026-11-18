@@ -45,6 +45,7 @@ class TestFrameCodec(unittest.TestCase):
         bodies = {
             "hello": {},
             "ping": {},
+            "pong": {"e": EPOCH, "s": 1},
             "ack": {"s": [0, 3, 10]},
             "req": {"url": "https://example.org", "req_id": "1"},
             "resp": {"status": "up", "req_id": "1"},

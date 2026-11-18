@@ -8,6 +8,7 @@ import io
 import heapq
 import logging
 import json
+import math
 import os
 import shutil
 import ssl
@@ -74,7 +75,7 @@ from outbox import outbox as dc_outbox, PRIO_ALERT, PRIO_REPLY, PRIO_UPDATE, PRI
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "2.43.0"
+VERSION = "2.43.1"
 SYNC_MAX_BYTES = 64 * 1024
 # 200 metrics / 100 cross-checks, including JSON's twelve-byte astral Unicode escaping at field limits.
 PEER_MAX_BYTES = 8 * 1024 * 1024
@@ -498,18 +499,25 @@ pending_batch_checks = {}  # req_id -> (Future, chat_id, number of targets)
 # Quorum alerting (/alertmode quorum, the default): this node and its live peers vote on whether a
 # failing target is reachable. Most nodes cannot reach it -> DOWN (incident). Some can't -> DEGRADED:
 # a notice in the chat, no incident and no downtime. With fewer than 2 voters this node decides alone.
-QUORUM_REVOTE_INTERVAL = 120          # peers are asked again at most this often while nothing changed locally
-QUORUM_REVOTE_INTERVAL_LONG = 600     # ...and this often for targets down/degraded for over an hour
+QUORUM_REVOTE_INTERVAL = 120
+QUORUM_REVOTE_STEPS = (QUORUM_REVOTE_INTERVAL, 300, 600)
+VOTE_PAUSE_AFTER = 3
+VOTE_PAUSE_MIN = 300
+VOTE_PAUSE_MAX = 1800
+_vote_peer_lock = threading.Lock()
+_vote_peers = {}          # peer identity -> _VotePeer
+_vote_check = contextvars.ContextVar("vote_check", default=None)  # None: one-off, False: regular, _GridVoteCheck: grid
 DEGRADED_CONFIRMATIONS = 2            # consecutive votes needed to enter or leave DEGRADED
 DEGRADED_NOTIFY_WINDOW = 10.0         # seconds to collect DEGRADED changes of a chat into one message
-_vote_cache = {}          # cross-check key -> (monotonic time, local_up, peer results)
+_vote_cache = {}          # cross-check key -> _CachedVote
 _alert_streaks = {}       # resource id -> (candidate alert state, consecutive votes for it)
 _degraded_notify_queue = {}  # chat id -> list of ("start" | "end", resource, votes, started_at)
 _degraded_flush_task = None
 # A peer reporting a target DOWN in its telemetry while this node sees it UP: the target's next
-# regular check asks all peers and votes (the case "this node reaches it, most others don't").
+# grid check asks peers and votes (the case "this node reaches it, most others don't").
 PEER_SUSPECT_MAX_AGE = 300  # seconds a report stays valid, and how old the peer's result may be
-_peer_suspects = {}  # url -> (monotonic time, reporting node)
+_peer_suspects = {}  # url -> (monotonic time, reporting node, wall clock tick)
+_peer_suspect_lock = threading.Lock()
 # A peer whose report could not count (its vote abstained because the node is unstable) is not heard
 # again for that target for a while: its votes are masked, the target stays UP, so every report of
 # it started another vote - a noisy node (bad home network, Docker Desktop ICMP, split-horizon DNS)
@@ -955,10 +963,88 @@ class _PeerVoteRound:
             _record_peer_rtt("vote_round", None, started_at, finished_at, ok)
 
 
+@dataclass
+class _VotePeer:
+    streak: int = 0
+    pause: int = 0
+    until: float = 0
+    last_answer: float = -math.inf
+    probing: bool = False
+
+
+def _vote_peer_key(peer):
+    return peer.get("fingerprint") or peer["email"].lower()
+
+
+def _note_vote_peer_result(peer, ok):
+    now = time.monotonic()
+    with _vote_peer_lock:
+        state = _vote_peers.setdefault(_vote_peer_key(peer), _VotePeer())
+        name = peer.get("node_name") or peer["email"]
+        if ok:
+            if state.pause:
+                logger.info("Votes resumed for %s after an answer", name)
+            state.last_answer = now
+            state.streak = state.pause = state.until = 0
+            return
+        state.streak += 1
+        if state.streak >= VOTE_PAUSE_AFTER and now >= state.until:
+            state.pause = min(VOTE_PAUSE_MAX, max(VOTE_PAUSE_MIN, state.pause * 2))
+            state.until = now + state.pause
+            logger.info("Non-urgent votes paused for %s for %d min", name, state.pause // 60)
+
+
+def _vote_peer_modes(peers, now):
+    """Caller holds the vote peer lock. Only one request may test an expired pause."""
+    modes = {}
+    for peer in peers:
+        key = _vote_peer_key(peer)
+        state = _vote_peers.get(key)
+        if state is None or not state.pause:
+            modes[key] = "ask"
+        elif state.until <= now and not state.probing:
+            modes[key] = "probe"
+        else:
+            modes[key] = "skip"
+    if modes and all(mode == "skip" for mode in modes.values()):
+        available = [key for key in modes if not _vote_peers[key].probing]
+        for key in sorted(available, key=lambda key: (_vote_peers[key].last_answer, key))[:2]:
+            modes[key] = "fallback"
+    return modes
+
+
+def _paused_vote_peers(peers):
+    now, wall = time.monotonic(), time.time()
+    with _vote_peer_lock:
+        modes = _vote_peer_modes([p for p in peers if not p.get("is_offline")], now)
+        return {
+            key: wall + _vote_peers[key].until - now
+            for key, mode in modes.items() if mode == "skip" and _vote_peers[key].until > now
+        }
+
+
+async def _probe_vote_peer(peer, request, *args, **kwargs):
+    key = _vote_peer_key(peer)
+    with _vote_peer_lock:
+        state = _vote_peers[key]
+        if state.probing or state.until > time.monotonic():
+            return []
+        probing = bool(state.pause)
+        if probing:
+            state.probing = True
+            logger.info("Probing %s after its vote pause", peer.get("node_name") or peer["email"])
+    try:
+        return await request(*args, **kwargs)
+    finally:
+        if probing:
+            with _vote_peer_lock:
+                state.probing = False
+
+
 class _PeerRtt:
     def __init__(self, kind, peer):
         self.kind = kind
-        self.peer = peer.get("node_name") or "Remote-Node"
+        self.peer = peer
         self.vote_round = _peer_vote_round.get()
         self.submitted_at = time.monotonic()
         self.sent_at = None
@@ -967,6 +1053,11 @@ class _PeerRtt:
     def start(self):
         self.sent_at = time.monotonic()
 
+    def note_single_answer(self, arrived_at, node_name):
+        self.answer = (arrived_at, node_name)
+        if self.vote_round is not None:
+            _note_vote_peer_result(self.peer, True)
+
     def finish(self, ok, finished_at=None, peer=None):
         if finished_at is None:
             finished_at = time.monotonic()
@@ -974,9 +1065,12 @@ class _PeerRtt:
         sent_at = self.sent_at
         started_at = sent_at if sent_at is not None and sent_at <= finished_at else self.submitted_at
         if self.kind:
-            _record_peer_rtt(self.kind, peer or self.peer, started_at, finished_at, ok)
+            _record_peer_rtt(self.kind, peer or self.peer.get("node_name") or "Remote-Node",
+                             started_at, finished_at, ok)
         if self.vote_round is not None:
             self.vote_round.samples.append((started_at, finished_at, ok))
+        if (self.vote_round is not None or self.kind == "vote") and self.answer is None and (ok or sent_at is not None):
+            _note_vote_peer_result(self.peer, ok)
 
 
 async def request_peer_cross_checks(target_dict: dict, timeout: float = 8.0, peers: list[dict] | None = None) -> list[dict]:
@@ -1171,7 +1265,14 @@ def _note_peer_announcement(peer: dict, data) -> dict:
     return peer
 
 
-async def request_peer_cross_checks_batched(target_dict: dict, reporter: str = None) -> list[dict]:
+@dataclass
+class _GridVoteCheck:
+    tick: float
+    requests: list
+    ready: asyncio.Event
+
+
+async def request_peer_cross_checks_batched(target_dict: dict, reporter: str = None, *, urgent=True) -> list[dict]:
     """Cross-check of a failing monitor, sent together with the others failing at the same time.
 
     Waits up to CROSS_CHECK_BATCH_WINDOW for more targets, then sends one request per peer (peers
@@ -1179,7 +1280,18 @@ async def request_peer_cross_checks_batched(target_dict: dict, reporter: str = N
     answers for this target, like request_peer_cross_checks."""
     global _cross_check_flush_task
     fut = asyncio.get_running_loop().create_future()
-    _cross_check_queue.append((target_dict, fut, reporter))
+    request = (target_dict, fut, reporter)
+    grid = _vote_check.get()
+    if not urgent:
+        if grid:
+            grid.requests.append(request)
+            grid.ready.set()
+        else:
+            await _flush_cross_checks([request], urgent=False)
+        return await fut
+    if grid:
+        grid.ready.set()
+    _cross_check_queue.append(request)
     if len(_cross_check_queue) >= CROSS_CHECK_BATCH_MAX:
         batch = _cross_check_queue[:]
         _cross_check_queue.clear()
@@ -1229,7 +1341,7 @@ async def _delayed_cross_check_flush():
     await _flush_cross_checks(batch)
 
 
-async def _flush_cross_checks(batch: list) -> None:
+async def _flush_cross_checks(batch: list, *, urgent: bool = True) -> None:
     """Sends one batch: identical targets once, a batch message per capable peer, old requests to the rest."""
     if not batch:
         return
@@ -1243,14 +1355,44 @@ async def _flush_cross_checks(batch: list) -> None:
     try:
         peers = await asyncio.to_thread(database.get_all_peers) or []
         # Peers known to be offline would only make everyone wait for the timeout
-        peers = [p for p in peers if not p.get("is_offline")]
-        peers = pick_vote_peers(peers, reporters)
+        live = [p for p in peers if not p.get("is_offline")]
+        peers = pick_vote_peers(live, reporters)
         stat_event("vote")
-        batch_peers = [p for p in peers if _peer_supports(p, PEER_CAP_BATCH_CHECK)]
-        legacy_peers = [p for p in peers if not _peer_supports(p, PEER_CAP_BATCH_CHECK)]
+        modes = {}
+        if not urgent:
+            with _vote_peer_lock:
+                modes = _vote_peer_modes(live, time.monotonic())
+            selected = {_vote_peer_key(p) for p in peers}
+            available = [p for p in live if modes[_vote_peer_key(p)] != "skip"]
+            if not any(modes[key] != "skip" for key in selected):
+                peers = peers + pick_vote_peers(available, reporters)
+            else:
+                peers = peers + [p for p in available if _vote_peer_key(p) not in selected
+                                 and modes[_vote_peer_key(p)] == "fallback"]
         items = [(key, target) for key, (target, _) in by_key.items()]
         jobs = []
-        for p in batch_peers:
+        legacy_peers = []
+
+        async def legacy_probe(peer, key, target):
+            results[key].extend(await _probe_vote_peer(
+                peer, request_peer_cross_checks, target, timeout=8.0, peers=[peer]))
+
+        for p in peers:
+            mode = modes.get(_vote_peer_key(p), "ask")
+            if mode == "skip":
+                database.record_peer_traffic("vote_skipped_paused", "mail", "out", 0)
+                continue
+            if not _peer_supports(p, PEER_CAP_BATCH_CHECK):
+                if mode == "probe":
+                    for key, target in items:
+                        node = p.get("node_name")
+                        if _peer_can_check(p, target) and not (
+                                node and database.is_node_target_ignored(node, target.get("url", ""))):
+                            jobs.append(legacy_probe(p, key, target))
+                            break
+                else:
+                    legacy_peers.append(p)
+                continue
             p_node = p.get("node_name") or ""
             p_items = []
             for key, t in items:
@@ -1266,8 +1408,11 @@ async def _flush_cross_checks(batch: list) -> None:
                     })
                     continue
                 p_items.append((key, t))
-            for i in range(0, len(p_items), CROSS_CHECK_BATCH_MAX):
-                jobs.append(_batch_cross_check_peer(p, p_items[i:i + CROSS_CHECK_BATCH_MAX], results))
+            if mode == "probe" and p_items:
+                jobs.append(_probe_vote_peer(p, _batch_cross_check_peer, p, p_items[:CROSS_CHECK_BATCH_MAX], results))
+            else:
+                for i in range(0, len(p_items), CROSS_CHECK_BATCH_MAX):
+                    jobs.append(_batch_cross_check_peer(p, p_items[i:i + CROSS_CHECK_BATCH_MAX], results))
         if legacy_peers:
             async def _legacy(key, target):
                 results[key].extend(await request_peer_cross_checks(target, timeout=8.0, peers=legacy_peers))
@@ -3579,10 +3724,15 @@ def note_peer_reported_down(peer_node: str, metrics: list[dict]) -> int:
                        f"its network is probably broken, ignoring its reports for {PEER_FLOOD_HOLD // 60} min")
         stat_event("held")
         return 0
-    for url in marked:
-        _peer_suspects[url] = (time.monotonic(), peer_node)
+    with _peer_suspect_lock:
+        observed_at = time.monotonic()
+        tick = _vote_grid_tick(time.time(), QUORUM_REVOTE_INTERVAL)
+        for url in marked:
+            previous = _peer_suspects.get(url)
+            due = previous[2] if previous and observed_at - previous[0] <= PEER_SUSPECT_MAX_AGE else tick
+            _peer_suspects[url] = (observed_at, peer_node, due)
     if marked:
-        logger.info(f"Peer {peer_node} reports DOWN or DEGRADED for {len(marked)} target(s) that are UP here; voting on their next check")
+        logger.info(f"Peer {peer_node} reports DOWN or DEGRADED for {len(marked)} target(s) that are UP here; scheduling votes")
     return len(marked)
 
 
@@ -3628,21 +3778,51 @@ def _db_quietly(fn, *args) -> None:
         logger.debug(f"{fn.__name__} failed: {e}")
 
 
+def _vote_grid_tick(earliest, interval):
+    return math.ceil(earliest / interval) * interval
+
+
+@dataclass
+class _CachedVote:
+    at: float
+    anchor: float
+    local_up: bool | str
+    results: list
+    step: int = 0
+    decision: str | None = None
+
+    @property
+    def due(self):
+        interval = QUORUM_REVOTE_STEPS[self.step]
+        return _vote_grid_tick(self.anchor + interval, interval)
+
+
+def _suspect_vote_due(entry, cached):
+    if cached:
+        return max(entry[2], _vote_grid_tick(cached.anchor + QUORUM_REVOTE_INTERVAL - 10, QUORUM_REVOTE_INTERVAL))
+    return entry[2]
+
+
 def _take_peer_suspect(rep: dict) -> str | None:
-    """The node that reported this target DOWN, if its report is current and peers were not asked
-    about it within QUORUM_REVOTE_INTERVAL (then the report waits for a later check)."""
-    entry = _peer_suspects.get(rep["url"])
-    if not entry:
+    """Take a fresh report when its grid check can ask for confirmation."""
+    grid = _vote_check.get()
+    if grid is False:
         return None
-    now = time.monotonic()
-    if now - entry[0] > PEER_SUSPECT_MAX_AGE:
-        _peer_suspects.pop(rep["url"], None)
-        return None
-    cached = _vote_cache.get(_cross_check_key(rep))
-    if cached and now - cached[0] < QUORUM_REVOTE_INTERVAL - 10:
-        return None
-    _peer_suspects.pop(rep["url"], None)
-    return entry[1]
+    with _peer_suspect_lock:
+        entry = _peer_suspects.get(rep["url"])
+        if not entry:
+            return None
+        now = time.monotonic()
+        if now - entry[0] > PEER_SUSPECT_MAX_AGE:
+            del _peer_suspects[rep["url"]]
+            return None
+        cached = _vote_cache.get(_cross_check_key(rep))
+        if grid and grid.tick < _suspect_vote_due(entry, cached):
+            return None
+        if not grid and cached and now - cached.at < QUORUM_REVOTE_INTERVAL - 10:
+            return None
+        del _peer_suspects[rep["url"]]
+        return entry[1]
 
 
 async def _quorum_resource_ids(group: list[dict]) -> set:
@@ -3651,27 +3831,51 @@ async def _quorum_resource_ids(group: list[dict]) -> set:
     peers = await asyncio.to_thread(database.get_all_peers)
     if not any(not p.get("is_offline") for p in peers or []):
         return set()
-    candidates = [r for r in group
-                  if await asyncio.to_thread(database.get_chat_alert_mode, r["dc_chat_id"]) == "quorum"]
+    modes = {chat: await asyncio.to_thread(database.get_chat_alert_mode, chat)
+             for chat in {r["dc_chat_id"] for r in group}}
+    candidates = [r for r in group if modes[r["dc_chat_id"]] == "quorum"]
     if not candidates:
         return set()
     shareable = await asyncio.to_thread(_filter_peer_shareable_resources, dc_bot_instance, dc_accid, candidates)
     return {r["id"] for r in shareable}
 
 
-async def collect_peer_votes(rep: dict, local_up: bool, fresh: bool = False, revote_interval: float = QUORUM_REVOTE_INTERVAL,
-                             reporter: str = None) -> list[dict]:
-    """The peers' results for this target. Re-used for revote_interval while this node's own
-    result is unchanged, so targets that stay down or degraded do not ask peers every minute."""
+async def collect_peer_votes(rep: dict, local_up: bool, fresh: bool = False, *,
+                             periodic: bool = False, reporter: str = None) -> list[dict] | None:
+    """Reuse a vote between grid ticks. Local changes still go straight to the urgent batch."""
     key = _cross_check_key(rep)
-    now = time.monotonic()
+    now, wall = time.monotonic(), time.time()
     cached = _vote_cache.get(key)
-    if cached and not fresh and cached[1] == local_up and now - cached[0] < revote_interval:
-        return cached[2]
-    results = await request_peer_cross_checks_batched(rep, reporter)
+    grid = _vote_check.get()
+    non_urgent = bool(periodic or reporter)
+    if periodic and not fresh:
+        if cached:
+            fresh = cached.local_up != local_up
+        else:
+            previous = next((v.get("status") for v in _votes_from_json(rep.get("last_votes"))
+                             if v.get("local")), rep.get("status"))
+            fresh = previous in VOTING_STATUSES and previous != check_status(local_up)
+    non_urgent = non_urgent and not fresh
+    if cached and not fresh and not reporter and cached.local_up == local_up:
+        if periodic and grid is not None:
+            if not grid or grid.tick < cached.due:
+                return cached.results
+        elif now - cached.at < QUORUM_REVOTE_INTERVAL:
+            return cached.results
+    if non_urgent and grid is False:
+        return None  # a scheduled check will get answers; keep the current alert state meanwhile
+    results = await request_peer_cross_checks_batched(rep, reporter, urgent=not non_urgent)
+    current = _vote_cache.get(key)
+    if current is not cached and current is not None and current.at >= now:
+        return results
+    if periodic and non_urgent and cached:
+        step = min(cached.step + 1, len(QUORUM_REVOTE_STEPS) - 1)
+    else:
+        step = 0
     if len(_vote_cache) > 5000:
         _vote_cache.clear()
-    _vote_cache[key] = (now, local_up, results)
+    _vote_cache[key] = _CachedVote(now, grid.tick if non_urgent and grid else wall,
+                                   local_up, results, step, cached.decision if cached else None)
     return results
 
 
@@ -3888,6 +4092,10 @@ async def check_network_probe(target, semaphore, session=None):
         return await run_single_check(target, session=session)
 
 
+def _resource_in_alert(resource):
+    return resource["status"] == "down" or resource.get("alert_state") in ("degraded", "down")
+
+
 async def check_group_task(group, semaphore, session=None):
     groups = collections.defaultdict(list)
     for resource in group:
@@ -3930,16 +4138,13 @@ async def check_group_task(group, semaphore, session=None):
         logger.debug(redact_url(f"Check skipped: {rep['name'] or rep['url']} (id: {rep['id']}) in chat {rep['dc_chat_id']} ({error_msg})"))
         return
 
-    def _in_alert(r):
-        return r["status"] == "down" or r.get("alert_state") in ("degraded", "down")
-
     # Retry logic: retry if check failed and at least one resource in the group was not already
     # DOWN or DEGRADED (those are re-checked every interval anyway).
     # Note: sleep(30) is executed OUTSIDE the semaphore so failing targets do not starve healthy checks!
-    if not is_up and any(not _in_alert(r) for r in group):
+    if not is_up and any(not _resource_in_alert(r) for r in group):
         for retry in range(1, 3):
             for r in group:
-                if not _in_alert(r):
+                if not _resource_in_alert(r):
                     logger.info(redact_url(f"Retry {retry}/2 for resource {r['id']} ({r['name'] or r['url']}) in chat {r['dc_chat_id']}"))
             await asyncio.sleep(30)
             res = await check_network_probe(rep, semaphore, session=session)
@@ -3961,7 +4166,7 @@ async def check_group_task(group, semaphore, session=None):
             return
 
     local_node = database.get_local_node_name()
-    in_alert = any(_in_alert(r) for r in group)
+    in_alert = any(_resource_in_alert(r) for r in group)
     # Reachable through a bad path from here: the peers say whether it is only this node's path
     locally_degraded = is_up == CHECK_DEGRADED
     if locally_degraded:
@@ -3972,31 +4177,30 @@ async def check_group_task(group, semaphore, session=None):
     quorum_ids = (await _quorum_resource_ids(group)
                   if (not is_up or in_alert or reported_by or locally_degraded) else set())
     quorum_group = [r for r in group if r["id"] in quorum_ids]
+    vote_key = _cross_check_key(rep)
+    previous_vote = _vote_cache.get(vote_key)
 
-    # Peers are asked when this node newly sees the target failing (fresh answers), and, for quorum
-    # monitors that are DOWN/DEGRADED, again to notice recovery or a change between the two
-    # (answers re-used for QUORUM_REVOTE_INTERVAL while this node's own result is unchanged).
-    newly_failing = not is_up and any(not _in_alert(r) for r in group)
+    newly_failing = not is_up and any(not _resource_in_alert(r) for r in group)
     peer_results = None
+    quorum_waiting = False
     try:
         if newly_failing and await _peer_cross_check_allowed(group):
             peer_results = await collect_peer_votes(rep, is_up, fresh=True)
         elif quorum_group and (not is_up or any(r.get("alert_state") in ("degraded", "down") for r in quorum_group)):
-            # Since when it is in this state: DEGRADED keeps status UP, so last_changed says nothing
-            oldest_change = min(((r.get("degraded_since") if r.get("alert_state") == "degraded" else r.get("last_changed")) or 0)
-                                for r in quorum_group)
-            long_running = oldest_change and time.time() - oldest_change > 3600
-            peer_results = await collect_peer_votes(
-                rep, is_up, revote_interval=QUORUM_REVOTE_INTERVAL_LONG if long_running else QUORUM_REVOTE_INTERVAL)
+            peer_results = await collect_peer_votes(rep, is_up, periodic=True)
+            quorum_waiting = peer_results is None
         elif reported_by and quorum_group:
-            logger.info(redact_url(f"{rep.get('name') or rep['url']}: UP here but {reported_by} reports it DOWN; asking all peers"))
-            peer_results = await collect_peer_votes(rep, is_up, fresh=True, reporter=reported_by)
+            logger.info(redact_url(f"{rep.get('name') or rep['url']}: UP here but {reported_by} reports it DOWN; asking peers"))
+            peer_results = await collect_peer_votes(rep, is_up, reporter=reported_by)
         elif locally_degraded and quorum_group:
             # Not fresh: answers are re-used for QUORUM_REVOTE_INTERVAL, so a path that stays bad
             # (e.g. this node's provider) does not ask the peers every minute
             peer_results = await collect_peer_votes(rep, is_up)
     except Exception as ex:
         logger.warning(redact_url(f"Error during peer cross-check: {ex}"))
+    finally:
+        if grid := _vote_check.get():
+            grid.ready.set()
 
     votes = build_votes(local_node, is_up, latency_ms, error_msg, peer_results) if peer_results is not None else None
     if votes:
@@ -4022,9 +4226,15 @@ async def check_group_task(group, semaphore, session=None):
 
     # Each monitor's result: (is_up, error_msg) as stored and alerted on
     outcomes = {}
+    quorum_changed = False
     for r in group:
+        if r["id"] in quorum_ids and quorum_waiting:
+            outcomes[r["id"]] = (r["status"] != "down", r.get("error_msg"))
+            continue
         if r["id"] in quorum_ids and votes is not None:
+            previous = "down" if r["status"] == "down" else (r.get("alert_state") or "up")
             state = await apply_quorum_state(r, votes, votes_json)
+            quorum_changed |= state != previous
             r_up = state != "down"
             r_err = None if is_up and state == "up" else _votes_summary(votes)
             if not is_up and error_msg:
@@ -4046,6 +4256,15 @@ async def check_group_task(group, semaphore, session=None):
                          r.get("last_votes"), 0)
             r["alert_state"] = "up" if is_up else "down"
         outcomes[r["id"]] = (bool(is_up), local_error_msg)
+
+    cached = _vote_cache.get(vote_key)
+    if quorum_group and votes is not None and cached and cached.results is peer_results:
+        decision = decide_quorum(votes)
+        if quorum_changed or (cached.decision is not None and cached.decision != decision):
+            cached.step = 0
+            if cached is previous_vote:
+                cached.anchor = time.time()
+        cached.decision = decision
 
     _count_check(is_up, latency_ms, rep.get("name") or rep["url"])  # the result after retries
 
@@ -4570,10 +4789,14 @@ def slowdown_note(resource: dict, now: int) -> str:
 _check_finished_at = {}
 
 
-async def run_and_track_group(group, semaphore, session=None):
+async def run_and_track_group(group, semaphore, session=None, *, vote_check=False):
+    token = _vote_check.set(vote_check)
     try:
         await check_group_task(group, semaphore, session=session)
     finally:
+        _vote_check.reset(token)
+        if vote_check:
+            vote_check.ready.set()
         async with running_lock:
             now = int(time.time())
             for r in group:
@@ -4583,6 +4806,46 @@ async def run_and_track_group(group, semaphore, session=None):
 
 async def run_checks_parallel(tasks_list):
     await asyncio.gather(*tasks_list, return_exceptions=True)
+
+
+def _due_vote_grid_ticks(resources, now, monotonic_now, bootstrap_tick, retry_at):
+    """Select grid work independently of the phases of the regular monitor checks."""
+    ticks = {}
+    for r in resources:
+        key = _cross_check_key(r)
+        if now < retry_at.get(key, 0):
+            continue
+        cached = _vote_cache.get(key)
+        if _resource_in_alert(r):
+            tick = cached.due if cached else bootstrap_tick
+        elif (entry := _peer_suspects.get(r["url"])) and monotonic_now - entry[0] <= PEER_SUSPECT_MAX_AGE:
+            tick = _suspect_vote_due(entry, cached)
+        else:
+            continue
+        if tick <= now:
+            ticks[key] = max(tick, ticks.get(key, tick))
+    return ticks
+
+
+async def _run_grid_checks(groups, ticks, semaphore, session):
+    requests = []
+    checks = [_GridVoteCheck(ticks[key], requests, asyncio.Event()) for key in groups]
+    tasks = [
+        asyncio.create_task(run_and_track_group(group, semaphore, session, vote_check=check))
+        for group, check in zip(groups.values(), checks)
+    ]
+    try:
+        # Local checks have different runtimes. Flush once all group members have either
+        # queued their vote or taken another path (for example, urgent recovery).
+        await asyncio.gather(*(check.ready.wait() for check in checks))
+        await _flush_cross_checks(requests, urgent=False)
+    except BaseException:
+        for task in tasks:
+            task.cancel()
+        raise
+    finally:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
 
 # Checks running at once. They are async (a socket each, little CPU), so the limit is about file
 # descriptors, not cores: with 50, ~150 hung targets (10 s timeouts, 3 attempts) filled every slot
@@ -4600,6 +4863,10 @@ async def monitoring_scheduler_loop():
     _last_peer_chat_trim = 0
     _last_transport_flush = 0
     _last_summary = int(time.time())
+    bootstrap_vote_tick = _vote_grid_tick(time.time(), QUORUM_REVOTE_INTERVAL)
+    grid_vote_retry_at = {}
+    grid_jitter = secrets.randbelow(3)
+    regular_checked_at = {}  # a grid-only check leaves the next regular local check on its normal phase
     # Validated, TTL-pinned DNS answers (see resolve_host_safe)
     # Above CHECK_CONCURRENCY: aiohttp counts the wait for a free connection against the request
     # timeout, so a smaller pool would turn queueing into false "Timeout" results
@@ -4631,14 +4898,31 @@ async def monitoring_scheduler_loop():
                 
                 # Group only identical effective assertions; peers use the same identity.
                 due_groups = collections.defaultdict(list)
+                grid_groups = collections.defaultdict(list)
                 seen_urls = set()
+                vote_now = now - grid_jitter
+                grid_ticks = _due_vote_grid_ticks(resources, vote_now, time.monotonic(),
+                                                  bootstrap_vote_tick, grid_vote_retry_at)
+                grid_ids = set()
+                if grid_ticks:
+                    candidates = [r for r in resources if _cross_check_key(r) in grid_ticks
+                                  and (_resource_in_alert(r) or r["url"] in _peer_suspects)]
+                    grid_ids = await _quorum_resource_ids(candidates)
+                    eligible_keys = {_cross_check_key(r) for r in candidates if r["id"] in grid_ids}
+                    for key in grid_ticks.keys() - eligible_keys:
+                        grid_vote_retry_at[key] = _vote_grid_tick(vote_now + 1, QUORUM_REVOTE_INTERVAL)
                 async with running_lock:
+                    grid_ready = running_resource_ids.isdisjoint(grid_ids)
+                    if grid_ready and vote_now >= bootstrap_vote_tick:
+                        bootstrap_vote_tick = _vote_grid_tick(vote_now + 1, QUORUM_REVOTE_INTERVAL)
+                    grid_vote_retry_at = {k: t for k, t in grid_vote_retry_at.items() if t > vote_now}
                     for r in resources:
                         r_id = r["id"]
                         if r_id in running_resource_ids:
                             continue
-                            
-                        last_checked = max(r["last_checked"] or 0, _check_finished_at.get(r_id, 0))
+                        target_key = _cross_check_key(r)
+                        last_checked = regular_checked_at.get(
+                            r_id, max(r["last_checked"] or 0, _check_finished_at.get(r_id, 0)))
                         interval = effective_check_interval(
                             max(10, r["interval"] or 60), r["status"], r.get("last_changed"), now)
                         
@@ -4651,13 +4935,19 @@ async def monitoring_scheduler_loop():
                         else:
                             is_due = (now - last_checked >= interval) and (current_bucket == slot_bucket or now - last_checked >= interval + 15)
                         
-                        if is_due:
+                        if r_id in grid_ids:
+                            if grid_ready:
+                                running_resource_ids.add(r_id)
+                                grid_groups[target_key].append(r)
+                                if is_due:
+                                    regular_checked_at.pop(r_id, None)
+                                else:
+                                    regular_checked_at[r_id] = last_checked
+                        elif is_due:
+                            regular_checked_at.pop(r_id, None)
                             running_resource_ids.add(r_id)
-                            target_key = _cross_check_key(r)
                             due_groups[target_key].append(r)
-                            seen_urls.add(r["url"])
-                        else:
-                            seen_urls.add(r["url"])
+                        seen_urls.add(r["url"])
 
                     # Add probe-only targets mirrored from peers if not already checked by local chats
                     for pt in probe_targets:
@@ -4684,6 +4974,14 @@ async def monitoring_scheduler_loop():
                             }
                             due_groups[_cross_check_key(probe_rep)].append(probe_rep)
                 
+                if grid_groups:
+                    for key, group in grid_groups.items():
+                        # A skipped probe or a changed sharing policy can leave the old vote due.
+                        grid_vote_retry_at[key] = _vote_grid_tick(vote_now + 1, QUORUM_REVOTE_INTERVAL)
+                        for r in group:
+                            r["last_checked"] = now
+                    asyncio.create_task(_run_grid_checks(grid_groups, grid_ticks, semaphore, shared_session))
+
                 tasks = []
                 for target_key, group in due_groups.items():
                     for r in group:
@@ -4750,6 +5048,8 @@ async def monitoring_scheduler_loop():
                     await run_db(database.cleanup_old_records, 90)
                     for k in [k for k, t in _check_finished_at.items() if now - t > 2 * 86400]:
                         del _check_finished_at[k]  # removed resources and peers' dropped targets
+                    active_ids = {r["id"] for r in resources}
+                    regular_checked_at = {k: t for k, t in regular_checked_at.items() if k in active_ids}
                     pruned_locks = prune_incident_sync_locks()
                     if pruned_locks:
                         logger.info(f"Pruned {pruned_locks} idle incident sync locks from memory")
@@ -4766,7 +5066,11 @@ async def monitoring_scheduler_loop():
             except Exception as e:
                 logger.error(f"Error in monitoring scheduler loop: {e}")
                 
-            await asyncio.sleep(5)
+            # Every vote interval is a multiple of a minute. Wake for its wall clock boundary
+            # even when the normal scheduler poll would land a few seconds later.
+            wall = time.time() - grid_jitter
+            until_minute = 60 - wall % 60
+            await asyncio.sleep(min(5, until_minute))
 
 # Web Server handling and dashboard HTML templates
 def _votes_html(r: dict) -> str:
@@ -8552,10 +8856,13 @@ def _peer_metrics_report(now):
         p50, p95 = _percentile(values, 50), _percentile(values, 95)
         durations.append(f"{kind} {p50:.0f}/{p95:.0f} ms" if values else f"{kind} n/a")
     timeout_label = "timeout" if timeouts == 1 else "timeouts"
-    return (
+    lines = (
         f"• Peer mails (24 h): {mails or 'none'} (in/out)",
         f"• Peer round trip (24 h): {', '.join(durations)} (p50/p95), {timeouts} {timeout_label}",
     )
+    if skipped := counts["vote_skipped_paused"]["out"]:
+        lines += (f"• Vote rounds skipped for paused peers (24 h): {skipped}",)
+    return lines
 
 
 def build_stats_report(bot, accid) -> str:
@@ -8574,6 +8881,12 @@ def build_stats_report(bot, accid) -> str:
     peers = database.get_all_peers() or []
     live = [p for p in peers if not p.get("is_offline")]
     unstable = [p["node_name"] for p in live if is_node_unstable(p.get("node_name") or "")]
+    vote_pauses = _paused_vote_peers(peers)
+    paused_by_time = collections.defaultdict(list)
+    for p in live:
+        if until := vote_pauses.get(_vote_peer_key(p)):
+            paused_by_time[datetime.datetime.fromtimestamp(until).strftime("%H:%M")].append(p.get("node_name") or p["email"])
+    paused_votes = ", ".join(f"{', '.join(names)} (until {until})" for until, names in paused_by_time.items())
     storage = _get_storage_stats(*_storage_paths(_storage_core_info(bot, accid)))
     try:
         relays = [t.get("addr") if isinstance(t, dict) else getattr(t, "addr", "?") for t in bot.rpc.list_transports(accid)]
@@ -8605,6 +8918,7 @@ def build_stats_report(bot, accid) -> str:
         "",
         "**Peers**",
         f"• {len(peers)} peers, {len(live)} online" + (f", unstable now: {', '.join(unstable)}" if unstable else ""),
+        f"• Votes paused for: {paused_votes}" if paused_votes else None,
         ("• Outdated (older than this node): " + ", ".join(old)) if (old := outdated_peers(peers)) else "• All peers run this version or newer",
         f"• Telemetry every `{format_duration(current_telemetry_interval())}`"
         + (f" (less often to {slower} peers that asked for it)" if (slower := sum(
@@ -8687,6 +9001,7 @@ def peers_command(bot, accid, event):
     else:
         reply += f"🔗 **Connected Probes ({len(peers)}):**\n"
         now = int(time.time())
+        vote_pauses = _paused_vote_peers(peers)
         for p in peers:
             last_seen = p.get("last_seen")
             if not last_seen or last_seen == 0:
@@ -8711,7 +9026,8 @@ def peers_command(bot, accid, event):
             key_lbl = f"Key: `{' '.join(fp[i:i + 4] for i in range(0, 16, 4))}…`" if fp else "Key: `not bound yet`"
             ver = p.get("version")
             ver_lbl = (f"`v{ver}`" + (" ⚠️ outdated" if version_tuple(ver) < version_tuple(VERSION) else "")) if ver else "`≤2.26.2` ⚠️ outdated"
-            reply += f"• {status_icon} **{p_node}** — `{p['email']}`\n  {key_lbl} | {chat_lbl} | Version: {ver_lbl} | Last seen: `{seen_str}` | Active metrics: `{node_meas_count}`\n\n"
+            vote_mark = " ⏸ votes paused" if _vote_peer_key(p) in vote_pauses else ""
+            reply += f"• {status_icon} **{p_node}**{vote_mark} — `{p['email']}`\n  {key_lbl} | {chat_lbl} | Version: {ver_lbl} | Last seen: `{seen_str}` | Active metrics: `{node_meas_count}`\n\n"
         reply += "Commands:\n• `/invitepeer` — Generate E2EE invite link\n• `/addpeer <email|link> [node_name]`\n• `/rmpeer <email|key>`\n• `/peershare [admin|all|none]`\n• `/nodename <name>`\n• `/probeignore [url|host|pattern]` — Exclude targets on this node (e.g. `*:25`), or list them\n• `/probeunignore <entry>` — Resume probing on this node\n• `/nodeignore [node_pat] [target_pat]` — Exclude targets on peer node(s) (e.g. `RU* facebook.*`)\n• `/nodeunignore <node_pat> [target_pat]` — Resume checks on node(s)"
     _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=reply.strip()))
 
@@ -9601,7 +9917,7 @@ def on_new_message(bot, accid, event):
             timings = _pending_peer_rtt.get(req_id)
             timing = timings.get(msg.chat_id) if timings is not None else None
             if timing is not None:
-                timing.answer = (arrived_at, node_name)
+                timing.note_single_answer(arrived_at, node_name)
             if len(resp_list) >= expected_count and not fut.done():
                 if async_event_loop and async_event_loop.is_running():
                     async_event_loop.call_soon_threadsafe(fut.set_result, resp_list)

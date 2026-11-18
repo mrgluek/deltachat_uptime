@@ -390,9 +390,21 @@ def init_db():
             ("rt_key_in", "BLOB"),
             ("rt_created_at", "INTEGER"),
             ("rt_mode", "TEXT NOT NULL DEFAULT 'auto' CHECK (rt_mode IN ('auto', 'on', 'off'))"),
+            ("rt_offer_cid", "TEXT"),
+            ("rt_offer_msg_id", "INTEGER"),
+            ("rt_offer_key", "BLOB"),
+            ("rt_offer_at", "INTEGER"),
+            ("rt_received_offer_at", "INTEGER"),
+            ("rt_lost", "INTEGER"),
+            ("rt_reset_at", "INTEGER"),
         ):
             if column not in peer_cols:
                 cursor.execute(f"ALTER TABLE peers ADD COLUMN {column} {kind}")
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS peer_rt_offer_attempts (
+                fingerprint TEXT NOT NULL, attempted_at INTEGER NOT NULL
+            )
+        """)
 
         # Telemetry metrics reported from remote peer probes
         cursor.execute('''
@@ -1875,7 +1887,9 @@ PEER_RT_FLAGS = ("off", "canary", "on")
 PEER_RT_MODES = ("auto", "on", "off")
 _CLEAR_PEER_RT = """
     UPDATE peers SET rt_cid = NULL, rt_msg_id = NULL, rt_key_out = NULL,
-                     rt_key_in = NULL, rt_created_at = NULL
+                     rt_key_in = NULL, rt_created_at = NULL, rt_offer_cid = NULL,
+                     rt_offer_msg_id = NULL, rt_offer_key = NULL, rt_offer_at = NULL,
+                     rt_received_offer_at = NULL, rt_lost = NULL, rt_reset_at = NULL
 """
 
 
@@ -1886,8 +1900,9 @@ def get_peer_rt_flag() -> str:
 
 def _clear_disabled_peer_rt(conn):
     conn.execute(_CLEAR_PEER_RT + """
-        WHERE (rt_cid IS NOT NULL OR rt_msg_id IS NOT NULL OR rt_key_out IS NOT NULL
-               OR rt_key_in IS NOT NULL OR rt_created_at IS NOT NULL)
+        WHERE COALESCE(rt_cid, rt_msg_id, rt_key_out, rt_key_in, rt_created_at, rt_offer_cid,
+                       rt_offer_msg_id, rt_offer_key, rt_offer_at, rt_received_offer_at,
+                       rt_lost, rt_reset_at) IS NOT NULL
           AND (rt_mode = 'off' OR NOT EXISTS (
               SELECT 1 FROM config WHERE key = 'peer_rt'
               AND (value = 'on' OR (value = 'canary' AND peers.rt_mode = 'on'))
@@ -1918,22 +1933,75 @@ def set_peer_rt_mode(email: str, mode: str) -> bool:
 
 def get_peer_rt(fingerprint: str) -> dict | None:
     peer = get_peer_by_fingerprint(fingerprint)
-    return {key: value for key, value in peer.items() if key.startswith("rt_")} if peer else None
+    fields = ("rt_cid", "rt_msg_id", "rt_key_out", "rt_key_in", "rt_created_at", "rt_mode")
+    return {key: peer[key] for key in fields} if peer else None
 
 
 def set_peer_rt(fingerprint: str, *, cid: str, msg_id: int, key_out: bytes,
-                key_in: bytes, created_at: int) -> bool:
+                key_in: bytes, created_at: int, received_offer_at: int | None = None) -> bool:
     """Store the local carrier and both directional keys together."""
     with _writer_transaction() as conn:
         return conn.execute("""
-            UPDATE peers SET rt_cid = ?, rt_msg_id = ?, rt_key_out = ?, rt_key_in = ?, rt_created_at = ?
+            UPDATE peers SET rt_cid = ?, rt_msg_id = ?, rt_key_out = ?, rt_key_in = ?, rt_created_at = ?,
+                             rt_offer_cid = NULL, rt_offer_msg_id = NULL, rt_offer_key = NULL,
+                             rt_received_offer_at = ?, rt_lost = NULL
             WHERE email = (SELECT email FROM peers WHERE fingerprint = ? LIMIT 1)
-        """, (cid, msg_id, key_out, key_in, created_at, normalize_fingerprint(fingerprint))).rowcount > 0
+        """, (cid, msg_id, key_out, key_in, created_at, received_offer_at,
+              normalize_fingerprint(fingerprint))).rowcount > 0
 
 
 def clear_peer_rt(fingerprint: str):
     with _writer_transaction() as conn:
         conn.execute(_CLEAR_PEER_RT + " WHERE fingerprint = ?", (normalize_fingerprint(fingerprint),))
+
+
+def reserve_peer_rt_offer(fingerprint: str, now: int, retry: int, hourly_limit: int) -> bool:
+    """Charge the attempt before calling the core, even if sending fails."""
+    with _writer_transaction() as conn:
+        conn.execute("DELETE FROM peer_rt_offer_attempts WHERE attempted_at <= ?", (now - 3600,))
+        attempts = conn.execute("SELECT fingerprint, attempted_at FROM peer_rt_offer_attempts").fetchall()
+        if len(attempts) >= hourly_limit or any(fp == fingerprint and now - at < retry for fp, at in attempts):
+            return False
+        if not conn.execute("""
+            UPDATE peers SET rt_offer_at = ? WHERE fingerprint = ?
+            AND (rt_offer_at IS NULL OR rt_offer_at <= ?)
+        """, (now, fingerprint, now - retry)).rowcount:
+            return False
+        conn.execute("INSERT INTO peer_rt_offer_attempts VALUES (?, ?)", (fingerprint, now))
+        return True
+
+
+def save_peer_rt_offer(fingerprint: str, cid: str, msg_id: int, key: bytes):
+    with _writer_transaction() as conn:
+        conn.execute("""
+            UPDATE peers SET rt_offer_cid = ?, rt_offer_msg_id = ?, rt_offer_key = ?
+            WHERE fingerprint = ?
+        """, (cid, msg_id, key, fingerprint))
+
+
+def mark_peer_rt_lost(msg_id: int):
+    with _writer_transaction() as conn:
+        conn.execute("UPDATE peers SET rt_lost = 1 WHERE rt_msg_id = ?", (msg_id,))
+        conn.execute("""
+            UPDATE peers SET rt_offer_cid = NULL, rt_offer_msg_id = NULL, rt_offer_key = NULL
+            WHERE rt_offer_msg_id = ?
+        """, (msg_id,))
+
+
+def reserve_peer_rt_reset(fingerprint: str, now: int) -> bool:
+    with _writer_transaction() as conn:
+        return conn.execute("""
+            UPDATE peers SET rt_reset_at = ? WHERE fingerprint = ?
+            AND (rt_reset_at IS NULL OR rt_reset_at <= ?)
+        """, (now, fingerprint, now - 3600)).rowcount > 0
+
+
+def get_peer_rt_message_ids() -> set[int]:
+    with contextlib.closing(_connect()) as conn:
+        return {r[0] for r in conn.execute("""
+            SELECT rt_msg_id FROM peers WHERE rt_msg_id IS NOT NULL
+            UNION SELECT rt_offer_msg_id FROM peers WHERE rt_offer_msg_id IS NOT NULL
+        """)}
 
 
 # Peer measurements (remote probe telemetry)

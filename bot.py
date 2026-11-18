@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import collections
 import functools
 import ipaddress
@@ -91,10 +92,12 @@ VOTE_ERROR_STORAGE_MAX = 200
 KEYWORD_SNIPPET_MAX = 80
 MISSING_KEYWORD_PREFIX = '200 OK (Missing keyword: "'
 _PROTOCOL_MARKER = re.compile(r"\[(/?UPTIME_(?:PEER_[A-Z_]+|BOT_SYNC_DATA)\])")
+_PEER_RT_MAIL_KINDS = frozenset(("RT_OFFER", "RT_ACCEPT", "RT_RESET"))
+_PEER_RT_MARKER = re.compile(r"\[UPTIME_PEER_(RT_OFFER|RT_ACCEPT|RT_RESET)\]")
 _PEER_MAIL_KINDS = frozenset((
     "CHECK_REQ", "CHECK_RESP", "CHECK_BATCH_REQ", "CHECK_BATCH_RESP",
     "METRICS", "HELLO", "HELLO_ACK", "BOT_SYNC_DATA",
-))
+)) | _PEER_RT_MAIL_KINDS
 
 
 def _peer_message_kind(text: str) -> str | None:
@@ -346,6 +349,12 @@ PEER_CAP_BATCH_CHECK = "batch_check"
 PEER_CAP_SMTP_CHECK = "smtp_check"
 OWN_PEER_CAPS = [PEER_CAP_BATCH_CHECK, PEER_CAP_SMTP_CHECK]
 PEER_CAP_RT = "rt1"
+PEER_RT_ROTATE = 14 * 86400
+PEER_RT_OFFER_RETRY = 600
+PEER_RT_OFFERS_PER_HOUR = 3
+PEER_RT_MAIL_MAX_BYTES = 512
+PEER_RT_XDC_MAX_BYTES = 4096
+_peer_rt_lock = threading.RLock()
 
 
 def _own_peer_caps() -> list[str]:
@@ -871,24 +880,33 @@ def trim_peer_chats(bot, accid) -> int:
         except Exception as e:
             logger.warning(f"Could not list peer chat {chat_id} ({peer.get('node_name')}): {e}")
             continue
-        for i in range(0, len(old), PEER_CHAT_TRIM_CHUNK):
-            chunk = old[i:i + PEER_CHAT_TRIM_CHUNK]
+        deleted += _delete_trimmed_messages(bot, accid, old)
+    if deleted:
+        logger.info(f"Deleted {deleted} old protocol messages from peer chats")
+        _bot_stats["trimmed"] += deleted
+    return deleted
+
+
+def _delete_trimmed_messages(bot, accid, old) -> int:
+    deleted = 0
+    for i in range(0, len(old), PEER_CHAT_TRIM_CHUNK):
+        # Recheck at deletion time so a just-accepted OFFER is protected too.
+        with _peer_rt_lock:
+            protected = database.get_peer_rt_message_ids()
+            chunk = [msg_id for msg_id in old[i:i + PEER_CHAT_TRIM_CHUNK] if msg_id not in protected]
+            if not chunk:
+                continue
             try:
                 bot.rpc.delete_messages(accid, chunk)
                 deleted += len(chunk)
             except Exception:
-                # The core stops at the first message that is gone - usually one its own
-                # delete_device_after removed meanwhile (both start with the oldest). One by one,
-                # skipping those, the rest of the chunk still goes.
+                # The core stops at the first message already gone.
                 for msg_id in chunk:
                     try:
                         bot.rpc.delete_messages(accid, [msg_id])
                         deleted += 1
                     except Exception:
                         pass
-    if deleted:
-        logger.info(f"Deleted {deleted} old protocol messages from peer chats")
-        _bot_stats["trimmed"] += deleted
     return deleted
 
 
@@ -928,18 +946,7 @@ def trim_user_chats(bot, accid) -> int:
                         old.append(msg_id)
                 except Exception:
                     continue  # A core expiry or concurrent deletion is harmless.
-            for i in range(0, len(old), PEER_CHAT_TRIM_CHUNK):
-                chunk = old[i:i + PEER_CHAT_TRIM_CHUNK]
-                try:
-                    bot.rpc.delete_messages(accid, chunk)
-                    deleted += len(chunk)
-                except Exception:
-                    for msg_id in chunk:
-                        try:
-                            bot.rpc.delete_messages(accid, [msg_id])
-                            deleted += 1
-                        except Exception:
-                            pass
+            deleted += _delete_trimmed_messages(bot, accid, old)
             if examined >= USER_CHAT_TRIM_MAX:
                 break
     except Exception as exc:
@@ -1296,10 +1303,11 @@ def outdated_peers(peers: list[dict]) -> list[str]:
 
 def _note_peer_caps(email: str, caps) -> None:
     if email and isinstance(caps, list):
-        _peer_caps[email.lower()] = {str(c)[:40] for c in caps[:20]}
+        with _peer_rt_lock:
+            _peer_caps[email.lower()] = {str(c)[:40] for c in caps[:20]}
 
 
-def _note_peer_announcement(peer: dict, data, *, allow_rename=True) -> dict:
+def _note_peer_announcement(peer: dict, data, *, allow_rename=True, telemetry=False) -> dict:
     """What a key-verified peer says about itself in protocol messages: its capabilities and its
     node name (changed with /nodename there). Returns the peer row, renamed if the name changed.
 
@@ -1307,7 +1315,17 @@ def _note_peer_announcement(peer: dict, data, *, allow_rename=True) -> dict:
     node or of another peer, so it cannot pose as a different node in votes and measurements."""
     if not isinstance(data, dict):
         return peer
-    _note_peer_caps(peer["email"], data.get("caps"))
+    with _peer_rt_lock:
+        caps = data.get("caps")
+        had_rt = _peer_supports(peer, PEER_CAP_RT) or peer.get("rt_cid") or peer.get("rt_offer_at") is not None
+        if telemetry and had_rt and not isinstance(caps, list):
+            # Older METRICS can omit caps entirely. Keep the legacy capability
+            # cache behavior for all other capabilities.
+            caps = [cap for cap in _peer_caps.get(peer["email"].lower(), ()) if cap != PEER_CAP_RT]
+        if isinstance(caps, list):
+            _note_peer_caps(peer["email"], caps)
+            if had_rt and not _peer_supports(peer, PEER_CAP_RT) and peer.get("fingerprint"):
+                database.clear_peer_rt(peer["fingerprint"])
     note_peer_version(peer["email"], data.get("version"))
     for field, store in (("telemetry_interval", _peer_telemetry_interval), ("desired_interval", _peer_desired_interval)):
         value = data.get(field)
@@ -2720,7 +2738,8 @@ def _get_peer_fingerprint(bot, accid, contact_id, contact_addr: str = "") -> str
     `contact_addr` is unused: core 2.66 no longer prints addresses in the encryption info."""
     return dc_fingerprint.get_contact_fingerprint(bot.rpc, accid, contact_id)
 
-def _get_verified_peer_for_msg(bot, accid, msg, is_private_chat: bool = True) -> tuple[dict | None, str]:
+def _get_verified_peer_for_msg(bot, accid, msg, is_private_chat: bool = True, *,
+                               bind: bool = True) -> tuple[dict | None, str]:
     """Resolves the peer sending a protocol message from Delta Chat contact data.
 
     A peer is identified by its key fingerprint: a bot with several relays sends from whichever
@@ -2732,7 +2751,8 @@ def _get_verified_peer_for_msg(bot, accid, msg, is_private_chat: bool = True) ->
     binds the sender's key to it. From then on only that key is accepted.
 
     Returns (peer_row_or_None, sender_addr). When the peer now sends from another address, the row
-    is moved to that address, so peer["email"] is the current one."""
+    is moved to that address, so peer["email"] is the current one. With bind=False, resolve only
+    an already bound fingerprint and leave the peer row untouched."""
     sender_addr = ""
     try:
         contact = bot.rpc.get_contact(accid, msg.from_id)
@@ -2748,6 +2768,8 @@ def _get_verified_peer_for_msg(bot, accid, msg, is_private_chat: bool = True) ->
     fp = _get_peer_fingerprint(bot, accid, msg.from_id, sender_addr) if encrypted else None
 
     peer = database.get_peer_by_fingerprint(fp) if fp else None
+    if not bind:
+        return peer, sender_addr
     if not peer:
         candidates = [database.get_peer(sender_addr)]
         if is_private_chat:
@@ -5127,6 +5149,8 @@ async def monitoring_scheduler_loop():
 
                 if now - _last_peer_audit >= 30:
                     _last_peer_audit = now
+                    if dc_bot_instance and dc_accid is not None:
+                        await asyncio.to_thread(audit_peer_rt_carriers, dc_bot_instance, dc_accid, int(now))
                     for node, secs in pop_recovered_nodes():
                         logger.info(f"Node {node} is stable again after {format_duration(secs)}")
                         asyncio.create_task(send_admin_notification(
@@ -6427,13 +6451,22 @@ def start_monitoring_thread():
 
 # Full-state webxdc updates: no per-chat tasks; the scheduler queues paced outbox jobs.
 _status_xdc_lock = threading.Lock()
+_peer_xdc_lock = threading.Lock()
 
 
 def build_status_xdc() -> str:
+    return _build_xdc("webxdc", "status", _status_xdc_lock)
+
+
+def build_peer_xdc() -> str:
+    return _build_xdc("webxdc_peer", "peer", _peer_xdc_lock, deterministic=True)
+
+
+def _build_xdc(source_dir, name, lock, *, deterministic=False) -> str:
     """Build the attachment atomically; cache by source contents and bot version."""
-    source = Path(__file__).resolve().parent / "webxdc"
+    source = Path(__file__).resolve().parent / source_dir
     data_dir = Path(os.getenv("DC_DB_DIR") or Path(database.DB_PATH).resolve().parent)
-    with _status_xdc_lock:
+    with lock:
         files = sorted(p for p in source.rglob("*") if p.is_file())
         digest = hashlib.sha256(VERSION.encode())
         for path in files:
@@ -6441,13 +6474,17 @@ def build_status_xdc() -> str:
             digest.update(path.read_bytes())
         signature = digest.hexdigest()
         data_dir.mkdir(parents=True, exist_ok=True)
-        target = data_dir / "status.xdc"
-        cache = data_dir / "status.xdc.sha256"
+        target = data_dir / f"{name}.xdc"
+        cache = data_dir / f"{name}.xdc.sha256"
         if not target.exists() or not cache.exists() or cache.read_text() != signature:
-            temporary = data_dir / "status.xdc.tmp"
+            temporary = data_dir / f"{name}.xdc.tmp"
             with zipfile.ZipFile(temporary, "w", zipfile.ZIP_DEFLATED) as archive:
                 for path in files:
-                    archive.write(path, path.relative_to(source).as_posix())
+                    entry = path.relative_to(source).as_posix()
+                    if deterministic:
+                        archive.writestr(zipfile.ZipInfo(entry), path.read_bytes(), compress_type=zipfile.ZIP_DEFLATED)
+                    else:
+                        archive.write(path, entry)
             temporary.replace(target)
             cache.write_text(signature)
         return str(target)
@@ -7061,6 +7098,14 @@ def on_status_realtime(bot, accid, event):
         logger.debug("Realtime pong to chat %s failed: %s", chat_id, exc)
 
 
+@dc_cli.on(events.RawEvent(func=lambda e: e.kind == "WebxdcInstanceDeleted"))
+def on_peer_rt_carrier_deleted(bot, accid, event):
+    msg_id = event.get("msg_id") or event.get("msgId")
+    if msg_id and database.get_peer_rt_flag() != "off":
+        with _peer_rt_lock:
+            database.mark_peer_rt_lost(msg_id)
+
+
 async def realtime_status_tick():
     """Every audit tick: push changed state to live channels, leave idle ones."""
     if not dc_bot_instance or dc_accid is None:
@@ -7139,11 +7184,15 @@ class _PeerDestination:
     accid: int
     chat_id: int
     securejoin_hello: bool = False
+    fingerprint: str | None = None
 
 
 def peer_send(peer, kind, payload, *, priority, expires_in, label, key=None, mail_kind="peer_other",
               after_send=None, before_send=None, should_send=None):
     """Send a peer payload through the mail outbox."""
+    if kind in _PEER_RT_MAIL_KINDS:
+        return dc_outbox.submit(functools.partial(_send_peer_rt_mail, peer, kind, payload),
+                                priority=priority, key=key, expires_in=expires_in, label=label)
     if kind == "HELLO" and isinstance(payload, str):
         # send_peer_hello_when_ready also accepts an already formatted HELLO.
         text = payload
@@ -7162,6 +7211,196 @@ def peer_send(peer, kind, payload, *, priority, expires_in, label, key=None, mai
     return _dc_send_msg_with_stats(peer.bot, peer.accid, peer.chat_id, MsgData(text=text), priority=priority, key=key,
                                    expires_in=expires_in, label=label, kind=mail_kind, after_send=after_send,
                                    before_send=before_send, should_send=should_send)
+
+
+def _peer_rt_enabled(peer, flag):
+    mode = peer.get("rt_mode", "auto")
+    return mode != "off" and (flag == "on" or (flag == "canary" and mode == "on"))
+
+
+def _peer_rt_eligible(peer, flag):
+    return bool(peer and peer.get("fingerprint") and peer.get("chat_id")
+                and _peer_rt_enabled(peer, flag) and _peer_supports(peer, PEER_CAP_RT))
+
+
+def _peer_rt_chat_is_private(bot, accid, chat_id):
+    chat = bot.rpc.get_basic_chat_info(accid, chat_id)
+    return (_field(chat, "chat_type") == "Single" and _field(chat, "is_encrypted") is True
+            and not _field(chat, "is_self_talk") and not _field(chat, "is_contact_request"))
+
+
+def _peer_rt_offer_due(peer, now):
+    last_attempt = peer["rt_offer_at"]
+    if last_attempt is not None:
+        # An unanswered OFFER can still be delivered or accepted. Keep its mail
+        # budget even when the other end has opted out for this pair.
+        delay = PEER_RT_ROTATE if peer["rt_offer_msg_id"] else PEER_RT_OFFER_RETRY
+        if now - last_attempt < delay:
+            return False
+    created = peer["rt_created_at"]
+    return (not peer["rt_msg_id"] or peer["rt_lost"] or created is None
+            or now - created >= PEER_RT_ROTATE)
+
+
+def _queue_peer_rt_mail(bot, accid, peer, kind, payload):
+    fingerprint = peer["fingerprint"]
+    destination = _PeerDestination(bot, accid, peer["chat_id"], fingerprint=fingerprint)
+    peer_send(destination, kind, payload, priority=PRIO_PEER, expires_in=PEER_RT_OFFER_RETRY,
+              label=f"peer {kind}", key=(kind, fingerprint))
+
+
+def _send_peer_rt_mail(destination, kind, payload):
+    """Recheck queued carrier mail just before sending. Keep keys out of logs."""
+    bot, accid, chat_id = destination.bot, destination.accid, destination.chat_id
+    fp = destination.fingerprint
+    with _peer_rt_lock:
+        peer = database.get_peer_by_fingerprint(fp)
+        if not _peer_rt_eligible(peer, database.get_peer_rt_flag()) or peer["chat_id"] != chat_id:
+            return
+        now = int(time.time())
+        try:
+            own_fp = dc_fingerprint.get_self_fingerprint(bot.rpc, accid)
+            if not own_fp or own_fp == fp or (own_fp < fp) != (kind == "RT_OFFER"):
+                return
+            if not _peer_rt_chat_is_private(bot, accid, chat_id):
+                return
+            contacts = bot.rpc.get_chat_contacts(accid, chat_id)
+            if len(contacts) != 1 or dc_fingerprint.get_contact_fingerprint(
+                    bot.rpc, accid, contacts[0], self_fp=own_fp) != fp:
+                return
+            if kind == "RT_OFFER":
+                if not _peer_rt_offer_due(peer, now) or not database.reserve_peer_rt_offer(
+                        fp, now, PEER_RT_OFFER_RETRY, PEER_RT_OFFERS_PER_HOUR):
+                    return
+                cid, key = secrets.token_hex(8), secrets.token_bytes(32)
+                payload = _peer_rt_key_payload(cid, key)
+                file = build_peer_xdc()
+            else:
+                cid, file = payload["cid"], None
+                if cid != peer["rt_cid"] or bool(peer["rt_lost"]) != (kind == "RT_RESET"):
+                    return
+                if kind == "RT_RESET" and not database.reserve_peer_rt_reset(fp, now):
+                    return
+            marker = f"UPTIME_PEER_{kind}"
+            text = f"[{marker}]{json.dumps(payload, separators=(',', ':'))}[/{marker}]"
+            msg_id = _send_msg_with_peer_metrics(bot, accid, chat_id, MsgData(text=text, file=file))
+            stat_event("mail_out")
+            if kind == "RT_OFFER":
+                database.save_peer_rt_offer(fp, cid, msg_id, key)
+            return msg_id
+        except Exception as exc:
+            logger.warning("Peer carrier %s in chat %s failed (%s)", kind, chat_id, type(exc).__name__)
+
+
+def _peer_rt_key_payload(cid, key):
+    # Each key authenticates the frames its sender will send.
+    return {"v": 1, "cid": cid, "key": base64.b64encode(key).decode("ascii")}
+
+
+def _decode_peer_rt_mail(kind, text):
+    marker = f"UPTIME_PEER_{kind}"
+    start, end = f"[{marker}]", f"[/{marker}]"
+    if (len(text) > PEER_RT_MAIL_MAX_BYTES or len(text.encode("utf-8")) > PEER_RT_MAIL_MAX_BYTES
+            or not text.startswith(start) or not text.endswith(end)):
+        return None
+    try:
+        data = json.loads(text[len(start):-len(end)])
+        fields = {"v", "cid"} if kind == "RT_RESET" else {"v", "cid", "key"}
+        if not isinstance(data, dict) or data.keys() != fields or type(data["v"]) is not int or data["v"] != 1:
+            return None
+        cid = data["cid"]
+        if not isinstance(cid, str) or not re.fullmatch(r"[0-9a-f]{16}", cid):
+            return None
+        if kind == "RT_RESET":
+            return cid, None
+        if isinstance(data["key"], str):
+            key = base64.b64decode(data["key"], validate=True)
+            if len(key) == 32:
+                return cid, key
+    except (ValueError, RecursionError):
+        pass
+    return None
+
+
+def _handle_peer_rt_mail(bot, accid, msg, kind, text):
+    with _peer_rt_lock:
+        flag = database.get_peer_rt_flag()
+        if flag == "off":
+            return
+        decoded = _decode_peer_rt_mail(kind, text)
+        if not decoded or _field(msg, "is_forwarded", False):
+            return
+        cid, key_in = decoded
+        if not _peer_rt_chat_is_private(bot, accid, msg.chat_id):
+            return
+        peer, _ = _get_verified_peer_for_msg(bot, accid, msg, True, bind=False)
+        if (not _is_trusted_peer_msg(msg, peer, True) or not _peer_rt_eligible(peer, flag)
+                or peer["chat_id"] != msg.chat_id):
+            return
+        fp = peer["fingerprint"]
+        own_fp = dc_fingerprint.get_self_fingerprint(bot.rpc, accid)
+        if not own_fp or own_fp == fp or (own_fp < fp) != (kind != "RT_OFFER"):
+            return
+        now = int(time.time())
+        if kind == "RT_OFFER":
+            size = _field(msg, "file_bytes")
+            timestamp = _field(msg, "timestamp")
+            if (_field(msg, "view_type") != "Webxdc" or type(size) is not int
+                    or not 0 < size <= PEER_RT_XDC_MAX_BYTES or type(timestamp) is not int
+                    or cid == peer["rt_cid"]
+                    or (peer["rt_received_offer_at"] is not None and timestamp <= peer["rt_received_offer_at"])):
+                return
+            key_out = secrets.token_bytes(32)
+            if database.set_peer_rt(fp, cid=cid, msg_id=msg.id, key_out=key_out, key_in=key_in,
+                                    created_at=now, received_offer_at=timestamp):
+                _queue_peer_rt_mail(bot, accid, peer, "RT_ACCEPT", _peer_rt_key_payload(cid, key_out))
+        elif kind == "RT_ACCEPT":
+            if cid == peer["rt_offer_cid"] and cid != peer["rt_cid"] and peer["rt_offer_msg_id"]:
+                database.set_peer_rt(fp, cid=cid, msg_id=peer["rt_offer_msg_id"],
+                                     key_out=peer["rt_offer_key"], key_in=key_in, created_at=now)
+        elif kind == "RT_RESET":
+            # A RESET can also refer to an OFFER whose ACCEPT was lost or delayed.
+            if cid == peer["rt_cid"] and peer["rt_msg_id"]:
+                database.mark_peer_rt_lost(peer["rt_msg_id"])
+            if cid == peer["rt_offer_cid"] and peer["rt_offer_msg_id"]:
+                database.mark_peer_rt_lost(peer["rt_offer_msg_id"])
+
+
+def audit_peer_rt_carriers(bot, accid, now):
+    flag = database.get_peer_rt_flag()
+    if flag == "off":
+        return
+    peers = [p for p in database.get_all_peers() if _peer_rt_eligible(p, flag)]
+    if not peers:
+        return
+    own_fp = dc_fingerprint.get_self_fingerprint(bot.rpc, accid)
+    if not own_fp:
+        return
+    # Give peers still waiting for a first offer priority over retries.
+    for candidate in sorted(peers, key=lambda p: p["rt_offer_at"] or 0):
+        fp = candidate["fingerprint"]
+        with _peer_rt_lock:
+            peer = database.get_peer_by_fingerprint(fp)
+            if fp == own_fp or not _peer_rt_eligible(peer, database.get_peer_rt_flag()):
+                continue
+            active = peer["rt_msg_id"] if not peer["rt_lost"] else None
+            pending = peer["rt_offer_msg_id"]
+            if active or pending:
+                try:
+                    ids = set(bot.rpc.get_message_ids(accid, peer["chat_id"], False, False))
+                except Exception:
+                    continue
+                if active and active not in ids:
+                    database.mark_peer_rt_lost(active)
+                    peer["rt_lost"] = 1
+                if pending and pending not in ids:
+                    database.mark_peer_rt_lost(pending)
+                    peer["rt_offer_msg_id"] = None
+            if own_fp < fp and _peer_rt_offer_due(peer, now):
+                _queue_peer_rt_mail(bot, accid, peer, "RT_OFFER", None)
+            elif own_fp > fp and peer["rt_lost"] and peer["rt_cid"] and (
+                    peer["rt_reset_at"] is None or now - peer["rt_reset_at"] >= 3600):
+                _queue_peer_rt_mail(bot, accid, peer, "RT_RESET", {"v": 1, "cid": peer["rt_cid"]})
 
 
 def _send_peer_check_answer(destination, kind, payload, *, replay=False):
@@ -9363,8 +9602,15 @@ def peers_command(bot, accid, event):
             ver_lbl = (f"`v{ver}`" + (" ⚠️ outdated" if version_tuple(ver) < version_tuple(VERSION) else "")) if ver else "`≤2.26.2` ⚠️ outdated"
             vote_mark = " ⏸ votes paused" if _vote_peer_key(p) in vote_pauses else ""
             rt_mode = p.get("rt_mode", "auto")
-            rt_enabled = rt_mode != "off" and (rt_flag == "on" or (rt_flag == "canary" and rt_mode == "on"))
-            rt_label = "iroh: mail only" if rt_enabled else "iroh: off"
+            rt_label = "iroh: off"
+            if _peer_rt_enabled(p, rt_flag):
+                if p["rt_msg_id"] and not p["rt_lost"] and p["rt_created_at"] is not None:
+                    age = max(0, now - p["rt_created_at"]) // 86400
+                    rt_label = f"iroh: carrier ok (age {age}d)"
+                elif p["rt_offer_msg_id"]:
+                    rt_label = "iroh: offer sent"
+                else:
+                    rt_label = "iroh: mail only"
             if rt_mode != "auto":
                 rt_label += f" (mode: {rt_mode})"
             reply += f"• {status_icon} **{p_node}**{vote_mark} — `{p['email']}`\n  {key_lbl} | {chat_lbl} | Version: {ver_lbl} | Last seen: `{seen_str}` | Active metrics: `{node_meas_count}` | {rt_label}\n\n"
@@ -9384,7 +9630,8 @@ def peerrt_command(bot, accid, event):
     if not parts:
         reply = f"Peer channel preview: `{database.get_peer_rt_flag()}`."
     elif len(parts) == 1 and value in database.PEER_RT_FLAGS:
-        database.set_peer_rt_flag(value)
+        with _peer_rt_lock:
+            database.set_peer_rt_flag(value)
         reply = f"✅ Peer channel preview set to `{value}`."
     elif len(parts) == 2 and value in database.PEER_RT_MODES:
         identifier = parts[0]
@@ -9392,7 +9639,9 @@ def peerrt_command(bot, accid, event):
         if not peer:
             peer = next((p for p in database.get_all_peers()
                          if (p["node_name"] or "").casefold() == identifier.casefold()), None)
-        if peer and database.set_peer_rt_mode(peer["email"], value):
+        with _peer_rt_lock:
+            changed = peer and database.set_peer_rt_mode(peer["email"], value)
+        if changed:
             reply = f"✅ Peer `{peer['email']}` preview mode set to `{value}`."
         else:
             reply = f"❌ Peer `{identifier}` not found."
@@ -9638,9 +9887,12 @@ def rmpeer_command(bot, accid, event):
         _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text="Usage: `/rmpeer <email|key>` (key: fingerprint or its first 8+ hex digits, see `/peers`)"))
         return
     peer = database.find_peer(ident)
-    with _peer_metrics_lock:
+    with _peer_metrics_lock, _peer_rt_lock:
         removed = peer and database.remove_peer(peer["email"])
         if removed:
+            caps = _peer_caps.get(peer["email"].lower())
+            if caps:
+                caps.discard(PEER_CAP_RT)
             _peer_metrics_timestamps.pop(peer["email"].lower(), None)
             if peer.get("fingerprint"):
                 _peer_metrics_timestamps.pop(peer["fingerprint"], None)
@@ -10122,7 +10374,7 @@ def handle_peer_metrics(bot, accid, peer, chat_id, data, via="mail"):
     with _peer_metrics_lock:
         last_timestamp = _peer_metrics_timestamps.get(identity)
         stale = timestamp is not None and last_timestamp is not None and timestamp < last_timestamp
-        peer = _note_peer_announcement(peer, metrics_data, allow_rename=not stale)
+        peer = _note_peer_announcement(peer, metrics_data, allow_rename=not stale, telemetry=not stale)
         if not isinstance(metrics_list, list):
             return
 
@@ -10171,6 +10423,14 @@ def on_new_message(bot, accid, event):
         return
 
     _count_peer_text(raw_text, "in")
+
+    carrier_marker = _PEER_RT_MARKER.match(text)
+    if carrier_marker:
+        try:
+            _handle_peer_rt_mail(bot, accid, msg, carrier_marker.group(1), text)
+        except Exception as exc:
+            logger.warning("Peer carrier mail in chat %s failed (%s)", msg.chat_id, type(exc).__name__)
+        return
 
     if "[UPTIME_PEER_" in text and (len(text) > PEER_MAX_BYTES or len(text.encode("utf-8")) > PEER_MAX_BYTES):
         logger.warning("Peer protocol payload exceeds byte limit; ignoring")

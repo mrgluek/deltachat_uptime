@@ -178,9 +178,17 @@ Relay selection and failover are handled by the Delta Chat core (2.61+): it keep
 
 The iroh peer channel preview is off by default. Use `/peerrt` to see the current
 setting, `/peerrt off|canary|on` to change it, or
-`/peerrt <peer name|email> on|off|auto` to set a peer's preview mode. Turning
-on the preview only advertises the `rt1` capability. All peer traffic still
-travels by mail.
+`/peerrt <peer name|email> on|off|auto` to set a peer's preview mode. In canary
+mode, only peers explicitly set to `on` are eligible. With the global setting
+`on`, peers set to `auto` are eligible too.
+
+Eligible peers that announce `rt1` and have a bound key exchange a small
+**Uptime peer link** app in their encrypted 1:1 chat. The peer with the lower
+fingerprint sends the app and replaces it every 14 days. Cleanup preserves the
+current app until its replacement is accepted. If it disappears, the peers
+recover by mail. `/peers` shows whether the app is ready, an offer is pending, or
+the peer is mail only. Older peers continue to use the existing mail protocol.
+Monitoring requests and telemetry still travel by mail.
 
 ### Status app (`/report app`)
 

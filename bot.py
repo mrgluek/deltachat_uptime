@@ -97,7 +97,7 @@ def redact_url(text_or_url) -> str:
 
 
 STATUS_REFRESH_SECONDS = 1800
-WEBXDC_APP_VERSION = 4  # Bump only for layout changes requiring a new app instance.
+WEBXDC_APP_VERSION = 5  # Bump only for layout changes requiring a new app instance.
 # Safety net; explicit trimming preserves app instances and ongoing incident messages.
 DELETE_DEVICE_AFTER = 30 * 86400
 USER_CHAT_KEEP_SECONDS = 86400

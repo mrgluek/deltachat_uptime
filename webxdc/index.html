@@ -124,14 +124,20 @@ if (window.webxdc) webxdc.setUpdateListener(update => { if (newer(update.payload
 const LIVE_KEY = "uptime-live";
 const liveToggle = document.getElementById("live-toggle");
 const liveStatus = text => { document.getElementById("live-status").textContent = text; };
-let channel = null, timer = null, lastLive = 0;
+let channel = null, timer = null, lastLive = 0, joinedLive = 0;
 function liveSend(t) {
   if (channel) channel.send(new TextEncoder().encode(JSON.stringify({t, v: 1})));
 }
 function liveTick() {
+  if (Date.now() - (lastLive || joinedLive) >= 3 * 60 * 1000) {
+    clearInterval(timer);
+    channel.leave();
+    channel = null;
+    startLive();
+    return;
+  }
   if (!lastLive) { liveSend("hello"); return; }
   liveSend("ping");
-  if (Date.now() - lastLive > 5 * 60 * 1000) liveStatus("Live · no news for a while");
 }
 function startLive() {
   if (channel) return;
@@ -152,6 +158,7 @@ function startLive() {
     if (newer(msg.u.payload)) render(msg.u.payload);
   });
   lastLive = 0;
+  joinedLive = Date.now();
   liveSend("hello");
   timer = setInterval(liveTick, 5 * 1000);
   liveStatus("Connecting…");

@@ -119,6 +119,31 @@ class TestWebxdcRealtime(unittest.TestCase):
         self.rpc.leave_webxdc_realtime.assert_called_once_with(1, 500)
         self.assertNotIn(500, bot._realtime_channels)
 
+    def test_fresh_instance_gets_first_state_despite_previous_attempts(self):
+        # Re-posted app in a realtime chat: the old instance sent 100 s ago, the 30 min mail
+        # interval must not keep the new one empty.
+        now = int(self.now)
+        database.set_chat_report_app(1, "on")
+        database.set_chat_status_line(1, 501, None)
+        for key, value in (("webxdc_app_version:1", str(bot.WEBXDC_APP_VERSION)), ("webxdc_posted_at:1", str(now)),
+                           ("webxdc_update_count:1", "0"), ("webxdc_updates:1", json.dumps([now - 100]))):
+            database.set_config(key, value)
+        self.rpc.get_existing_msg_ids.side_effect = lambda acc, ids: ids
+        self.rpc.get_basic_chat_info.return_value = {"name": "Test chat"}
+        self.rpc.get_webxdc_info.return_value = {"sendUpdateMaxSize": 128000, "sendUpdateInterval": 10000}
+        with patch.object(bot, "dc_outbox", MagicMock()):
+            bot._deliver_status_app(1, self.client, 1, known_msg_id=500)
+        self.rpc.send_webxdc_status_update.assert_called_once()
+        # The next, non-urgent change waits for the realtime mail interval
+        self.rpc.send_webxdc_status_update.reset_mock()
+        with database._writer_transaction() as conn:
+            conn.execute("UPDATE resources SET name='Renamed'")
+        database.set_config("webxdc_clean:1", database.get_config("webxdc_dirty:1"))  # not urgent
+        self.now += 120
+        with patch.object(bot, "dc_outbox", MagicMock()):
+            bot._deliver_status_app(1, self.client, 1, known_msg_id=500)
+        self.rpc.send_webxdc_status_update.assert_not_called()
+
     def test_failed_join_can_retry(self):
         self.rpc.send_webxdc_realtime_advertisement.side_effect = [RuntimeError("offline"), None]
         ad = Event(kind="WebxdcRealtimeAdvertisementReceived", msg_id=500)

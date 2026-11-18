@@ -6236,7 +6236,13 @@ def _deliver_status_app(chat_id, bot, accid, known_msg_id=None):
         if len(updates) >= 30 and not first_state:
             _status_app_capped(chat_id, len(updates), now)
             return
-        if updates and now - max(updates) < interval:
+        # The attempts list survives a re-post: a fresh instance must not wait out the previous
+        # one's attempts (30 min apart in realtime chats). Its own first-state retries keep the
+        # usual 60 s debounce.
+        posted_at = int(database.get_config(f"webxdc_posted_at:{chat_id}") or 0)
+        own_attempts = [ts for ts in updates if ts >= posted_at]
+        gap = max(60, field("sendUpdateInterval", 10000) / 1000) if first_state else interval
+        if own_attempts and now - max(own_attempts) < gap:
             return
         if saved["webxdc_state_hash"] == digest and not first_state and not refresh_due:
             if line_changed:

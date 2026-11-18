@@ -24,6 +24,8 @@ li { padding: 4px 0; overflow-wrap: anywhere; }
 }
 </style>
 <header><h1>Uptime Status</h1><div id="counts"></div><div id="chat"></div><p id="updated"></p></header>
+<section id="live" hidden><button id="live-toggle" type="button">Live updates</button> <span id="live-status" class="meta" aria-live="polite"></span>
+<p class="meta">Live updates arrive in seconds while this app is open, but connect directly to the bot and to other members who have them on: they can see your IP address.</p></section>
 <div class="filter"><input id="filter" type="search" placeholder="Filter monitors" aria-label="Filter monitors by name or URL"><button id="clear" type="button">Clear</button></div><div id="filtered" class="meta" aria-live="polite"></div>
 <p id="empty">Waiting for the first update. The bot will send this chat's monitor status soon.</p>
 <p id="note"></p><main id="monitors"></main>
@@ -111,7 +113,58 @@ function render(state) {
   document.getElementById("journal").hidden = !(state.events || []).length;
   if (!visible.length) list.append(element("p", query ? "No matching monitors." : "No monitors in this chat yet."));
 }
+// Mail updates and live updates both carry complete snapshots; never let an older one replace a newer one.
+const newer = state => !currentState || (state && (state.generated_at || 0) >= (currentState.generated_at || 0));
 // Core replays history in serial order. Each payload is a complete replacement snapshot.
-if (window.webxdc) webxdc.setUpdateListener(update => render(update.payload), 0);
+if (window.webxdc) webxdc.setUpdateListener(update => { if (newer(update.payload)) render(update.payload); }, 0);
+
+// Live updates over the webxdc realtime channel (opt-in, remembered on this device).
+// Protocol: app sends {"t":"hello"} until the first state arrives (the bot joins only after it
+// receives our advertisement), then {"t":"ping"} every minute; the bot sends {"t":"state","u":update}.
+const LIVE_KEY = "uptime-live";
+const liveToggle = document.getElementById("live-toggle");
+const liveStatus = text => { document.getElementById("live-status").textContent = text; };
+let channel = null, timer = null, lastLive = 0;
+function liveSend(t) {
+  if (channel) channel.send(new TextEncoder().encode(JSON.stringify({t, v: 1})));
+}
+function liveTick() {
+  if (!lastLive) { liveSend("hello"); return; }
+  liveSend("ping");
+  if (Date.now() - lastLive > 5 * 60 * 1000) liveStatus("Live · no news for a while");
+}
+function startLive() {
+  if (channel) return;
+  channel = webxdc.joinRealtimeChannel();
+  channel.setListener(data => {
+    let msg;
+    try { msg = JSON.parse(new TextDecoder().decode(data)); } catch (e) { return; }
+    if (!msg || msg.t !== "state" || !msg.u || !msg.u.payload) return;
+    const first = !lastLive;
+    lastLive = Date.now();
+    liveStatus("Live");
+    if (first) { clearInterval(timer); timer = setInterval(liveTick, 60 * 1000); }
+    if (newer(msg.u.payload)) render(msg.u.payload);
+  });
+  lastLive = 0;
+  liveSend("hello");
+  timer = setInterval(liveTick, 5 * 1000);
+  liveStatus("Connecting…");
+  liveToggle.textContent = "Stop live updates";
+  localStorage.setItem(LIVE_KEY, "1");
+}
+function stopLive() {
+  clearInterval(timer);
+  if (channel) channel.leave();
+  channel = null;
+  liveStatus("");
+  liveToggle.textContent = "Live updates";
+  localStorage.removeItem(LIVE_KEY);
+}
+if (window.webxdc && typeof webxdc.joinRealtimeChannel === "function") {
+  document.getElementById("live").hidden = false;
+  liveToggle.addEventListener("click", () => channel ? stopLive() : startLive());
+  if (localStorage.getItem(LIVE_KEY)) startLive();
+}
 </script>
 </html>

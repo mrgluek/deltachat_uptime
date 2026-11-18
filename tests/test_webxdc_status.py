@@ -177,7 +177,7 @@ class TestWebxdcStatus(unittest.TestCase):
         with patch.object(bot, "VERSION", "99.0.0"):
             self.push()
         self.rpc.send_msg.assert_not_called()
-        with patch.object(bot, "WEBXDC_APP_VERSION", 3):
+        with patch.object(bot, "WEBXDC_APP_VERSION", bot.WEBXDC_APP_VERSION + 1):
             self.push()
         self.assertEqual(self.rpc.send_msg.call_count, 2)
         self.rpc.set_pinned_message_state.assert_any_call(1, 401, True)

@@ -97,7 +97,7 @@ def redact_url(text_or_url) -> str:
 
 
 STATUS_REFRESH_SECONDS = 1800
-WEBXDC_APP_VERSION = 2  # Bump only for layout changes requiring a new app instance.
+WEBXDC_APP_VERSION = 3  # Bump only for layout changes requiring a new app instance.
 # Safety net; explicit trimming preserves app instances and ongoing incident messages.
 DELETE_DEVICE_AFTER = 30 * 86400
 USER_CHAT_KEEP_SECONDS = 86400
@@ -4582,6 +4582,7 @@ async def monitoring_scheduler_loop():
                     _last_incident_audit = now
                     await _check_report_notices()
                     await push_status_apps()
+                    await realtime_status_tick()
                     active_incidents = await run_db(database.get_all_active_incidents)
                     for inc in active_incidents:
                         asyncio.create_task(sync_chat_incident_state(inc["dc_chat_id"]))
@@ -6217,7 +6218,8 @@ def _deliver_status_app(chat_id, bot, accid, known_msg_id=None):
             return default
         limit = min(60000, int(field("sendUpdateMaxSize", 128000)))
         # The webxdc API expresses sendUpdateInterval in milliseconds.
-        interval = max(0 if status_app_urgent(chat_id) else 60, field("sendUpdateInterval", 10000) / 1000)
+        interval = max(0 if status_app_urgent(chat_id) else status_mail_interval(chat_id),
+                       field("sendUpdateInterval", 10000) / 1000)
         digest = status_state_hash(state)
         full_digest = status_full_state_hash(state)
         refresh_due = status_app_refresh_due(chat_id, saved, state, now)
@@ -6290,7 +6292,8 @@ async def push_status_apps():
                 name = str(chat.get("name") if isinstance(chat, dict) else chat.name)
                 if name != await run_db(database.get_config, f"webxdc_chat_name:{chat_id}"):
                     await run_db(database.set_config, f"webxdc_chat_name:{chat_id}", name)
-                if (saved["webxdc_last_sent_at"] is not None and now - saved["webxdc_last_sent_at"] < 60
+                if (saved["webxdc_last_sent_at"] is not None
+                        and now - saved["webxdc_last_sent_at"] < status_mail_interval(chat_id)
                         and not await run_db(status_app_urgent, chat_id)):
                     continue
                 state = await run_db(build_status_state, chat_id)
@@ -6307,6 +6310,140 @@ async def push_status_apps():
             queue_status_app(chat_id, dc_bot_instance, dc_accid)
         except Exception as exc:
             logger.warning("Cannot queue status app in chat %s: %s", chat_id, exc)
+
+
+# Realtime status channel (prototype). While someone has the status app open with "Live updates"
+# on, the bot sends the state over the webxdc realtime channel (iroh gossip) instead of mail.
+# Mail status updates in these chats drop to one per REALTIME_EMAIL_INTERVAL, except urgent ones
+# (incidents, monitor edits), so clients without realtime still get the state.
+# Only chats listed in STATUS_REALTIME_CHATS (comma-separated chat ids) take part.
+STATUS_REALTIME_CHATS = {int(x) for x in os.environ.get("STATUS_REALTIME_CHATS", "").replace(" ", "").split(",")
+                         if x.isdigit()}
+REALTIME_EMAIL_INTERVAL = 1800
+# The app sends a heartbeat every 60 s; after three missed ones the bot leaves the channel,
+# so it does not keep gossiping to nobody. The next app open advertises again.
+REALTIME_IDLE_LEAVE = 180
+# Size of one realtime message; the core/gossip limit is not documented, so it is configurable
+# and failures are logged with the size that was tried.
+REALTIME_MAX_BYTES = int(os.environ.get("STATUS_REALTIME_MAX_BYTES", "60000"))
+REALTIME_PROTOCOL = 1
+_realtime_channels = {}  # webxdc msg_id -> {"chat_id", "joined_at", "last_seen", "last_hash"}
+_realtime_lock = threading.Lock()
+
+
+def realtime_chat(chat_id) -> bool:
+    return chat_id in STATUS_REALTIME_CHATS
+
+
+def status_mail_interval(chat_id) -> int:
+    """Minimum seconds between non-urgent mail status updates in a chat."""
+    return REALTIME_EMAIL_INTERVAL if realtime_chat(chat_id) else 60
+
+
+def _realtime_chat_for_msg(msg_id):
+    """The realtime-enabled chat whose current status app instance is msg_id, else None."""
+    for chat_id in STATUS_REALTIME_CHATS:
+        if database.get_chat_webxdc(chat_id)["webxdc_msg_id"] == msg_id:
+            return chat_id
+    return None
+
+
+def _decode_realtime(data):
+    """App -> bot messages are small JSON objects sent as bytes: {"t": "hello"|"ping", "v": 1}."""
+    try:
+        msg = json.loads(bytes(data[:1024]).decode())
+    except (TypeError, ValueError):
+        return None
+    return msg if isinstance(msg, dict) and isinstance(msg.get("t"), str) else None
+
+
+def _encode_realtime_state(state: dict) -> bytes:
+    # Same trimming as the mail update, so an oversized state degrades the same way.
+    update = _status_update_json(state, REALTIME_MAX_BYTES - 32)
+    return ('{"t":"state","v":%d,"u":%s}' % (REALTIME_PROTOCOL, update)).encode()
+
+
+def _send_realtime_state(bot, accid, msg_id, force=False) -> bool:
+    """Sends the chat's state to the channel if it changed (latencies included). True if sent."""
+    with _realtime_lock:
+        entry = _realtime_channels.get(msg_id)
+    if not entry:
+        return False
+    state = build_status_state(entry["chat_id"])
+    digest = status_full_state_hash(state)
+    if not force and digest == entry["last_hash"]:
+        return False
+    blob = _encode_realtime_state(state)
+    try:
+        bot.rpc.send_webxdc_realtime_data(accid, msg_id, list(blob))
+    except Exception as exc:
+        logger.warning("Realtime state (%d bytes) to chat %s failed: %s", len(blob), entry["chat_id"], exc)
+        return False
+    entry["last_hash"] = digest
+    stat_event("realtime_out")
+    return True
+
+
+def _realtime_join(bot, accid, msg_id, chat_id) -> None:
+    now = time.time()
+    with _realtime_lock:
+        entry = _realtime_channels.get(msg_id)
+        if entry:
+            entry["last_seen"] = now
+            return
+        _realtime_channels[msg_id] = {"chat_id": chat_id, "joined_at": now, "last_seen": now, "last_hash": None}
+    try:
+        # Joins the gossip topic; the core also mails a small hidden advertisement to the chat.
+        bot.rpc.send_webxdc_realtime_advertisement(accid, msg_id)
+        stat_event("mail_out")
+        logger.info("Joined realtime status channel in chat %s", chat_id)
+    except Exception as exc:
+        with _realtime_lock:
+            _realtime_channels.pop(msg_id, None)
+        logger.warning("Cannot join realtime status channel in chat %s: %s", chat_id, exc)
+
+
+@dc_cli.on(events.RawEvent(func=lambda e: e.kind in ("WebxdcRealtimeAdvertisementReceived", "WebxdcRealtimeData")))
+def on_status_realtime(bot, accid, event):
+    msg_id = event.get("msg_id") or event.get("msgId")
+    if not STATUS_REALTIME_CHATS or not msg_id:
+        return
+    chat_id = _realtime_chat_for_msg(msg_id)
+    if chat_id is None:
+        return
+    if event.kind == "WebxdcRealtimeAdvertisementReceived":
+        # Someone opened the app with live updates on: join so its "hello" reaches us
+        _realtime_join(bot, accid, msg_id, chat_id)
+        return
+    msg = _decode_realtime(event.get("data") or [])
+    if not msg or msg["t"] not in ("hello", "ping"):
+        return
+    _realtime_join(bot, accid, msg_id, chat_id)  # refreshes last_seen when already joined
+    if msg["t"] == "hello":
+        _send_realtime_state(bot, accid, msg_id, force=True)
+
+
+async def realtime_status_tick():
+    """Every audit tick: push changed state to live channels, leave idle ones."""
+    if not dc_bot_instance or dc_accid is None:
+        return
+    now = time.time()
+    with _realtime_lock:
+        channels = list(_realtime_channels.items())
+    for msg_id, entry in channels:
+        if now - entry["last_seen"] > REALTIME_IDLE_LEAVE:
+            with _realtime_lock:
+                _realtime_channels.pop(msg_id, None)
+            try:
+                await run_rpc(dc_bot_instance.rpc.leave_webxdc_realtime, dc_accid, msg_id)
+            except Exception as exc:
+                logger.debug("Leaving realtime channel %s: %s", msg_id, exc)
+            logger.info("Left idle realtime status channel in chat %s", entry["chat_id"])
+            continue
+        try:
+            await asyncio.to_thread(_send_realtime_state, dc_bot_instance, dc_accid, msg_id)
+        except Exception as exc:
+            logger.warning("Realtime tick in chat %s: %s", entry["chat_id"], exc)
 
 
 # Command Handlers

@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Join accepted peer channels, exchange authenticated heartbeats, and show channel health and round-trip time in `/peers` and `/stats`.
 - Send cross-check requests and answers over healthy iroh peer channels. Fall back to mail after three seconds without acknowledgment or when the channel goes down. Count one answer per peer and show round-trip times by transport in `/stats`.
+- Send peer telemetry over healthy iroh channels, with full snapshots at the peer interval, a ten-second window for status changes, and an hourly mail keepalive. Resume regular mail on the next tick after a channel goes down. Valid realtime frames keep peers online, and `/stats` counts realtime METRICS.
 
 ### Fixed
 - Send a realtime ping every 30 seconds on each side so both peers can measure their own round-trip time while replying to each other.

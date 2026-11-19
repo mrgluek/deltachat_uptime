@@ -1573,7 +1573,7 @@ def get_peer_metrics_24h(now: float) -> tuple[list, list]:
         traffic = conn.execute('''
             SELECT kind, dir, SUM(n) FROM peer_traffic_recent
             WHERE ts > ? AND ts <= ?
-              AND (transport = 'mail' OR kind IN ('rt_fallback', 'rt_invalid'))
+              AND (transport = 'mail' OR kind IN ('rt_fallback', 'rt_invalid', 'peer_metrics_rt'))
             GROUP BY kind, dir ORDER BY kind, dir
         ''', (cutoff, int(now))).fetchall()
         rtt = conn.execute('''
@@ -1810,7 +1810,7 @@ def get_all_peers() -> list[dict]:
     finally:
         conn.close()
 
-def update_peer_last_seen(email: str, timestamp: int = None) -> tuple[bool, int, dict | None]:
+def update_peer_last_seen(email: str, timestamp: int = None, *, min_interval: int = 0) -> tuple[bool, int, dict | None]:
     """
     Updates peer last_seen timestamp.
     If the peer was previously marked offline, recovers it and returns:
@@ -1823,6 +1823,8 @@ def update_peer_last_seen(email: str, timestamp: int = None) -> tuple[bool, int,
         cursor.execute("SELECT email, node_name, chat_id, last_seen, is_offline, went_offline_at FROM peers WHERE email = ?", (email,))
         row = cursor.fetchone()
         if not row:
+            return False, 0, None
+        if min_interval and not row[4] and now - (row[3] or 0) < min_interval:
             return False, 0, None
             
         peer = {
@@ -1844,7 +1846,7 @@ def audit_peers_offline(threshold_seconds: int = 360, now: int = None, threshold
     """
     Finds active peers that have stopped responding (last_seen older than threshold)
     and marks them offline, returning list of newly offline peers.
-    thresholds: email -> seconds for peers that announced a longer telemetry interval.
+    thresholds: email -> seconds based on the peer's advertised telemetry interval.
     """
     cur_time = now if now is not None else int(time.time())
     thresholds = thresholds or {}

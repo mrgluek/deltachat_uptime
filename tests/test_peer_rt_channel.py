@@ -226,7 +226,7 @@ class TestPeerRTChannel(unittest.IsolatedAsyncioTestCase):
         self.advance(0.002)
         self.assertIn("iroh: DOWN since", self.command(bot.peers_command))
         self.assertIn("Peer channels: 0 up, 1 down, 1 mail only", bot.build_stats_report(self.client, 1))
-        self.assertEqual(database.get_peer(EMAIL)["last_seen"], 1_800_000_000)
+        self.assertEqual(database.get_peer(EMAIL)["last_seen"], 1_800_000_030)
         counts = self.traffic()
         for kind, direction in (("hello", "out"), ("ping", "out"), ("ping", "in"), ("pong", "in"), ("pong", "out")):
             self.assertEqual(counts[kind, "rt", direction][0], 1)

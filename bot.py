@@ -394,11 +394,16 @@ _telemetry_interval_now = TELEMETRY_INTERVAL  # this node's, set at each broadca
 TELEMETRY_TICK = 30
 TELEMETRY_MIN_GAP = 120
 TELEMETRY_IDLE_INTERVAL = 300
+RT_TELEMETRY_DEBOUNCE = 10
+RT_MAIL_KEEPALIVE = 3600
+RT_ACTIVITY_INTERVAL = 30
 _peer_desired_interval = {}   # peer email (lower) -> how often it wants telemetry
 _telemetry_sent_at = {}       # peer email (lower) -> monotonic time of the last enqueue
 _telemetry_queued_status = {}  # full status snapshot at the last enqueue
 _telemetry_delivered = {}     # (monotonic time, full status snapshot) at the last successful send
 _telemetry_started_at = {}     # last RPC attempt, written by the outbox
+_telemetry_rt_peers = {}       # telemetry state by peer identity, across carrier changes
+_telemetry_delta_timer = None
 
 
 def interval_for_peer(email: str, own: int) -> int:
@@ -1308,7 +1313,12 @@ def telemetry_interval(peer_count: int) -> int:
 def peer_offline_after(email: str) -> int:
     """Silence after which a peer counts as offline: PEER_OFFLINE_INTERVALS of the telemetry
     interval it announced (older peers announce none: 2 min, so 6 min as before)."""
-    return PEER_OFFLINE_INTERVALS * _peer_telemetry_interval.get((email or "").lower(), TELEMETRY_INTERVAL)
+    email = (email or "").lower()
+    with _peer_rt_lock:
+        for link in _peer_rt_links.values():
+            if link.peer["email"].lower() == email and link.state.is_up and link.incoming_metrics_interval is not None:
+                return PEER_OFFLINE_INTERVALS * link.incoming_metrics_interval
+    return PEER_OFFLINE_INTERVALS * _peer_telemetry_interval.get(email, TELEMETRY_INTERVAL)
 
 
 _VERSION_RE = re.compile(r"^\d{1,4}\.\d{1,4}\.\d{1,4}$")
@@ -1694,20 +1704,22 @@ async def _peer_cross_check_allowed(resources: list[dict]) -> bool:
     shareable = await asyncio.to_thread(_filter_peer_shareable_resources, dc_bot_instance, dc_accid, resources)
     return bool(shareable)
 
-def pick_telemetry_batch(email: str, all_metrics: list[dict], batch_size: int) -> list[dict]:
+def pick_telemetry_batch(email: str, all_metrics: list[dict], batch_size: int, *, sent=None, offsets=None) -> list[dict]:
     """Entries for one telemetry message: status changes since the last message first, then a
     rotating slice of the others. Everything fits: send it all."""
+    offsets = _telemetry_rotation_offsets if offsets is None else offsets
     if len(all_metrics) <= batch_size:
-        _telemetry_rotation_offsets[email] = 0
+        offsets[email] = 0
         return all_metrics
-    sent = _telemetry_last_sent.get(email, {})
+    if sent is None:
+        sent = _telemetry_last_sent.get(email, {})
     changed = [m for m in all_metrics if sent.get(m["url"]) != m["status"]][:batch_size]
     changed_urls = {m["url"] for m in changed}
     batch = list(changed)
     # The rotation walks the full list (not the list minus changes, which differs every time),
     # so consecutive messages continue where the last one stopped
     total = len(all_metrics)
-    pos = _telemetry_rotation_offsets.get(email, 0) % total
+    pos = offsets.get(email, 0) % total
     for _ in range(total):
         if len(batch) >= batch_size:
             break
@@ -1715,18 +1727,18 @@ def pick_telemetry_batch(email: str, all_metrics: list[dict], batch_size: int) -
         pos = (pos + 1) % total
         if m["url"] not in changed_urls:
             batch.append(m)
-    _telemetry_rotation_offsets[email] = pos
+    offsets[email] = pos
     return batch
 
 
-def _peer_metrics_payload(metrics, now, node_name, self_addr, caps, interval, change_gap):
+def _peer_metrics_payload(metrics, now, node_name, self_addr, caps, interval, announced_interval):
     return {
         "node_name": node_name,
         "sender_email": self_addr,
         "timestamp": now,
         "msg_id": f"{now}_{secrets.token_hex(4)}",
         "caps": caps,
-        "telemetry_interval": max(TELEMETRY_IDLE_INTERVAL, change_gap),
+        "telemetry_interval": announced_interval,
         "desired_interval": interval,
         "version": VERSION,
         "metrics": metrics,
@@ -1743,6 +1755,8 @@ def _recent_peer_caps_changes(peer, now):
 
 
 def _peer_caps_announcement_due(peer, signature, now):
+    if _up_peer_rt_link(peer.get("chat_id"), peer.get("fingerprint")):
+        return False  # The live channel carries the current capabilities, even without monitors.
     if _peer_caps_changed(peer, signature):
         return len(_recent_peer_caps_changes(peer, now)) < PEER_CAPS_CHANGE_LIMIT
     last_attempt = peer["caps_announce_attempt_at"]
@@ -1809,7 +1823,8 @@ def _announce_peer_caps(bot, accid):
     interval = telemetry_interval(len(peers))
     for peer in due:
         change_gap = max(TELEMETRY_MIN_GAP, interval_for_peer(peer["email"], interval))
-        payload = _peer_metrics_payload([], int(time.time()), node_name, self_addr, caps, interval, change_gap)
+        payload = _peer_metrics_payload([], int(time.time()), node_name, self_addr, caps, interval,
+                                        max(TELEMETRY_IDLE_INTERVAL, change_gap))
         if peer["email"].lower() not in _peer_caps:
             # An already-running peer may have announced before this node restarted.
             payload["request_caps"] = True
@@ -1836,7 +1851,89 @@ async def _broadcast_peer_updates():
     await broadcast_telemetry_to_peers()
 
 
-async def broadcast_telemetry_to_peers():
+def _schedule_peer_metrics_delta(delay=RT_TELEMETRY_DEBOUNCE - 1):
+    """Coalesce changes with a second of the ten-second budget left for delivery."""
+    global _telemetry_delta_timer
+    with _peer_rt_lock:
+        if not any(link.state.is_up for link in _peer_rt_links.values()):
+            return
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + delay
+    if _telemetry_delta_timer is not None:
+        if _telemetry_delta_timer.when() <= deadline:
+            return
+        _telemetry_delta_timer.cancel()
+
+    def push():
+        global _telemetry_delta_timer
+        _telemetry_delta_timer = None
+        loop.create_task(broadcast_telemetry_to_peers(rt_delta=True))
+
+    _telemetry_delta_timer = loop.call_at(deadline, push)
+
+
+async def _broadcast_peer_rt_metrics(p, match, state, all_metrics, statuses, interval, node_name, self_addr, rt_delta):
+    """Return True when the UP channel handled this tick, including its mail keepalive."""
+    msg_id, link = match
+    at = monotonic()
+    if state.keepalive_at is None:
+        state.keepalive_at = at + RT_MAIL_KEEPALIVE
+    elif (last_mail := _telemetry_delivered.get(p["email"].lower())) is not None:
+        state.keepalive_at = max(state.keepalive_at, last_mail[0] + RT_MAIL_KEEPALIVE)
+    if state.busy:
+        if rt_delta:
+            _schedule_peer_metrics_delta()
+        return True
+    peer_interval = interval_for_peer(p["email"], interval)
+    keepalive = not rt_delta and at >= state.keepalive_at
+    full = keepalive or at - state.full_at >= peer_interval
+    if not full and not rt_delta:
+        return True
+    batch = [] if full else [m for m in all_metrics if state.statuses.get(m["url"]) != m["status"]][:200]
+    if not full and not batch:
+        return True
+    if not keepalive and (wait := state.sent_at + RT_TELEMETRY_DEBOUNCE - at) > 0:
+        _schedule_peer_metrics_delta(wait)
+        return True
+
+    if full:
+        batch = pick_telemetry_batch(p["email"], all_metrics, 200, sent=state.statuses, offsets=state.offsets)
+    payload = _peer_metrics_payload(batch, int(time.time()), node_name, self_addr, _own_peer_caps(),
+                                    interval, peer_interval)
+    if keepalive:
+        # The keepalive takes this full snapshot's slot. Reserve it before queuing so a
+        # concurrent change push doesn't resend the same snapshot over the channel.
+        state.keepalive_at = at + RT_MAIL_KEEPALIVE
+        dest = _PeerDestination(dc_bot_instance, dc_accid, p["chat_id"])
+
+        def record_keepalive():
+            state.keepalive_at = monotonic() + RT_MAIL_KEEPALIVE
+            database.record_peer_traffic("peer_metrics_idle", "mail", "out", 0)
+
+        peer_send(dest, "METRICS", payload, priority=PRIO_TELEMETRY, key=("telemetry", p["chat_id"]),
+                  expires_in=peer_interval, label=f"telemetry keepalive to {p['email']}", mail_kind="peer_metrics",
+                  should_send=lambda: _up_peer_rt_link(p["chat_id"], p["fingerprint"]) == match,
+                  after_send=record_keepalive)
+    else:
+        state.busy = True
+        state.sent_at = at
+        try:
+            sent = await _send_peer_rt_unacked(dc_bot_instance, dc_accid, msg_id, link, "metrics", payload)
+            if sent is not True:
+                # An RPC exception leaves delivery uncertain. Retry on a later tick.
+                return sent is None
+            state.sent_at = monotonic()
+            database.record_peer_traffic("peer_metrics_rt", "rt", "out", 0)
+        finally:
+            state.busy = False
+    if full:
+        state.full_at = at
+    state.statuses = {url: status for url, status in state.statuses.items() if url in statuses}
+    state.statuses.update((m["url"], m["status"]) for m in batch)
+    return True
+
+
+async def broadcast_telemetry_to_peers(*, rt_delta=False):
     """Periodically sends local monitor telemetry to all configured peers via 1:1 chat.
 
     Each peer receives the local monitors allowed by the share scope plus the results for the
@@ -1855,7 +1952,7 @@ async def broadcast_telemetry_to_peers():
     resources = await asyncio.to_thread(database.get_all_resources)
     resources = await asyncio.to_thread(_filter_peer_shareable_resources, dc_bot_instance, dc_accid, resources or [])
     probe_targets = await asyncio.to_thread(database.get_active_probe_targets)
-    if not resources and not probe_targets:
+    if not resources and not probe_targets and not (_peer_rt_links or _telemetry_rt_peers):
         return
 
     now = int(time.time())
@@ -1903,11 +2000,26 @@ async def broadcast_telemetry_to_peers():
         change_gap = max(TELEMETRY_MIN_GAP, interval_for_peer(email, interval))
         idle_gap = max(TELEMETRY_IDLE_INTERVAL, change_gap)
         all_metrics = probe_by_source.get(email, []) + shared_metrics
-        if not all_metrics:
-            continue
+        identity = _peer_identity(p)
+        rt_state = _telemetry_rt_peers.get(identity)
+        match = _up_peer_rt_link(p.get("chat_id"), p.get("fingerprint"))
         statuses = {m["url"]: m["status"] for m in all_metrics}
+        if match:
+            rt_state = _mark_peer_telemetry_up(identity)
+            if await _broadcast_peer_rt_metrics(p, match, rt_state, all_metrics, statuses, interval,
+                                                 node_name, self_addr, rt_delta):
+                continue
+            if _up_peer_rt_link(p["chat_id"], p["fingerprint"]) != match:
+                match = None
+        force_mail = not match and rt_state is not None and rt_state.needs_mail_on_down
+        if rt_delta and not match:
+            continue  # Mail-only peers keep the existing tick and pacing.
+        if not all_metrics and not force_mail:
+            continue
 
         def due(at):
+            if force_mail:
+                return True
             queued = _telemetry_sent_at.get(email)
             if queued is None:
                 return True
@@ -1937,16 +2049,22 @@ async def broadcast_telemetry_to_peers():
         metrics_batch = pick_telemetry_batch(email, all_metrics, batch_size)
 
         payload = _peer_metrics_payload(metrics_batch, now, node_name, self_addr,
-                                        _own_peer_caps(), interval, change_gap)
+                                        _own_peer_caps(), interval, idle_gap)
 
-        def _start_send(email=email, statuses=statuses):
+        def _start_send(email=email, statuses=statuses, force_mail=force_mail, match=match, rt_state=rt_state,
+                        chat_id=chat_id, fingerprint=p.get("fingerprint")):
             # While the job waited, its predecessor may have sent or the peer interval may have grown.
+            if (current := _up_peer_rt_link(chat_id, fingerprint)) and current != match:
+                return False
             at = monotonic()
             gap = max(TELEMETRY_MIN_GAP, interval_for_peer(email, current_telemetry_interval()))
             delivered, last_statuses = _telemetry_delivered.get(email, (float("-inf"), None))
             delivery_gap = max(TELEMETRY_IDLE_INTERVAL, gap) if statuses == last_statuses else gap
-            if at - delivered < delivery_gap or at - _telemetry_started_at.get(email, float("-inf")) < gap:
+            force = force_mail and rt_state.needs_mail_on_down
+            if not force and (at - delivered < delivery_gap or at - _telemetry_started_at.get(email, float("-inf")) < gap):
                 return False
+            if force:
+                rt_state.needs_mail_on_down = False
             _telemetry_started_at[email] = at
             return True
 
@@ -4422,6 +4540,8 @@ async def check_group_task(group, semaphore, session=None):
         status_str = check_status(is_up)  # "degraded" goes to the requesting peer in telemetry
         local_node = database.get_local_node_name()
         await run_db(database.update_probe_target_result, rep["url"], status_str, latency_ms, error_msg)
+        if status_str != rep.get("last_status"):
+            _schedule_peer_metrics_delta()
         await run_db(database.save_peer_measurement, rep["url"], local_node, status_str, latency_ms, error_msg)
         return
 
@@ -4469,6 +4589,7 @@ async def check_group_task(group, semaphore, session=None):
     in_alert = any(_resource_in_alert(r) for r in group)
     # Reachable through a bad path from here: the peers say whether it is only this node's path
     locally_degraded = is_up == CHECK_DEGRADED
+    was_locally_degraded = rep["url"] in _local_degraded
     if locally_degraded:
         _local_degraded[rep["url"]] = time.time()
     else:
@@ -4570,9 +4691,10 @@ async def check_group_task(group, semaphore, session=None):
 
     # One transaction for the whole check: every monitor of this target + the local measurement
     status_str = check_status(is_up)
-    await run_db(database.record_check_results,
-                 [_status_update_for(r, outcomes[r["id"]][0], outcomes[r["id"]][1], latency_ms) for r in group],
-                 (rep["url"], local_node, status_str, latency_ms, error_msg))
+    updates = [_status_update_for(r, outcomes[r["id"]][0], outcomes[r["id"]][1], latency_ms) for r in group]
+    await run_db(database.record_check_results, updates, (rep["url"], local_node, status_str, latency_ms, error_msg))
+    if locally_degraded != was_locally_degraded or any(r.get("status") != u["status"] for r, u in zip(group, updates)):
+        _schedule_peer_metrics_delta()
 
     for r in group:
         if latency_ms is not None:
@@ -5028,7 +5150,10 @@ async def handle_check_result(resource, is_up, error_msg, latency_ms=None, statu
     now = int(time.time())
     in_maintenance = now < (resource.get("maintenance_until") or 0)
     if not status_written:
-        await run_db(database.batch_update_resource_status, [_status_update_for(resource, is_up, error_msg, latency_ms)])
+        update = _status_update_for(resource, is_up, error_msg, latency_ms)
+        await run_db(database.batch_update_resource_status, [update])
+        if resource["status"] != update["status"]:
+            _schedule_peer_metrics_delta()
     if in_maintenance:
         return
 
@@ -7375,10 +7500,7 @@ def peer_send(peer, kind, payload, *, priority, expires_in, label, key=None, mai
             and isinstance(payload, dict) and payload.get("req_id")):
         loop = _peer_rt_event_loop()
         if loop is not None and (dc_accid is None or peer.accid == dc_accid):
-            with _peer_rt_lock:
-                match = next(((msg_id, link) for msg_id, link in _peer_rt_links.items()
-                              if link.peer["chat_id"] == peer.chat_id and link.state.is_up
-                              and link.peer["fingerprint"] == peer.fingerprint), None)
+            match = _up_peer_rt_link(peer.chat_id, peer.fingerprint)
             if match is not None:
                 msg_id, link = match
                 deadline = time.monotonic() + expires_in if rt_kind in _PEER_RT_REQUESTS else None
@@ -7440,6 +7562,15 @@ def _peer_rt_eligible(peer, flag):
                 and _peer_rt_enabled(peer, flag) and _peer_supports(peer, PEER_CAP_RT))
 
 
+def _up_peer_rt_link(chat_id, fingerprint):
+    if not chat_id or not fingerprint:
+        return None
+    with _peer_rt_lock:
+        return next(((msg_id, link) for msg_id, link in _peer_rt_links.items()
+                     if link.peer["chat_id"] == chat_id and link.peer["fingerprint"] == fingerprint
+                     and link.state.is_up), None)
+
+
 def _peer_rt_channel_status(peer, flag):
     """Return the display state and link snapshot for a peer."""
     if not _peer_rt_eligible(peer, flag) or not peer.get("rt_msg_id") or peer.get("rt_lost"):
@@ -7470,6 +7601,25 @@ def _peer_rt_label(peer, flag, now):
 
 
 @dataclass
+class _PeerRealtimeTelemetry:
+    sent_at: float = -math.inf
+    full_at: float = -math.inf
+    keepalive_at: float | None = None
+    busy: bool = False
+    needs_mail_on_down: bool = False
+    statuses: dict[str, str] = field(default_factory=dict)
+    offsets: dict[str, int] = field(default_factory=dict)
+
+
+def _mark_peer_telemetry_up(identity):
+    state = _telemetry_rt_peers.get(identity)
+    if state is None:
+        state = _telemetry_rt_peers.setdefault(identity, _PeerRealtimeTelemetry())
+    state.needs_mail_on_down = True
+    return state
+
+
+@dataclass(eq=False)
 class _PeerRealtimeLink:
     peer: dict
     advertise_at: float | None
@@ -7484,6 +7634,7 @@ class _PeerRealtimeLink:
     acks: peer_rt.AckTracker = field(default_factory=lambda: peer_rt.AckTracker(clock=time.monotonic))
     fallbacks: dict[int, tuple[bool, Callable]] = field(default_factory=dict)
     activity_at: float = -math.inf
+    incoming_metrics_interval: int | None = None
 
     @property
     def down_since(self):
@@ -7543,10 +7694,10 @@ def _peer_rt_event_loop():
 
 
 def _dispatch_peer_rt(bot, accid, msg_id, event):
-    """Verify frames in the event thread and share the mail handlers for checks."""
+    """Verify frames in the event thread and dispatch peer data to the mail handlers."""
     if dc_accid is not None and dc_accid != accid:
         return False
-    check = None
+    message = None
     with _peer_rt_lock:
         if msg_id not in _peer_rt_carrier_ids and msg_id not in _peer_rt_leaves:
             return False
@@ -7558,14 +7709,14 @@ def _dispatch_peer_rt(bot, accid, msg_id, event):
                 _peer_rt_pending_adverts.add(msg_id)
             database.record_peer_traffic("rt_advert", "mail", "in", 0)
         elif link:
-            check = _verify_peer_rt_frame(link, event.get("data"))
+            message = _verify_peer_rt_frame(link, event.get("data"))
         else:
             data = event.get("data")
             size = len(data) if isinstance(data, (bytes, list)) else 0
             reason = "Inactive peer carrier" if _peer_rt_limiter.allow(msg_id, size) else "Frame rate exceeded"
             _record_invalid_peer_rt(msg_id, size, reason)
-    if check is not None:
-        _deliver_peer_rt_check(bot, accid, msg_id, link, *check)
+    if message is not None:
+        _deliver_peer_rt_message(bot, accid, msg_id, link, *message)
     return True
 
 
@@ -7597,11 +7748,16 @@ def _verify_peer_rt_frame(link, data):
             if not link.state.is_up or frame["a"] != 1 or not isinstance(req_id, str) or not 0 < len(req_id) <= 64:
                 raise peer_rt.FrameError("Check requires an UP channel, acknowledgment and request ID")
             return frame, time.monotonic(), size
+        if kind == "metrics":
+            if frame["a"] or not isinstance(frame["b"].get("metrics"), list):
+                raise peer_rt.FrameError("Invalid metrics frame")
+            return frame, time.monotonic(), size
         if frame["a"] or kind not in peer_rt.RT_HEALTH_KINDS | {"ack"}:
             raise peer_rt.FrameError("Unsupported peer channel frame")
         if kind == "ack":
             if not link.state.is_up:
                 raise peer_rt.FrameError("Acknowledgment on a DOWN channel")
+            link.state.on_frame()
             for seq in frame["b"]["s"]:
                 if link.acks.ack(seq):
                     link.state.on_ack()
@@ -7619,11 +7775,19 @@ def _verify_peer_rt_frame(link, data):
         _record_invalid_peer_rt(fp, size, exc)
 
 
-def _deliver_peer_rt_check(bot, accid, msg_id, link, frame, received_at, size):
+def _reserve_peer_rt_activity(link, received_at):
+    if received_at is None or received_at - link.activity_at < RT_ACTIVITY_INTERVAL:
+        return False
+    link.activity_at = received_at
+    return True
+
+
+def _deliver_peer_rt_message(bot, accid, msg_id, link, frame, received_at, size):
     fp = link.peer["fingerprint"]
+    kind = frame["k"]
     with _peer_rt_lock:
         peer = database.get_peer_by_fingerprint(fp)
-        if (_peer_rt_links.get(msg_id) is not link or not link.state.is_up
+        if (_peer_rt_links.get(msg_id) is not link or (kind != "metrics" and not link.state.is_up)
                 or not _peer_rt_eligible(peer, database.get_peer_rt_flag())
                 or peer["rt_msg_id"] != msg_id or peer["rt_lost"]
                 or peer["rt_cid"] != link.peer["rt_cid"] or peer["chat_id"] != link.peer["chat_id"]
@@ -7631,26 +7795,25 @@ def _deliver_peer_rt_check(bot, accid, msg_id, link, frame, received_at, size):
             _record_invalid_peer_rt(fp, size, "Inactive peer carrier")
             return
         link.state.on_frame(received_at)
-        active = received_at - link.activity_at >= PEER_RT_PING_INTERVAL
-        if active:
-            link.activity_at = received_at
-    kind = frame["k"]
+        _mark_peer_telemetry_up(fp)
+        active = _reserve_peer_rt_activity(link, received_at)
     handler = {
         "req": handle_peer_check_req, "resp": handle_peer_check_resp,
         "breq": handle_peer_check_batch_req, "bresp": handle_peer_check_batch_resp,
+        "metrics": handle_peer_metrics,
     }[kind]
     try:
         if active:
-            _record_peer_activity(peer["email"])
-        timing = {} if kind in _PEER_RT_REQUESTS else {"arrived_at": received_at}
+            _record_peer_activity(peer["email"], via="rt")
+        timing = {"arrived_at": received_at} if kind in ("resp", "bresp") else {}
         handler(bot, accid, peer, peer["chat_id"], frame["b"], via="rt", **timing)
     except (TypeError, ValueError) as exc:
         _record_invalid_peer_rt(fp, size, type(exc).__name__)
         return
     database.record_peer_traffic(kind, "rt", "in", size)
-    if (loop := _peer_rt_event_loop()) is not None:
+    if frame["a"] and (loop := _peer_rt_event_loop()) is not None:
         loop.call_soon_threadsafe(lambda: loop.create_task(
-            _send_peer_rt_health(bot, accid, msg_id, link, "ack", {"s": [frame["s"]]})))
+            _send_peer_rt_unacked(bot, accid, msg_id, link, "ack", {"s": [frame["s"]]})))
 
 
 def _fallback_peer_rt_sends(link):
@@ -7740,27 +7903,43 @@ async def _send_peer_rt_check(destination, msg_id, link, kind, payload, send_mai
         after_send()
 
 
-async def _send_peer_rt_health(bot, accid, msg_id, link, kind, body):
+async def _send_peer_rt_unacked(bot, accid, msg_id, link, kind, body):
+    def current():
+        return _peer_rt_links.get(msg_id) is link and (kind != "metrics" or link.state.is_up)
+
     with _peer_rt_lock:
-        if _peer_rt_links.get(msg_id) is not link:
-            return
+        if not current():
+            return False
         seq = link.seq
+        try:
+            blob = peer_rt.encode(kind, _peer_rt_epoch, seq, body, link.peer["rt_key_out"], clock=time.time)
+        except peer_rt.FrameError:
+            return False  # METRICS can fall back to the larger mail format.
         link.seq += 1
-    blob = peer_rt.encode(kind, _peer_rt_epoch, seq, body, link.peer["rt_key_out"], clock=time.time)
     sent_at = time.monotonic()
+
+    def send():
+        with _peer_rt_lock:
+            if not current():
+                return False
+        # Core 2.66 joins implicitly on send.
+        bot.rpc.send_webxdc_realtime_data(accid, msg_id, list(blob))
+        return True
+
     try:
-        # Core 2.66 joins implicitly on send; there is no mail-free standalone join RPC.
-        await run_rpc(bot.rpc.send_webxdc_realtime_data, accid, msg_id, list(blob))
+        if not await run_rpc(send):
+            return False
     except Exception as exc:
         if _peer_rt_log.should_log((msg_id, "send")):
             logger.warning("Realtime %s on carrier %s failed (%s)", kind, msg_id, type(exc).__name__)
-        return
+        return None
     if kind in ("hello", "ping"):
         with _peer_rt_lock:
             link.probes[seq] = sent_at
     database.record_peer_traffic(kind, "rt", "out", len(blob))
     if kind == "hello":
         logger.debug("Joined peer realtime carrier %s and sent hello", msg_id)
+    return True
 
 
 async def _leave_peer_rt(bot, accid, msg_id):
@@ -7785,9 +7964,12 @@ def _reserve_peer_rt_advert(msg_id, link, recover):
         now = time.time()
         rejoin_at, step = peer["rt_rejoin_at"], peer["rt_rejoin_step"]
         if recover:
-            # last_seen and offline status still come from the existing mail path.
-            if (link.frames or not peer["last_seen"] or peer["is_offline"]
+            down_since = link.down_since
+            if (link.frames or link.state.is_up or down_since is None or not peer["last_seen"] or peer["is_offline"]
                     or now - peer["last_seen"] >= peer_offline_after(peer["email"])):
+                return False
+            # Activity before the timeout could have come from the old realtime channel.
+            if peer["last_seen"] <= int(now - (time.monotonic() - down_since)):
                 return False
             if rejoin_at is not None and now < rejoin_at:
                 return False
@@ -7819,14 +8001,21 @@ async def _advertise_peer_rt(bot, accid, msg_id, link, *, recover=False):
 
 async def _tick_peer_rt_link(bot, accid, msg_id, link):
     with _peer_rt_lock:
+        if _peer_rt_links.get(msg_id) is not link:
+            return
         frames = list(link.frames)
         link.frames.clear()
         hello, link.hello_requested = link.hello_requested, False
         was_up = link.state.is_up
         if frames:
             link.state.on_frame(frames[-1][2])
+            if link.state.is_up:
+                _mark_peer_telemetry_up(link.peer["fingerprint"])
+        active = _reserve_peer_rt_activity(link, link.state.last_frame_at)
         _expire_peer_rt_acks(link)
     now = time.monotonic()
+    if active:
+        await run_db(_record_peer_activity, link.peer["email"], "rt")
     if frames:
         if not was_up:
             logger.info("Peer realtime carrier %s is UP", msg_id)
@@ -7841,12 +8030,12 @@ async def _tick_peer_rt_link(bot, accid, msg_id, link):
                     link.rtt_ms = round((received_at - sent) * 1000)
                 database.record_peer_rtt("channel_ping", "rt", link.peer["node_name"], link.rtt_ms, True)
         else:
-            await _send_peer_rt_health(bot, accid, msg_id, link, "pong", echo)
+            await _send_peer_rt_unacked(bot, accid, msg_id, link, "pong", echo)
     for seq, sent in list(link.probes.items()):
         if now - sent >= peer_rt.RT_CHANNEL_TIMEOUT:
             del link.probes[seq]
     if hello:
-        await _send_peer_rt_health(bot, accid, msg_id, link, "hello", {})
+        await _send_peer_rt_unacked(bot, accid, msg_id, link, "hello", {})
     if link.advertise_at is not None and now >= link.advertise_at:
         link.advertise_at, link.started_at = None, now
         await _advertise_peer_rt(bot, accid, msg_id, link)
@@ -7857,7 +8046,7 @@ async def _tick_peer_rt_link(bot, accid, msg_id, link):
             link.next_ping_at = ping_at + PEER_RT_PING_INTERVAL
     elif ping_at >= link.next_ping_at:
         link.next_ping_at = ping_at + PEER_RT_PING_INTERVAL
-        await _send_peer_rt_health(bot, accid, msg_id, link, "ping", {})
+        await _send_peer_rt_unacked(bot, accid, msg_id, link, "ping", {})
     down_since = link.down_since
     if (not link.state.is_up and down_since is not None and now - down_since >= PEER_RT_REJOIN_DELAYS[0]
             and (link.peer["rt_rejoin_at"] is None or time.time() >= link.peer["rt_rejoin_at"])):
@@ -10076,7 +10265,8 @@ def _peer_metrics_report(now):
             timeouts[transport] += 1
     lines = (
         f"• Peer mails (24 h): {mails or 'none'} (in/out)",
-        f"• METRICS sent (24 h): idle {counts['peer_metrics_idle']['out']}, on change {counts['peer_metrics_change']['out']}",
+        f"• METRICS sent (24 h): idle {counts['peer_metrics_idle']['out']}, on change {counts['peer_metrics_change']['out']}, "
+        f"rt {counts['peer_metrics_rt']['out']}",
     )
     for transport in ("mail", "rt", "mixed"):
         if transport not in transports:
@@ -10587,6 +10777,7 @@ def rmpeer_command(bot, accid, event):
         removed = peer and database.remove_peer(peer["email"])
         if removed:
             _refresh_peer_rt_channels()
+            _telemetry_rt_peers.pop(_peer_identity(peer), None)
             _peer_caps_announcements.pop(_peer_identity(peer), None)
             _peer_caps_requests.discard(_peer_identity(peer))
             caps = _peer_caps.get(peer["email"].lower())
@@ -10897,10 +11088,11 @@ def on_start(bot, _args):
         except Exception as e:
             bot.logger.error(f"Failed to generate QR code: {e}")
 
-def _record_peer_activity(sender_addr: str):
+def _record_peer_activity(sender_addr: str, via="mail"):
     if not sender_addr:
         return
-    was_offline, downtime_sec, peer_data = database.update_peer_last_seen(sender_addr)
+    options = {"min_interval": RT_ACTIVITY_INTERVAL} if via == "rt" else {}
+    was_offline, downtime_sec, peer_data = database.update_peer_last_seen(sender_addr, **options)
     if was_offline and peer_data:
         p_node = peer_data.get("node_name") or "Remote"
         p_email = peer_data.get("email")
@@ -11091,7 +11283,8 @@ def handle_peer_metrics(bot, accid, peer, chat_id, data, via="mail"):
     if type(timestamp) not in (int, float) or (isinstance(timestamp, float) and not math.isfinite(timestamp)):
         timestamp = None
 
-    _record_peer_activity(peer["email"])
+    if via == "mail":
+        _record_peer_activity(peer["email"])
     identity = _peer_identity(peer)
     with _peer_metrics_lock:
         last_timestamp = _peer_metrics_timestamps.get(identity)
@@ -11100,7 +11293,13 @@ def handle_peer_metrics(bot, accid, peer, chat_id, data, via="mail"):
                 and (not msg_id or msg_id not in _processed_msg_ids)):
             with _peer_rt_lock:
                 _peer_caps_requests.add(identity)
-        peer = _note_peer_announcement(peer, metrics_data, allow_rename=not stale, telemetry=not stale)
+        if not stale:
+            peer = _note_peer_announcement(peer, metrics_data, allow_rename=via == "mail", telemetry=True)
+            if via == "rt" and type(announced := metrics_data.get("telemetry_interval")) is int:
+                with _peer_rt_lock:
+                    link = _peer_rt_links.get(peer.get("rt_msg_id"))
+                    if link and link.peer["fingerprint"] == peer.get("fingerprint"):
+                        link.incoming_metrics_interval = min(900, max(60, announced))
         if not isinstance(metrics_list, list):
             return
 

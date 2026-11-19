@@ -69,7 +69,7 @@ Additionally, it automatically generates a secure, beautiful web status dashboar
   - **Status Page & History:** DEGRADED monitors are shown in orange with the last vote; partial outages are listed on the status page, in `/events` and in `/history <id>` (not counted as downtime).
   - **Batched Cross-Checks:** Monitors that fail within the same 5 seconds go to each peer in one message (up to 100 targets) and come back in one, instead of a message per target and peer. In a mass outage this keeps the bots far below the chatmail relays' send limit (60 messages a minute). Bots announce the feature (`caps` in telemetry and check messages); peers that have not announced it yet get the classic one-target requests, so nodes can be updated one at a time.
   - **Inbound Probe Limits:** Single and batch requests share 20 probe slots, with at most 10 outstanding probes and 120 requests per minute per peer. Duplicate request IDs are dropped for 10 minutes. Batch workers reserve their slots before scheduling; excess requests receive no reply.
-  - **Peer Telemetry:** Peers get a snapshot every five minutes while monitor and probe statuses stay the same. When statuses change, the bot waits at least two minutes after the previous snapshot. Both schedules honor longer intervals based on peer count or a peer’s request. Each message announces its idle interval so peers can detect silence after three intervals. Snapshots carry up to 200 targets and larger sets rotate with changes first. In `/stats`, **Peers** shows idle and changed METRICS counts for the past 24 hours, and **Mail (last hour)** shows outgoing mail by kind for the same period.
+  - **Peer Telemetry:** Over mail, peers get a snapshot every five minutes while monitor and probe statuses stay the same. When statuses change, the bot waits at least two minutes after the previous snapshot. Both schedules honor longer intervals based on peer count or a peer’s request. Snapshots carry up to 200 targets and larger sets rotate with changes first. In `/stats`, **Peers** shows idle, changed and realtime METRICS counts for the past 24 hours.
   - Peer measurement storage keeps at most 1,000 rows per peer identity for seven days from local receipt. Claimed check times are clamped to seven days ago through 60 seconds ahead; mirrored targets unseen for seven days are removed. Handshakes and renames cannot take this node's or another peer's name.
   - **Aggregated Web Dashboard:** Web status pages show latency and status badges for all active probe locations (`[📍 Frankfurt-DE: 18ms] [🛰️ RU-Moscow: 45ms]`).
 - 🤖 **Identified User-Agent:** Sends a custom `User-Agent` header (e.g. `Delta Chat Uptime Monitor/2.12.1 (+https://git.gluek.info/gluek/deltachat_uptime)`) during HTTP checks so server administrators can easily identify monitoring requests in server logs. The name deliberately avoids the word "bot", because some services (e.g. Hiddify subscription links) answer `400 Bad Request` to bot User-Agents.
@@ -216,8 +216,15 @@ An UP channel carries cross-check requests and answers, including batched votes
 and `/ping`. A missing acknowledgment after three seconds, or a channel going
 DOWN, sends the same check by mail within the original wait. The first answer
 from each peer counts once. Peers without `rt1`, disabled channels and oversized
-checks use mail. Telemetry still travels by mail. `/stats` shows mail and
+checks use mail. `/stats` shows mail and
 realtime round-trip percentiles and the number of mail fallbacks.
+
+An UP channel also carries full telemetry snapshots at the peer interval, two
+minutes by default. Monitor and probe status changes are grouped in a ten-second
+window and can send a partial snapshot containing the changed targets. Valid
+frames keep the peer online. The bot sends one hourly mail snapshot while UP,
+uses mail when a snapshot exceeds the channel's size limit, and resumes the
+regular mail schedule on the next telemetry tick after a channel goes DOWN.
 
 ### Status app (`/report app`)
 

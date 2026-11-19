@@ -1572,12 +1572,13 @@ def get_peer_metrics_24h(now: float) -> tuple[list, list]:
         conn.execute('BEGIN')  # Both lines use the same snapshot during a concurrent flush.
         traffic = conn.execute('''
             SELECT kind, dir, SUM(n) FROM peer_traffic_recent
-            WHERE ts > ? AND ts <= ? AND transport = 'mail'
+            WHERE ts > ? AND ts <= ?
+              AND (transport = 'mail' OR kind IN ('rt_fallback', 'rt_invalid'))
             GROUP BY kind, dir ORDER BY kind, dir
         ''', (cutoff, int(now))).fetchall()
         rtt = conn.execute('''
-            SELECT kind, ms, ok FROM peer_rtt
-            WHERE ts > ? AND ts <= ? AND transport = 'mail'
+            SELECT kind, transport, ms, ok FROM peer_rtt
+            WHERE ts > ? AND ts <= ?
         ''', (cutoff, int(now))).fetchall()
     return traffic, rtt
 

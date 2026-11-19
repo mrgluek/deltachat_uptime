@@ -207,11 +207,17 @@ An advertisement triggers an authenticated `hello` on the channel. Each side
 sends its own `ping` every 30 seconds, even while answering the other side.
 Both frames receive a `pong` that echoes the sender's epoch and sequence number.
 `/peers` shows the carrier age while waiting to join, `UP` with this bot's own
-measured RTT when available, or `DOWN` after 90 seconds without a valid frame.
-`/stats` totals these channels.
+measured RTT when available, or `DOWN` after 90 seconds without a valid frame
+or two consecutive missed acknowledgments. `/stats` totals these channels.
 If the peer is still active by mail, the bot tries to rejoin after five minutes
-down, then after 15 minutes and hourly. Realtime currently carries channel health
-checks. Monitoring requests, answers, votes and telemetry travel by mail.
+down, then after 15 minutes and hourly.
+
+An UP channel carries cross-check requests and answers, including batched votes
+and `/ping`. A missing acknowledgment after three seconds, or a channel going
+DOWN, sends the same check by mail within the original wait. The first answer
+from each peer counts once. Peers without `rt1`, disabled channels and oversized
+checks use mail. Telemetry still travels by mail. `/stats` shows mail and
+realtime round-trip percentiles and the number of mail fallbacks.
 
 ### Status app (`/report app`)
 

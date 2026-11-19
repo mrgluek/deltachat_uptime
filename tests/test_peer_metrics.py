@@ -136,7 +136,7 @@ class TestPeerMetrics(unittest.TestCase):
                           ("2026-11-17", 1, 5), ("2026-11-18", 2, 10)])
         traffic, rtt = database.get_peer_metrics_24h(now)
         self.assertEqual(traffic, [("METRICS", "in", 3)])
-        self.assertCountEqual(rtt, [("ping", 25, 1), ("vote", 900, 0)] * 3)
+        self.assertCountEqual(rtt, [("ping", "mail", 25, 1), ("vote", "mail", 900, 0)] * 3)
         with patch("database.time.time", return_value=now):
             cleaned = database.cleanup_old_records()
         self.assertEqual((cleaned["peer_traffic"], cleaned["peer_traffic_recent"], cleaned["peer_rtt"]), (1, 3, 4))
@@ -161,6 +161,11 @@ class TestPeerMetrics(unittest.TestCase):
         database.record_peer_rtt("ping", "mail", "Berlin", 6500, False)
         database.record_peer_rtt("vote", "mail", "Paris", 2010, True)
         database.record_peer_rtt("vote_round", "mail", None, 2150, True)
+        database.record_peer_rtt("vote", "rt", "Paris", 100, True)
+        database.record_peer_rtt("vote", "rt", "Paris", 300, True)
+        database.record_peer_rtt("vote_round", "mixed", None, 4200, True)
+        database.record_peer_traffic("rt_fallback", "fallback", "out", 0)
+        database.record_peer_traffic("rt_invalid", "rt", "in", 123)
         database.flush_peer_metrics()
         rpc_bot = MagicMock()
         with patch.object(bot, "_is_dc_admin", return_value=True):
@@ -171,13 +176,16 @@ class TestPeerMetrics(unittest.TestCase):
                       "CHECK_REQ 0/1, CHECK_RESP 0/1, HELLO 0/1, HELLO_ACK 0/1, METRICS 1/2, "
                       "rt_advert 0/1 (in/out)", report)
         self.assertIn("METRICS sent (24 h): idle 1, on change 1", report.split("**Peers**", 1)[1])
-        self.assertIn("Peer round trip (24 h): ping 200/290 ms, vote 2010/2010 ms, "
+        self.assertIn("Peer round trip (24 h, mail): ping 200/290 ms, vote 2010/2010 ms, "
                       "vote_round 2150/2150 ms (p50/p95), 1 timeout", report)
+        self.assertIn("Peer round trip (24 h, rt): ping n/a, vote 200/290 ms, vote_round n/a (p50/p95), 0 timeouts", report)
+        self.assertIn("Peer round trip (24 h, mixed): vote_round 4200/4200 ms (p50/p95), 0 timeouts", report)
+        self.assertIn("Realtime checks (24 h): 1 mail fallback, 1 invalid frame", report)
         self.assertLess(len(report.encode()), 4096)
         self.assertEqual(bot._peer_metrics_report(time.time() + 86401),
                          ("• Peer mails (24 h): none (in/out)",
                           "• METRICS sent (24 h): idle 0, on change 0",
-                          "• Peer round trip (24 h): ping n/a, vote n/a, vote_round n/a (p50/p95), 0 timeouts"))
+                          "• Peer round trip (24 h, mail): ping n/a, vote n/a, vote_round n/a (p50/p95), 0 timeouts"))
 
     def test_ping_batch_and_round_rtt(self):
         paris = {"email": "paris@example.org", "node_name": "Paris", "chat_id": 7}

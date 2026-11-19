@@ -119,7 +119,8 @@ class TestPeerHandlers(_DbCase):
             asyncio.run(reply())
         answer.assert_awaited_once_with(self.rpc_bot, 1, self.chat_id, "abc",
                                        [{"id": 0, "url": self.url, "type": "http",
-                                         "expected_keyword": None, "family": None}, None], 2)
+                                         "expected_keyword": None, "family": None}, None], 2,
+                                       fingerprint=None, via="mail")
 
     def test_check_resp_stores_only_the_first_answer_for_a_chat(self):
         future, responses, chats = Future(), [], {self.chat_id}

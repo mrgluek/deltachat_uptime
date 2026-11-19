@@ -220,6 +220,9 @@ class AckTracker:
             return False
         return True
 
+    def discard(self, seq: int) -> bool:
+        return self._pending.pop(seq, None) is not None
+
     def expire(self):
         now = self._clock()
         due = [seq for seq, (deadline, _) in self._pending.items() if deadline <= now]
@@ -238,6 +241,7 @@ class PeerChannelState:
         self._clock = clock
         self._last_frame_at = None
         self._ack_failures = 0
+        self._ack_failed_at = None
 
     @property
     def is_up(self) -> bool:
@@ -249,15 +253,25 @@ class PeerChannelState:
     def last_frame_at(self) -> float | None:
         return self._last_frame_at
 
+    @property
+    def ack_failed_at(self) -> float | None:
+        return self._ack_failed_at
+
     def on_frame(self, received_at=None):
-        self._last_frame_at = self._clock() if received_at is None else received_at
-        if self._ack_failures >= RT_ACK_FAILURES:
+        seen_at = self._clock() if received_at is None else received_at
+        if self._last_frame_at is None or seen_at > self._last_frame_at:
+            self._last_frame_at = seen_at
+        if self._ack_failed_at is not None and seen_at >= self._ack_failed_at:
             # Fresh traffic can restore the channel even while sends are using mail.
             self._ack_failures = 0
+            self._ack_failed_at = None
 
     def on_ack(self):
         self._ack_failures = 0
+        self._ack_failed_at = None
         self.on_frame()
 
     def on_ack_timeout(self):
         self._ack_failures += 1
+        if self._ack_failures == RT_ACK_FAILURES:
+            self._ack_failed_at = self._clock()

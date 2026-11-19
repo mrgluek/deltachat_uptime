@@ -233,7 +233,7 @@ class TestPeerRTChannel(unittest.IsolatedAsyncioTestCase):
             self.assertGreater(counts[kind, "rt", direction][1], 0)
         with sqlite3.connect(database.DB_PATH) as conn:
             self.assertEqual(conn.execute("SELECT kind, transport, peer, ms, ok FROM peer_rtt").fetchall(),
-                             [("ping", "rt", "Peer", 125, 1)])
+                             [("channel_ping", "rt", "Peer", 125, 1)])
 
     async def test_replying_to_peer_pings_keeps_local_ping_cadence_and_rtt(self):
         self.carrier()

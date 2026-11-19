@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import collections
+from collections.abc import Callable
 import functools
 import ipaddress
 import contextlib
@@ -94,6 +95,10 @@ KEYWORD_SNIPPET_MAX = 80
 MISSING_KEYWORD_PREFIX = '200 OK (Missing keyword: "'
 _PROTOCOL_MARKER = re.compile(r"\[(/?UPTIME_(?:PEER_[A-Z_]+|BOT_SYNC_DATA)\])")
 _PEER_RT_MAIL_KINDS = frozenset(("RT_OFFER", "RT_ACCEPT", "RT_RESET"))
+_PEER_RT_CHECK_KINDS = {
+    "CHECK_REQ": "req", "CHECK_RESP": "resp", "CHECK_BATCH_REQ": "breq", "CHECK_BATCH_RESP": "bresp",
+}
+_PEER_RT_REQUESTS = frozenset(("req", "breq"))
 _PEER_RT_MARKER = re.compile(r"\[UPTIME_PEER_(RT_OFFER|RT_ACCEPT|RT_RESET)\]")
 _PEER_MAIL_KINDS = frozenset((
     "CHECK_REQ", "CHECK_RESP", "CHECK_BATCH_REQ", "CHECK_BATCH_RESP",
@@ -335,7 +340,8 @@ async_event_loop = None
 
 # Peering globals
 pending_peer_checks = {} # req_id -> (Future, expected_count, list_of_responses, expected_chat_ids)
-_pending_peer_rtt = {}  # req_id -> {chat_id: _PeerRtt}
+_pending_peer_rtt = {}  # req_id -> {chat_id: _PeerRtt}, single and batch
+_peer_answer_lock = threading.Lock()
 _peer_vote_round = contextvars.ContextVar("peer_vote_round", default=None)
 last_peer_telemetry_broadcast = 0.0
 _telemetry_rotation_offsets = {}  # peer email -> rotation offset
@@ -1038,8 +1044,8 @@ async def _resolve_peer_chat_id(p: dict):
     return chat_id
 
 
-def _record_peer_rtt(kind, peer, started_at, finished_at, ok):
-    database.record_peer_rtt(kind, "mail", peer, round((finished_at - started_at) * 1000), ok)
+def _record_peer_rtt(kind, peer, started_at, finished_at, ok, transport="mail"):
+    database.record_peer_rtt(kind, transport, peer, round((finished_at - started_at) * 1000), ok)
 
 
 class _PeerVoteRound:
@@ -1049,10 +1055,12 @@ class _PeerVoteRound:
     def finish(self):
         # The individual attempts finish before their jobs return from gather.
         if self.samples:
-            started_at = min(start for start, _, _ in self.samples)
-            finished_at = max(end for _, end, _ in self.samples)
-            ok = all(ok for _, _, ok in self.samples)
-            _record_peer_rtt("vote_round", None, started_at, finished_at, ok)
+            started_at = min(start for start, _, _, _ in self.samples)
+            finished_at = max(end for _, end, _, _ in self.samples)
+            ok = all(ok for _, _, ok, _ in self.samples)
+            transports = {transport for _, _, _, transport in self.samples}
+            transport = transports.pop() if len(transports) == 1 else "mixed"
+            _record_peer_rtt("vote_round", None, started_at, finished_at, ok, transport)
 
 
 @dataclass
@@ -1140,28 +1148,40 @@ class _PeerRtt:
         self.vote_round = _peer_vote_round.get()
         self.submitted_at = time.monotonic()
         self.sent_at = None
+        self.rt_sent_at = None
         self.answer = None
 
     def start(self):
         self.sent_at = time.monotonic()
 
-    def note_single_answer(self, arrived_at, node_name):
-        self.answer = (arrived_at, node_name)
-        if self.vote_round is not None:
+    def start_rt(self):
+        self.rt_sent_at = time.monotonic()
+
+    def note_answer(self, arrived_at, node_name, via):
+        self.answer = (arrived_at, node_name, via)
+        if self.vote_round is not None or self.kind == "vote":
             _note_vote_peer_result(self.peer, True)
 
     def finish(self, ok, finished_at=None, peer=None):
+        via = "mail" if self.sent_at is not None or self.rt_sent_at is None else "rt"
+        if self.answer is not None:
+            finished_at, peer, via = self.answer
         if finished_at is None:
             finished_at = time.monotonic()
         # A request can expire in the outbox before it gets a send token.
-        sent_at = self.sent_at
+        sent_at = self.rt_sent_at if via == "rt" or self.sent_at is None else self.sent_at
+        if sent_at is not None and sent_at > finished_at:
+            sent_at = self.rt_sent_at
         started_at = sent_at if sent_at is not None and sent_at <= finished_at else self.submitted_at
         if self.kind:
             _record_peer_rtt(self.kind, peer or self.peer.get("node_name") or "Remote-Node",
-                             started_at, finished_at, ok)
+                             started_at, finished_at, ok, via)
         if self.vote_round is not None:
-            self.vote_round.samples.append((started_at, finished_at, ok))
-        if (self.vote_round is not None or self.kind == "vote") and self.answer is None and (ok or sent_at is not None):
+            # A round includes any time spent waiting for a fallback.
+            self.vote_round.samples.append((self.rt_sent_at if self.rt_sent_at is not None else started_at,
+                                            finished_at, ok, via))
+        if (self.vote_round is not None or self.kind == "vote") and self.answer is None and (
+                ok or self.sent_at is not None or self.rt_sent_at is not None):
             _note_vote_peer_result(self.peer, ok)
 
 
@@ -1233,9 +1253,13 @@ async def request_peer_cross_checks(target_dict: dict, timeout: float = 8.0, pee
             timing = timings[chat_id] = _PeerRtt(kind, p)
             try:
                 # A request still queued when the answer is no longer awaited is dropped
-                await asyncio.to_thread(peer_send, _PeerDestination(dc_bot_instance, dc_accid, chat_id), "CHECK_REQ", req_payload,
+                destination = _PeerDestination(dc_bot_instance, dc_accid, chat_id, fingerprint=p.get("fingerprint"))
+                await asyncio.to_thread(peer_send, destination, "CHECK_REQ", req_payload,
                                         priority=PRIO_PEER, expires_in=timeout, label="cross-check request",
-                                        mail_kind="peer_vote" if is_vote else "peer_other", before_send=timing.start)
+                                        mail_kind="peer_vote" if is_vote else "peer_other", before_send=timing.start,
+                                        before_rt_send=timing.start_rt,
+                                        rt_waiting=lambda chat_id=chat_id: not fut.done() and req_id in pending_peer_checks
+                                        and chat_id in expected_chats)
             except Exception as e:
                 logger.warning(f"Failed to send cross-check request to peer {p.get('email')}: {e}")
 
@@ -1250,9 +1274,8 @@ async def request_peer_cross_checks(target_dict: dict, timeout: float = 8.0, pee
         _pending_peer_rtt.pop(req_id, None)
 
     for timing in timings.values():
-        if (answer := timing.answer) is not None:
-            arrived_at, node_name = answer
-            timing.finish(True, arrived_at, node_name)
+        if timing.answer is not None:
+            timing.finish(True)
         elif timed_out_at is not None:
             timing.finish(False, timed_out_at)
 
@@ -1563,11 +1586,14 @@ async def _batch_cross_check_peer(peer: dict, items: list, results: dict) -> Non
     }
     fut = asyncio.get_running_loop().create_future()
     pending_batch_checks[req_id] = (fut, chat_id, len(items))
+    timing = _PeerRtt("vote", peer)
+    _pending_peer_rtt[req_id] = {chat_id: timing}
     try:
-        timing = _PeerRtt("vote", peer)
-        await asyncio.to_thread(peer_send, _PeerDestination(dc_bot_instance, dc_accid, chat_id), "CHECK_BATCH_REQ", payload,
+        destination = _PeerDestination(dc_bot_instance, dc_accid, chat_id, fingerprint=peer.get("fingerprint"))
+        await asyncio.to_thread(peer_send, destination, "CHECK_BATCH_REQ", payload,
                                 priority=PRIO_PEER, expires_in=CROSS_CHECK_BATCH_TIMEOUT, label="batch cross-check request",
-                                mail_kind="peer_vote", before_send=timing.start)
+                                mail_kind="peer_vote", before_send=timing.start, before_rt_send=timing.start_rt,
+                                rt_waiting=lambda: not fut.done() and req_id in pending_batch_checks)
         answers = await asyncio.wait_for(fut, CROSS_CHECK_BATCH_TIMEOUT)
     except asyncio.TimeoutError:
         timing.finish(False)
@@ -1578,6 +1604,7 @@ async def _batch_cross_check_peer(peer: dict, items: list, results: dict) -> Non
         return
     finally:
         pending_batch_checks.pop(req_id, None)
+        _pending_peer_rtt.pop(req_id, None)
     timing.finish(True, peer=answers[0]["node_name"] if answers else None)
     answered = []
     for (key, target), answer in zip(items, answers):
@@ -1593,7 +1620,7 @@ def _clean_peer_result(item, node_name: str, url: str) -> dict:
     """A peer's answer for one target, with the same limits as single responses."""
     item = item if isinstance(item, dict) else {}
     status = item.get("status")
-    if status not in VOTING_STATUSES:
+    if not isinstance(status, str) or status not in VOTING_STATUSES:
         status = "unknown"  # also "skip": the peer could not check it (no IPv6 there)
     latency_ms = item.get("latency_ms")
     if not isinstance(latency_ms, int) or isinstance(latency_ms, bool) or not 0 <= latency_ms <= 600000:
@@ -1603,7 +1630,8 @@ def _clean_peer_result(item, node_name: str, url: str) -> dict:
             "error_msg": str(error_msg)[:500] if error_msg else None, "node_name": node_name}
 
 
-async def _answer_batch_cross_check(bot, accid, chat_id: int, req_id: str, targets: list, concurrency=1) -> None:
+async def _answer_batch_cross_check(bot, accid, chat_id: int, req_id: str, targets: list, concurrency=1,
+                                    *, fingerprint=None, via="mail") -> None:
     """Run only the workers reserved at admission, with no task per waiting target."""
 
     async def one(t):
@@ -1629,7 +1657,8 @@ async def _answer_batch_cross_check(bot, accid, chat_id: int, req_id: str, targe
     await asyncio.gather(*(worker() for _ in range(min(concurrency, len(targets)))))
     payload = {"req_id": req_id, "node_name": database.get_local_node_name(), "caps": _own_peer_caps(), "results": answers}
     # The requester waits CROSS_CHECK_BATCH_TIMEOUT from sending; a later answer is ignored there
-    await asyncio.to_thread(_send_peer_check_answer, _PeerDestination(bot, accid, chat_id), "CHECK_BATCH_RESP", payload)
+    destination = _PeerDestination(bot, accid, chat_id, fingerprint=fingerprint, via=via)
+    await asyncio.to_thread(_send_peer_check_answer, destination, "CHECK_BATCH_RESP", payload)
 
 
 def _valid_peer_fields(item):
@@ -7209,7 +7238,7 @@ def on_status_realtime(bot, accid, event):
     msg_id = event.get("msg_id") or event.get("msgId")
     if not msg_id:
         return
-    if _dispatch_peer_rt(accid, msg_id, event):
+    if _dispatch_peer_rt(bot, accid, msg_id, event):
         return
     chat_id = _realtime_chat_for_msg(msg_id)
     if chat_id is None:
@@ -7330,11 +7359,54 @@ class _PeerDestination:
     chat_id: int
     securejoin_hello: bool = False
     fingerprint: str | None = None
+    via: str = "auto"
 
 
 def peer_send(peer, kind, payload, *, priority, expires_in, label, key=None, mail_kind="peer_other",
-              after_send=None, before_send=None, should_send=None):
-    """Send a peer payload through the mail outbox."""
+              after_send=None, before_send=None, should_send=None, before_rt_send=None, rt_waiting=None):
+    """Send checks over an UP peer channel, with the existing mail outbox as fallback."""
+    def send_mail(ttl):
+        return _send_peer_mail(peer, kind, payload, priority=priority, expires_in=ttl, label=label, key=key,
+                               mail_kind=mail_kind, after_send=after_send, before_send=before_send,
+                               should_send=should_send)
+
+    if ((rt_kind := _PEER_RT_CHECK_KINDS.get(kind)) and peer.fingerprint and expires_in is not None
+            and peer.via != "mail" and not peer.securejoin_hello
+            and isinstance(payload, dict) and payload.get("req_id")):
+        loop = _peer_rt_event_loop()
+        if loop is not None and (dc_accid is None or peer.accid == dc_accid):
+            with _peer_rt_lock:
+                match = next(((msg_id, link) for msg_id, link in _peer_rt_links.items()
+                              if link.peer["chat_id"] == peer.chat_id and link.state.is_up
+                              and link.peer["fingerprint"] == peer.fingerprint), None)
+            if match is not None:
+                msg_id, link = match
+                deadline = time.monotonic() + expires_in if rt_kind in _PEER_RT_REQUESTS else None
+                if after_send:
+                    notify = after_send
+                    lock = threading.Lock()
+
+                    def once():
+                        nonlocal notify
+                        with lock:
+                            callback, notify = notify, None
+                        if callback is not None:
+                            callback()
+
+                    after_send = once
+                try:
+                    loop.call_soon_threadsafe(lambda: loop.create_task(
+                        _send_peer_rt_check(peer, msg_id, link, rt_kind, payload, send_mail, expires_in, deadline,
+                                            before_rt_send, after_send, should_send, rt_waiting)))
+                except RuntimeError:
+                    pass  # The loop shut down before accepting the send.
+                else:
+                    return None
+    return send_mail(expires_in)
+
+
+def _send_peer_mail(peer, kind, payload, *, priority, expires_in, label, key, mail_kind,
+                    after_send, before_send, should_send):
     if kind in _PEER_RT_MAIL_KINDS:
         return dc_outbox.submit(lambda: _send_peer_rt_mail(peer, kind, payload) or SKIP_SEND,
                                 priority=priority, key=key, expires_in=expires_in, label=label, kind=mail_kind)
@@ -7409,9 +7481,14 @@ class _PeerRealtimeLink:
     seq: int = 0
     probes: dict[int, float] = field(default_factory=dict)
     rtt_ms: int | None = None
+    acks: peer_rt.AckTracker = field(default_factory=lambda: peer_rt.AckTracker(clock=time.monotonic))
+    fallbacks: dict[int, tuple[bool, Callable]] = field(default_factory=dict)
+    activity_at: float = -math.inf
 
     @property
     def down_since(self):
+        if self.state.ack_failed_at is not None:
+            return self.state.ack_failed_at
         last_frame = self.state.last_frame_at
         return self.started_at if last_frame is None else last_frame + peer_rt.RT_CHANNEL_TIMEOUT
 
@@ -7438,9 +7515,12 @@ def _refresh_peer_rt_channels():
                 and p["rt_key_in"] and p["rt_key_out"] and _peer_rt_eligible(p, flag)}
         for msg_id, link in list(_peer_rt_links.items()):
             current = live.get(msg_id)
-            if not current or any(current[k] != link.peer[k] for k in ("rt_cid", "fingerprint", "chat_id")):
-                _peer_rt_leaves.add(msg_id)
+            keys = ("rt_cid", "fingerprint", "chat_id", "rt_key_in", "rt_key_out")
+            if not current or any(current[k] != link.peer[k] for k in keys):
+                if not current:
+                    _peer_rt_leaves.add(msg_id)
                 del _peer_rt_links[msg_id]
+                _fallback_peer_rt_sends(link)
             else:
                 link.peer["node_name"] = current["node_name"]
         for msg_id, peer in live.items():
@@ -7453,10 +7533,20 @@ def _refresh_peer_rt_channels():
                 _peer_rt_pending_adverts.discard(msg_id)
 
 
-def _dispatch_peer_rt(accid, msg_id, event):
-    """Verify carrier identity and frames in the event thread before queueing control work."""
+def _peer_rt_event_loop():
+    if async_event_loop and async_event_loop.is_running():
+        return async_event_loop
+    try:
+        return asyncio.get_running_loop()
+    except RuntimeError:
+        return None
+
+
+def _dispatch_peer_rt(bot, accid, msg_id, event):
+    """Verify frames in the event thread and share the mail handlers for checks."""
     if dc_accid is not None and dc_accid != accid:
         return False
+    check = None
     with _peer_rt_lock:
         if msg_id not in _peer_rt_carrier_ids and msg_id not in _peer_rt_leaves:
             return False
@@ -7468,18 +7558,32 @@ def _dispatch_peer_rt(accid, msg_id, event):
                 _peer_rt_pending_adverts.add(msg_id)
             database.record_peer_traffic("rt_advert", "mail", "in", 0)
         elif link:
-            _verify_peer_rt_frame(link, event.get("data"))
-        return True
+            check = _verify_peer_rt_frame(link, event.get("data"))
+        else:
+            data = event.get("data")
+            size = len(data) if isinstance(data, (bytes, list)) else 0
+            reason = "Inactive peer carrier" if _peer_rt_limiter.allow(msg_id, size) else "Frame rate exceeded"
+            _record_invalid_peer_rt(msg_id, size, reason)
+    if check is not None:
+        _deliver_peer_rt_check(bot, accid, msg_id, link, *check)
+    return True
+
+
+def _record_invalid_peer_rt(peer, size, error):
+    database.record_peer_traffic("rt_invalid", "rt", "in", size)
+    if _peer_rt_log.should_log(peer):
+        label = peer[-8:] if isinstance(peer, str) else peer
+        logger.warning("Dropped realtime frame from peer %s: %s", label, error)
 
 
 def _verify_peer_rt_frame(link, data):
     fp = link.peer["fingerprint"]
     size = len(data) if isinstance(data, (bytes, list)) else 0
     try:
-        if size > peer_rt.RT_PEER_MAX_BYTES:
-            raise peer_rt.FrameError("Frame too large")
         if not _peer_rt_limiter.allow(fp, size):
             raise peer_rt.FrameError("Frame rate exceeded")
+        if size > peer_rt.RT_PEER_MAX_BYTES:
+            raise peer_rt.FrameError("Frame too large")
         if not size:
             raise peer_rt.FrameError("Missing frame bytes")
         try:
@@ -7488,17 +7592,152 @@ def _verify_peer_rt_frame(link, data):
             raise peer_rt.FrameError("Invalid frame bytes") from exc
         frame = peer_rt.decode(blob, link.peer["rt_key_in"], peer=fp, replay=_peer_rt_replay, clock=time.time)
         kind = frame["k"]
-        if kind not in peer_rt.RT_HEALTH_KINDS or frame["a"]:
+        if kind in _PEER_RT_CHECK_KINDS.values():
+            req_id = frame["b"].get("req_id")
+            if not link.state.is_up or frame["a"] != 1 or not isinstance(req_id, str) or not 0 < len(req_id) <= 64:
+                raise peer_rt.FrameError("Check requires an UP channel, acknowledgment and request ID")
+            return frame, time.monotonic(), size
+        if frame["a"] or kind not in peer_rt.RT_HEALTH_KINDS | {"ack"}:
             raise peer_rt.FrameError("Unsupported peer channel frame")
+        if kind == "ack":
+            if not link.state.is_up:
+                raise peer_rt.FrameError("Acknowledgment on a DOWN channel")
+            for seq in frame["b"]["s"]:
+                if link.acks.ack(seq):
+                    link.state.on_ack()
+                    # An acknowledged request still needs an answer if the link goes down.
+                    if not link.fallbacks[seq][0]:
+                        del link.fallbacks[seq]
+            database.record_peer_traffic(kind, "rt", "in", size)
+            return
         if len(link.frames) >= peer_rt.RT_FRAME_BURST:
             raise peer_rt.FrameError("Frame queue full")
         echo = frame["b"] if kind == "pong" else {"e": frame["e"], "s": frame["s"]}
         link.frames.append((kind, echo, time.monotonic()))
         database.record_peer_traffic(kind, "rt", "in", size)
     except peer_rt.FrameError as exc:
-        database.record_peer_traffic("rt_invalid", "rt", "in", size)
-        if _peer_rt_log.should_log(fp):
-            logger.warning("Dropped realtime frame from peer %s: %s", fp[-8:], exc)
+        _record_invalid_peer_rt(fp, size, exc)
+
+
+def _deliver_peer_rt_check(bot, accid, msg_id, link, frame, received_at, size):
+    fp = link.peer["fingerprint"]
+    with _peer_rt_lock:
+        peer = database.get_peer_by_fingerprint(fp)
+        if (_peer_rt_links.get(msg_id) is not link or not link.state.is_up
+                or not _peer_rt_eligible(peer, database.get_peer_rt_flag())
+                or peer["rt_msg_id"] != msg_id or peer["rt_lost"]
+                or peer["rt_cid"] != link.peer["rt_cid"] or peer["chat_id"] != link.peer["chat_id"]
+                or peer["rt_key_in"] != link.peer["rt_key_in"]):
+            _record_invalid_peer_rt(fp, size, "Inactive peer carrier")
+            return
+        link.state.on_frame(received_at)
+        active = received_at - link.activity_at >= PEER_RT_PING_INTERVAL
+        if active:
+            link.activity_at = received_at
+    kind = frame["k"]
+    handler = {
+        "req": handle_peer_check_req, "resp": handle_peer_check_resp,
+        "breq": handle_peer_check_batch_req, "bresp": handle_peer_check_batch_resp,
+    }[kind]
+    try:
+        if active:
+            _record_peer_activity(peer["email"])
+        timing = {} if kind in _PEER_RT_REQUESTS else {"arrived_at": received_at}
+        handler(bot, accid, peer, peer["chat_id"], frame["b"], via="rt", **timing)
+    except (TypeError, ValueError) as exc:
+        _record_invalid_peer_rt(fp, size, type(exc).__name__)
+        return
+    database.record_peer_traffic(kind, "rt", "in", size)
+    if (loop := _peer_rt_event_loop()) is not None:
+        loop.call_soon_threadsafe(lambda: loop.create_task(
+            _send_peer_rt_health(bot, accid, msg_id, link, "ack", {"s": [frame["s"]]})))
+
+
+def _fallback_peer_rt_sends(link):
+    for _, fallback in list(link.fallbacks.values()):
+        fallback()
+
+
+def _expire_peer_rt_acks(link):
+    with _peer_rt_lock:
+        if link.state.is_up:
+            link.acks.expire()
+        else:
+            _fallback_peer_rt_sends(link)
+
+
+def _discard_peer_rt_send(link, seq):
+    with _peer_rt_lock:
+        link.acks.discard(seq)
+        return link.fallbacks.pop(seq, None)
+
+
+async def _send_peer_rt_check(destination, msg_id, link, kind, payload, send_mail, ttl, deadline,
+                              before_send, after_send, should_send, still_waiting):
+    loop = asyncio.get_running_loop()
+
+    def mail(*, fallback=False):
+        remaining = ttl if deadline is None else deadline - time.monotonic()
+        if remaining <= 0 or (still_waiting is not None and not still_waiting()):
+            return
+        if fallback:
+            database.record_peer_traffic("rt_fallback", "fallback", "out", 0)
+        send_mail(remaining)
+
+    def fallback():
+        if _discard_peer_rt_send(link, seq) is not None:
+            loop.call_soon_threadsafe(lambda: loop.create_task(asyncio.to_thread(mail, fallback=True)))
+
+    def timed_out(_):
+        link.state.on_ack_timeout()
+        fallback()
+        if not link.state.is_up:
+            _fallback_peer_rt_sends(link)
+
+    if ((deadline is not None and deadline <= time.monotonic())
+            or (should_send is not None and not should_send()) or (still_waiting is not None and not still_waiting())):
+        return
+    blob = None
+    with _peer_rt_lock:
+        if _peer_rt_links.get(msg_id) is link and link.state.is_up:
+            seq = link.seq
+            try:
+                blob = peer_rt.encode(kind, _peer_rt_epoch, seq, payload, link.peer["rt_key_out"],
+                                      ack=1, clock=time.time)
+            except peer_rt.FrameError:
+                pass  # The mail format has a larger size limit.
+            if blob is not None:
+                link.seq += 1
+                link.fallbacks[seq] = (deadline is not None, fallback)
+                link.acks.track({"a": 1, "s": seq}, timed_out)
+                loop.call_later(peer_rt.RT_ACK_TIMEOUT, _expire_peer_rt_acks, link)
+                if deadline is not None:
+                    loop.call_later(max(0, deadline - time.monotonic()), _discard_peer_rt_send, link, seq)
+    if blob is None:
+        await asyncio.to_thread(mail)
+        return
+
+    def send():
+        with _peer_rt_lock:
+            if _peer_rt_links.get(msg_id) is not link or not link.state.is_up or seq not in link.fallbacks:
+                return False
+        if before_send:
+            before_send()
+        destination.bot.rpc.send_webxdc_realtime_data(destination.accid, msg_id, list(blob))
+        return True
+
+    try:
+        sent = await run_rpc(send)
+    except Exception as exc:
+        if _peer_rt_log.should_log((msg_id, "send")):
+            logger.warning("Realtime %s on carrier %s failed (%s)", kind, msg_id, type(exc).__name__)
+        sent = False
+    if not sent:
+        fallback()
+        return
+    database.record_peer_traffic(kind, "rt", "out", len(blob))
+    if after_send:
+        after_send()
 
 
 async def _send_peer_rt_health(bot, accid, msg_id, link, kind, body):
@@ -7516,7 +7755,7 @@ async def _send_peer_rt_health(bot, accid, msg_id, link, kind, body):
         if _peer_rt_log.should_log((msg_id, "send")):
             logger.warning("Realtime %s on carrier %s failed (%s)", kind, msg_id, type(exc).__name__)
         return
-    if kind != "pong":
+    if kind in ("hello", "ping"):
         with _peer_rt_lock:
             link.probes[seq] = sent_at
     database.record_peer_traffic(kind, "rt", "out", len(blob))
@@ -7586,6 +7825,7 @@ async def _tick_peer_rt_link(bot, accid, msg_id, link):
         was_up = link.state.is_up
         if frames:
             link.state.on_frame(frames[-1][2])
+        _expire_peer_rt_acks(link)
     now = time.monotonic()
     if frames:
         if not was_up:
@@ -7599,7 +7839,7 @@ async def _tick_peer_rt_link(bot, accid, msg_id, link):
             if sent is not None and 0 <= received_at - sent < peer_rt.RT_CHANNEL_TIMEOUT:
                 with _peer_rt_lock:
                     link.rtt_ms = round((received_at - sent) * 1000)
-                database.record_peer_rtt("ping", "rt", link.peer["node_name"], link.rtt_ms, True)
+                database.record_peer_rtt("channel_ping", "rt", link.peer["node_name"], link.rtt_ms, True)
         else:
             await _send_peer_rt_health(bot, accid, msg_id, link, "pong", echo)
     for seq, sent in list(link.probes.items()):
@@ -7849,14 +8089,15 @@ def _send_peer_check_answer(destination, kind, payload, *, replay=False):
               label=label, after_send=after_send)
 
 
-def _resend_cached_probe_answer(bot, accid, chat_id, peer, req_id):
+def _resend_cached_probe_answer(bot, accid, chat_id, peer, req_id, via="mail"):
     answer = _inbound_probes.cached_answer(peer, req_id)
     if answer is None:
         return False
     kind, payload = answer
     if "caps" in payload:
         payload = dict(payload, caps=_own_peer_caps())
-    _send_peer_check_answer(_PeerDestination(bot, accid, chat_id), kind, payload, replay=True)
+    destination = _PeerDestination(bot, accid, chat_id, fingerprint=peer.get("fingerprint"), via=via)
+    _send_peer_check_answer(destination, kind, payload, replay=True)
     return True
 
 
@@ -9825,23 +10066,37 @@ def _peer_metrics_report(now):
     mails = ", ".join(f"{kind} {counts[kind]['in']}/{counts[kind]['out']}"
                       for kind in sorted(counts.keys() & (_PEER_MAIL_KINDS | {"rt_advert"})))
     samples = collections.defaultdict(list)
-    timeouts = 0
-    for kind, ms, ok in rtt:
+    timeouts = collections.Counter()
+    transports = {"mail"}
+    for kind, transport, ms, ok in rtt:
+        transports.add(transport)
         if ok:
-            samples[kind].append(ms)
+            samples[transport, kind].append(ms)
         else:
-            timeouts += 1
-    durations = []
-    for kind in ("ping", "vote", "vote_round"):
-        values = sorted(samples[kind])
-        p50, p95 = _percentile(values, 50), _percentile(values, 95)
-        durations.append(f"{kind} {p50:.0f}/{p95:.0f} ms" if values else f"{kind} n/a")
-    timeout_label = "timeout" if timeouts == 1 else "timeouts"
+            timeouts[transport] += 1
     lines = (
         f"• Peer mails (24 h): {mails or 'none'} (in/out)",
         f"• METRICS sent (24 h): idle {counts['peer_metrics_idle']['out']}, on change {counts['peer_metrics_change']['out']}",
-        f"• Peer round trip (24 h): {', '.join(durations)} (p50/p95), {timeouts} {timeout_label}",
     )
+    for transport in ("mail", "rt", "mixed"):
+        if transport not in transports:
+            continue
+        kinds = ("vote_round",) if transport == "mixed" else ("ping", "vote", "vote_round")
+        if (transport, "channel_ping") in samples:
+            kinds += ("channel_ping",)
+        durations = []
+        for kind in kinds:
+            values = sorted(samples[transport, kind])
+            p50, p95 = _percentile(values, 50), _percentile(values, 95)
+            durations.append(f"{kind} {p50:.0f}/{p95:.0f} ms" if values else f"{kind} n/a")
+        n = timeouts[transport]
+        timeout_label = "timeout" if n == 1 else "timeouts"
+        lines += (f"• Peer round trip (24 h, {transport}): {', '.join(durations)} (p50/p95), {n} {timeout_label}",)
+    fallbacks, invalid = counts["rt_fallback"]["out"], counts["rt_invalid"]["in"]
+    if fallbacks or invalid:
+        fallback_label = "fallback" if fallbacks == 1 else "fallbacks"
+        invalid_label = "frame" if invalid == 1 else "frames"
+        lines += (f"• Realtime checks (24 h): {fallbacks} mail {fallback_label}, {invalid} invalid {invalid_label}",)
     if skipped := counts["vote_skipped_paused"]["out"]:
         lines += (f"• Vote rounds skipped for paused peers (24 h): {skipped}",)
     return lines
@@ -10660,10 +10915,17 @@ def _record_peer_activity(sender_addr: str):
             asyncio.run_coroutine_threadsafe(send_admin_notification(rec_txt), async_event_loop)
 
 
+def _note_peer_check_activity(peer, data, via):
+    if via == "mail":
+        _record_peer_activity(peer["email"])
+        return _note_peer_announcement(peer, data)
+    return peer
+
+
 def handle_peer_check_req(bot, accid, peer, chat_id, data, via="mail"):
     req_data = data
     req_id = req_data.get("req_id")
-    if _resend_cached_probe_answer(bot, accid, chat_id, peer, req_id):
+    if _resend_cached_probe_answer(bot, accid, chat_id, peer, req_id, via):
         return
     target_url = req_data.get("url")
     check_type = req_data.get("type", "http")
@@ -10679,8 +10941,7 @@ def handle_peer_check_req(bot, accid, peer, chat_id, data, via="mail"):
             "family": family,
         }
         async def _do_cross_check_reply():
-            _record_peer_activity(peer["email"])
-            _note_peer_announcement(peer, req_data)
+            _note_peer_check_activity(peer, req_data, via)
             if not await _prewarm_target_dns(target_url, check_type) or not is_safe_target_url(target_url, check_type, resolve_dns=False):
                 return
             if await asyncio.to_thread(database.is_probe_target_ignored, target_url):
@@ -10703,34 +10964,39 @@ def handle_peer_check_req(bot, accid, peer, chat_id, data, via="mail"):
                 "node_name": database.get_local_node_name(),
                 "caps": _own_peer_caps(),  # lets the requester switch to batched requests
             }
-            _send_peer_check_answer(_PeerDestination(bot, accid, chat_id), "CHECK_RESP", resp_payload)
+            destination = _PeerDestination(bot, accid, chat_id, fingerprint=peer.get("fingerprint"), via=via)
+            await asyncio.to_thread(_send_peer_check_answer, destination, "CHECK_RESP", resp_payload)
 
-        _submit_inbound_probe(peer, req_id, _do_cross_check_reply)
+        if not _submit_inbound_probe(peer, req_id, _do_cross_check_reply):
+            _resend_cached_probe_answer(bot, accid, chat_id, peer, req_id, via)
 
 
 def handle_peer_check_batch_req(bot, accid, peer, chat_id, data, via="mail"):
     req_data = data
     req_id = req_data.get("req_id")
-    if _resend_cached_probe_answer(bot, accid, chat_id, peer, req_id):
+    if _resend_cached_probe_answer(bot, accid, chat_id, peer, req_id, via):
         return
     raw_targets = req_data.get("targets")
     workers = min(10, max(1, len(raw_targets))) if isinstance(raw_targets, list) else 1
     async def answer():
-        _record_peer_activity(peer["email"])
-        _note_peer_announcement(peer, req_data)
+        _note_peer_check_activity(peer, req_data, via)
         targets = await run_db(_parse_batch_targets, req_data.get("targets"))
         if targets:
-            await _answer_batch_cross_check(bot, accid, chat_id, req_id, targets, workers)
-    _submit_inbound_probe(peer, req_id, answer, workers)
+            await _answer_batch_cross_check(bot, accid, chat_id, req_id, targets, workers,
+                                            fingerprint=peer.get("fingerprint"), via=via)
+    if not _submit_inbound_probe(peer, req_id, answer, workers):
+        _resend_cached_probe_answer(bot, accid, chat_id, peer, req_id, via)
 
 
-def handle_peer_check_batch_resp(bot, accid, peer, chat_id, data, via="mail", *, sender_addr=None):
+def handle_peer_check_batch_resp(bot, accid, peer, chat_id, data, via="mail", *, sender_addr=None, arrived_at=None):
+    if arrived_at is None:
+        arrived_at = time.monotonic()
     resp_data = data
     sender_addr = peer["email"] if sender_addr is None else sender_addr
-    _record_peer_activity(peer["email"])
-    peer = _note_peer_announcement(peer, resp_data)
+    peer = _note_peer_check_activity(peer, resp_data, via)
     # Only an answer to a batch this node sent, from the chat it was sent to
-    pending = pending_batch_checks.get(resp_data.get("req_id"))
+    req_id = resp_data.get("req_id")
+    pending = pending_batch_checks.get(req_id)
     if not pending:
         return
     fut, expected_chat, count = pending
@@ -10742,11 +11008,17 @@ def handle_peer_check_batch_resp(bot, accid, peer, chat_id, data, via="mail", *,
     node_name = peer.get("node_name") or "Remote-Node"
     # URLs come from our own request (the future's owner knows them): only positions are trusted here
     answers = [_clean_peer_result(raw[i] if i < len(raw) else None, node_name, None) for i in range(count)]
-    if not fut.done():
-        if async_event_loop and async_event_loop.is_running():
-            async_event_loop.call_soon_threadsafe(lambda: fut.done() or fut.set_result(answers))
-        else:
+    def resolve():
+        if not fut.done():
+            timing = _pending_peer_rtt.get(req_id, {}).get(chat_id)
+            if timing is not None:
+                timing.note_answer(arrived_at, node_name, via)
             fut.set_result(answers)
+
+    if async_event_loop and async_event_loop.is_running():
+        async_event_loop.call_soon_threadsafe(resolve)
+    else:
+        resolve()
 
 
 def handle_peer_check_resp(bot, accid, peer, chat_id, data, via="mail", *, sender_addr=None, arrived_at=None):
@@ -10760,21 +11032,23 @@ def handle_peer_check_resp(bot, accid, peer, chat_id, data, via="mail", *, sende
     error_msg = resp_data.get("error_msg")
 
     sender_addr = peer["email"] if sender_addr is None else sender_addr
-    _record_peer_activity(peer["email"])
-    peer = _note_peer_announcement(peer, resp_data)
+    peer = _note_peer_check_activity(peer, resp_data, via)
 
     # Only answers to a request this node sent to this very peer are accepted
     pending = pending_peer_checks.get(req_id) if req_id else None
     if not pending:
         return
     fut, expected_count, resp_list, expected_chats = pending
-    if chat_id not in expected_chats:
-        logger.warning(f"Dropping check response for req_id {req_id} from unexpected peer {sender_addr} in chat {chat_id}")
-        return
-    expected_chats.discard(chat_id)
+    with _peer_answer_lock:
+        if fut.done():
+            return
+        if chat_id not in expected_chats:
+            logger.warning(f"Dropping check response for req_id {req_id} from unexpected peer {sender_addr} in chat {chat_id}")
+            return
+        expected_chats.discard(chat_id)
 
     node_name = peer.get("node_name") or "Remote-Node"
-    if status not in VOTING_STATUSES:
+    if not isinstance(status, str) or status not in VOTING_STATUSES:
         status = "unknown"
     if not isinstance(latency_ms, int) or isinstance(latency_ms, bool):
         latency_ms = None
@@ -10784,21 +11058,24 @@ def handle_peer_check_resp(bot, accid, peer, chat_id, data, via="mail", *, sende
         database.save_peer_measurement(target_url, node_name, status, latency_ms, error_msg, int(time.time()),
                                        peer.get("fingerprint") or peer["email"])
 
-    resp_list.append({
-        "req_id": req_id,
-        "url": target_url,
-        "status": status,
-        "latency_ms": latency_ms,
-        "error_msg": error_msg,
-        "node_name": node_name,
-    })
-    timings = _pending_peer_rtt.get(req_id)
-    timing = timings.get(chat_id) if timings is not None else None
-    if timing is not None:
-        timing.note_single_answer(arrived_at, node_name)
-    if len(resp_list) >= expected_count and not fut.done():
+    with _peer_answer_lock:
+        if fut.done():
+            return
+        resp_list.append({
+            "req_id": req_id,
+            "url": target_url,
+            "status": status,
+            "latency_ms": latency_ms,
+            "error_msg": error_msg,
+            "node_name": node_name,
+        })
+        timing = _pending_peer_rtt.get(req_id, {}).get(chat_id)
+        if timing is not None:
+            timing.note_answer(arrived_at, node_name, via)
+        complete = len(resp_list) >= expected_count
+    if complete:
         if async_event_loop and async_event_loop.is_running():
-            async_event_loop.call_soon_threadsafe(fut.set_result, resp_list)
+            async_event_loop.call_soon_threadsafe(lambda: fut.done() or fut.set_result(resp_list))
         else:
             try:
                 fut.set_result(resp_list)
@@ -11070,7 +11347,8 @@ def on_new_message(bot, accid, event):
             if not _is_trusted_peer_msg(msg, peer, is_private_chat):
                 logger.warning(f"Dropping batch check response from untrusted sender {sender_addr or msg.from_id}")
                 return
-            handle_peer_check_batch_resp(bot, accid, peer, msg.chat_id, resp_data, sender_addr=sender_addr)
+            handle_peer_check_batch_resp(bot, accid, peer, msg.chat_id, resp_data, sender_addr=sender_addr,
+                                         arrived_at=arrived_at)
         except Exception as e:
             logger.error(f"Error handling peer batch check response: {e}")
         return

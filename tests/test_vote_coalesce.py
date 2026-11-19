@@ -318,6 +318,61 @@ class VoteTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(new_batches, 0)
         self.assertGreaterEqual(old_batches, new_batches * 3)
 
+    async def test_seventy_minute_peer_transport_simulation(self):
+        self.peers = [dict(peer(i), fingerprint=f"{i:040X}") for i in range(8)]
+        resources = [target(i) for i in range(6)]
+        loop = asyncio.get_running_loop()
+        client = MagicMock()
+        counts = collections.Counter()
+        links = {
+            i: bot._PeerRealtimeLink(p, None)
+            for i, p in enumerate(self.peers)
+        }
+        by_chat = {p["chat_id"]: p for p in self.peers}
+
+        def answer(chat, payload, via):
+            remote = by_chat[chat]
+            counts[via] += 2   # One batch request and one batch answer.
+            bot.handle_peer_check_batch_resp(client, 1, remote, chat, {
+                "req_id": payload["req_id"],
+                "results": [{"status": "down"}] * len(payload["targets"]),
+            }, via=via)
+
+        def mail(destination, kind, payload, *, before_send, **kwargs):
+            self.assertEqual(kind, "CHECK_BATCH_REQ")
+            before_send()
+            answer(destination.chat_id, payload, "mail")
+
+        async def realtime(destination, _msg_id, _link, kind, payload, _mail, _ttl, _deadline,
+                           before_send, _after_send, _should_send, _waiting):
+            self.assertEqual(kind, "breq")
+            before_send()
+            answer(destination.chat_id, payload, "rt")
+
+        self.install(bot, dc_bot_instance=client, dc_accid=1, async_event_loop=loop, _peer_rt_links=links,
+                     _record_peer_activity=MagicMock(), _note_peer_announcement=lambda p, data: p,
+                     _record_peer_rtt=MagicMock())
+        with patch.multiple(bot, _send_peer_mail=mail, _send_peer_rt_check=realtime):
+            for up in (False, True):
+                bot._vote_cache.clear()
+                for monitor, phase in zip(resources, (8, 26, 44, 62, 80, 100)):
+                    self.seed(monitor, phase)
+                for now in range(0, 4200, 5):
+                    self.clock.now = now
+                    if up:
+                        for link in links.values():
+                            link.state.on_frame()
+                    await self.grid(resources, now)
+                if not up:
+                    down_mails = counts["mail"]
+                    counts.clear()
+
+        print(f"70-minute peer transport simulation: {down_mails} vote mails DOWN, "
+              f"{counts['mail']} vote mails UP ({counts['rt']} realtime vote frames)")
+        self.assertGreater(down_mails, 0)
+        self.assertLessEqual(counts["mail"], down_mails * 0.1)
+        self.assertEqual(counts["mail"] + counts["rt"], down_mails)
+
 
 if __name__ == "__main__":
     unittest.main()

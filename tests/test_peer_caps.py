@@ -47,6 +47,7 @@ class PeerNode:
             _processed_msg_ids=bot._ProcessedMessageIds(), _peer_metrics_timestamps=OrderedDict(), stat_event=MagicMock(),
         )
         self.mail_kinds = MagicMock()
+        self.peer_traffic = MagicMock()
         with self.active():
             database.init_db()
             database.set_local_node_name(name)
@@ -57,7 +58,7 @@ class PeerNode:
     def active(self):
         with patch.multiple(bot, **self.state), patch.multiple(
                 database, DB_PATH=str(self.path / "test.db"), time=self.clock,
-                record_mail_kind=self.mail_kinds, record_peer_traffic=MagicMock()):
+                record_mail_kind=self.mail_kinds, record_peer_traffic=self.peer_traffic):
             try:
                 yield
             finally:
@@ -147,6 +148,9 @@ class TestPeerCapabilities(unittest.TestCase):
             self.tick()
             self.assertEqual(len(self.left.sent("METRICS")), 2)
             self.assertEqual([c.args for c in self.left.mail_kinds.call_args_list], [("peer_metrics",)] * 2)
+            reasons = [c.args for c in self.left.peer_traffic.call_args_list if c.args[0].startswith("peer_metrics_")]
+            self.assertEqual(reasons, [("peer_metrics_change", "mail", "out", 0),
+                                       ("peer_metrics_idle", "mail", "out", 0)])
             bot.audit_peer_rt_carriers(self.left.client, 1, self.clock.now)
             self.assertEqual(self.left.sent("RT_OFFER"), [])
 

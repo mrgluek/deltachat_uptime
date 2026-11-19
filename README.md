@@ -203,11 +203,12 @@ count toward a limit of three per node per hour.
 The bots join through Delta Chat Core without opening the app. Each side mails
 one hidden address advertisement after accepting the app and on restart, with
 up to 60 seconds of jitter and at least 60 seconds between attempts per carrier.
-An advertisement triggers an authenticated `hello` on the channel. Idle peers
-send a `ping` after 30 seconds. Both frames receive a `pong` that echoes the
-sender's epoch and sequence number for round-trip timing. `/peers` shows the
-carrier age while waiting to join, `UP` with the measured RTT when available,
-or `DOWN` after 90 seconds without a valid frame. `/stats` totals these channels.
+An advertisement triggers an authenticated `hello` on the channel. Each side
+sends its own `ping` every 30 seconds, even while answering the other side.
+Both frames receive a `pong` that echoes the sender's epoch and sequence number.
+`/peers` shows the carrier age while waiting to join, `UP` with this bot's own
+measured RTT when available, or `DOWN` after 90 seconds without a valid frame.
+`/stats` totals these channels.
 If the peer is still active by mail, the bot tries to rejoin after five minutes
 down, then after 15 minutes and hourly. Realtime currently carries channel health
 checks. Monitoring requests, answers, votes and telemetry travel by mail.

@@ -235,6 +235,39 @@ class TestPeerRTChannel(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(conn.execute("SELECT kind, transport, peer, ms, ok FROM peer_rtt").fetchall(),
                              [("ping", "rt", "Peer", 125, 1)])
 
+    async def test_replying_to_peer_pings_keeps_local_ping_cadence_and_rtt(self):
+        self.carrier()
+        await self.tick()
+        for probe_at, expected_rtt in ((30, 250), (60, 500)):
+            self.send.reset_mock()
+            self.advance(probe_at - 0.25 - self.mono)
+            self.receive(self.inbound("ping"))
+            await self.tick()
+            self.assertEqual([frame["k"] for frame in self.outbound()], ["pong"])
+            self.send.reset_mock()
+
+            self.advance(0.25)
+            self.receive(self.inbound("ping"))
+            await self.tick()
+            frames = self.outbound()
+            self.assertEqual([frame["k"] for frame in frames], ["pong", "ping"])
+            reply, probe = frames
+            await self.tick()
+            self.assertEqual(self.send.call_count, 2)
+
+            previous = self.command(bot.peers_command)
+            self.receive(self.inbound("pong", {k: reply[k] for k in ("e", "s")}))
+            await self.tick()
+            self.assertEqual(self.command(bot.peers_command), previous)
+            self.advance(expected_rtt / 1000)
+            self.receive(self.inbound("pong", {k: probe[k] for k in ("e", "s")}))
+            await self.tick()
+            self.assertIn(f"iroh: UP (rtt {expected_rtt} ms)", self.command(bot.peers_command))
+
+        self.traffic()
+        with sqlite3.connect(database.DB_PATH) as conn:
+            self.assertEqual(conn.execute("SELECT ms FROM peer_rtt ORDER BY rowid").fetchall(), [(250,), (500,)])
+
     async def test_rejoin_requires_mail_and_persists_backoff(self):
         self.carrier()
         await self.tick()

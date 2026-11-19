@@ -1690,14 +1690,14 @@ def pick_telemetry_batch(email: str, all_metrics: list[dict], batch_size: int) -
     return batch
 
 
-def _peer_metrics_payload(metrics, now, node_name, self_addr, caps, interval, peer_interval):
+def _peer_metrics_payload(metrics, now, node_name, self_addr, caps, interval, change_gap):
     return {
         "node_name": node_name,
         "sender_email": self_addr,
         "timestamp": now,
         "msg_id": f"{now}_{secrets.token_hex(4)}",
         "caps": caps,
-        "telemetry_interval": max(TELEMETRY_IDLE_INTERVAL, peer_interval),
+        "telemetry_interval": max(TELEMETRY_IDLE_INTERVAL, change_gap),
         "desired_interval": interval,
         "version": VERSION,
         "metrics": metrics,
@@ -7403,8 +7403,7 @@ class _PeerRealtimeLink:
     advertise_at: float | None
     state: peer_rt.PeerChannelState = field(default_factory=lambda: peer_rt.PeerChannelState(clock=time.monotonic))
     started_at: float | None = None
-    last_sent_at: float = float("-inf")
-    last_ping_attempt: float = float("-inf")
+    next_ping_at: float | None = None
     hello_requested: bool = False
     frames: collections.deque[tuple[str, dict, float]] = field(default_factory=collections.deque)
     seq: int = 0
@@ -7517,9 +7516,8 @@ async def _send_peer_rt_health(bot, accid, msg_id, link, kind, body):
         if _peer_rt_log.should_log((msg_id, "send")):
             logger.warning("Realtime %s on carrier %s failed (%s)", kind, msg_id, type(exc).__name__)
         return
-    with _peer_rt_lock:
-        link.last_sent_at = sent_at
-        if kind != "pong":
+    if kind != "pong":
+        with _peer_rt_lock:
             link.probes[seq] = sent_at
     database.record_peer_traffic(kind, "rt", "out", len(blob))
     if kind == "hello":
@@ -7611,12 +7609,14 @@ async def _tick_peer_rt_link(bot, accid, msg_id, link):
         await _send_peer_rt_health(bot, accid, msg_id, link, "hello", {})
     if link.advertise_at is not None and now >= link.advertise_at:
         link.advertise_at, link.started_at = None, now
-        link.last_ping_attempt = now
         await _advertise_peer_rt(bot, accid, msg_id, link)
-    # Keep retrying after a lost initial hello or after a transient RPC failure.
-    if (link.started_at is not None or hello or frames) and (
-            now - max(link.last_sent_at, link.last_ping_attempt) >= PEER_RT_PING_INTERVAL):
-        link.last_ping_attempt = now
+    # Schedule local probes independently of replies to the other peer.
+    ping_at = time.monotonic()
+    if link.next_ping_at is None:
+        if link.started_at is not None or hello or frames:
+            link.next_ping_at = ping_at + PEER_RT_PING_INTERVAL
+    elif ping_at >= link.next_ping_at:
+        link.next_ping_at = ping_at + PEER_RT_PING_INTERVAL
         await _send_peer_rt_health(bot, accid, msg_id, link, "ping", {})
     down_since = link.down_since
     if (not link.state.is_up and down_since is not None and now - down_since >= PEER_RT_REJOIN_DELAYS[0]

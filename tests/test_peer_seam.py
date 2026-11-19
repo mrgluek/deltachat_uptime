@@ -84,7 +84,8 @@ class TestPeerSend(unittest.TestCase):
 
 def inline_peer_metrics(test):
     test.enterContext(patch.object(bot._peer_metrics_inbox, "submit",
-                                 side_effect=lambda peer, data, via, _size: bot._apply_peer_metrics(peer, data, via)))
+                                 side_effect=lambda peer, data, via, _size, **kwargs:
+                                 bot._apply_peer_metrics(peer, data, via, **kwargs)))
 
 
 class TestPeerHandlers(_DbCase):

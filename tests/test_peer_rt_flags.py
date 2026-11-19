@@ -69,7 +69,8 @@ class TestPeerRTFlags(unittest.TestCase):
                 flag = value.strip().lower()
                 self.assertIn(f"`{flag}`", self.set_flag(value))
                 self.assertEqual(database.get_peer_rt_flag(), flag)
-                self.assertEqual(bot._own_peer_caps(), base if flag == "off" else base + ["rt1"])
+                peer = database.get_peer(EMAIL)
+                self.assertEqual(bot._own_peer_caps(peer), base + ["rt1"] if flag == "on" else base)
 
     def test_replayed_answer_advertises_current_capability(self):
         caps = bot._own_peer_caps()

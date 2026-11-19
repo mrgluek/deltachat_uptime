@@ -321,7 +321,8 @@ class TestPeerRTChannel(unittest.IsolatedAsyncioTestCase):
                 elif action == "mode":
                     self.command(bot.peerrt_command, EMAIL + " off")
                 elif action == "downgrade":
-                    bot._note_peer_announcement(database.get_peer(EMAIL), {"caps": ["batch_check"]}, telemetry=True)
+                    bot._note_peer_announcement(database.get_peer(EMAIL), {"caps": ["batch_check"]},
+                                                telemetry=True, stamp=(self.now, 400))
                 else:
                     self.command(bot.rmpeer_command, EMAIL)
                 self.advertisement(msg_id)

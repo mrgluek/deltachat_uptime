@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Require fresh peer announcements and matching check responses before clearing realtime capability or carrier state.
+- Advertise realtime only to enabled peers and wait for capability exchange before sending carrier offers.
+- Retry unaccepted carrier offers after ten minutes and resume negotiation promptly when realtime is re-enabled.
+- Reply by mail when a fallback arrives while a realtime check is still running.
+- Keep realtime peer activity current when a paired bot switches relay addresses.
+- Limit caps-only mail to one startup attempt per peer with realtime off and back off when enabled peers never announce caps.
+- Cap future METRICS timestamps at five minutes ahead for telemetry ordering.
+
 ## [3.0.0] - 2026-11-19
 
 ### Added

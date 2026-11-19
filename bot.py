@@ -22,7 +22,7 @@ import weakref
 import hashlib
 import zipfile
 from pathlib import Path
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum, auto
 import time
 from time import monotonic
@@ -358,6 +358,8 @@ PEER_CAP_SMTP_CHECK = "smtp_check"
 OWN_PEER_CAPS = [PEER_CAP_BATCH_CHECK, PEER_CAP_SMTP_CHECK]
 PEER_CAP_RT = "rt1"
 PEER_CAPS_ANNOUNCE_INTERVAL = 600
+PEER_CAPS_ANNOUNCE_MAX_INTERVAL = 6 * 3600
+PEER_CAPS_MAIL_MAX_AGE = 600
 PEER_CAPS_CHANGE_LIMIT = 3
 PEER_RT_AUDIT_INTERVAL = 60
 PEER_RT_ROTATE = 14 * 86400
@@ -371,13 +373,14 @@ PEER_RT_PING_INTERVAL = 30
 PEER_RT_REJOIN_DELAYS = (300, 900, 3600)
 _peer_rt_lock = threading.RLock()
 _peer_rt_audit_requested = threading.Event()
+_peer_rt_retry_now = set()
 _last_peer_rt_audit = None
 
 
-def _own_peer_caps() -> list[str]:
-    if database.get_peer_rt_flag() == "off":
-        return OWN_PEER_CAPS
-    return [*OWN_PEER_CAPS, PEER_CAP_RT]
+def _own_peer_caps(peer=None, *, flag=None) -> list[str]:
+    if flag is None:
+        flag = database.get_peer_rt_flag()
+    return [*OWN_PEER_CAPS, PEER_CAP_RT] if _peer_rt_enabled(peer or {}, flag) else OWN_PEER_CAPS
 CROSS_CHECK_BATCH_WINDOW = 5.0    # seconds to collect failing targets before sending
 CROSS_CHECK_BATCH_MAX = 100       # targets per batch message
 CROSS_CHECK_BATCH_TIMEOUT = 25.0  # a peer checks up to 100 targets (10 s timeouts) and mails back
@@ -453,7 +456,7 @@ class InboundProbeAdmission:
         self.outstanding = collections.Counter()
         self.rates = {}
         self.seen = collections.OrderedDict()
-        self.running = set()
+        self.running = {}
         self.answers = collections.OrderedDict()
         self.replay_rates = collections.OrderedDict()
         self.warned = {}
@@ -518,7 +521,7 @@ class InboundProbeAdmission:
             if len(self.answers) > PEER_ANSWER_CACHE_MAX:
                 self.answers.popitem(last=False)
 
-    def acquire(self, peer, req_id, slots=1):
+    def acquire(self, peer, req_id, slots=1, *, via="mail"):
         if not isinstance(req_id, str) or not 0 < len(req_id) <= 64:
             return _ProbeAdmission.REJECTED, None
         identity = _peer_identity(peer)
@@ -529,6 +532,8 @@ class InboundProbeAdmission:
             while self.seen and next(iter(self.seen.values())) <= now - 600:
                 self.seen.popitem(last=False)
             if key in self.running:
+                if via == "mail":
+                    self.running[key] = "mail"
                 return _ProbeAdmission.RUNNING, None
             if key in self.answers or key in self.seen:
                 return _ProbeAdmission.COMPLETED, None
@@ -558,14 +563,18 @@ class InboundProbeAdmission:
             self.outstanding[identity] += slots
             self.rates.setdefault(identity, collections.deque()).append(now)
             self.seen[key] = now
-            self.running.add(key)
+            self.running[key] = via
             return _ProbeAdmission.ACCEPTED, (key, slots)
+
+    def reply_via(self, key):
+        with self.lock:
+            return self.running[key]
 
     def release(self, reservation):
         key, slots = reservation
         identity, _ = key
         with self.lock:
-            self.running.remove(key)
+            del self.running[key]
             self.outstanding[identity] -= slots
             if not self.outstanding[identity]:
                 del self.outstanding[identity]
@@ -580,7 +589,7 @@ _inbound_probe_answer = contextvars.ContextVar("inbound_probe_answer", default=N
 
 def _submit_inbound_probe(peer, req_id, make_coro, slots=1, *, via):
     admission = _inbound_probes
-    outcome, reservation = admission.acquire(peer, req_id, slots)
+    outcome, reservation = admission.acquire(peer, req_id, slots, via=via)
     if reservation is None:
         return outcome
     started = False
@@ -589,8 +598,7 @@ def _submit_inbound_probe(peer, req_id, make_coro, slots=1, *, via):
         nonlocal started
         started = True
         key, _ = reservation
-        remember = functools.partial(admission.remember_answer, key, via=via)
-        token = _inbound_probe_answer.set((key, remember))
+        token = _inbound_probe_answer.set((key, admission))
         try:
             await make_coro()
         finally:
@@ -619,6 +627,9 @@ def _submit_inbound_probe(peer, req_id, make_coro, slots=1, *, via):
 _peer_caps = {}  # peer email (lower) -> set of capabilities it announced
 _peer_caps_announcements = {}  # peer identity -> last successfully announced local caps, per process
 _peer_caps_requests = set()  # peer identities awaiting a capability announcement
+_peer_caps_refresh = set()  # peers newly enabled for realtime, pending a fresh announcement
+_peer_caps_attempted = set()  # peer identities that had a caps-only announcement attempt this process
+_peer_caps_backoff = {}  # peer identity -> (announced signature, retry delay) while remote caps are unknown
 _cross_check_queue = []  # (target_dict, future, reporting node or None) waiting for the next batch
 # A vote asks a sample of the most stable peers, not all: every peer asked is two mails, and a
 # quorum of 7 tells "down / only some" about as well as 20. Up to this many peers all are asked.
@@ -758,7 +769,7 @@ class _PeerMetricsInbox:
         self.executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=PEER_METRICS_WORKERS, thread_name_prefix="uptime_peer_metrics")
 
-    def submit(self, peer, data, via, size):
+    def submit(self, peer, data, via, size, stamp=None):
         identity = _peer_identity(peer)
         with self.lock:
             queue = self.pending.get(identity)
@@ -767,7 +778,7 @@ class _PeerMetricsInbox:
                 return
             if replace_size:
                 queue.popleft()
-            self.pending.setdefault(identity, collections.deque()).append((peer, data, via, size))
+            self.pending.setdefault(identity, collections.deque()).append((peer, data, via, stamp, size))
             self.bytes += size - replace_size
             if identity not in self.active and self.workers < PEER_METRICS_WORKERS:
                 self.workers += 1
@@ -788,14 +799,14 @@ class _PeerMetricsInbox:
                     self.workers -= 1
                     return
                 queue = self.pending[identity]
-                peer, data, via, size = queue.popleft()
+                peer, data, via, stamp, size = queue.popleft()
                 if queue:
                     self.pending.move_to_end(identity)
                 else:
                     del self.pending[identity]
                 self.active.add(identity)
             try:
-                _apply_peer_metrics(peer, data, via)
+                _apply_peer_metrics(peer, data, via, stamp=stamp)
             except Exception:
                 logger.exception("Could not process peer metrics for %s", identity)
             finally:
@@ -1354,7 +1365,7 @@ async def request_peer_cross_checks(target_dict: dict, timeout: float = 8.0, pee
         "type": target_dict.get("type", "http"),
         "expected_keyword": target_dict.get("expected_keyword"),
         "node_name": database.get_local_node_name(),
-        "caps": _own_peer_caps(),
+        "caps": OWN_PEER_CAPS,
     }
     if target_dict.get("family") in (4, 6):
         req_payload["family"] = target_dict["family"]  # older peers ignore it and check any family
@@ -1390,7 +1401,8 @@ async def request_peer_cross_checks(target_dict: dict, timeout: float = 8.0, pee
             try:
                 # A request still queued when the answer is no longer awaited is dropped
                 destination = _PeerDestination(dc_bot_instance, dc_accid, chat_id, fingerprint=p.get("fingerprint"))
-                await asyncio.to_thread(peer_send, destination, "CHECK_REQ", req_payload,
+                payload = dict(req_payload, caps=_own_peer_caps(p))
+                await asyncio.to_thread(peer_send, destination, "CHECK_REQ", payload,
                                         priority=PRIO_PEER, expires_in=timeout, label="cross-check request",
                                         mail_kind="peer_vote" if is_vote else "peer_other", before_send=timing.start,
                                         before_rt_send=timing.start_rt,
@@ -1499,8 +1511,29 @@ def _note_peer_caps(email: str, caps) -> None:
             _peer_caps[email] = announced
 
 
+def _fresh_peer_caps(peer, timestamp, msg_id):
+    if timestamp is not None:
+        now = time.time()
+        if not now - PEER_CAPS_MAIL_MAX_AGE <= timestamp <= now + PEER_CAPS_MAIL_MAX_AGE:
+            return False
+        previous = peer.get("rt_caps_timestamp")
+        if previous is not None and (timestamp < previous or (timestamp == previous and msg_id is None)):
+            return False
+    previous_id = peer.get("rt_caps_msg_id")
+    if msg_id is not None:
+        return previous_id is None or msg_id > previous_id
+    return timestamp is not None
+
+
+def _mail_announcement_stamp(msg):
+    timestamp = _field(msg, "timestamp")
+    msg_id = _field(msg, "id")
+    return (timestamp if type(timestamp) is int and timestamp > 0 else None,
+            msg_id if type(msg_id) is int and msg_id > 0 else None)
+
+
 def _note_peer_announcement(peer: dict, data, *, allow_rename=True, telemetry=False, allow_caps=True,
-                            via="mail") -> dict:
+                            via="mail", stamp=None) -> dict:
     """What a key-verified peer says about itself in protocol messages: its capabilities and its
     node name (changed with /nodename there). Returns the peer row, renamed if the name changed.
 
@@ -1511,18 +1544,35 @@ def _note_peer_announcement(peer: dict, data, *, allow_rename=True, telemetry=Fa
     if allow_caps:
         with _peer_rt_lock:
             caps = data.get("caps")
-            had_rt = _peer_supports(peer, PEER_CAP_RT) or peer.get("rt_cid") or peer.get("rt_offer_at") is not None
+            fingerprint = peer.get("fingerprint")
+            if fingerprint:
+                peer = database.get_peer_by_fingerprint(fingerprint) or peer
+            had_rt = (_peer_supports(peer, PEER_CAP_RT) or peer.get("rt_capable")
+                      or peer.get("rt_cid") or peer.get("rt_offer_at") is not None)
             if telemetry and had_rt and not isinstance(caps, list):
                 # Older METRICS can omit caps entirely. Keep the legacy capability
                 # cache behavior for all other capabilities.
                 caps = [cap for cap in _peer_caps.get(peer["email"].lower(), ()) if cap != PEER_CAP_RT]
             if isinstance(caps, list):
+                caps = [str(cap)[:40] for cap in caps[:20]]
+                supports_rt = PEER_CAP_RT in caps
+                timestamp, msg_id = stamp or (None, None)
+                fresh = (_fresh_peer_caps(peer, timestamp, msg_id)
+                         or stamp is None and supports_rt and not peer.get("rt_caps_timestamp")
+                         and not peer.get("rt_caps_msg_id"))
+                # An older message may still teach legacy capabilities. It must
+                # preserve the current realtime capability and carrier.
+                if (had_rt or supports_rt) and not fresh:
+                    caps = [cap for cap in caps if cap != PEER_CAP_RT]
+                    if had_rt:
+                        caps.insert(0, PEER_CAP_RT)
                 _note_peer_caps(peer["email"], caps)
-                supports_rt = _peer_supports(peer, PEER_CAP_RT)
-                if peer.get("fingerprint") and ((supports_rt and not peer.get("rt_capable"))
-                                                or (had_rt and not supports_rt)):
-                    database.set_peer_rt_capability(peer["fingerprint"], supports_rt)
-                    _refresh_peer_rt_channels()
+                if isinstance(data.get("caps"), list):
+                    _peer_caps_backoff.pop(_peer_identity(peer), None)
+                if fingerprint and fresh and (had_rt or supports_rt):
+                    database.set_peer_rt_capability(fingerprint, supports_rt, timestamp=timestamp, msg_id=msg_id)
+                    if supports_rt != bool(peer.get("rt_capable")) or not supports_rt:
+                        _refresh_peer_rt_channels()
     note_peer_version(peer["email"], data.get("version"))
     email = peer["email"].lower()
     announced = data.get("telemetry_interval")
@@ -1734,7 +1784,7 @@ async def _batch_cross_check_peer(peer: dict, items: list, results: dict) -> Non
     payload = {
         "req_id": req_id,
         "node_name": database.get_local_node_name(),
-        "caps": _own_peer_caps(),
+        "caps": _own_peer_caps(peer),
         "targets": [{k: t.get(k) for k in ("url", "type", "expected_keyword", "family")} for _, t in items],
     }
     fut = asyncio.get_running_loop().create_future()
@@ -1808,7 +1858,9 @@ async def _answer_batch_cross_check(bot, accid, chat_id: int, req_id: str, targe
                 answers[index] = {"status": "unknown", "latency_ms": None, "error_msg": str(exc)[:200]}
 
     await asyncio.gather(*(worker() for _ in range(min(concurrency, len(targets)))))
-    payload = {"req_id": req_id, "node_name": database.get_local_node_name(), "caps": _own_peer_caps(), "results": answers}
+    peer = database.get_peer_by_chat_id(chat_id)
+    payload = {"req_id": req_id, "node_name": database.get_local_node_name(), "caps": _own_peer_caps(peer),
+               "results": answers}
     # The requester waits CROSS_CHECK_BATCH_TIMEOUT from sending; a later answer is ignored there
     destination = _PeerDestination(bot, accid, chat_id, fingerprint=fingerprint, via=via)
     await asyncio.to_thread(_send_peer_check_answer, destination, "CHECK_BATCH_RESP", payload)
@@ -1890,21 +1942,26 @@ def _peer_metrics_payload(metrics, now, node_name, self_addr, caps, interval, an
 
 def _peer_caps_changed(peer, signature):
     last_caps = peer["caps_announce_value"]
-    return last_caps is not None and last_caps != signature
+    return (last_caps is not None and last_caps != signature) or _peer_identity(peer) in _peer_caps_refresh
 
 
 def _recent_peer_caps_changes(peer, now):
     return [at for at in json.loads(peer["caps_change_attempts"]) if now - at < PEER_CAPS_ANNOUNCE_INTERVAL]
 
 
-def _peer_caps_announcement_due(peer, signature, now):
+def _peer_caps_announcement_due(peer, signature, now, flag):
+    identity = _peer_identity(peer)
+    if flag == "off" and identity in _peer_caps_attempted:
+        return False
     if _up_peer_rt_link(peer.get("chat_id"), peer.get("fingerprint")):
         return False  # The live channel carries the current capabilities, even without monitors.
+    last_attempt = peer["caps_announce_attempt_at"]
+    previous, interval = _peer_caps_backoff.get(identity, (None, PEER_CAPS_ANNOUNCE_INTERVAL))
+    if previous == signature and last_attempt is not None and now - last_attempt < interval:
+        return False
     if _peer_caps_changed(peer, signature):
         return len(_recent_peer_caps_changes(peer, now)) < PEER_CAPS_CHANGE_LIMIT
-    last_attempt = peer["caps_announce_attempt_at"]
-    identity = _peer_identity(peer)
-    return ((last_attempt is None or now - last_attempt >= PEER_CAPS_ANNOUNCE_INTERVAL)
+    return ((last_attempt is None or now - last_attempt >= interval)
             and (identity not in _peer_caps_announcements or identity in _peer_caps_requests
                  or peer["email"].lower() not in _peer_caps))
 
@@ -1913,6 +1970,8 @@ def _note_peer_caps_sent(identity, signature):
     with _peer_rt_lock:
         previous = _peer_caps_announcements.get(identity)
         _peer_caps_announcements[identity] = signature
+        if PEER_CAP_RT in json.loads(signature):
+            _peer_caps_refresh.discard(identity)
         if previous != signature or identity in _peer_caps_requests:
             _peer_caps_requests.discard(identity)
             _peer_rt_audit_requested.set()
@@ -1935,16 +1994,24 @@ def _queue_peer_caps_announcement(bot, accid, peer, signature, payload, change_g
         with _peer_rt_lock:
             current = database.get_peer_by_chat_id(chat_id)
             at = time.time()
-            if (not current or _peer_identity(current) != identity or signature != json.dumps(sorted(_own_peer_caps()))
-                    or not _peer_caps_announcement_due(current, signature, at)):
+            flag = database.get_peer_rt_flag()
+            if (not current or _peer_identity(current) != identity
+                    or signature != json.dumps(sorted(_own_peer_caps(current, flag=flag)))
+                    or not _peer_caps_announcement_due(current, signature, at, flag)):
                 return False
             attempts = None
-            if _peer_caps_changed(current, signature):
+            changed = _peer_caps_changed(current, signature)
+            if changed:
                 attempts = [*_recent_peer_caps_changes(current, at), at]
             if not database.reserve_peer_caps_announcement(current, at, attempts):
                 return False
             reserved_at = at
             previous_signature = current["caps_announce_value"]
+            _peer_caps_attempted.add(identity)
+            if current["email"].lower() not in _peer_caps:
+                previous, interval = _peer_caps_backoff.get(identity, (None, 0))
+                delay = interval * 2 if previous == signature else PEER_CAPS_ANNOUNCE_INTERVAL
+                _peer_caps_backoff[identity] = (signature, min(delay, PEER_CAPS_ANNOUNCE_MAX_INTERVAL))
             return True
 
     def record_sent():
@@ -1964,18 +2031,22 @@ def _queue_peer_caps_announcement(bot, accid, peer, signature, payload, change_g
 def _announce_peer_caps(bot, accid):
     """Send capabilities even when there are no monitor or probe results to share."""
     peers = database.get_all_peers()
-    caps = _own_peer_caps()
-    signature = json.dumps(sorted(caps))
+    flag = database.get_peer_rt_flag()
     now = time.time()
     with _peer_rt_lock:
-        due = [p for p in peers if p.get("chat_id") and _peer_caps_announcement_due(p, signature, now)]
+        due = []
+        for peer in peers:
+            caps = _own_peer_caps(peer, flag=flag)
+            signature = json.dumps(sorted(caps))
+            if peer.get("chat_id") and _peer_caps_announcement_due(peer, signature, now, flag):
+                due.append((peer, caps, signature))
     if not due:
         return
 
     node_name = database.get_local_node_name()
     self_addr = _get_self_addr(bot, accid)
     interval = telemetry_interval(len(peers))
-    for peer in due:
+    for peer, caps, signature in due:
         change_gap = max(TELEMETRY_MIN_GAP, interval_for_peer(peer["email"], interval))
         payload = _peer_metrics_payload([], int(time.time()), node_name, self_addr, caps, interval,
                                         max(TELEMETRY_IDLE_INTERVAL, change_gap))
@@ -2052,7 +2123,7 @@ async def _broadcast_peer_rt_metrics(p, match, state, all_metrics, statuses, int
 
     if full:
         batch = pick_telemetry_batch(p["email"], all_metrics, 200, sent=state.statuses, offsets=state.offsets)
-    payload = _peer_metrics_payload(batch, int(time.time()), node_name, self_addr, _own_peer_caps(),
+    payload = _peer_metrics_payload(batch, int(time.time()), node_name, self_addr, _own_peer_caps(p),
                                     interval, peer_interval)
     if keepalive:
         # The keepalive takes this full snapshot's slot. Reserve it before queuing so a
@@ -2211,12 +2282,15 @@ async def broadcast_telemetry_to_peers(*, rt_delta=False):
         metrics_batch = pick_telemetry_batch(email, all_metrics, batch_size)
 
         payload = _peer_metrics_payload(metrics_batch, now, node_name, self_addr,
-                                        _own_peer_caps(), interval, RT_MAIL_KEEPALIVE if heartbeat else idle_gap)
+                                        _own_peer_caps(p, flag=rt_flag), interval, RT_MAIL_KEEPALIVE if heartbeat else idle_gap)
 
         def _start_send(email=email, statuses=statuses, force_mail=force_mail, match=match, rt_state=rt_state,
-                        chat_id=chat_id, fingerprint=p.get("fingerprint"), heartbeat=heartbeat):
+                        chat_id=chat_id, fingerprint=p.get("fingerprint"), heartbeat=heartbeat, caps=payload["caps"]):
             # While the job waited, its predecessor may have sent or the peer interval may have grown.
             if (current := _up_peer_rt_link(chat_id, fingerprint)) and current != match:
+                return False
+            peer = database.get_peer_by_chat_id(chat_id)
+            if peer and _own_peer_caps(peer) != caps:
                 return False
             at = monotonic()
             gap = max(TELEMETRY_MIN_GAP, interval_for_peer(email, current_telemetry_interval()))
@@ -3272,7 +3346,13 @@ def _get_verified_peer_for_msg(bot, accid, msg, is_private_chat: bool = True, *,
                     logger.info(f"Peer {updated.get('node_name')} now sends from {updated['email']} (was {peer['email']})")
                 if "fingerprint" in changes:
                     logger.info(f"Peer {updated.get('node_name')} bound to key {fp}")
+                    with _peer_rt_lock:
+                        if _peer_identity(peer) in _peer_caps_attempted:
+                            _peer_caps_attempted.discard(_peer_identity(peer))
+                            _peer_caps_attempted.add(fp)
                 peer = updated
+                if peer.get("rt_msg_id") and ("new_email" in changes or "chat_id" in changes):
+                    _refresh_peer_rt_channels()
     return peer, sender_addr
 
 def _is_trusted_peer_msg(msg, peer: dict | None, is_private_chat: bool) -> bool:
@@ -7714,16 +7794,30 @@ def _send_peer_mail(peer, kind, payload, *, priority, expires_in, label, key, ma
     else:
         marker = f"UPTIME_PEER_{kind}"
         text = f"[{marker}]\n{json.dumps(payload)}\n[/{marker}]"
+    message = MsgData(text=text)
+    if (kind != "METRICS" and isinstance(payload, dict)
+            and payload.get("caps") in (OWN_PEER_CAPS, [*OWN_PEER_CAPS, PEER_CAP_RT])):
+        # Votes and handshakes can wait in the outbox across a preview-mode change.
+        start = before_send
+
+        def before_send():
+            flag = database.get_peer_rt_flag()
+            current = database.get_peer_by_chat_id(peer.chat_id) if flag != "off" else None
+            caps = _own_peer_caps(current, flag=flag) if current else OWN_PEER_CAPS
+            if caps != payload["caps"]:
+                message.text = f"[{marker}]\n{json.dumps(dict(payload, caps=caps))}\n[/{marker}]"
+            if start:
+                start()
     if peer.securejoin_hello:
         # SecureJoin retries need the outbox future and only count peer traffic.
         def send():
-            msg_id = _send_msg_with_peer_metrics(peer.bot, peer.accid, peer.chat_id, MsgData(text=text), before_send)
+            msg_id = _send_msg_with_peer_metrics(peer.bot, peer.accid, peer.chat_id, message, before_send)
             if after_send:
                 after_send()
             return msg_id
 
         return dc_outbox.submit(send, priority=priority, key=key, expires_in=expires_in, label=label, kind=mail_kind)
-    return _dc_send_msg_with_stats(peer.bot, peer.accid, peer.chat_id, MsgData(text=text), priority=priority, key=key,
+    return _dc_send_msg_with_stats(peer.bot, peer.accid, peer.chat_id, message, priority=priority, key=key,
                                    expires_in=expires_in, label=label, kind=mail_kind, after_send=after_send,
                                    before_send=before_send, should_send=should_send)
 
@@ -7850,7 +7944,7 @@ def _refresh_peer_rt_channels():
                 del _peer_rt_links[msg_id]
                 _fallback_peer_rt_sends(link)
             else:
-                link.peer["node_name"] = current["node_name"]
+                link.peer.update(email=current["email"], node_name=current["node_name"])
         for msg_id, peer in live.items():
             if msg_id not in _peer_rt_links:
                 delay = secrets.randbelow(PEER_RT_ADVERT_SPREAD * 1000) / 1000
@@ -7981,10 +8075,10 @@ def _deliver_peer_rt_message(bot, accid, msg_id, link, frame, received_at, size)
     }[kind]
     try:
         if active:
-            _record_peer_activity(peer["email"], via="rt")
+            _record_peer_activity(None, via="rt", fingerprint=fp, chat_id=peer["chat_id"])
         timing = {"arrived_at": received_at} if kind in ("resp", "bresp") else {}
         if kind == "metrics":
-            timing["wire_size"] = size
+            timing.update(wire_size=size, stamp=(frame["ts"], None))
         outcome = handler(bot, accid, peer, peer["chat_id"], frame["b"], via="rt", **timing)
     except (TypeError, ValueError) as exc:
         _record_invalid_peer_rt(fp, size, type(exc).__name__)
@@ -8200,7 +8294,8 @@ async def _tick_peer_rt_link(bot, accid, msg_id, link):
         _expire_peer_rt_acks(link)
     now = time.monotonic()
     if active:
-        await run_db(_record_peer_activity, link.peer["email"], "rt")
+        await run_db(functools.partial(_record_peer_activity, None, "rt",
+                                       fingerprint=link.peer["fingerprint"], chat_id=link.peer["chat_id"]))
     if frames:
         if not was_up:
             logger.info("Peer realtime carrier %s is UP", msg_id)
@@ -8267,12 +8362,8 @@ def _peer_rt_chat_is_private(bot, accid, chat_id):
 
 def _peer_rt_offer_due(peer, now):
     last_attempt = peer["rt_offer_at"]
-    if last_attempt is not None:
-        # An unanswered OFFER can still be delivered or accepted. Keep its mail
-        # budget even when the other end has opted out for this pair.
-        delay = PEER_RT_ROTATE if peer["rt_offer_msg_id"] else PEER_RT_OFFER_RETRY
-        if now - last_attempt < delay:
-            return False
+    if last_attempt is not None and now - last_attempt < PEER_RT_OFFER_RETRY:
+        return False
     created = peer["rt_created_at"]
     return (not peer["rt_msg_id"] or peer["rt_lost"] or created is None
             or now - created >= PEER_RT_ROTATE)
@@ -8294,8 +8385,10 @@ def _send_peer_rt_mail(destination, kind, payload):
         if not _peer_rt_eligible(peer, database.get_peer_rt_flag()) or peer["chat_id"] != chat_id:
             return
         last_caps = _peer_caps_announcements.get(fp, peer["caps_announce_value"])
-        if kind == "RT_OFFER" and (fp in _peer_caps_requests
-                                    or (last_caps is not None and PEER_CAP_RT not in json.loads(last_caps))):
+        reset_after_enable = kind == "RT_RESET" and not peer["rt_cid"] and peer["rt_disabled_cid"]
+        if (kind == "RT_OFFER" or reset_after_enable) and (
+                fp in _peer_caps_requests or fp in _peer_caps_refresh
+                or last_caps is None or PEER_CAP_RT not in json.loads(last_caps)):
             # The recipient needs our rt1 announcement to accept the offer.
             return
         now = int(time.time())
@@ -8311,15 +8404,20 @@ def _send_peer_rt_mail(destination, kind, payload):
                 return
             if kind == "RT_OFFER":
                 if not _peer_rt_offer_due(peer, now) or not database.reserve_peer_rt_offer(
-                        fp, now, PEER_RT_OFFER_RETRY, PEER_RT_OFFERS_PER_HOUR):
+                        fp, now, PEER_RT_OFFER_RETRY, PEER_RT_OFFERS_PER_HOUR,
+                        retry_now=fp in _peer_rt_retry_now):
                     return
+                _peer_rt_retry_now.discard(fp)
                 _refresh_peer_rt_channels()
                 cid, key = secrets.token_hex(8), secrets.token_bytes(32)
                 payload = _peer_rt_key_payload(cid, key)
                 file = build_peer_xdc()
             else:
                 cid, file = payload["cid"], None
-                if cid != peer["rt_cid"] or bool(peer["rt_lost"]) != (kind == "RT_RESET"):
+                if reset_after_enable:
+                    if cid != peer["rt_disabled_cid"]:
+                        return
+                elif cid != peer["rt_cid"] or bool(peer["rt_lost"]) != (kind == "RT_RESET"):
                     return
                 if kind == "RT_RESET" and not database.reserve_peer_rt_reset(fp, now):
                     return
@@ -8450,16 +8548,19 @@ def audit_peer_rt_carriers(bot, accid, now):
                     _refresh_peer_rt_channels()
             if own_fp < fp and _peer_rt_offer_due(peer, now):
                 _queue_peer_rt_mail(bot, accid, peer, "RT_OFFER", None)
-            elif own_fp > fp and peer["rt_lost"] and peer["rt_cid"] and (
-                    peer["rt_reset_at"] is None or now - peer["rt_reset_at"] >= 3600):
-                _queue_peer_rt_mail(bot, accid, peer, "RT_RESET", {"v": 1, "cid": peer["rt_cid"]})
+            elif own_fp > fp:
+                reset_cid = peer["rt_cid"] if peer["rt_lost"] else peer["rt_disabled_cid"]
+                if reset_cid and (peer["rt_reset_at"] is None or now - peer["rt_reset_at"] >= 3600):
+                    _queue_peer_rt_mail(bot, accid, peer, "RT_RESET", {"v": 1, "cid": reset_cid})
 
 
 def _send_peer_check_answer(destination, kind, payload, *, key=None, should_send=None, after_send=None):
     if key is None and (request := _inbound_probe_answer.get()):
-        request_key, remember = request
+        request_key, admission = request
+        via = admission.reply_via(request_key)
+        destination = replace(destination, via=via)
         key = ("peer_answer", *request_key)
-        after_send = functools.partial(remember, kind, payload)
+        after_send = functools.partial(admission.remember_answer, request_key, kind, payload, via=via)
     label = "batch cross-check answer" if kind == "CHECK_BATCH_RESP" else "cross-check answer"
     peer_send(destination, kind, payload, priority=PRIO_PEER, expires_in=PEER_ANSWER_TTL,
               label=label, key=key, should_send=should_send, after_send=after_send)
@@ -8470,7 +8571,7 @@ def _resend_cached_probe_answer(bot, accid, chat_id, peer, req_id, via="mail"):
     if replay is not None:
         kind, payload, pending, sent = replay
         if "caps" in payload:
-            payload = dict(payload, caps=_own_peer_caps())
+            payload = dict(payload, caps=_own_peer_caps(peer))
         destination = _PeerDestination(bot, accid, chat_id, fingerprint=peer.get("fingerprint"), via=via)
         _send_peer_check_answer(destination, kind, payload, key=("peer_answer", _peer_identity(peer), req_id),
                                 should_send=pending, after_send=sent)
@@ -10682,6 +10783,20 @@ def peers_command(bot, accid, event):
         reply += "Commands:\n• `/invitepeer` — Generate E2EE invite link\n• `/addpeer <email|link> [node_name]`\n• `/rmpeer <email|key>`\n• `/peershare [admin|all|none]`\n• `/nodename <name>`\n• `/probeignore [url|host|pattern]` — Exclude targets on this node (e.g. `*:25`), or list them\n• `/probeunignore <entry>` — Resume probing on this node\n• `/nodeignore [node_pat] [target_pat]` — Exclude targets on peer node(s) (e.g. `RU* facebook.*`)\n• `/nodeunignore <node_pat> [target_pat]` — Resume checks on node(s)"
     _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=reply.strip()))
 
+def _note_peer_rt_setting_change(peer, was_enabled, enabled):
+    identity = _peer_identity(peer)
+    _peer_caps_backoff.pop(identity, None)
+    if enabled == was_enabled:
+        return
+    if enabled:
+        _peer_caps_refresh.add(identity)
+        if peer.get("fingerprint"):
+            _peer_rt_retry_now.add(peer["fingerprint"])
+    else:
+        _peer_caps_refresh.discard(identity)
+        _peer_rt_retry_now.discard(peer.get("fingerprint"))
+
+
 @dc_cli.on(events.NewMessage(command="/peerrt"))
 @command_budget
 def peerrt_command(bot, accid, event):
@@ -10699,6 +10814,8 @@ def peerrt_command(bot, accid, event):
             previous = database.get_peer_rt_flag()
             database.set_peer_rt_flag(value)
             if value != previous:
+                for peer in database.get_all_peers():
+                    _note_peer_rt_setting_change(peer, _peer_rt_enabled(peer, previous), _peer_rt_enabled(peer, value))
                 _refresh_peer_rt_channels()
                 _peer_rt_audit_requested.set()
         reply = f"✅ Peer channel preview set to `{value}`."
@@ -10711,6 +10828,9 @@ def peerrt_command(bot, accid, event):
         with _peer_rt_lock:
             changed = peer and database.set_peer_rt_mode(peer["email"], value)
             if changed and peer.get("rt_mode", "auto") != value:
+                flag = database.get_peer_rt_flag()
+                _note_peer_rt_setting_change(peer, _peer_rt_enabled(peer, flag),
+                                             _peer_rt_enabled(dict(peer, rt_mode=value), flag))
                 _refresh_peer_rt_channels()
                 _peer_rt_audit_requested.set()
         if changed:
@@ -10826,12 +10946,12 @@ def addpeer_command(bot, accid, event):
             name_parts.append(part)
     node_name = " ".join(name_parts).strip()[:64] or "Remote-Node"
 
-    def _hello_payload():
+    def _hello_payload(chat_id):
         hello_payload = {
             "node_name": database.get_local_node_name(),
             "sender_email": _get_self_addr(bot, accid),
             "version": VERSION,
-            "caps": _own_peer_caps(),
+            "caps": _own_peer_caps(database.get_peer_by_chat_id(chat_id)),
         }
         if invite_token:
             hello_payload["invite_token"] = invite_token
@@ -10887,7 +11007,8 @@ def addpeer_command(bot, accid, event):
                 peer_email = existing["email"]
             database.add_or_update_peer(peer_email, node_name, chat_id, fingerprint=peer_fp)
             # Not right away: the handshake is still running (see send_peer_hello_when_ready)
-            threading.Thread(target=send_peer_hello_when_ready, args=(bot, accid, chat_id, _hello_payload(), node_name),
+            threading.Thread(target=send_peer_hello_when_ready,
+                             args=(bot, accid, chat_id, _hello_payload(chat_id), node_name),
                              daemon=True, name="peer-hello").start()
 
             _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(
@@ -10910,7 +11031,7 @@ def addpeer_command(bot, accid, event):
         contact_id = bot.rpc.create_contact(accid, email, node_name)
         chat_id = bot.rpc.create_chat_by_contact_id(accid, contact_id)
         database.add_or_update_peer(email, node_name, chat_id)
-        peer_send(_PeerDestination(bot, accid, chat_id), "HELLO", _hello_payload(),
+        peer_send(_PeerDestination(bot, accid, chat_id), "HELLO", _hello_payload(chat_id),
                   priority=PRIO_PEER, expires_in=None, label="peer hello")
 
         _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(
@@ -10967,6 +11088,10 @@ def rmpeer_command(bot, accid, event):
             _telemetry_rt_peers.pop(_peer_identity(peer), None)
             _peer_caps_announcements.pop(_peer_identity(peer), None)
             _peer_caps_requests.discard(_peer_identity(peer))
+            _peer_caps_refresh.discard(_peer_identity(peer))
+            _peer_caps_attempted.discard(_peer_identity(peer))
+            _peer_caps_backoff.pop(_peer_identity(peer), None)
+            _peer_rt_retry_now.discard(peer.get("fingerprint"))
             caps = _peer_caps.get(peer["email"].lower())
             if caps:
                 caps.discard(PEER_CAP_RT)
@@ -11275,10 +11400,12 @@ def on_start(bot, _args):
         except Exception as e:
             bot.logger.error(f"Failed to generate QR code: {e}")
 
-def _record_peer_activity(sender_addr: str, via="mail"):
-    if not sender_addr:
+def _record_peer_activity(sender_addr: str | None, via="mail", *, fingerprint=None, chat_id=None):
+    if not sender_addr and not fingerprint:
         return
     options = {"min_interval": RT_ACTIVITY_INTERVAL} if via == "rt" else {}
+    if fingerprint:
+        options.update(fingerprint=fingerprint, chat_id=chat_id)
     was_offline, downtime_sec, peer_data = database.update_peer_last_seen(sender_addr, **options)
     if was_offline and peer_data:
         p_node = peer_data.get("node_name") or "Remote"
@@ -11294,14 +11421,14 @@ def _record_peer_activity(sender_addr: str, via="mail"):
             asyncio.run_coroutine_threadsafe(send_admin_notification(rec_txt), async_event_loop)
 
 
-def _note_peer_check_activity(peer, data, via):
+def _note_peer_check_activity(peer, data, via, stamp):
     if via == "mail":
         _record_peer_activity(peer["email"])
-        return _note_peer_announcement(peer, data)
+        return _note_peer_announcement(peer, data, stamp=stamp)
     return peer
 
 
-def handle_peer_check_req(bot, accid, peer, chat_id, data, via="mail"):
+def handle_peer_check_req(bot, accid, peer, chat_id, data, via="mail", *, stamp=None):
     req_data = data
     req_id = req_data.get("req_id")
     if _resend_cached_probe_answer(bot, accid, chat_id, peer, req_id, via):
@@ -11320,7 +11447,7 @@ def handle_peer_check_req(bot, accid, peer, chat_id, data, via="mail"):
             "family": family,
         }
         async def _do_cross_check_reply():
-            _note_peer_check_activity(peer, req_data, via)
+            current = _note_peer_check_activity(peer, req_data, via, stamp)
             if not await _prewarm_target_dns(target_url, check_type) or not is_safe_target_url(target_url, check_type, resolve_dns=False):
                 return
             if await asyncio.to_thread(database.is_probe_target_ignored, target_url):
@@ -11341,7 +11468,7 @@ def handle_peer_check_req(bot, accid, peer, chat_id, data, via="mail"):
                 "latency_ms": latency_ms,
                 "error_msg": error_msg,
                 "node_name": database.get_local_node_name(),
-                "caps": _own_peer_caps(),  # lets the requester switch to batched requests
+                "caps": _own_peer_caps(database.get_peer_by_chat_id(chat_id) or current),
             }
             destination = _PeerDestination(bot, accid, chat_id, fingerprint=peer.get("fingerprint"), via=via)
             await asyncio.to_thread(_send_peer_check_answer, destination, "CHECK_RESP", resp_payload)
@@ -11353,7 +11480,7 @@ def handle_peer_check_req(bot, accid, peer, chat_id, data, via="mail"):
     return _ProbeAdmission.REJECTED
 
 
-def handle_peer_check_batch_req(bot, accid, peer, chat_id, data, via="mail"):
+def handle_peer_check_batch_req(bot, accid, peer, chat_id, data, via="mail", *, stamp=None):
     req_data = data
     req_id = req_data.get("req_id")
     if _resend_cached_probe_answer(bot, accid, chat_id, peer, req_id, via):
@@ -11361,7 +11488,7 @@ def handle_peer_check_batch_req(bot, accid, peer, chat_id, data, via="mail"):
     raw_targets = req_data.get("targets")
     workers = min(10, max(1, len(raw_targets))) if isinstance(raw_targets, list) else 1
     async def answer():
-        _note_peer_check_activity(peer, req_data, via)
+        _note_peer_check_activity(peer, req_data, via, stamp)
         targets = await run_db(_parse_batch_targets, req_data.get("targets"))
         if targets:
             await _answer_batch_cross_check(bot, accid, chat_id, req_id, targets, workers,
@@ -11372,21 +11499,28 @@ def handle_peer_check_batch_req(bot, accid, peer, chat_id, data, via="mail"):
     return outcome
 
 
-def handle_peer_check_batch_resp(bot, accid, peer, chat_id, data, via="mail", *, sender_addr=None, arrived_at=None):
+def handle_peer_check_batch_resp(bot, accid, peer, chat_id, data, via="mail", *,
+                                 sender_addr=None, arrived_at=None, stamp=None):
     if arrived_at is None:
         arrived_at = time.monotonic()
     resp_data = data
     sender_addr = peer["email"] if sender_addr is None else sender_addr
-    peer = _note_peer_check_activity(peer, resp_data, via)
     # Only an answer to a batch this node sent, from the chat it was sent to
     req_id = resp_data.get("req_id")
-    pending = pending_batch_checks.get(req_id)
-    if not pending:
+    if not isinstance(req_id, str):
         return
-    fut, expected_chat, count = pending
-    if chat_id != expected_chat:
-        logger.warning(f"Dropping batch check response from unexpected peer {sender_addr} in chat {chat_id}")
-        return
+    with _peer_answer_lock:
+        pending = pending_batch_checks.get(req_id)
+        if not pending:
+            return
+        fut, expected_chat, count = pending
+        if fut.done():
+            return
+        if chat_id != expected_chat:
+            logger.warning(f"Dropping batch check response from unexpected peer {sender_addr} in chat {chat_id}")
+            return
+        pending_batch_checks.pop(req_id, None)
+    peer = _note_peer_check_activity(peer, resp_data, via, stamp)
     raw = resp_data.get("results")
     raw = raw if isinstance(raw, list) else []
     node_name = peer.get("node_name") or "Remote-Node"
@@ -11405,7 +11539,8 @@ def handle_peer_check_batch_resp(bot, accid, peer, chat_id, data, via="mail", *,
         resolve()
 
 
-def handle_peer_check_resp(bot, accid, peer, chat_id, data, via="mail", *, sender_addr=None, arrived_at=None):
+def handle_peer_check_resp(bot, accid, peer, chat_id, data, via="mail", *,
+                           sender_addr=None, arrived_at=None, stamp=None):
     if arrived_at is None:
         arrived_at = time.monotonic()
     resp_data = data
@@ -11416,10 +11551,9 @@ def handle_peer_check_resp(bot, accid, peer, chat_id, data, via="mail", *, sende
     error_msg = resp_data.get("error_msg")
 
     sender_addr = peer["email"] if sender_addr is None else sender_addr
-    peer = _note_peer_check_activity(peer, resp_data, via)
 
     # Only answers to a request this node sent to this very peer are accepted
-    pending = pending_peer_checks.get(req_id) if req_id else None
+    pending = pending_peer_checks.get(req_id) if isinstance(req_id, str) else None
     if not pending:
         return
     fut, expected_count, resp_list, expected_chats = pending
@@ -11431,6 +11565,7 @@ def handle_peer_check_resp(bot, accid, peer, chat_id, data, via="mail", *, sende
             return
         expected_chats.discard(chat_id)
 
+    peer = _note_peer_check_activity(peer, resp_data, via, stamp)
     node_name = peer.get("node_name") or "Remote-Node"
     if not isinstance(status, str) or status not in VOTING_STATUSES:
         status = "unknown"
@@ -11471,7 +11606,7 @@ def _valid_metrics_msg_id(msg_id):
     return isinstance(msg_id, str) and len(msg_id) <= 128
 
 
-def handle_peer_metrics(bot, accid, peer, chat_id, data, via="mail", *, wire_size=0):
+def handle_peer_metrics(bot, accid, peer, chat_id, data, via="mail", *, wire_size=0, stamp=None):
     if isinstance(data, str):
         # Keep the original mail JSON compact until a worker can process it.
         size = data.__sizeof__()
@@ -11479,7 +11614,7 @@ def handle_peer_metrics(bot, accid, peer, chat_id, data, via="mail", *, wire_siz
         size = wire_size * 8  # The parsed realtime payload takes more space than the frame.
     else:
         return
-    _peer_metrics_inbox.submit(peer, data, via, max(4096, size))
+    _peer_metrics_inbox.submit(peer, data, via, max(4096, size), stamp=stamp)
 
 
 def _current_metrics_peer(peer):
@@ -11490,7 +11625,7 @@ def _current_metrics_peer(peer):
         return current
 
 
-def _apply_peer_metrics(peer, data, via):
+def _apply_peer_metrics(peer, data, via, *, stamp=None):
     metrics_data = json.loads(data) if isinstance(data, str) else data
     if not isinstance(metrics_data, dict) or not _valid_metrics_msg_id(msg_id := metrics_data.get("msg_id")):
         return
@@ -11498,6 +11633,10 @@ def _apply_peer_metrics(peer, data, via):
     timestamp = metrics_data.get("timestamp")
     if type(timestamp) not in (int, float) or (isinstance(timestamp, float) and not math.isfinite(timestamp)):
         timestamp = None
+    if timestamp is not None:
+        sent_at, mail_id = stamp or (None, None)
+        stamp = (timestamp if sent_at is None else min(timestamp, sent_at), mail_id)
+        timestamp = min(timestamp, time.time() + 300)
 
     identity = _peer_identity(peer)
     key = (identity, msg_id)
@@ -11515,7 +11654,8 @@ def _apply_peer_metrics(peer, data, via):
             with _peer_rt_lock:
                 _peer_caps_requests.add(identity)
         if not stale:
-            peer = _note_peer_announcement(peer, metrics_data, allow_rename=via == "mail", telemetry=True, via=via)
+            peer = _note_peer_announcement(peer, metrics_data, allow_rename=via == "mail",
+                                           telemetry=True, via=via, stamp=stamp)
             if via == "rt" and type(announced := metrics_data.get("telemetry_interval")) is int:
                 with _peer_rt_lock:
                     link = _peer_rt_links.get(peer.get("rt_msg_id"))
@@ -11561,6 +11701,7 @@ def _apply_peer_metrics(peer, data, via):
 def on_new_message(bot, accid, event):
     arrived_at = time.monotonic()
     msg = event.msg
+    stamp = _mail_announcement_stamp(msg)
     if msg.is_info:
         return
     if msg.from_id != 1:
@@ -11698,12 +11839,12 @@ def on_new_message(bot, accid, event):
                 "node_name": database.get_local_node_name(),
                 "sender_email": _get_self_addr(bot, accid),
                 "version": VERSION,
-                "caps": _own_peer_caps(),
+                "caps": _own_peer_caps(peer),
             }
             peer_send(_PeerDestination(bot, accid, msg.chat_id), "HELLO_ACK", ack_payload,
                       priority=PRIO_PEER, expires_in=None, label="peer hello ack")
             _note_peer_announcement(peer, hello_data,
-                                    allow_caps=_is_trusted_peer_msg(msg, peer, is_private_chat))
+                                    allow_caps=_is_trusted_peer_msg(msg, peer, is_private_chat), stamp=stamp)
         except Exception as e:
             logger.error(f"Error handling peer hello: {e}")
         return
@@ -11723,7 +11864,7 @@ def on_new_message(bot, accid, event):
             database.add_or_update_peer(peer["email"], chat_id=msg.chat_id, last_seen=int(time.time()))
             _record_peer_activity(peer["email"])
             _note_peer_announcement(peer, ack_data,
-                                    allow_caps=_is_trusted_peer_msg(msg, peer, is_private_chat))
+                                    allow_caps=_is_trusted_peer_msg(msg, peer, is_private_chat), stamp=stamp)
         except Exception as e:
             logger.error(f"Error handling peer hello ack: {e}")
         return
@@ -11740,7 +11881,7 @@ def on_new_message(bot, accid, event):
             if not _is_trusted_peer_msg(msg, peer, is_private_chat):
                 logger.warning(f"Dropping check request from untrusted sender {sender_addr or msg.from_id} in chat {msg.chat_id}")
                 return
-            handle_peer_check_req(bot, accid, peer, msg.chat_id, req_data)
+            handle_peer_check_req(bot, accid, peer, msg.chat_id, req_data, stamp=stamp)
         except Exception as e:
             logger.error(f"Error processing peer check request: {e}")
         return
@@ -11756,7 +11897,7 @@ def on_new_message(bot, accid, event):
             if not _is_trusted_peer_msg(msg, peer, is_private_chat):
                 logger.warning(f"Dropping batch check request from untrusted sender {sender_addr or msg.from_id} in chat {msg.chat_id}")
                 return
-            handle_peer_check_batch_req(bot, accid, peer, msg.chat_id, req_data)
+            handle_peer_check_batch_req(bot, accid, peer, msg.chat_id, req_data, stamp=stamp)
         except Exception as e:
             logger.error(f"Error processing peer batch check request: {e}")
         return
@@ -11772,7 +11913,7 @@ def on_new_message(bot, accid, event):
                 logger.warning(f"Dropping batch check response from untrusted sender {sender_addr or msg.from_id}")
                 return
             handle_peer_check_batch_resp(bot, accid, peer, msg.chat_id, resp_data, sender_addr=sender_addr,
-                                         arrived_at=arrived_at)
+                                         arrived_at=arrived_at, stamp=stamp)
         except Exception as e:
             logger.error(f"Error handling peer batch check response: {e}")
         return
@@ -11788,7 +11929,8 @@ def on_new_message(bot, accid, event):
             if not _is_trusted_peer_msg(msg, peer, is_private_chat):
                 logger.warning(f"Dropping check response from untrusted sender {sender_addr or msg.from_id}")
                 return
-            handle_peer_check_resp(bot, accid, peer, msg.chat_id, resp_data, sender_addr=sender_addr, arrived_at=arrived_at)
+            handle_peer_check_resp(bot, accid, peer, msg.chat_id, resp_data, sender_addr=sender_addr,
+                                   arrived_at=arrived_at, stamp=stamp)
         except Exception as e:
             logger.error(f"Error handling peer check response: {e}")
         return
@@ -11802,7 +11944,7 @@ def on_new_message(bot, accid, event):
             if not _is_trusted_peer_msg(msg, peer, is_private_chat):
                 logger.warning(f"Dropping telemetry from untrusted sender {sender_addr or msg.from_id}")
                 return
-            handle_peer_metrics(bot, accid, peer, msg.chat_id, text[start_idx:end_idx].strip())
+            handle_peer_metrics(bot, accid, peer, msg.chat_id, text[start_idx:end_idx].strip(), stamp=stamp)
         except Exception as e:
             logger.error(f"Error handling peer metrics: {e}")
         return

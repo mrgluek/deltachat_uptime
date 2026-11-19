@@ -192,7 +192,7 @@ class TestRealtimeChecks(unittest.IsolatedAsyncioTestCase):
         database.set_peer_rt_flag("off")
         bot._refresh_peer_rt_channels()
         await self.until(lambda: self.mails)
-        self.assertEqual(self.mail_body(), req["b"])
+        self.assertEqual(self.mail_body(), dict(req["b"], caps=bot.OWN_PEER_CAPS))
         self.assertEqual(self.submits.call_args.kwargs["expires_in"], bot.CROSS_CHECK_BATCH_TIMEOUT - 1)
         self.receive_mail("CHECK_BATCH_RESP", self.answer_body(req["b"]))
         self.assertEqual(len(await task), 1)
@@ -318,10 +318,10 @@ class TestRealtimeChecks(unittest.IsolatedAsyncioTestCase):
             self.receive_mail("CHECK_REQ", req)
             self.assertEqual(self.mails, [])
             finish.set()
-            await self.until(lambda: len(self.wire) == 2)
-            ack, answer = self.wire
-            self.assertEqual((ack["k"], answer["k"], answer["b"]["req_id"]), ("ack", "resp", req["req_id"]))
-            self.acknowledge(answer)
+            await self.until(lambda: self.mails and self.wire)
+            ack, = self.wire
+            self.assertEqual(ack["k"], "ack")
+            self.assertEqual(self.mail_body()["req_id"], req["req_id"])
             check.assert_awaited_once()
 
     async def test_ping_uses_single_request_and_first_response(self):

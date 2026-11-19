@@ -392,6 +392,8 @@ def init_db():
             ("rt_created_at", "INTEGER"),
             ("rt_mode", "TEXT NOT NULL DEFAULT 'auto' CHECK (rt_mode IN ('auto', 'on', 'off'))"),
             ("rt_capable", "INTEGER NOT NULL DEFAULT 0"),
+            ("rt_caps_timestamp", "REAL"),
+            ("rt_caps_msg_id", "INTEGER"),
             ("rt_offer_cid", "TEXT"),
             ("rt_offer_msg_id", "INTEGER"),
             ("rt_offer_key", "BLOB"),
@@ -399,6 +401,7 @@ def init_db():
             ("rt_received_offer_at", "INTEGER"),
             ("rt_lost", "INTEGER"),
             ("rt_reset_at", "INTEGER"),
+            ("rt_disabled_cid", "TEXT"),
             ("rt_advert_at", "REAL"),
             ("rt_rejoin_at", "REAL"),
             ("rt_rejoin_step", "INTEGER"),
@@ -757,7 +760,7 @@ def delete_chat_data(dc_chat_id: int) -> int:
             cursor.execute("DELETE FROM config WHERE key = ?", (f"{key}:{dc_chat_id}",))
         cursor.execute("DELETE FROM chat_events WHERE dc_chat_id = ?", (dc_chat_id,))
         cursor.execute("DELETE FROM config WHERE key LIKE ?", (f"journal:%:{dc_chat_id}:%",))
-        cursor.execute(_CLEAR_PEER_RT + " WHERE chat_id = ?", (dc_chat_id,))
+        cursor.execute(_CLEAR_PEER_RT + ", rt_disabled_cid = NULL WHERE chat_id = ?", (dc_chat_id,))
         return len(ids)
 
 
@@ -1810,17 +1813,19 @@ def get_all_peers() -> list[dict]:
     finally:
         conn.close()
 
-def update_peer_last_seen(email: str, timestamp: int = None, *, min_interval: int = 0) -> tuple[bool, int, dict | None]:
+def update_peer_last_seen(email: str | None, timestamp: int = None, *, min_interval: int = 0,
+                          fingerprint: str | None = None, chat_id: int | None = None) -> tuple[bool, int, dict | None]:
     """
     Updates peer last_seen timestamp.
     If the peer was previously marked offline, recovers it and returns:
     (was_recovered, downtime_seconds, peer_dict).
     """
-    email = email.lower().strip()
     now = timestamp if timestamp is not None else int(time.time())
     with _writer_transaction() as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT email, node_name, chat_id, last_seen, is_offline, went_offline_at FROM peers WHERE email = ?", (email,))
+        where = "fingerprint = ? AND chat_id = ?" if fingerprint else "email = ?"
+        key = (fingerprint, chat_id) if fingerprint else (email.lower().strip(),)
+        cursor.execute(f"SELECT email, node_name, chat_id, last_seen, is_offline, went_offline_at FROM peers WHERE {where}", key)
         row = cursor.fetchone()
         if not row:
             return False, 0, None
@@ -1839,7 +1844,7 @@ def update_peer_last_seen(email: str, timestamp: int = None, *, min_interval: in
         went_offline_at = peer.get("went_offline_at") or 0
         downtime = max(1, now - went_offline_at) if was_offline and went_offline_at > 0 else 0
 
-        cursor.execute("UPDATE peers SET last_seen = ?, is_offline = 0, went_offline_at = 0 WHERE email = ?", (now, email))
+        cursor.execute("UPDATE peers SET last_seen = ?, is_offline = 0, went_offline_at = 0 WHERE email = ?", (now, row[0]))
         return was_offline, downtime, peer
 
 def audit_peers_offline(threshold_seconds: int = 360, now: int = None, thresholds: dict = None) -> list[dict]:
@@ -1919,7 +1924,7 @@ _CLEAR_PEER_RT = """
     UPDATE peers SET rt_cid = NULL, rt_msg_id = NULL, rt_key_out = NULL,
                      rt_key_in = NULL, rt_created_at = NULL, rt_offer_cid = NULL,
                      rt_offer_msg_id = NULL, rt_offer_key = NULL, rt_offer_at = NULL,
-                     rt_received_offer_at = NULL, rt_lost = NULL, rt_reset_at = NULL,
+                     rt_lost = NULL, rt_reset_at = NULL,
                      rt_advert_at = NULL, rt_rejoin_at = NULL, rt_rejoin_step = NULL
 """
 
@@ -1929,12 +1934,15 @@ def get_peer_rt_flag() -> str:
     return flag if flag in PEER_RT_FLAGS else "off"
 
 
-def set_peer_rt_capability(fingerprint: str, supported: bool):
+def set_peer_rt_capability(fingerprint: str, supported: bool, *, timestamp=None, msg_id=None):
     """Remember a bound peer's last advertised rt1 capability across restarts."""
     with _writer_transaction() as conn:
-        conn.execute("UPDATE peers SET rt_capable = ? WHERE fingerprint = ?", (supported, fingerprint))
+        conn.execute("""
+            UPDATE peers SET rt_capable = ?, rt_caps_timestamp = COALESCE(?, rt_caps_timestamp),
+                             rt_caps_msg_id = COALESCE(?, rt_caps_msg_id) WHERE fingerprint = ?
+        """, (supported, timestamp, msg_id, fingerprint))
         if not supported:
-            conn.execute(_CLEAR_PEER_RT + " WHERE fingerprint = ?", (fingerprint,))
+            conn.execute(_CLEAR_PEER_RT + ", rt_disabled_cid = NULL WHERE fingerprint = ?", (fingerprint,))
 
 
 def reserve_peer_caps_announcement(peer: dict, now: float, change_attempts: list[float] | None) -> bool:
@@ -1956,11 +1964,10 @@ def record_peer_caps_announcement(chat_id: int, identity: str, at: float, caps: 
 
 
 def _clear_disabled_peer_rt(conn):
+    # Keep the recipient's last CID for RT_RESET after re-enabling. Never keep its keys.
     conn.execute(_CLEAR_PEER_RT + """
-        WHERE COALESCE(rt_cid, rt_msg_id, rt_key_out, rt_key_in, rt_created_at, rt_offer_cid,
-                       rt_offer_msg_id, rt_offer_key, rt_offer_at, rt_received_offer_at,
-                       rt_lost, rt_reset_at, rt_advert_at, rt_rejoin_at, rt_rejoin_step) IS NOT NULL
-          AND (rt_mode = 'off' OR NOT EXISTS (
+        , rt_disabled_cid = CASE WHEN rt_received_offer_at IS NOT NULL THEN rt_cid END
+        WHERE COALESCE(rt_cid, rt_offer_at) IS NOT NULL AND (rt_mode = 'off' OR NOT EXISTS (
               SELECT 1 FROM config WHERE key = 'peer_rt'
               AND (value = 'on' OR (value = 'canary' AND peers.rt_mode = 'on'))
           ))
@@ -2010,7 +2017,7 @@ def set_peer_rt(fingerprint: str, *, cid: str, msg_id: int, key_out: bytes,
         return conn.execute("""
             UPDATE peers SET rt_cid = ?, rt_msg_id = ?, rt_key_out = ?, rt_key_in = ?, rt_created_at = ?,
                              rt_offer_cid = NULL, rt_offer_msg_id = NULL, rt_offer_key = NULL,
-                             rt_received_offer_at = ?, rt_lost = NULL,
+                             rt_received_offer_at = ?, rt_lost = NULL, rt_disabled_cid = NULL,
                              rt_advert_at = NULL, rt_rejoin_at = NULL, rt_rejoin_step = NULL
             WHERE email = (SELECT email FROM peers WHERE fingerprint = ? LIMIT 1)
         """, (cid, msg_id, key_out, key_in, created_at, received_offer_at, fingerprint)).rowcount > 0
@@ -2018,7 +2025,7 @@ def set_peer_rt(fingerprint: str, *, cid: str, msg_id: int, key_out: bytes,
 
 def clear_peer_rt(fingerprint: str):
     with _writer_transaction() as conn:
-        conn.execute(_CLEAR_PEER_RT + " WHERE fingerprint = ?", (normalize_fingerprint(fingerprint),))
+        conn.execute(_CLEAR_PEER_RT + ", rt_disabled_cid = NULL WHERE fingerprint = ?", (normalize_fingerprint(fingerprint),))
 
 
 def reserve_peer_rt_advert(fingerprint, msg_id, cid, now, cooldown, rejoin_at, rejoin_step):
@@ -2039,13 +2046,13 @@ def reset_peer_rt_rejoin(fingerprint, msg_id, cid):
         """, (fingerprint, msg_id, cid))
 
 
-def reserve_peer_rt_offer(fingerprint: str, now: int, retry: int, hourly_limit: int) -> bool:
+def reserve_peer_rt_offer(fingerprint: str, now: int, retry: int, hourly_limit: int, *, retry_now=False) -> bool:
     """Charge the attempt before calling the core, even if sending fails."""
     with _writer_transaction() as conn:
         conn.execute("DELETE FROM peer_rt_offer_attempts WHERE attempted_at <= ?", (now - 3600,))
         attempts = conn.execute("SELECT fingerprint, attempted_at, accepted FROM peer_rt_offer_attempts").fetchall()
-        if len(attempts) >= hourly_limit or any(
-                fp == fingerprint and not accepted and now - at < retry for fp, at, accepted in attempts):
+        if len(attempts) >= hourly_limit or (not retry_now and any(
+                fp == fingerprint and not accepted and now - at < retry for fp, at, accepted in attempts)):
             return False
         # The caller has checked the pending offer's lifetime. Retire it so a failed
         # replacement starts the short retry window and cannot inherit a stale ACCEPT.

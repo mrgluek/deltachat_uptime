@@ -31,6 +31,7 @@ class PeerNode:
         self.path.mkdir()
         self.name, self.fp, self.chat = name, fp, chat
         self.email = f"{name.lower()}@example.org"
+        self.next_incoming_id = 399
         self.clock = clock
         self.client = MagicMock()
         self.rpc = self.client.rpc
@@ -43,6 +44,8 @@ class PeerNode:
         self.state = dict(
             time=clock, dc_bot_instance=self.client, dc_accid=1, async_event_loop=None,
             dc_outbox=Outbox(clock=clock.monotonic), _peer_caps={}, _peer_caps_announcements={}, _peer_caps_requests=set(),
+            _peer_caps_attempted=set(), _peer_caps_backoff={}, _peer_caps_refresh=set(), _peer_rt_retry_now=set(),
+            _peer_rt_links={}, _peer_rt_carrier_ids=set(), _peer_rt_pending_adverts=set(), _peer_rt_leaves=set(),
             _peer_rt_audit_requested=threading.Event(), _last_peer_rt_audit=None, _peer_telemetry_interval={},
             _peer_desired_interval={}, _peer_versions={}, _scheduler_cache={},
             _processed_msg_ids=bot._ProcessedMessageIds(), _peer_metrics_timestamps=OrderedDict(), stat_event=MagicMock(),
@@ -71,9 +74,13 @@ class PeerNode:
             address=self.email if contact == 1 else other.email)
         self.rpc.get_contact_encryption_info.return_value = f"Self:\n{self.fp}\n\nPeer:\n{other.fp}"
 
-    def receive(self, text, *, encrypted=True, kind="Text", msg_id=400):
+    def receive(self, text, *, encrypted=True, kind="Text", msg_id=None, **fields):
+        if msg_id is None:
+            msg_id = self.next_incoming_id + 1
+        self.next_incoming_id = max(msg_id, self.next_incoming_id)
         message = SimpleNamespace(id=msg_id, from_id=21, chat_id=self.chat, text=text, is_info=False,
                                   show_padlock=encrypted, view_type=kind, file_bytes=500, timestamp=self.clock.now)
+        vars(message).update(fields)
         bot.on_new_message(self.client, 1, SimpleNamespace(msg=message))
 
     def command(self, handler, payload):
@@ -217,7 +224,7 @@ class TestPeerCapabilities(unittest.TestCase):
             self.assertEqual(len(self.right.sent("RT_ACCEPT")), 2)
             self.assertEqual(len(self.right.sent("RT_RESET")), 1)
 
-            self.left.command(bot.peerrt_command, "off")
+            self.left.command(bot.peerrt_command, f"{self.right.name} off")
             self.clock.now += bot.TELEMETRY_TICK
             self.tick()
             _, disabled = self.left.sent("METRICS")[-1]
@@ -231,7 +238,7 @@ class TestPeerCapabilities(unittest.TestCase):
         with self.left.active():
             self.tick()
             self.assertEqual(len(self.left.sent("RT_OFFER")), 2)
-            self.left.command(bot.peerrt_command, "on")
+            self.left.command(bot.peerrt_command, f"{self.right.name} on")
             self.clock.now += bot.TELEMETRY_TICK
             self.tick()
             _, enabled = self.left.sent("METRICS")[-1]
@@ -362,15 +369,18 @@ class TestPeerCapabilities(unittest.TestCase):
             self.register_right()
             bot._note_peer_caps(self.right.email, ["batch_check"])
             self.tick()
-            for elapsed, flag in ((5, "on"), (10, "off"), (20, "on")):
+            self.clock.now = started_at + 5
+            self.left.command(bot.peerrt_command, "on")
+            self.tick()
+            for elapsed, mode in ((10, "off"), (20, "on")):
                 self.clock.now = started_at + elapsed
-                self.left.command(bot.peerrt_command, flag)
+                self.left.command(bot.peerrt_command, f"{self.right.name} {mode}")
                 self.tick()
             self.assertEqual(len(self.left.sent("METRICS")), 4)
         self.left.state["_peer_caps_announcements"] = {}
         with self.left.active():
             self.clock.now = started_at + 25
-            self.left.command(bot.peerrt_command, "off")
+            self.left.command(bot.peerrt_command, f"{self.right.name} off")
             self.tick()
             self.clock.now = started_at + 604
             self.tick()
@@ -380,7 +390,7 @@ class TestPeerCapabilities(unittest.TestCase):
             self.assertEqual(len(self.left.sent("METRICS")), 5)
             self.assertNotIn("rt1", json.loads(self.left.sent("METRICS")[-1][1].splitlines()[1])["caps"])
             self.clock.now = started_at + 606
-            self.left.command(bot.peerrt_command, "on")
+            self.left.command(bot.peerrt_command, f"{self.right.name} on")
             self.tick()
             self.assertEqual(len(self.left.sent("METRICS")), 5)
 

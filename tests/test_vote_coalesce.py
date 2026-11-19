@@ -350,7 +350,7 @@ class VoteTests(unittest.IsolatedAsyncioTestCase):
             answer(destination.chat_id, payload, "rt")
 
         self.install(bot, dc_bot_instance=client, dc_accid=1, async_event_loop=loop, _peer_rt_links=links,
-                     _record_peer_activity=MagicMock(), _note_peer_announcement=lambda p, data: p,
+                     _record_peer_activity=MagicMock(), _note_peer_announcement=lambda p, data, **kwargs: p,
                      _record_peer_rtt=MagicMock())
         with patch.multiple(bot, _send_peer_mail=mail, _send_peer_rt_check=realtime):
             for up in (False, True):

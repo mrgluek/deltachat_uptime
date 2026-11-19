@@ -85,6 +85,8 @@ class TestPeerRTCarrier(unittest.TestCase):
         self.ids[chat] = []
         database.add_or_update_peer(email, email, chat, fingerprint=fingerprint)
         bot._note_peer_caps(email, list(caps))
+        if fingerprint:
+            bot._note_peer_caps_sent(fingerprint, json.dumps(sorted(bot._own_peer_caps())))
 
     def audit(self, seconds=0):
         self.now += seconds
@@ -129,7 +131,7 @@ class TestPeerRTCarrier(unittest.TestCase):
         self.assertEqual(Path(msg.file).name, "peer.xdc")
         self.assertEqual(self.row()["rt_offer_msg_id"], self.next_id)
         self.assertIsNone(self.row()["rt_cid"])
-        self.audit(600)
+        self.audit(599)
         self.rpc.send_msg.assert_called_once()
 
     def test_non_owner_stores_local_id_and_directional_keys(self):
@@ -250,7 +252,8 @@ class TestPeerRTCarrier(unittest.TestCase):
             self.audit()
             send = submit.call_args.args[0]
             self.assertEqual(submit.call_args.kwargs["kind"], "peer_other")
-        bot.handle_peer_metrics(self.bot, 1, self.row(), CHAT, {"msg_id": "downgrade", "caps": ["batch_check"]})
+        bot.handle_peer_metrics(self.bot, 1, self.row(), CHAT,
+                                {"msg_id": "downgrade", "timestamp": self.now, "caps": ["batch_check"]})
         self.assertIs(send(), bot.SKIP_SEND)
         self.rpc.send_msg.assert_not_called()
 
@@ -364,7 +367,7 @@ class TestPeerRTCarrier(unittest.TestCase):
         self.tick()
         expired = self.row()
         with patch.object(self.rpc, "send_msg", side_effect=RuntimeError("offline")) as failed:
-            self.tick(bot.PEER_RT_ROTATE)
+            self.tick(bot.PEER_RT_OFFER_RETRY)
             failed.assert_called_once()
         self.assertIsNone(self.row()["rt_offer_msg_id"])
         self.receive("ACCEPT", text=envelope("ACCEPT", cid=expired["rt_offer_cid"]))
@@ -454,7 +457,8 @@ class TestPeerRTCarrier(unittest.TestCase):
         database.set_peer_rt_mode(EMAIL, "on")
         self.audit()
         self.accept_pending()
-        bot.handle_peer_metrics(self.bot, 1, self.row(), CHAT, {"msg_id": "downgrade", "caps": ["batch_check"]})
+        bot.handle_peer_metrics(self.bot, 1, self.row(), CHAT,
+                                {"msg_id": "downgrade", "timestamp": self.now, "caps": ["batch_check"]})
         self.assertEqual(self.row()["rt_mode"], "on")
         self.assertIsNone(self.row()["rt_cid"])
         self.assertEqual(database.get_peer_rt_message_ids(), set())
@@ -472,7 +476,7 @@ class TestPeerRTCarrier(unittest.TestCase):
         self.audit()
         self.accept_pending()
         bot._note_peer_caps(EMAIL, ["rt1", "batch_check"])
-        bot.handle_peer_metrics(self.bot, 1, self.row(), CHAT, {"msg_id": "without-caps"})
+        bot.handle_peer_metrics(self.bot, 1, self.row(), CHAT, {"msg_id": "without-caps", "timestamp": self.now})
         self.assertIsNone(self.row()["rt_msg_id"])
         self.assertEqual(bot._peer_caps[EMAIL], {"batch_check"})
 

@@ -63,7 +63,7 @@ class TestPeerAnswerCache(_PeerCase):
                     self.assertTrue(sent[0][1].startswith(f"[UPTIME_PEER_{kind}]\n"))
                     self.assertEqual(sent, [sent[0]] * 2)
                     self.check.assert_awaited_once()
-                    acquire.assert_called_once_with(self.peer, kind, 1)
+                    acquire.assert_called_once_with(self.peer, kind, 1, via="mail")
                     self.assertEqual(self.admission.outstanding, {})
                     self.assertEqual([c.kwargs for c in submit.call_args_list], [
                         dict(priority=bot.PRIO_PEER, expires_in=bot.PEER_ANSWER_TTL, label=label,

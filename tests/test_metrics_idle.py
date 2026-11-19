@@ -10,10 +10,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import bot
 import database
 from outbox import Outbox
+from test_peer_seam import inline_peer_metrics
 
 
 class TestMetricsIdle(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
+        inline_peer_metrics(self)
         directory = self.enterContext(tempfile.TemporaryDirectory())
         database.close_db()
         self.enterContext(patch.object(database, "DB_PATH", str(Path(directory) / "uptime.db")))
@@ -217,7 +219,7 @@ class TestMetricsIdle(unittest.IsolatedAsyncioTestCase):
         database.add_or_update_peer(email, "Peer", 10)
         database.save_peer_measurement("https://omitted.example.org", "Peer", "up", source_peer=email)
         self.client.rpc.get_basic_chat_info.return_value = {"chat_type": "Single"}
-        payload = {"node_name": "Peer", "telemetry_interval": 300, "metrics": [self.resources[0]]}
+        payload = {"msg_id": "interval", "node_name": "Peer", "telemetry_interval": 300, "metrics": [self.resources[0]]}
         msg = SimpleNamespace(from_id=42, chat_id=10, is_info=False,
                               text=f"[UPTIME_PEER_METRICS]\n{json.dumps(payload)}\n[/UPTIME_PEER_METRICS]")
         with patch.object(bot, "_get_verified_peer_for_msg", return_value=(peer, email)), \

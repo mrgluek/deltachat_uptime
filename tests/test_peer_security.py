@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import bot
 import database
+from test_peer_seam import inline_peer_metrics
 
 TEST_DB = "test_uptime_peer_security_db.db"
 
@@ -20,6 +21,7 @@ class TestPeerFederationSecurity(unittest.TestCase):
     """Peer protocol hardening: who may become a peer, which messages are accepted, what is disclosed."""
 
     def setUp(self):
+        inline_peer_metrics(self)
         self.orig_db = database.DB_PATH
         database.close_db()
         database.DB_PATH = TEST_DB
@@ -75,6 +77,7 @@ class TestPeerFederationSecurity(unittest.TestCase):
 
     def _metrics(self, url="https://peer-target.example.org", sender_email="attacker@evil.example", node="Fake"):
         return _wrap("UPTIME_PEER_METRICS", {
+            "msg_id": f"metrics-{node}",
             "node_name": node,
             "sender_email": sender_email,
             "metrics": [{"url": url, "type": "http", "status": "down", "latency_ms": 1}],

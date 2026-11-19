@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import bot
 import database
 from outbox import Outbox
-from test_peer_seam import _DbCase
+from test_peer_seam import _DbCase, inline_peer_metrics
 
 
 class _PeerCase(_DbCase):
@@ -59,16 +59,16 @@ class TestPeerAnswerCache(_PeerCase):
                     for _ in range(3):
                         self.request(kind, batch=batch)
                     sent = self.sent()
-                    self.assertEqual(len(sent), 3)
+                    self.assertEqual(len(sent), 2)
                     self.assertTrue(sent[0][1].startswith(f"[UPTIME_PEER_{kind}]\n"))
-                    self.assertEqual(sent, [sent[0]] * 3)
+                    self.assertEqual(sent, [sent[0]] * 2)
                     self.check.assert_awaited_once()
                     acquire.assert_called_once_with(self.peer, kind, 1)
                     self.assertEqual(self.admission.outstanding, {})
                     self.assertEqual([c.kwargs for c in submit.call_args_list], [
-                        dict(priority=bot.PRIO_PEER, expires_in=bot.PEER_ANSWER_TTL, label=label, key=None,
-                             kind="peer_other")
-                    ] * 3)
+                        dict(priority=bot.PRIO_PEER, expires_in=bot.PEER_ANSWER_TTL, label=label,
+                             key=("peer_answer", self.peer["email"], kind), kind="peer_other"),
+                    ] * 2)
 
     def test_repeat_during_probe_is_ignored(self):
         async def scenario(batch):
@@ -125,13 +125,13 @@ class TestPeerAnswerCache(_PeerCase):
         with patch.object(bot, "time", wraps=bot.time) as clock:
             for i in range(2001):
                 clock.monotonic.return_value = 1000 + i / 100
-                self.admission.remember_answer((key, str(i)), "CHECK_RESP", {"req_id": str(i)})
+                self.admission.remember_answer((key, str(i)), "CHECK_RESP", {"req_id": str(i)}, via="mail")
             self.assertEqual(len(self.admission.answers), 2000)
-            self.assertIsNone(self.admission.cached_answer(self.peer, "0"))
-            self.assertEqual(self.admission.cached_answer(self.peer, "1")[1], {"req_id": "1"})
-            self.assertEqual(self.admission.cached_answer(self.peer, "2000")[1], {"req_id": "2000"})
+            self.assertEqual(self.admission.reserve_replay(self.peer, "0", "mail"), (False, None))
+            self.assertEqual(self.admission.reserve_replay(self.peer, "1", "mail")[1][1], {"req_id": "1"})
+            self.assertEqual(self.admission.reserve_replay(self.peer, "2000", "mail")[1][1], {"req_id": "2000"})
             clock.monotonic.return_value = 1140
-            self.assertIsNone(self.admission.cached_answer(self.peer, "2000"))
+            self.assertEqual(self.admission.reserve_replay(self.peer, "2000", "mail"), (False, None))
             self.assertEqual(self.admission.answers, {})
 
     def test_same_req_id_is_isolated_by_verified_peer_identity(self):
@@ -152,6 +152,7 @@ class TestPeerAnswerCache(_PeerCase):
 class TestPeerMetricsDedupe(_PeerCase):
     def setUp(self):
         super().setUp()
+        inline_peer_metrics(self)
         self.enterContext(patch.object(bot, "_processed_msg_ids", bot._ProcessedMessageIds()))
         self.enterContext(patch.object(bot, "_peer_metrics_timestamps", collections.OrderedDict()))
         self.enterContext(patch.object(bot, "_scheduler_cache", {}))
@@ -175,9 +176,11 @@ class TestPeerMetricsDedupe(_PeerCase):
                 self.metrics(str(i), metrics=[])
             self.metrics("0", metrics=[])  # a duplicate leaves the FIFO position alone
             self.metrics("2000", metrics=[])
-            self.assertEqual(list(bot._processed_msg_ids), [str(i) for i in range(1, 2001)])
+            identity = bot._peer_identity(self.peer)
+            self.assertEqual(list(bot._processed_msg_ids), [(identity, str(i)) for i in range(1, 2001)])
             self.metrics("0", metrics=[])
-            self.assertEqual(list(bot._processed_msg_ids), [str(i) for i in range(2, 2001)] + ["0"])
+            self.assertEqual(list(bot._processed_msg_ids), [(identity, str(i)) for i in range(2, 2001)]
+                             + [(identity, "0")])
 
     def test_stale_metrics_keep_the_newer_measurement_and_target_and_refresh_last_seen(self):
         with patch.object(database, "time", wraps=database.time) as clock:

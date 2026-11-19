@@ -42,6 +42,7 @@ class TestRealtimeChecks(unittest.IsolatedAsyncioTestCase):
         self.enterContext(patch.multiple(
             bot, time=self.clock, async_event_loop=asyncio.get_running_loop(), dc_accid=1,
             dc_bot_instance=self.client, dc_outbox=self.outbox, _peer_caps={},
+            _peer_caps_announcements={}, _peer_caps_requests=set(),
             _peer_rt_links={}, _peer_rt_carrier_ids=set(), _peer_rt_leaves=set(), _peer_rt_pending_adverts=set(),
             _peer_rt_epoch="feed1234", _peer_rt_replay=peer_rt.ReplayWindow(clock=self.clock.monotonic),
             _peer_rt_limiter=peer_rt.TokenBucketLimiter(clock=self.clock.monotonic),
@@ -341,7 +342,7 @@ class TestRealtimeChecks(unittest.IsolatedAsyncioTestCase):
         body = {"req_id": "checked", "targets": [TARGET]}
         self.advance(peer_rt.RT_CHANNEL_TIMEOUT)
         peer = database.get_peer_by_fingerprint(channel.FP)
-        with patch.object(bot, "handle_peer_check_batch_req") as handler:
+        with patch.object(bot, "handle_peer_check_batch_req", return_value=bot._ProbeAdmission.ACCEPTED) as handler:
             self.receive_frame("breq", body)
             self.link.state.on_frame()
             self.receive_bytes(self.incoming("breq", body, key=b"x" * 32))

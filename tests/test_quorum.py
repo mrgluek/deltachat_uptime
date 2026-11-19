@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import bot
 import database
+from test_peer_seam import inline_peer_metrics
 
 TEST_DB = "test_uptime_quorum.db"
 URL = "http://quorum-target.example.org"
@@ -445,6 +446,7 @@ class TestPeerReportedDown(unittest.TestCase):
     """Stage 2: this node reaches a target, peers report it DOWN in their telemetry."""
 
     def setUp(self):
+        inline_peer_metrics(self)
         self.orig_db = database.DB_PATH
         database.close_db()
         database.DB_PATH = TEST_DB
@@ -567,7 +569,7 @@ class TestPeerReportedDown(unittest.TestCase):
         event.msg.chat_id = 201
         event.msg.show_padlock = True
         import time
-        event.msg.text = "[UPTIME_PEER_METRICS]\n" + json.dumps({"metrics": [
+        event.msg.text = "[UPTIME_PEER_METRICS]\n" + json.dumps({"msg_id": "early-recheck", "metrics": [
             {"url": URL, "type": "http", "status": "down", "last_checked": int(time.time())}]}) + "\n[/UPTIME_PEER_METRICS]"
         with patch("bot.is_safe_target_url", return_value=True):
             bot.on_new_message(mock_bot, 1, event)

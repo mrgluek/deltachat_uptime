@@ -74,13 +74,14 @@ class TestPeerRTFlags(unittest.TestCase):
     def test_replayed_answer_advertises_current_capability(self):
         caps = bot._own_peer_caps()
         cached = ("CHECK_RESP", {"req_id": "req", "caps": caps})
-        with patch.object(bot._inbound_probes, "cached_answer", return_value=cached), \
+        peer = {"email": EMAIL}
+        with patch.object(bot._inbound_probes, "reserve_replay", return_value=(True, (*cached, None, None))), \
              patch.object(bot, "_send_peer_check_answer") as send:
             database.set_peer_rt_flag("on")
-            self.assertTrue(bot._resend_cached_probe_answer(MagicMock(), 1, CHAT_ID, {}, "req"))
+            self.assertTrue(bot._resend_cached_probe_answer(MagicMock(), 1, CHAT_ID, peer, "req"))
             self.assertIn("rt1", send.call_args.args[2]["caps"])
             database.set_peer_rt_flag("off")
-            self.assertTrue(bot._resend_cached_probe_answer(MagicMock(), 1, CHAT_ID, {}, "req"))
+            self.assertTrue(bot._resend_cached_probe_answer(MagicMock(), 1, CHAT_ID, peer, "req"))
             self.assertEqual(send.call_args.args[2]["caps"], caps)
         self.assertNotIn("rt1", cached[1]["caps"])
 

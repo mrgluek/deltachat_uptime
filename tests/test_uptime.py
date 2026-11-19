@@ -74,6 +74,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import database
 import bot
+from test_peer_seam import inline_peer_metrics
 
 
 def _backdate_outage(conn, r_id, down_since):
@@ -84,6 +85,7 @@ def _backdate_outage(conn, r_id, down_since):
 
 class TestUptimeBot(unittest.TestCase):
     def setUp(self):
+        inline_peer_metrics(self)
         database.close_db()
         database.DB_PATH = TEST_DB
         database.init_db()
@@ -2181,7 +2183,7 @@ class TestUptimeBot(unittest.TestCase):
         # 3. Incoming [UPTIME_PEER_METRICS]
         mock_event.msg.text = (
             '[UPTIME_PEER_METRICS]\n'
-            '{"node_name": "Helsinki-Updated", "timestamp": 1700000000, "metrics": ['
+            '{"msg_id": "helsinki", "node_name": "Helsinki-Updated", "timestamp": 1700000000, "metrics": ['
             '{"url": "https://api.mytest.org", "status": "up", "latency_ms": 38}'
             ']}\n'
             '[/UPTIME_PEER_METRICS]'

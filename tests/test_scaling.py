@@ -13,6 +13,7 @@ import aiohttp
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import bot
 import database
+from test_peer_seam import inline_peer_metrics
 
 TEST_DB = "test_uptime_scaling.db"
 
@@ -40,6 +41,7 @@ class _FailingRequest:
 
 class TestScaling(unittest.TestCase):
     def setUp(self):
+        inline_peer_metrics(self)
         self.orig_db = database.DB_PATH
         database.close_db()
         database.DB_PATH = TEST_DB
@@ -213,7 +215,7 @@ class TestScaling(unittest.TestCase):
 
     def test_caps_learned_from_telemetry(self):
         database.add_or_update_peer("it@example.org", "IT", 700)
-        metrics = _wrap("UPTIME_PEER_METRICS", {"node_name": "IT", "caps": ["batch_check"], "metrics": []})
+        metrics = _wrap("UPTIME_PEER_METRICS", {"msg_id": "caps", "node_name": "IT", "caps": ["batch_check"], "metrics": []})
         bot.on_new_message(self._peer_bot("it@example.org"), 1, self._event(metrics, 700))
         self.assertTrue(bot._peer_supports({"email": "IT@example.org"}, bot.PEER_CAP_BATCH_CHECK))
 

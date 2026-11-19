@@ -13,10 +13,12 @@ import bot
 import database
 from deltachat2 import JsonRpcError, MessageState
 from outbox import Outbox
+from test_peer_seam import inline_peer_metrics
 
 
 class AuditCase(unittest.TestCase):
     def setUp(self):
+        inline_peer_metrics(self)
         self.tmp = tempfile.TemporaryDirectory()
         self.old_path = database.DB_PATH
         database.close_db()
@@ -161,11 +163,11 @@ class TestProbeAdmission(AuditCase):
     def test_failed_multi_slot_reservation_returns_all_slots(self):
         admission = bot.InboundProbeAdmission()
         peers = [dict(email=f'{i}@example.org') for i in range(3)]
-        first = admission.acquire(peers[0], 'one', 10)
-        second = admission.acquire(peers[1], 'two', 9)
-        self.assertIsNone(admission.acquire(peers[2], 'too-large', 2))
-        third = admission.acquire(peers[2], 'one-left')
-        self.assertIsNotNone(third)
+        _, first = admission.acquire(peers[0], 'one', 10)
+        _, second = admission.acquire(peers[1], 'two', 9)
+        self.assertEqual(admission.acquire(peers[2], 'too-large', 2), (bot._ProbeAdmission.REJECTED, None))
+        outcome, third = admission.acquire(peers[2], 'one-left')
+        self.assertIs(outcome, bot._ProbeAdmission.ACCEPTED)
         for reservation in (first, second, third):
             admission.release(reservation)
         self.assertFalse(admission.outstanding)
@@ -182,22 +184,22 @@ class TestProbeAdmission(AuditCase):
         admission, peer = bot.InboundProbeAdmission(), self.peer()
         with patch('bot.time.monotonic', return_value=1000) as clock, self.assertLogs('uptime_bot', 'WARNING') as logs:
             for i in range(120):
-                identity = admission.acquire(peer, str(i))
-                self.assertIsNotNone(identity)
-                admission.release(identity)
+                outcome, reservation = admission.acquire(peer, str(i))
+                self.assertIs(outcome, bot._ProbeAdmission.ACCEPTED)
+                admission.release(reservation)
             for i in range(20):
-                self.assertIsNone(admission.acquire(peer, 'over'))
+                self.assertEqual(admission.acquire(peer, 'over'), (bot._ProbeAdmission.REJECTED, None))
             self.assertEqual(len(logs.output), 1)
             clock.return_value = 1061
-            self.assertIsNone(admission.acquire(peer, '0'))  # replay outlives rate window
-            identity = admission.acquire(peer, 'fresh')
-            admission.release(identity)
+            self.assertEqual(admission.acquire(peer, '0'), (bot._ProbeAdmission.COMPLETED, None))
+            _, reservation = admission.acquire(peer, 'fresh')
+            admission.release(reservation)
             clock.return_value = 1601
-            identity = admission.acquire(peer, '0')
-            self.assertIsNotNone(identity)
-            admission.release(identity)
+            outcome, reservation = admission.acquire(peer, '0')
+            self.assertIs(outcome, bot._ProbeAdmission.ACCEPTED)
+            admission.release(reservation)
             admission.seen = collections.OrderedDict(((str(i), 'id'), 1601) for i in range(10000))
-            self.assertIsNone(admission.acquire(peer, 'cache-full'))
+            self.assertEqual(admission.acquire(peer, 'cache-full'), (bot._ProbeAdmission.REJECTED, None))
 
 
 class TestPeerNames(AuditCase):
@@ -211,7 +213,7 @@ class TestPeerNames(AuditCase):
                 self.receive(evil, tag, dict(node_name=name))
                 self.assertEqual(database.get_peer(evil['email'])['node_name'], 'Evil')
         with patch.object(bot, 'is_safe_target_url', return_value=True):
-            self.receive(evil, 'UPTIME_PEER_METRICS', dict(node_name='Honest', metrics=[dict(url=url, type='http', status='up')]))
+            self.receive(evil, 'UPTIME_PEER_METRICS', dict(msg_id='names', node_name='Honest', metrics=[dict(url=url, type='http', status='up')]))
         rows = {r['node_name']: r for r in database.get_peer_measurements_for_url(url)}
         self.assertEqual(rows['Honest']['status'], 'down')
         self.assertEqual(rows['Evil']['status'], 'up')

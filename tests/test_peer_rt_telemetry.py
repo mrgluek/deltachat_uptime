@@ -13,12 +13,14 @@ import bot
 import database
 import peer_rt
 from outbox import Outbox
+from test_peer_seam import inline_peer_metrics
 from test_peer_metrics import event, message
 from test_peer_rt_channel import CHAT, CID, EMAIL, FP, IN_KEY, MSG, OUT_KEY, Event
 
 
 class TestRealtimeTelemetry(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
+        inline_peer_metrics(self)
         directory = self.enterContext(tempfile.TemporaryDirectory())
         database.close_db()
         self.enterContext(patch.multiple(database, DB_PATH=str(Path(directory) / "uptime.db"),

@@ -82,9 +82,15 @@ class TestPeerSend(unittest.TestCase):
         self.assertEqual(calls, ["before", "rpc", "after"])
 
 
+def inline_peer_metrics(test):
+    test.enterContext(patch.object(bot._peer_metrics_inbox, "submit",
+                                 side_effect=lambda peer, data, via, _size: bot._apply_peer_metrics(peer, data, via)))
+
+
 class TestPeerHandlers(_DbCase):
     def setUp(self):
         super().setUp()
+        inline_peer_metrics(self)
         self.chat_id = 700
         self.url = "https://site.example.org"
         self.rpc_bot = MagicMock()

@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import bot
 import database
 from outbox import Outbox
+from test_peer_seam import inline_peer_metrics
 
 
 class Clock:
@@ -86,6 +87,7 @@ class PeerNode:
 
 class TestPeerCapabilities(unittest.TestCase):
     def setUp(self):
+        inline_peer_metrics(self)
         database.close_db()
         directory = self.enterContext(tempfile.TemporaryDirectory())
         self.clock = Clock()
@@ -180,7 +182,7 @@ class TestPeerCapabilities(unittest.TestCase):
         with self.right.active():
             self.assertEqual(bot._peer_caps, {})
             self.tick()
-            self.assertEqual(len(self.right.sent("METRICS")), 1)
+            self.assertEqual(len(self.right.sent("METRICS")), 2)  # Caps request and DOWN heartbeat.
             self.right.rpc.get_message_ids.return_value = []
             bot.on_peer_rt_carrier_deleted(self.right.client, 1, {"msgId": 400})
             self.clock.now += bot.TELEMETRY_TICK
@@ -189,7 +191,7 @@ class TestPeerCapabilities(unittest.TestCase):
         with self.left.active():
             self.assertEqual(bot._peer_caps, {})
             self.tick()
-            self.assertEqual(len(self.left.sent("METRICS")), 1)
+            self.assertEqual(len(self.left.sent("METRICS")), 2)  # Caps request and DOWN heartbeat.
             self.left.receive(reset)
             self.assertTrue(bot._peer_rt_audit_requested.is_set())
             self.clock.now += bot.TELEMETRY_TICK
@@ -259,7 +261,7 @@ class TestPeerCapabilities(unittest.TestCase):
         with self.left.active():
             self.register_right()
             peer = database.get_peer(self.right.email)
-            data = {"metrics": [{"url": url, "type": "http", "status": "up"}], "timestamp": self.clock.now}
+            data = {"msg_id": "targets", "metrics": [{"url": url, "type": "http", "status": "up"}], "timestamp": self.clock.now}
             with patch.object(bot, "is_safe_target_url", return_value=True):
                 bot.handle_peer_metrics(self.left.client, 1, peer, self.left.chat, data)
             measurements = database.get_peer_measurements_for_url(url)
@@ -269,7 +271,7 @@ class TestPeerCapabilities(unittest.TestCase):
             self.clock.now += 10
             with patch.object(bot, "note_peer_reported_down") as report:
                 bot.handle_peer_metrics(self.left.client, 1, peer, self.left.chat,
-                                        dict(data, timestamp=self.clock.now, caps=["rt1"], metrics=[]))
+                                        dict(data, msg_id="empty", timestamp=self.clock.now, caps=["rt1"], metrics=[]))
             self.assertEqual(database.get_peer_measurements_for_url(url), measurements)
             self.assertEqual(database.get_active_probe_targets(), targets)
             self.assertEqual(database.get_peer(self.right.email)["last_seen"], self.clock.now)

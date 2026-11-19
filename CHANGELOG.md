@@ -16,6 +16,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Send a realtime ping every 30 seconds on each side so both peers can measure their own round-trip time while replying to each other.
 - Announce peer capability changes on the next telemetry tick, including when the realtime preview is enabled on idle peers. Limit changes to three attempts per peer in ten minutes and send the carrier offer after announcing `rt1`.
 - Recover deleted peer channel apps on the next telemetry tick, including after restart, and check once a minute for missed deletions, offer retries, and rotation. Replace an accepted app promptly after a reset or after re-enabling the preview.
+- Acknowledge realtime check requests only after admission so requests rejected at capacity can fall back to mail.
+- Coalesce and rate-limit cached check answers while honoring the first mail fallback.
+- Validate telemetry message IDs and deduplicate them per verified peer.
+- Satisfy capability requests over realtime so healthy channels can rotate after 14 days.
+- Send hourly mail heartbeats when an established peer channel is down and there are no targets to share.
+- Validate incoming telemetry in bounded worker queues so DNS cannot stall peer event delivery.
 
 ## [2.44.2] - 2026-11-19
 

@@ -23,6 +23,7 @@ import hashlib
 import zipfile
 from pathlib import Path
 from dataclasses import dataclass, field
+from enum import Enum, auto
 import time
 from time import monotonic
 import datetime
@@ -416,11 +417,32 @@ def current_telemetry_interval() -> int:
 PEER_ANSWER_TTL = 20.0  # an answer to a peer's cross-check is dropped if the outbox could not send it by then
 PEER_ANSWER_CACHE_TTL = 120
 PEER_ANSWER_CACHE_MAX = 2000
+PEER_ANSWER_REPLAY_GAP = 5
+PEER_ANSWER_REPLAYS_PER_MINUTE = 6
 PEER_BATCH_CHECK_CONCURRENCY = 20
 
 
 def _peer_identity(peer):
     return peer.get("fingerprint") or peer["email"].lower()
+
+
+class _ProbeAdmission(Enum):
+    ACCEPTED = auto()
+    RUNNING = auto()
+    COMPLETED = auto()
+    REJECTED = auto()
+
+
+@dataclass
+class _CachedProbeAnswer:
+    sent_at: float
+    kind: str
+    payload: dict
+    via: str
+    replay_at: float = -math.inf
+    mail_fallback_used: bool = False
+    queued: object | None = None
+    queued_until: float = -math.inf
 
 
 class InboundProbeAdmission:
@@ -433,32 +455,72 @@ class InboundProbeAdmission:
         self.seen = collections.OrderedDict()
         self.running = set()
         self.answers = collections.OrderedDict()
+        self.replay_rates = collections.OrderedDict()
         self.warned = {}
 
     def _expire_answers(self, now):
-        while self.answers and next(iter(self.answers.values()))[0] <= now - PEER_ANSWER_CACHE_TTL:
+        while self.answers and next(iter(self.answers.values())).sent_at <= now - PEER_ANSWER_CACHE_TTL:
             self.answers.popitem(last=False)
 
-    def cached_answer(self, peer, req_id):
-        if not isinstance(req_id, str):
-            return None
+    def reserve_replay(self, peer, req_id, via):
+        if not isinstance(req_id, str) or not 0 < len(req_id) <= 64:
+            return False, None
+        identity = _peer_identity(peer)
         with self.lock:
-            self._expire_answers(time.monotonic())
-            answer = self.answers.get((_peer_identity(peer), req_id))
-            return answer[1:] if answer else None
+            now = time.monotonic()
+            self._expire_answers(now)
+            answer = self.answers.get((identity, req_id))
+            if answer is None:
+                return False, None
+            first_fallback = via == "mail" and answer.via == "rt" and not answer.mail_fallback_used
+            if first_fallback:
+                # The requester's mail fallback must work even if a realtime replay is queued.
+                answer.mail_fallback_used = True
+            else:
+                if now < answer.queued_until or now - answer.replay_at < PEER_ANSWER_REPLAY_GAP:
+                    return True, None
+                times = self.replay_rates.setdefault(identity, collections.deque())
+                while times and times[0] <= now - 60:
+                    times.popleft()
+                if len(times) >= PEER_ANSWER_REPLAYS_PER_MINUTE:
+                    return True, None
+                times.append(now)
+                self.replay_rates.move_to_end(identity)
+                if len(self.replay_rates) > PEER_ANSWER_CACHE_MAX:
+                    self.replay_rates.popitem(last=False)
+                answer.replay_at = now
+            ticket = answer.queued = object()
+            expires_at = answer.queued_until = now + PEER_ANSWER_TTL
 
-    def remember_answer(self, key, kind, payload):
+        def pending():
+            with self.lock:
+                return answer.queued is ticket and time.monotonic() < expires_at
+
+        def sent():
+            with self.lock:
+                if answer.queued is ticket:
+                    if not first_fallback:
+                        answer.replay_at = time.monotonic()
+                    # A realtime answer can still fall back to mail after an ACK timeout.
+                    if via == "mail":
+                        answer.queued_until = -math.inf
+
+        return True, (answer.kind, answer.payload, pending, sent)
+
+    def remember_answer(self, key, kind, payload, *, via):
         with self.lock:
             now = time.monotonic()
             self._expire_answers(now)
             # A sent answer takes over replay protection from admission.
             self.seen.pop(key, None)
-            self.answers[key] = (now, kind, payload)
+            self.answers[key] = _CachedProbeAnswer(now, kind, payload, via)
             self.answers.move_to_end(key)
             if len(self.answers) > PEER_ANSWER_CACHE_MAX:
                 self.answers.popitem(last=False)
 
     def acquire(self, peer, req_id, slots=1):
+        if not isinstance(req_id, str) or not 0 < len(req_id) <= 64:
+            return _ProbeAdmission.REJECTED, None
         identity = _peer_identity(peer)
         key = (identity, req_id)
         with self.lock:
@@ -466,6 +528,10 @@ class InboundProbeAdmission:
             self._expire_answers(now)
             while self.seen and next(iter(self.seen.values())) <= now - 600:
                 self.seen.popitem(last=False)
+            if key in self.running:
+                return _ProbeAdmission.RUNNING, None
+            if key in self.answers or key in self.seen:
+                return _ProbeAdmission.COMPLETED, None
             for rate_identity, times in list(self.rates.items()):
                 while times and times[0] <= now - 60:
                     times.popleft()
@@ -473,9 +539,7 @@ class InboundProbeAdmission:
                     del self.rates[rate_identity]
             self.warned = {key: ts for key, ts in self.warned.items() if ts > now - 600}
             times = self.rates.get(identity, ())
-            valid = isinstance(req_id, str) and 0 < len(req_id) <= 64
-            rejected = (not valid or key in self.seen or key in self.running or key in self.answers
-                        or len(self.seen) + len(self.answers) >= 10000
+            rejected = (len(self.seen) + len(self.answers) >= 10000
                         or self.outstanding[identity] + slots > 10 or len(times) >= 120)
             reserved = 0
             if not rejected:
@@ -489,13 +553,13 @@ class InboundProbeAdmission:
                     self.slots.release()
                 if identity not in self.warned:
                     self.warned[identity] = now
-                    logger.warning("Dropping excess or duplicate probe requests from peer %s", identity)
-                return None
+                    logger.warning("Dropping excess probe requests from peer %s", identity)
+                return _ProbeAdmission.REJECTED, None
             self.outstanding[identity] += slots
             self.rates.setdefault(identity, collections.deque()).append(now)
             self.seen[key] = now
             self.running.add(key)
-            return key, slots
+            return _ProbeAdmission.ACCEPTED, (key, slots)
 
     def release(self, reservation):
         key, slots = reservation
@@ -514,17 +578,19 @@ _inbound_probes = InboundProbeAdmission()
 _inbound_probe_answer = contextvars.ContextVar("inbound_probe_answer", default=None)
 
 
-def _submit_inbound_probe(peer, req_id, make_coro, slots=1):
-    reservation = _inbound_probes.acquire(peer, req_id, slots)
-    if reservation is None:
-        return False
+def _submit_inbound_probe(peer, req_id, make_coro, slots=1, *, via):
     admission = _inbound_probes
+    outcome, reservation = admission.acquire(peer, req_id, slots)
+    if reservation is None:
+        return outcome
     started = False
 
     async def run():
         nonlocal started
         started = True
-        token = _inbound_probe_answer.set(functools.partial(admission.remember_answer, reservation[0]))
+        key, _ = reservation
+        remember = functools.partial(admission.remember_answer, key, via=via)
+        token = _inbound_probe_answer.set((key, remember))
         try:
             await make_coro()
         finally:
@@ -547,7 +613,7 @@ def _submit_inbound_probe(peer, req_id, make_coro, slots=1):
         if not started:
             admission.release(reservation)
         raise
-    return True
+    return outcome
 
 
 _peer_caps = {}  # peer email (lower) -> set of capabilities it announced
@@ -674,6 +740,71 @@ _processed_msg_ids = _ProcessedMessageIds()
 _peer_metrics_lock = threading.Lock()
 _peer_metrics_timestamps = collections.OrderedDict()  # peer identity -> latest applied timestamp
 PEER_METRICS_TIMESTAMPS_MAX = 256
+PEER_METRICS_QUEUE_SIZE = 4
+PEER_METRICS_QUEUE_BYTES = 8 * 1024 * 1024
+PEER_METRICS_WORKERS = 2
+PEER_METRICS_BATCH_DEADLINE = 10
+
+
+class _PeerMetricsInbox:
+    """Bound the backlog and let one worker at a time apply each peer's snapshots."""
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.pending = collections.OrderedDict()
+        self.active = set()
+        self.bytes = 0
+        self.workers = 0
+        self.closed = False
+        self.executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=PEER_METRICS_WORKERS, thread_name_prefix="uptime_peer_metrics")
+
+    def submit(self, peer, data, via, size):
+        identity = _peer_identity(peer)
+        with self.lock:
+            queue = self.pending.get(identity)
+            replace_size = queue[0][-1] if queue and len(queue) >= PEER_METRICS_QUEUE_SIZE else 0
+            if self.closed or self.bytes + size - replace_size > PEER_METRICS_QUEUE_BYTES:
+                return
+            if replace_size:
+                queue.popleft()
+            self.pending.setdefault(identity, collections.deque()).append((peer, data, via, size))
+            self.bytes += size - replace_size
+            if identity not in self.active and self.workers < PEER_METRICS_WORKERS:
+                self.workers += 1
+                self.executor.submit(self._drain)
+
+    def close(self):
+        with self.lock:
+            self.closed = True
+            self.bytes -= sum(job[-1] for queue in self.pending.values() for job in queue)
+            self.pending.clear()
+        self.executor.shutdown(wait=False)
+
+    def _drain(self):
+        while True:
+            with self.lock:
+                identity = next((key for key in self.pending if key not in self.active), None)
+                if identity is None:
+                    self.workers -= 1
+                    return
+                queue = self.pending[identity]
+                peer, data, via, size = queue.popleft()
+                if queue:
+                    self.pending.move_to_end(identity)
+                else:
+                    del self.pending[identity]
+                self.active.add(identity)
+            try:
+                _apply_peer_metrics(peer, data, via)
+            except Exception:
+                logger.exception("Could not process peer metrics for %s", identity)
+            finally:
+                with self.lock:
+                    self.bytes -= size
+                    self.active.remove(identity)
+
+
+_peer_metrics_inbox = _PeerMetricsInbox()
 
 # Scheduler DB cache (reduces repeated full-table scans)
 _scheduler_cache = {
@@ -1368,7 +1499,8 @@ def _note_peer_caps(email: str, caps) -> None:
             _peer_caps[email] = announced
 
 
-def _note_peer_announcement(peer: dict, data, *, allow_rename=True, telemetry=False, allow_caps=True) -> dict:
+def _note_peer_announcement(peer: dict, data, *, allow_rename=True, telemetry=False, allow_caps=True,
+                            via="mail") -> dict:
     """What a key-verified peer says about itself in protocol messages: its capabilities and its
     node name (changed with /nodename there). Returns the peer row, renamed if the name changed.
 
@@ -1392,10 +1524,21 @@ def _note_peer_announcement(peer: dict, data, *, allow_rename=True, telemetry=Fa
                     database.set_peer_rt_capability(peer["fingerprint"], supports_rt)
                     _refresh_peer_rt_channels()
     note_peer_version(peer["email"], data.get("version"))
-    for field, store in (("telemetry_interval", _peer_telemetry_interval), ("desired_interval", _peer_desired_interval)):
-        value = data.get(field)
-        if isinstance(value, int) and not isinstance(value, bool):
-            store[peer["email"].lower()] = min(900, max(60, value))
+    email = peer["email"].lower()
+    announced = data.get("telemetry_interval")
+    if type(announced) is int:
+        empty_rt_mail = (telemetry and via == "mail" and data.get("metrics") == [] and peer.get("rt_msg_id")
+                         and isinstance(data.get("caps"), list) and PEER_CAP_RT in data["caps"])
+        # Realtime has its own interval while UP. Keep the mail cadence across short recoveries
+        # and caps-only mail until the peer resumes sending nonempty mail snapshots.
+        if empty_rt_mail and announced == RT_MAIL_KEEPALIVE:
+            _peer_telemetry_interval[email] = RT_MAIL_KEEPALIVE
+        elif (_peer_telemetry_interval.get(email) != RT_MAIL_KEEPALIVE
+              or (via == "mail" and not empty_rt_mail)):
+            _peer_telemetry_interval[email] = min(900, max(60, announced))
+    desired = data.get("desired_interval")
+    if type(desired) is int:
+        _peer_desired_interval[email] = min(900, max(60, desired))
     if not allow_rename:
         return peer
     claimed = data.get("node_name")
@@ -1766,6 +1909,21 @@ def _peer_caps_announcement_due(peer, signature, now):
                  or peer["email"].lower() not in _peer_caps))
 
 
+def _note_peer_caps_sent(identity, signature):
+    with _peer_rt_lock:
+        previous = _peer_caps_announcements.get(identity)
+        _peer_caps_announcements[identity] = signature
+        if previous != signature or identity in _peer_caps_requests:
+            _peer_caps_requests.discard(identity)
+            _peer_rt_audit_requested.set()
+
+
+def _note_peer_rt_caps_sent(link, body):
+    caps = body.get("caps")
+    if isinstance(caps, list) and all(isinstance(cap, str) for cap in caps):
+        _note_peer_caps_sent(link.peer["fingerprint"], json.dumps(sorted(caps)))
+
+
 def _queue_peer_caps_announcement(bot, accid, peer, signature, payload, change_gap):
     chat_id = peer["chat_id"]
     identity = _peer_identity(peer)
@@ -1794,11 +1952,7 @@ def _queue_peer_caps_announcement(bot, accid, peer, signature, payload, change_g
         database.record_peer_traffic(kind, "mail", "out", 0)
         with _peer_rt_lock:
             if database.record_peer_caps_announcement(chat_id, identity, reserved_at, signature):
-                previous = _peer_caps_announcements.get(identity)
-                _peer_caps_announcements[identity] = signature
-                if previous != signature or identity in _peer_caps_requests:
-                    _peer_caps_requests.discard(identity)
-                    _peer_rt_audit_requested.set()
+                _note_peer_caps_sent(identity, signature)
 
     # Queue before carrier offers, using a separate key from monitor telemetry.
     peer_send(_PeerDestination(bot, accid, chat_id), "METRICS", payload,
@@ -1909,6 +2063,7 @@ async def _broadcast_peer_rt_metrics(p, match, state, all_metrics, statuses, int
         def record_keepalive():
             state.keepalive_at = monotonic() + RT_MAIL_KEEPALIVE
             database.record_peer_traffic("peer_metrics_idle", "mail", "out", 0)
+            _note_peer_caps_sent(_peer_identity(p), json.dumps(sorted(payload["caps"])))
 
         peer_send(dest, "METRICS", payload, priority=PRIO_TELEMETRY, key=("telemetry", p["chat_id"]),
                   expires_in=peer_interval, label=f"telemetry keepalive to {p['email']}", mail_kind="peer_metrics",
@@ -1952,8 +2107,10 @@ async def broadcast_telemetry_to_peers(*, rt_delta=False):
     resources = await asyncio.to_thread(database.get_all_resources)
     resources = await asyncio.to_thread(_filter_peer_shareable_resources, dc_bot_instance, dc_accid, resources or [])
     probe_targets = await asyncio.to_thread(database.get_active_probe_targets)
-    if not resources and not probe_targets and not (_peer_rt_links or _telemetry_rt_peers):
+    has_carrier = any(peer.get("rt_msg_id") for peer in peers)
+    if not resources and not probe_targets and not (has_carrier or _peer_rt_links or _telemetry_rt_peers):
         return
+    rt_flag = await asyncio.to_thread(database.get_peer_rt_flag) if has_carrier else "off"
 
     now = int(time.time())
 
@@ -2014,10 +2171,15 @@ async def broadcast_telemetry_to_peers(*, rt_delta=False):
         force_mail = not match and rt_state is not None and rt_state.needs_mail_on_down
         if rt_delta and not match:
             continue  # Mail-only peers keep the existing tick and pacing.
-        if not all_metrics and not force_mail:
+        heartbeat = not all_metrics and not match and p.get("rt_msg_id") and _peer_rt_eligible(p, rt_flag)
+        if heartbeat and rt_state is None:
+            rt_state = _telemetry_rt_peers.setdefault(identity, _PeerRealtimeTelemetry())
+        if not all_metrics and not (heartbeat or force_mail):
             continue
 
         def due(at):
+            if heartbeat:
+                return at >= rt_state.empty_mail_at + RT_MAIL_KEEPALIVE
             if force_mail:
                 return True
             queued = _telemetry_sent_at.get(email)
@@ -2049,10 +2211,10 @@ async def broadcast_telemetry_to_peers(*, rt_delta=False):
         metrics_batch = pick_telemetry_batch(email, all_metrics, batch_size)
 
         payload = _peer_metrics_payload(metrics_batch, now, node_name, self_addr,
-                                        _own_peer_caps(), interval, idle_gap)
+                                        _own_peer_caps(), interval, RT_MAIL_KEEPALIVE if heartbeat else idle_gap)
 
         def _start_send(email=email, statuses=statuses, force_mail=force_mail, match=match, rt_state=rt_state,
-                        chat_id=chat_id, fingerprint=p.get("fingerprint")):
+                        chat_id=chat_id, fingerprint=p.get("fingerprint"), heartbeat=heartbeat):
             # While the job waited, its predecessor may have sent or the peer interval may have grown.
             if (current := _up_peer_rt_link(chat_id, fingerprint)) and current != match:
                 return False
@@ -2061,26 +2223,37 @@ async def broadcast_telemetry_to_peers(*, rt_delta=False):
             delivered, last_statuses = _telemetry_delivered.get(email, (float("-inf"), None))
             delivery_gap = max(TELEMETRY_IDLE_INTERVAL, gap) if statuses == last_statuses else gap
             force = force_mail and rt_state.needs_mail_on_down
-            if not force and (at - delivered < delivery_gap or at - _telemetry_started_at.get(email, float("-inf")) < gap):
+            if heartbeat:
+                if at < rt_state.empty_mail_at + RT_MAIL_KEEPALIVE:
+                    return False
+                rt_state.empty_mail_at = at
+            elif not force and (at - delivered < delivery_gap
+                                or at - _telemetry_started_at.get(email, float("-inf")) < gap):
                 return False
             if force:
                 rt_state.needs_mail_on_down = False
             _telemetry_started_at[email] = at
             return True
 
-        def _record_sent(email=email, batch=metrics_batch, statuses=statuses):
+        def _record_sent(email=email, batch=metrics_batch, statuses=statuses, heartbeat=heartbeat,
+                         rt_state=rt_state, identity=identity, caps=payload["caps"]):
             # Keep statuses only for live URLs that have actually gone out, including rotated batches.
             sent = {u: st for u, st in _telemetry_last_sent.get(email, {}).items() if u in statuses}
             sent.update({m["url"]: m["status"] for m in batch})
             _telemetry_last_sent[email] = sent
             _, last_statuses = _telemetry_delivered.get(email, (None, None))
-            _telemetry_delivered[email] = (monotonic(), statuses)
-            kind = "peer_metrics_idle" if statuses == last_statuses else "peer_metrics_change"
+            at = monotonic()
+            _telemetry_delivered[email] = (at, statuses)
+            if heartbeat:
+                rt_state.empty_mail_at = at
+            _note_peer_caps_sent(identity, json.dumps(sorted(caps)))
+            kind = "peer_metrics_idle" if heartbeat or statuses == last_statuses else "peer_metrics_change"
             database.record_peer_traffic(kind, "mail", "out", 0)
 
         # One telemetry message per peer at a time: a newer one replaces a still queued one.
         peer_send(_PeerDestination(dc_bot_instance, dc_accid, chat_id), "METRICS", payload,
-                  priority=PRIO_TELEMETRY, key=("telemetry", chat_id), expires_in=change_gap,
+                  priority=PRIO_TELEMETRY, key=("telemetry", chat_id),
+                  expires_in=interval_for_peer(email, interval) if heartbeat else change_gap,
                   label=f"telemetry to {email}", mail_kind="peer_metrics",
                   should_send=_start_send, after_send=_record_sent)
 
@@ -2827,7 +3000,7 @@ async def probe_addresses(host: str, family: int | None = None) -> list[str]:
     return pick_probe_addresses(host, await resolve_host_safe(host), family)
 
 
-def resolve_host_safe_sync(host: str) -> list[str]:
+def resolve_host_safe_sync(host: str, *, deadline=None) -> list[str]:
     """Blocking variant of resolve_host_safe (system resolver, TTL unknown -> DNS_CACHE_DEFAULT_TTL)."""
     host = (host or "").strip().lower().rstrip(".")
     literal = _literal_ip(host)
@@ -2835,9 +3008,12 @@ def resolve_host_safe_sync(host: str) -> list[str]:
         return _validated_ips(host, [literal])
     cached = _dns_cache_get(host)
     if cached is None:
+        timeout = DNS_DEADLINE if deadline is None else min(DNS_DEADLINE, deadline - monotonic())
+        if timeout <= 0:
+            raise TimeoutError("DNS deadline exceeded")
         future = _submit_bounded(dns_executor, _dns_slots, socket.getaddrinfo, host, None)
         try:
-            infos = future.result(timeout=DNS_DEADLINE)
+            infos = future.result(timeout=timeout)
         except concurrent.futures.TimeoutError:
             raise TimeoutError("DNS deadline exceeded")
         cached = _dns_cache_put(host, [info[4][0] for info in infos], DNS_CACHE_DEFAULT_TTL)
@@ -2970,7 +3146,7 @@ def _no_ipv6_note(url: str, check_type: str) -> str:
     return ""
 
 
-def is_safe_target_url(url: str, check_type: str = "http", *, resolve_dns: bool = True) -> bool:
+def is_safe_target_url(url: str, check_type: str = "http", *, resolve_dns: bool = True, dns_deadline=None) -> bool:
     """Validates target format and blocks dangerous internal/private/metadata IP addresses (SSRF prevention)."""
     try:
         expected_type, validated = parse_target(url)
@@ -3008,7 +3184,7 @@ def is_safe_target_url(url: str, check_type: str = "http", *, resolve_dns: bool 
 
         # DNS resolution check through the shared pinning cache (the connection reuses this answer)
         try:
-            resolve_host_safe_sync(host)
+            resolve_host_safe_sync(host, deadline=dns_deadline)
         except BlockedAddressError:
             return False
         except socket.gaierror:
@@ -7605,6 +7781,7 @@ class _PeerRealtimeTelemetry:
     sent_at: float = -math.inf
     full_at: float = -math.inf
     keepalive_at: float | None = None
+    empty_mail_at: float = -math.inf
     busy: bool = False
     needs_mail_on_down: bool = False
     statuses: dict[str, str] = field(default_factory=dict)
@@ -7806,12 +7983,16 @@ def _deliver_peer_rt_message(bot, accid, msg_id, link, frame, received_at, size)
         if active:
             _record_peer_activity(peer["email"], via="rt")
         timing = {"arrived_at": received_at} if kind in ("resp", "bresp") else {}
-        handler(bot, accid, peer, peer["chat_id"], frame["b"], via="rt", **timing)
+        if kind == "metrics":
+            timing["wire_size"] = size
+        outcome = handler(bot, accid, peer, peer["chat_id"], frame["b"], via="rt", **timing)
     except (TypeError, ValueError) as exc:
         _record_invalid_peer_rt(fp, size, type(exc).__name__)
         return
     database.record_peer_traffic(kind, "rt", "in", size)
-    if frame["a"] and (loop := _peer_rt_event_loop()) is not None:
+    if (frame["a"] and (kind not in _PEER_RT_REQUESTS or outcome in (
+            _ProbeAdmission.ACCEPTED, _ProbeAdmission.RUNNING, _ProbeAdmission.COMPLETED))
+            and (loop := _peer_rt_event_loop()) is not None):
         loop.call_soon_threadsafe(lambda: loop.create_task(
             _send_peer_rt_unacked(bot, accid, msg_id, link, "ack", {"s": [frame["s"]]})))
 
@@ -7881,6 +8062,8 @@ async def _send_peer_rt_check(destination, msg_id, link, kind, payload, send_mai
         return
 
     def send():
+        if should_send is not None and not should_send():
+            return False
         with _peer_rt_lock:
             if _peer_rt_links.get(msg_id) is not link or not link.state.is_up or seq not in link.fallbacks:
                 return False
@@ -7899,6 +8082,7 @@ async def _send_peer_rt_check(destination, msg_id, link, kind, payload, send_mai
         fallback()
         return
     database.record_peer_traffic(kind, "rt", "out", len(blob))
+    _note_peer_rt_caps_sent(link, payload)
     if after_send:
         after_send()
 
@@ -7937,6 +8121,7 @@ async def _send_peer_rt_unacked(bot, accid, msg_id, link, kind, body):
         with _peer_rt_lock:
             link.probes[seq] = sent_at
     database.record_peer_traffic(kind, "rt", "out", len(blob))
+    _note_peer_rt_caps_sent(link, body)
     if kind == "hello":
         logger.debug("Joined peer realtime carrier %s and sent hello", msg_id)
     return True
@@ -8108,7 +8293,7 @@ def _send_peer_rt_mail(destination, kind, payload):
         peer = database.get_peer_by_fingerprint(fp)
         if not _peer_rt_eligible(peer, database.get_peer_rt_flag()) or peer["chat_id"] != chat_id:
             return
-        last_caps = peer["caps_announce_value"]
+        last_caps = _peer_caps_announcements.get(fp, peer["caps_announce_value"])
         if kind == "RT_OFFER" and (fp in _peer_caps_requests
                                     or (last_caps is not None and PEER_CAP_RT not in json.loads(last_caps))):
             # The recipient needs our rt1 announcement to accept the offer.
@@ -8270,24 +8455,26 @@ def audit_peer_rt_carriers(bot, accid, now):
                 _queue_peer_rt_mail(bot, accid, peer, "RT_RESET", {"v": 1, "cid": peer["rt_cid"]})
 
 
-def _send_peer_check_answer(destination, kind, payload, *, replay=False):
-    remember = None if replay else _inbound_probe_answer.get()
-    after_send = functools.partial(remember, kind, payload) if remember else None
+def _send_peer_check_answer(destination, kind, payload, *, key=None, should_send=None, after_send=None):
+    if key is None and (request := _inbound_probe_answer.get()):
+        request_key, remember = request
+        key = ("peer_answer", *request_key)
+        after_send = functools.partial(remember, kind, payload)
     label = "batch cross-check answer" if kind == "CHECK_BATCH_RESP" else "cross-check answer"
     peer_send(destination, kind, payload, priority=PRIO_PEER, expires_in=PEER_ANSWER_TTL,
-              label=label, after_send=after_send)
+              label=label, key=key, should_send=should_send, after_send=after_send)
 
 
 def _resend_cached_probe_answer(bot, accid, chat_id, peer, req_id, via="mail"):
-    answer = _inbound_probes.cached_answer(peer, req_id)
-    if answer is None:
-        return False
-    kind, payload = answer
-    if "caps" in payload:
-        payload = dict(payload, caps=_own_peer_caps())
-    destination = _PeerDestination(bot, accid, chat_id, fingerprint=peer.get("fingerprint"), via=via)
-    _send_peer_check_answer(destination, kind, payload, replay=True)
-    return True
+    found, replay = _inbound_probes.reserve_replay(peer, req_id, via)
+    if replay is not None:
+        kind, payload, pending, sent = replay
+        if "caps" in payload:
+            payload = dict(payload, caps=_own_peer_caps())
+        destination = _PeerDestination(bot, accid, chat_id, fingerprint=peer.get("fingerprint"), via=via)
+        _send_peer_check_answer(destination, kind, payload, key=("peer_answer", _peer_identity(peer), req_id),
+                                should_send=pending, after_send=sent)
+    return found
 
 
 def _react(bot, accid: int, msg_id: int | None, emoji: str):
@@ -11118,7 +11305,7 @@ def handle_peer_check_req(bot, accid, peer, chat_id, data, via="mail"):
     req_data = data
     req_id = req_data.get("req_id")
     if _resend_cached_probe_answer(bot, accid, chat_id, peer, req_id, via):
-        return
+        return _ProbeAdmission.COMPLETED
     target_url = req_data.get("url")
     check_type = req_data.get("type", "http")
     keyword = req_data.get("expected_keyword")
@@ -11159,15 +11346,18 @@ def handle_peer_check_req(bot, accid, peer, chat_id, data, via="mail"):
             destination = _PeerDestination(bot, accid, chat_id, fingerprint=peer.get("fingerprint"), via=via)
             await asyncio.to_thread(_send_peer_check_answer, destination, "CHECK_RESP", resp_payload)
 
-        if not _submit_inbound_probe(peer, req_id, _do_cross_check_reply):
+        outcome = _submit_inbound_probe(peer, req_id, _do_cross_check_reply, via=via)
+        if outcome is _ProbeAdmission.COMPLETED:
             _resend_cached_probe_answer(bot, accid, chat_id, peer, req_id, via)
+        return outcome
+    return _ProbeAdmission.REJECTED
 
 
 def handle_peer_check_batch_req(bot, accid, peer, chat_id, data, via="mail"):
     req_data = data
     req_id = req_data.get("req_id")
     if _resend_cached_probe_answer(bot, accid, chat_id, peer, req_id, via):
-        return
+        return _ProbeAdmission.COMPLETED
     raw_targets = req_data.get("targets")
     workers = min(10, max(1, len(raw_targets))) if isinstance(raw_targets, list) else 1
     async def answer():
@@ -11176,8 +11366,10 @@ def handle_peer_check_batch_req(bot, accid, peer, chat_id, data, via="mail"):
         if targets:
             await _answer_batch_cross_check(bot, accid, chat_id, req_id, targets, workers,
                                             fingerprint=peer.get("fingerprint"), via=via)
-    if not _submit_inbound_probe(peer, req_id, answer, workers):
+    outcome = _submit_inbound_probe(peer, req_id, answer, workers, via=via)
+    if outcome is _ProbeAdmission.COMPLETED:
         _resend_cached_probe_answer(bot, accid, chat_id, peer, req_id, via)
+    return outcome
 
 
 def handle_peer_check_batch_resp(bot, accid, peer, chat_id, data, via="mail", *, sender_addr=None, arrived_at=None):
@@ -11275,26 +11467,55 @@ def handle_peer_check_resp(bot, accid, peer, chat_id, data, via="mail", *, sende
                 pass
 
 
-def handle_peer_metrics(bot, accid, peer, chat_id, data, via="mail"):
-    metrics_data = data
+def _valid_metrics_msg_id(msg_id):
+    return isinstance(msg_id, str) and len(msg_id) <= 128
+
+
+def handle_peer_metrics(bot, accid, peer, chat_id, data, via="mail", *, wire_size=0):
+    if isinstance(data, str):
+        # Keep the original mail JSON compact until a worker can process it.
+        size = data.__sizeof__()
+    elif isinstance(data, dict) and _valid_metrics_msg_id(data.get("msg_id")):
+        size = wire_size * 8  # The parsed realtime payload takes more space than the frame.
+    else:
+        return
+    _peer_metrics_inbox.submit(peer, data, via, max(4096, size))
+
+
+def _current_metrics_peer(peer):
+    if fingerprint := peer.get("fingerprint"):
+        return database.get_peer_by_fingerprint(fingerprint)
+    current = database.get_peer(peer["email"])
+    if current and not current.get("fingerprint"):
+        return current
+
+
+def _apply_peer_metrics(peer, data, via):
+    metrics_data = json.loads(data) if isinstance(data, str) else data
+    if not isinstance(metrics_data, dict) or not _valid_metrics_msg_id(msg_id := metrics_data.get("msg_id")):
+        return
     metrics_list = metrics_data.get("metrics", [])
-    msg_id = metrics_data.get("msg_id")
     timestamp = metrics_data.get("timestamp")
     if type(timestamp) not in (int, float) or (isinstance(timestamp, float) and not math.isfinite(timestamp)):
         timestamp = None
 
-    if via == "mail":
-        _record_peer_activity(peer["email"])
     identity = _peer_identity(peer)
+    key = (identity, msg_id)
     with _peer_metrics_lock:
+        peer = _current_metrics_peer(peer)
+        if not peer:
+            return
+        if via == "mail":
+            _record_peer_activity(peer["email"])
         last_timestamp = _peer_metrics_timestamps.get(identity)
         stale = timestamp is not None and last_timestamp is not None and timestamp < last_timestamp
-        if (not stale and metrics_list == [] and metrics_data.get("request_caps") is True
-                and (not msg_id or msg_id not in _processed_msg_ids)):
+        if key in _processed_msg_ids:
+            return
+        if not stale and metrics_list == [] and metrics_data.get("request_caps") is True:
             with _peer_rt_lock:
                 _peer_caps_requests.add(identity)
         if not stale:
-            peer = _note_peer_announcement(peer, metrics_data, allow_rename=via == "mail", telemetry=True)
+            peer = _note_peer_announcement(peer, metrics_data, allow_rename=via == "mail", telemetry=True, via=via)
             if via == "rt" and type(announced := metrics_data.get("telemetry_interval")) is int:
                 with _peer_rt_lock:
                     link = _peer_rt_links.get(peer.get("rt_msg_id"))
@@ -11302,23 +11523,27 @@ def handle_peer_metrics(bot, accid, peer, chat_id, data, via="mail"):
                         link.incoming_metrics_interval = min(900, max(60, announced))
         if not isinstance(metrics_list, list):
             return
-
-        if msg_id:
-            if msg_id in _processed_msg_ids:
-                logger.info(f"Ignoring duplicate telemetry batch msg_id={msg_id}")
-                return
-            _processed_msg_ids.add(msg_id)
+        _processed_msg_ids.add(key)
         if stale or not metrics_list:
             return
 
-        # Sanitize metrics targets before saving
-        safe_metrics = [
-            dict(m, received_at=int(time.time()),
-                 last_checked=database._clamp_measurement_time(m.get("last_checked"), int(time.time())))
-            for m in metrics_list[:200]
-            if isinstance(m, dict) and _valid_peer_fields(m) and is_safe_target_url(str(m.get("url", "")), str(m.get("type", "http")))
-        ]
-        if not safe_metrics:
+    deadline = monotonic() + PEER_METRICS_BATCH_DEADLINE
+    safe_metrics = []
+    for metric in metrics_list[:200]:
+        if monotonic() >= deadline:
+            break
+        if (isinstance(metric, dict) and _valid_peer_fields(metric)
+                and is_safe_target_url(str(metric.get("url", "")), str(metric.get("type", "http")),
+                                       dns_deadline=deadline)):
+            now = int(time.time())
+            safe_metrics.append(dict(metric, received_at=now,
+                                     last_checked=database._clamp_measurement_time(metric.get("last_checked"), now)))
+    if not safe_metrics:
+        return
+
+    with _peer_metrics_lock:
+        peer = _current_metrics_peer(peer)
+        if not peer:
             return
         peer_node = peer.get("node_name") or "Remote-Node"
         database.save_peer_measurements_batch(peer_node, safe_metrics, peer.get("fingerprint") or peer["email"])
@@ -11573,14 +11798,11 @@ def on_new_message(bot, accid, event):
         try:
             start_idx = text.find("[UPTIME_PEER_METRICS]") + len("[UPTIME_PEER_METRICS]")
             end_idx = text.find("[/UPTIME_PEER_METRICS]")
-            metrics_data = json.loads(text[start_idx:end_idx].strip())
-            metrics_data.get("metrics", [])  # Preserve the pre-verification error for non-object JSON.
-
             peer, sender_addr = _get_verified_peer_for_msg(bot, accid, msg, is_private_chat)
             if not _is_trusted_peer_msg(msg, peer, is_private_chat):
                 logger.warning(f"Dropping telemetry from untrusted sender {sender_addr or msg.from_id}")
                 return
-            handle_peer_metrics(bot, accid, peer, msg.chat_id, metrics_data)
+            handle_peer_metrics(bot, accid, peer, msg.chat_id, text[start_idx:end_idx].strip())
         except Exception as e:
             logger.error(f"Error handling peer metrics: {e}")
         return
@@ -11659,4 +11881,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        _peer_metrics_inbox.close()

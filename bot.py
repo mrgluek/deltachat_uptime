@@ -7894,13 +7894,18 @@ def _mark_peer_telemetry_up(identity):
 class _PeerRealtimeLink:
     peer: dict
     advertise_at: float | None
+    epoch: str = field(default_factory=lambda: secrets.token_hex(16))
+    remote_epoch: str | None = None
+    replay: peer_rt.ReplayWindow = field(default_factory=lambda: peer_rt.ReplayWindow(clock=time.monotonic))
+    discovery_replay: peer_rt.ReplayWindow = field(default_factory=lambda: peer_rt.ReplayWindow(clock=time.monotonic))
     state: peer_rt.PeerChannelState = field(default_factory=lambda: peer_rt.PeerChannelState(clock=time.monotonic))
     started_at: float | None = None
     next_ping_at: float | None = None
     hello_requested: bool = False
     frames: collections.deque[tuple[str, dict, float]] = field(default_factory=collections.deque)
+    hellos: collections.deque[tuple[str, int | None]] = field(default_factory=collections.deque)
     seq: int = 0
-    probes: dict[int, float] = field(default_factory=dict)
+    probes: dict[int, tuple[str, float]] = field(default_factory=dict)
     rtt_ms: int | None = None
     acks: peer_rt.AckTracker = field(default_factory=lambda: peer_rt.AckTracker(clock=time.monotonic))
     fallbacks: dict[int, tuple[bool, Callable]] = field(default_factory=dict)
@@ -7915,12 +7920,10 @@ class _PeerRealtimeLink:
         return self.started_at if last_frame is None else last_frame + peer_rt.RT_CHANNEL_TIMEOUT
 
 
-_peer_rt_epoch = secrets.token_hex(4)
 _peer_rt_links: dict[int, _PeerRealtimeLink] = {}
 _peer_rt_carrier_ids: set[int] = set()
 _peer_rt_pending_adverts: set[int] = set()
 _peer_rt_leaves: set[int] = set()
-_peer_rt_replay = peer_rt.ReplayWindow()
 _peer_rt_limiter = peer_rt.TokenBucketLimiter()
 _peer_rt_log = peer_rt.LogOnce()
 
@@ -7951,7 +7954,8 @@ def _refresh_peer_rt_channels():
                 if peer["rt_advert_at"] is not None:
                     delay = max(delay, peer["rt_advert_at"] + PEER_RT_ADVERT_COOLDOWN - time.time())
                 _peer_rt_links[msg_id] = _PeerRealtimeLink(
-                    peer, time.monotonic() + delay, hello_requested=msg_id in _peer_rt_pending_adverts)
+                    peer, time.monotonic() + delay,
+                    hello_requested=msg_id in _peer_rt_pending_adverts or peer["rt_advert_at"] is not None)
                 _peer_rt_pending_adverts.discard(msg_id)
 
 
@@ -8012,20 +8016,51 @@ def _verify_peer_rt_frame(link, data):
             blob = bytes(data)
         except (TypeError, ValueError, OverflowError) as exc:
             raise peer_rt.FrameError("Invalid frame bytes") from exc
-        frame = peer_rt.decode(blob, link.peer["rt_key_in"], peer=fp, replay=_peer_rt_replay, clock=time.time)
-        kind = frame["k"]
+        frame = peer_rt.authenticate(blob, link.peer["rt_key_in"], clock=time.time)
+        kind, epoch, recipient = frame["k"], frame["e"], frame["r"]
+        if recipient != link.epoch and recipient is not None:
+            raise peer_rt.FrameError("Frame addressed to a different session")
+        if kind == "hello":
+            if (frame["a"] or len(link.hellos) >= peer_rt.RT_FRAME_BURST
+                    or not link.discovery_replay.accept(fp, epoch, frame["s"])):
+                raise peer_rt.FrameError("Invalid or repeated session hello")
+            # A hello can ask for a fresh challenge, but never opens a session on its own.
+            link.hellos.append((epoch, frame["s"] if recipient is not None else None))
+            database.record_peer_traffic(kind, "rt", "in", size)
+            return
+        received_at = time.monotonic()
+        if kind == "pong":
+            echo = frame["b"]
+            probe = link.probes.get(echo["s"])
+            if (frame["a"] or echo["e"] != link.epoch or probe is None or probe[0] != epoch
+                    or not 0 <= received_at - probe[1] < peer_rt.RT_CHANNEL_TIMEOUT):
+                raise peer_rt.FrameError("Pong does not match a current probe")
+            if epoch != link.remote_epoch:
+                # The peer answered a challenge addressed to its epoch with our fresh receiver epoch.
+                link.remote_epoch = epoch
+                link.replay = peer_rt.ReplayWindow(clock=time.monotonic)
+                link.state = peer_rt.PeerChannelState(clock=time.monotonic)
+                link.frames.clear()
+                link.probes.clear()
+                _fallback_peer_rt_sends(link)
+        elif epoch != link.remote_epoch:
+            raise peer_rt.FrameError("Frame from an unconfirmed session")
+        if not link.replay.accept(fp, epoch, frame["s"]):
+            raise peer_rt.FrameError("Frame replay or full replay window")
         if kind in _PEER_RT_CHECK_KINDS.values():
             req_id = frame["b"].get("req_id")
             if not link.state.is_up or frame["a"] != 1 or not isinstance(req_id, str) or not 0 < len(req_id) <= 64:
                 raise peer_rt.FrameError("Check requires an UP channel, acknowledgment and request ID")
-            return frame, time.monotonic(), size
+            return frame, received_at, size
         if kind == "metrics":
             if frame["a"] or not isinstance(frame["b"].get("metrics"), list):
                 raise peer_rt.FrameError("Invalid metrics frame")
-            return frame, time.monotonic(), size
+            return frame, received_at, size
         if frame["a"] or kind not in peer_rt.RT_HEALTH_KINDS | {"ack"}:
             raise peer_rt.FrameError("Unsupported peer channel frame")
         if kind == "ack":
+            if frame["b"]["e"] != link.epoch:
+                raise peer_rt.FrameError("Acknowledgment for a different session")
             if not link.state.is_up:
                 raise peer_rt.FrameError("Acknowledgment on a DOWN channel")
             link.state.on_frame()
@@ -8039,8 +8074,11 @@ def _verify_peer_rt_frame(link, data):
             return
         if len(link.frames) >= peer_rt.RT_FRAME_BURST:
             raise peer_rt.FrameError("Frame queue full")
-        echo = frame["b"] if kind == "pong" else {"e": frame["e"], "s": frame["s"]}
-        link.frames.append((kind, echo, time.monotonic()))
+        if kind == "pong":
+            link.probes.pop(echo["s"], None)
+            link.rtt_ms = round((received_at - probe[1]) * 1000)
+            database.record_peer_rtt("channel_ping", "rt", link.peer["node_name"], link.rtt_ms, True)
+        link.frames.append((kind, {"e": epoch, "s": frame["s"]}, received_at))
         database.record_peer_traffic(kind, "rt", "in", size)
     except peer_rt.FrameError as exc:
         _record_invalid_peer_rt(fp, size, exc)
@@ -8058,7 +8096,8 @@ def _deliver_peer_rt_message(bot, accid, msg_id, link, frame, received_at, size)
     kind = frame["k"]
     with _peer_rt_lock:
         peer = database.get_peer_by_fingerprint(fp)
-        if (_peer_rt_links.get(msg_id) is not link or (kind != "metrics" and not link.state.is_up)
+        if (_peer_rt_links.get(msg_id) is not link or frame["e"] != link.remote_epoch
+                or (kind != "metrics" and not link.state.is_up)
                 or not _peer_rt_eligible(peer, database.get_peer_rt_flag())
                 or peer["rt_msg_id"] != msg_id or peer["rt_lost"]
                 or peer["rt_cid"] != link.peer["rt_cid"] or peer["chat_id"] != link.peer["chat_id"]
@@ -8088,7 +8127,7 @@ def _deliver_peer_rt_message(bot, accid, msg_id, link, frame, received_at, size)
             _ProbeAdmission.ACCEPTED, _ProbeAdmission.RUNNING, _ProbeAdmission.COMPLETED))
             and (loop := _peer_rt_event_loop()) is not None):
         loop.call_soon_threadsafe(lambda: loop.create_task(
-            _send_peer_rt_unacked(bot, accid, msg_id, link, "ack", {"s": [frame["s"]]})))
+            _send_peer_rt_unacked(bot, accid, msg_id, link, "ack", {"e": frame["e"], "s": [frame["s"]]})))
 
 
 def _fallback_peer_rt_sends(link):
@@ -8139,9 +8178,10 @@ async def _send_peer_rt_check(destination, msg_id, link, kind, payload, send_mai
     with _peer_rt_lock:
         if _peer_rt_links.get(msg_id) is link and link.state.is_up:
             seq = link.seq
+            recipient = link.remote_epoch
             try:
-                blob = peer_rt.encode(kind, _peer_rt_epoch, seq, payload, link.peer["rt_key_out"],
-                                      ack=1, clock=time.time)
+                blob = peer_rt.encode(kind, link.epoch, seq, payload, link.peer["rt_key_out"],
+                                      recipient=recipient, ack=1, clock=time.time)
             except peer_rt.FrameError:
                 pass  # The mail format has a larger size limit.
             if blob is not None:
@@ -8159,7 +8199,8 @@ async def _send_peer_rt_check(destination, msg_id, link, kind, payload, send_mai
         if should_send is not None and not should_send():
             return False
         with _peer_rt_lock:
-            if _peer_rt_links.get(msg_id) is not link or not link.state.is_up or seq not in link.fallbacks:
+            if (_peer_rt_links.get(msg_id) is not link or link.remote_epoch != recipient
+                    or not link.state.is_up or seq not in link.fallbacks):
                 return False
         if before_send:
             before_send()
@@ -8181,25 +8222,33 @@ async def _send_peer_rt_check(destination, msg_id, link, kind, payload, send_mai
         after_send()
 
 
-async def _send_peer_rt_unacked(bot, accid, msg_id, link, kind, body):
+async def _send_peer_rt_unacked(bot, accid, msg_id, link, kind, body, *, recipient=None):
     def current():
-        return _peer_rt_links.get(msg_id) is link and (kind != "metrics" or link.state.is_up)
+        return (_peer_rt_links.get(msg_id) is link
+                and (kind != "metrics" or link.state.is_up)
+                and (kind not in ("ack", "metrics", "ping") or link.remote_epoch == recipient))
 
     with _peer_rt_lock:
+        if kind == "ack":
+            recipient = body["e"]
+        elif kind in ("ping", "metrics"):
+            recipient = link.remote_epoch
         if not current():
             return False
         seq = link.seq
         try:
-            blob = peer_rt.encode(kind, _peer_rt_epoch, seq, body, link.peer["rt_key_out"], clock=time.time)
+            blob = peer_rt.encode(kind, link.epoch, seq, body, link.peer["rt_key_out"],
+                                  recipient=recipient, clock=time.time)
         except peer_rt.FrameError:
             return False  # METRICS can fall back to the larger mail format.
         link.seq += 1
-    sent_at = time.monotonic()
 
     def send():
         with _peer_rt_lock:
             if not current():
                 return False
+            if recipient is not None and kind in ("hello", "ping"):
+                link.probes[seq] = (recipient, time.monotonic())
         # Core 2.66 joins implicitly on send.
         bot.rpc.send_webxdc_realtime_data(accid, msg_id, list(blob))
         return True
@@ -8208,12 +8257,11 @@ async def _send_peer_rt_unacked(bot, accid, msg_id, link, kind, body):
         if not await run_rpc(send):
             return False
     except Exception as exc:
+        with _peer_rt_lock:
+            link.probes.pop(seq, None)
         if _peer_rt_log.should_log((msg_id, "send")):
             logger.warning("Realtime %s on carrier %s failed (%s)", kind, msg_id, type(exc).__name__)
         return None
-    if kind in ("hello", "ping"):
-        with _peer_rt_lock:
-            link.probes[seq] = sent_at
     database.record_peer_traffic(kind, "rt", "out", len(blob))
     _note_peer_rt_caps_sent(link, body)
     if kind == "hello":
@@ -8284,7 +8332,13 @@ async def _tick_peer_rt_link(bot, accid, msg_id, link):
             return
         frames = list(link.frames)
         link.frames.clear()
+        hellos = list(link.hellos)
+        link.hellos.clear()
         hello, link.hello_requested = link.hello_requested, False
+        now = time.monotonic()
+        for seq, (_, sent_at) in list(link.probes.items()):
+            if now - sent_at >= peer_rt.RT_CHANNEL_TIMEOUT:
+                del link.probes[seq]
         was_up = link.state.is_up
         if frames:
             link.state.on_frame(frames[-1][2])
@@ -8292,7 +8346,6 @@ async def _tick_peer_rt_link(bot, accid, msg_id, link):
                 _mark_peer_telemetry_up(link.peer["fingerprint"])
         active = _reserve_peer_rt_activity(link, link.state.last_frame_at)
         _expire_peer_rt_acks(link)
-    now = time.monotonic()
     if active:
         await run_db(functools.partial(_record_peer_activity, None, "rt",
                                        fingerprint=link.peer["fingerprint"], chat_id=link.peer["chat_id"]))
@@ -8302,18 +8355,18 @@ async def _tick_peer_rt_link(bot, accid, msg_id, link):
         if link.peer["rt_rejoin_at"] is not None:
             await run_db(database.reset_peer_rt_rejoin, link.peer["fingerprint"], msg_id, link.peer["rt_cid"])
             link.peer.update(rt_rejoin_at=None, rt_rejoin_step=None)
-    for kind, echo, received_at in frames:
-        if kind == "pong":
-            sent = link.probes.pop(echo["s"], None) if echo["e"] == _peer_rt_epoch else None
-            if sent is not None and 0 <= received_at - sent < peer_rt.RT_CHANNEL_TIMEOUT:
-                with _peer_rt_lock:
-                    link.rtt_ms = round((received_at - sent) * 1000)
-                database.record_peer_rtt("channel_ping", "rt", link.peer["node_name"], link.rtt_ms, True)
-        else:
-            await _send_peer_rt_unacked(bot, accid, msg_id, link, "pong", echo)
-    for seq, sent in list(link.probes.items()):
-        if now - sent >= peer_rt.RT_CHANNEL_TIMEOUT:
-            del link.probes[seq]
+    for kind, echo, _ in frames:
+        if kind == "ping":
+            await _send_peer_rt_unacked(bot, accid, msg_id, link, "pong", echo, recipient=echo["e"])
+    challenged = set()
+    for epoch, seq in hellos:
+        if seq is not None:
+            await _send_peer_rt_unacked(bot, accid, msg_id, link, "pong", {"e": epoch, "s": seq}, recipient=epoch)
+        with _peer_rt_lock:
+            needs_probe = seq is None or epoch != link.remote_epoch or not link.state.is_up
+        if needs_probe and epoch not in challenged:
+            challenged.add(epoch)
+            await _send_peer_rt_unacked(bot, accid, msg_id, link, "hello", {}, recipient=epoch)
     if hello:
         await _send_peer_rt_unacked(bot, accid, msg_id, link, "hello", {})
     if link.advertise_at is not None and now >= link.advertise_at:
@@ -8322,11 +8375,12 @@ async def _tick_peer_rt_link(bot, accid, msg_id, link):
     # Schedule local probes independently of replies to the other peer.
     ping_at = time.monotonic()
     if link.next_ping_at is None:
-        if link.started_at is not None or hello or frames:
+        if link.started_at is not None or hello or frames or hellos:
             link.next_ping_at = ping_at + PEER_RT_PING_INTERVAL
     elif ping_at >= link.next_ping_at:
         link.next_ping_at = ping_at + PEER_RT_PING_INTERVAL
-        await _send_peer_rt_unacked(bot, accid, msg_id, link, "ping", {})
+        kind = "ping" if link.state.is_up else "hello"
+        await _send_peer_rt_unacked(bot, accid, msg_id, link, kind, {})
     down_since = link.down_since
     if (not link.state.is_up and down_since is not None and now - down_since >= PEER_RT_REJOIN_DELAYS[0]
             and (link.peer["rt_rejoin_at"] is None or time.time() >= link.peer["rt_rejoin_at"])):

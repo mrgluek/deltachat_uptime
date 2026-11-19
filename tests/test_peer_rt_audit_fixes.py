@@ -13,7 +13,7 @@ import database
 import peer_rt
 from outbox import Outbox
 from test_peer_metrics import event, message
-from test_peer_rt_channel import CHAT, CID, EMAIL, FP, IN_KEY, MSG, OUT_KEY, Event
+from test_peer_rt_channel import CHAT, CID, EMAIL, FP, IN_KEY, MSG, OUT_KEY, REMOTE_EPOCH, Event
 from test_peer_seam import inline_peer_metrics
 from test_peer_scaling import _DbCase
 
@@ -38,7 +38,6 @@ class TestPeerRTAuditFixes(_DbCase, unittest.IsolatedAsyncioTestCase):
             dc_bot_instance=self.client, dc_outbox=self.outbox, stat_event=Mock(),
             _inbound_probes=bot.InboundProbeAdmission(), _peer_rt_links={},
             _peer_rt_carrier_ids=set(), _peer_rt_pending_adverts=set(), _peer_rt_leaves=set(),
-            _peer_rt_replay=peer_rt.ReplayWindow(clock=self.clock.monotonic),
             _peer_rt_limiter=peer_rt.TokenBucketLimiter(clock=self.clock.monotonic),
             _peer_rt_audit_requested=threading.Event(), _peer_caps={}, _peer_caps_announcements={},
             _peer_caps_requests=set(), _peer_telemetry_interval={}, _peer_desired_interval={}, _peer_versions={},
@@ -58,6 +57,7 @@ class TestPeerRTAuditFixes(_DbCase, unittest.IsolatedAsyncioTestCase):
         database.set_peer_rt(FP, cid=CID, msg_id=MSG, key_in=IN_KEY, key_out=OUT_KEY, created_at=self.now)
         bot._refresh_peer_rt_channels()
         self.link = bot._peer_rt_links[MSG]
+        self.link.remote_epoch = REMOTE_EPOCH
         self.peer = database.get_peer_by_fingerprint(FP)
 
     async def asyncSetUp(self):
@@ -69,7 +69,8 @@ class TestPeerRTAuditFixes(_DbCase, unittest.IsolatedAsyncioTestCase):
 
     def receive_rt(self, kind, body, *, ack=1):
         self.seq += 1
-        frame = peer_rt.encode(kind, "feed1234", self.seq, body, IN_KEY, ack=ack, clock=self.clock.time)
+        frame = peer_rt.encode(kind, REMOTE_EPOCH, self.seq, body, IN_KEY,
+                               recipient=self.link.epoch, ack=ack, clock=self.clock.time)
         bot.on_status_realtime(self.client, 1, Event(kind="WebxdcRealtimeData", msg_id=MSG, data=list(frame)))
 
     def receive_mail(self, kind, body, chat=CHAT):
@@ -112,7 +113,7 @@ class TestPeerRTAuditFixes(_DbCase, unittest.IsolatedAsyncioTestCase):
             self.receive_rt("breq", batch)
             await self.until(lambda: send_rt.await_count == 2)
             self.assertEqual([call.args[4:] for call in send_rt.await_args_list],
-                             [("ack", {"s": [3]}), ("ack", {"s": [4]})])
+                             [("ack", {"e": REMOTE_EPOCH, "s": [3]}), ("ack", {"e": REMOTE_EPOCH, "s": [4]})])
             self.assertEqual(check.await_count, 2)
 
     async def test_replays_coalesce_while_queued_and_respect_peer_budget(self):

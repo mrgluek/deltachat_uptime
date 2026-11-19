@@ -20,6 +20,7 @@ CHAT = 42
 MSG = 456
 CID = "ba" * 8
 IN_KEY, OUT_KEY = b"i" * 32, b"o" * 32
+REMOTE_EPOCH = "ca1ab1e5" * 4
 
 
 class Event(dict):
@@ -60,8 +61,7 @@ class TestPeerRTChannel(unittest.IsolatedAsyncioTestCase):
 
     def channel_globals(self):
         return dict(_peer_rt_links={}, _peer_rt_carrier_ids=set(), _peer_rt_leaves=set(),
-                    _peer_rt_pending_adverts=set(), _peer_rt_epoch="feed1234",
-                    _peer_rt_replay=peer_rt.ReplayWindow(clock=self.clock.monotonic),
+                    _peer_rt_pending_adverts=set(),
                     _peer_rt_limiter=peer_rt.TokenBucketLimiter(clock=self.clock.monotonic),
                     _peer_rt_log=peer_rt.LogOnce(clock=self.clock.monotonic))
 
@@ -88,8 +88,9 @@ class TestPeerRTChannel(unittest.IsolatedAsyncioTestCase):
 
     def inbound(self, kind="ping", body=None, *, offset=0, key=IN_KEY, ack=0):
         self.seq += 1
-        return list(peer_rt.encode(kind, "ca1ab1e5", self.seq, {} if body is None else body, key,
-                                   ack=ack, clock=lambda: self.now + offset))
+        recipient = None if kind == "hello" else bot._peer_rt_links[MSG].epoch
+        return list(peer_rt.encode(kind, REMOTE_EPOCH, self.seq, {} if body is None else body, key,
+                                   recipient=recipient, ack=ack, clock=lambda: self.now + offset))
 
     def outbound(self):
         return [peer_rt.decode(bytes(call.args[2]), OUT_KEY, peer=FP, replay=self.replay, clock=self.clock.time)
@@ -199,7 +200,7 @@ class TestPeerRTChannel(unittest.IsolatedAsyncioTestCase):
     async def test_ping_pong_visibility_and_timeout(self):
         self.carrier()
         self.assertIn("iroh: carrier ok (age 0d)", self.command(bot.peers_command))
-        self.advertisement()
+        self.receive(self.inbound("hello"))
         await self.tick()
         hello, = self.outbound()
         self.advance(0.125)
@@ -237,6 +238,7 @@ class TestPeerRTChannel(unittest.IsolatedAsyncioTestCase):
 
     async def test_replying_to_peer_pings_keeps_local_ping_cadence_and_rtt(self):
         self.carrier()
+        bot._peer_rt_links[MSG].remote_epoch = REMOTE_EPOCH
         await self.tick()
         for probe_at, expected_rtt in ((30, 250), (60, 500)):
             self.send.reset_mock()
@@ -270,6 +272,7 @@ class TestPeerRTChannel(unittest.IsolatedAsyncioTestCase):
 
     async def test_rejoin_requires_mail_and_persists_backoff(self):
         self.carrier()
+        bot._peer_rt_links[MSG].remote_epoch = REMOTE_EPOCH
         await self.tick()
         self.receive(self.inbound())
         await self.tick()
@@ -302,6 +305,7 @@ class TestPeerRTChannel(unittest.IsolatedAsyncioTestCase):
             await self.tick()
             self.assertEqual(self.leave.call_count, 3)
             self.assertEqual(database.get_peer(EMAIL)["rt_rejoin_at"], self.now + 3600)
+            bot._peer_rt_links[MSG].remote_epoch = REMOTE_EPOCH
             self.receive(self.inbound())
             await self.tick()
             self.assertIsNone(database.get_peer(EMAIL)["rt_rejoin_at"])
@@ -362,11 +366,12 @@ class TestPeerRTChannel(unittest.IsolatedAsyncioTestCase):
     async def test_rate_limit_and_only_health_traffic(self):
         self.jitter = 30_000
         self.carrier()
+        bot._peer_rt_links[MSG].remote_epoch = REMOTE_EPOCH
         with self.assertLogs(bot.logger, level="WARNING"):
             for kind in ("req", "resp", "breq", "bresp", "metrics"):
                 self.receive(self.inbound(kind))
             for _ in range(50):
-                self.receive(self.inbound("pong", {"e": "ba5eba11", "s": 4}))
+                self.receive(self.inbound("ping"))
         await self.tick()
         self.assertFalse(any(json.loads(bytes(call.args[2]))["k"] not in peer_rt.RT_HEALTH_KINDS
                              for call in self.send.call_args_list))

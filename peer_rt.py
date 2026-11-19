@@ -8,7 +8,7 @@ from collections import Counter, OrderedDict
 from collections.abc import Callable, Hashable
 from dataclasses import dataclass
 
-RT_VERSION = 1
+RT_VERSION = 2
 RT_PEER_MAX_BYTES = 100_000
 RT_TIMESTAMP_SKEW = 120
 RT_REPLAY_WINDOW = 300
@@ -24,8 +24,8 @@ RT_CHANNEL_TIMEOUT = 90
 _MAIL_KINDS = frozenset({"req", "resp", "breq", "bresp", "metrics"})
 RT_HEALTH_KINDS = frozenset({"hello", "ping", "pong"})
 RT_KINDS = _MAIL_KINDS | RT_HEALTH_KINDS | {"ack"}
-_FRAME_FIELDS = {"v", "k", "e", "s", "ts", "a", "b", "h"}
-_EPOCH = re.compile(r"[0-9a-fA-F]{8}")
+_FRAME_FIELDS = {"v", "k", "e", "r", "s", "ts", "a", "b", "h"}
+_EPOCH = re.compile(r"[0-9a-f]{32}")
 _HMAC_HEX = re.compile(r"[0-9a-f]{64}")
 
 
@@ -48,15 +48,20 @@ def _is_seq(value) -> bool:
     return type(value) is int and value >= 0
 
 
+def _is_epoch(value) -> bool:
+    return isinstance(value, str) and _EPOCH.fullmatch(value) is not None
+
+
 def _validate_frame(frame: dict):
     if type(frame["v"]) is not int or frame["v"] != RT_VERSION:
         raise FrameError("Unknown frame version")
     kind = frame["k"]
     if not isinstance(kind, str) or kind not in RT_KINDS:
         raise FrameError("Unknown frame kind")
-    epoch = frame["e"]
-    if not isinstance(epoch, str) or not _EPOCH.fullmatch(epoch):
+    if not _is_epoch(frame["e"]):
         raise FrameError("Invalid frame epoch")
+    if not _is_epoch(frame["r"]) and not (kind == "hello" and frame["r"] is None):
+        raise FrameError("Invalid recipient epoch")
     if not _is_seq(frame["s"]) or type(frame["ts"]) is not int:
         raise FrameError("Invalid frame sequence or timestamp")
     if type(frame["a"]) is not int or frame["a"] not in (0, 1):
@@ -65,23 +70,23 @@ def _validate_frame(frame: dict):
     if kind in _MAIL_KINDS and not isinstance(body, dict):
         raise FrameError("Invalid mail payload")
     if kind == "ack" and (
-        not isinstance(body, dict) or body.keys() != {"s"}
+        not isinstance(body, dict) or body.keys() != {"e", "s"} or not _is_epoch(body["e"])
         or not isinstance(body["s"], list) or not all(map(_is_seq, body["s"]))
     ):
         raise FrameError("Invalid ack payload")
     if kind == "pong" and (
         not isinstance(body, dict) or body.keys() != {"e", "s"}
-        or not isinstance(body["e"], str) or not _EPOCH.fullmatch(body["e"])
+        or not _is_epoch(body["e"])
         or not _is_seq(body["s"])
     ):
         raise FrameError("Invalid pong payload")
 
 
-def encode(kind: str, epoch: str, seq: int, body, key: bytes, *, ack: int = 0,
+def encode(kind: str, epoch: str, seq: int, body, key: bytes, *, recipient: str | None, ack: int = 0,
            clock: Callable[[], float] = time.time) -> bytes:
     """Encode a frame with the sender's directional key and a Unix timestamp."""
     frame = {
-        "v": RT_VERSION, "k": kind, "e": epoch, "s": seq, "ts": int(clock()),
+        "v": RT_VERSION, "k": kind, "e": epoch, "r": recipient, "s": seq, "ts": int(clock()),
         "a": int(ack) if isinstance(ack, bool) else ack, "b": body,
     }
     _validate_frame(frame)
@@ -123,8 +128,7 @@ class ReplayWindow:
         return True
 
 
-def decode(data: bytes, key: bytes, *, peer: Hashable, replay: ReplayWindow,
-           clock: Callable[[], float] = time.time) -> dict:
+def authenticate(data: bytes, key: bytes, *, clock: Callable[[], float] = time.time) -> dict:
     """Authenticate one incoming frame using a verified peer's incoming key."""
     if len(data) > RT_PEER_MAX_BYTES:
         raise FrameError("Frame too large")
@@ -143,9 +147,15 @@ def decode(data: bytes, key: bytes, *, peer: Hashable, replay: ReplayWindow,
     now = clock()
     if not now - RT_TIMESTAMP_SKEW <= frame["ts"] <= now + RT_TIMESTAMP_SKEW:
         raise FrameError("Frame timestamp out of range")
+    frame["h"] = tag
+    return frame
+
+
+def decode(data: bytes, key: bytes, *, peer: Hashable, replay: ReplayWindow,
+           clock: Callable[[], float] = time.time) -> dict:
+    frame = authenticate(data, key, clock=clock)
     if not replay.accept(peer, frame["e"], frame["s"]):
         raise FrameError("Frame replay or full replay window")
-    frame["h"] = tag
     return frame
 
 

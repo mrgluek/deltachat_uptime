@@ -8,7 +8,8 @@ import peer_rt as rt
 
 KEY_OUT = b"a" * 32
 KEY_IN = b"b" * 32
-EPOCH = "a1b2c3d4"
+EPOCH = "a1b2c3d4" * 4
+RECIPIENT = "f00d1234" * 4
 PEER = "A" * 40
 OTHER_PEER = "B" * 40
 
@@ -30,7 +31,7 @@ class TestFrameCodec(unittest.TestCase):
         self.replay = rt.ReplayWindow(clock=self.clock)
 
     def encode(self, kind="ping", seq=1, body=None, **kwargs):
-        return rt.encode(kind, EPOCH, seq, body, KEY_OUT, clock=self.clock, **kwargs)
+        return rt.encode(kind, EPOCH, seq, body, KEY_OUT, recipient=RECIPIENT, clock=self.clock, **kwargs)
 
     def decode(self, data, key=KEY_OUT, peer=PEER):
         return rt.decode(data, key, peer=peer, replay=self.replay, clock=self.clock)
@@ -46,7 +47,7 @@ class TestFrameCodec(unittest.TestCase):
             "hello": {},
             "ping": {},
             "pong": {"e": EPOCH, "s": 1},
-            "ack": {"s": [0, 3, 10]},
+            "ack": {"e": RECIPIENT, "s": [0, 3, 10]},
             "req": {"url": "https://example.org", "req_id": "1"},
             "resp": {"status": "up", "req_id": "1"},
             "breq": {"targets": [{"url": "https://example.org"}], "req_id": "2"},
@@ -59,13 +60,13 @@ class TestFrameCodec(unittest.TestCase):
                 ack = int(kind in {"req", "resp", "breq", "bresp"})
                 data = self.encode(kind, seq, body, ack=ack)
                 self.assertIsInstance(data, bytes)
-                expected = {"v": 1, "k": kind, "e": EPOCH, "s": seq,
+                expected = {"v": 2, "k": kind, "e": EPOCH, "r": RECIPIENT, "s": seq,
                             "ts": self.clock.now, "a": ack, "b": body}
                 self.assertEqual(self.decode(data), dict(expected, h=self.sign(expected)))
 
     def test_tampered_body_timestamp_and_sequence(self):
         data = self.encode("req", body={"site": "original"})
-        for field, value in (("b", {"site": "changed"}), ("ts", self.clock.now + 1), ("s", 2)):
+        for field, value in (("b", {"site": "changed"}), ("ts", self.clock.now + 1), ("s", 2), ("r", EPOCH)):
             with self.subTest(field=field):
                 altered = dict(json.loads(data), **{field: value})
                 with self.assertRaisesRegex(rt.FrameError, "HMAC"):
@@ -83,7 +84,7 @@ class TestFrameCodec(unittest.TestCase):
     def test_timestamp_window_in_both_directions(self):
         for seq, difference in enumerate((-121, -120, 120, 121)):
             with self.subTest(difference=difference):
-                frame = rt.encode("ping", EPOCH, seq, {}, KEY_OUT,
+                frame = rt.encode("ping", EPOCH, seq, {}, KEY_OUT, recipient=RECIPIENT,
                                   clock=lambda: self.clock() + difference)
                 if abs(difference) > 120:
                     with self.assertRaisesRegex(rt.FrameError, "timestamp"):
@@ -103,7 +104,7 @@ class TestFrameCodec(unittest.TestCase):
         with self.assertRaisesRegex(rt.FrameError, "replay"):
             self.decode(data)
         self.decode(data, peer=OTHER_PEER)
-        next_epoch = rt.encode("ping", "01234567", 1, {}, KEY_OUT, clock=self.clock)
+        next_epoch = rt.encode("ping", "01234567" * 4, 1, {}, KEY_OUT, recipient=RECIPIENT, clock=self.clock)
         self.decode(next_epoch)
         self.clock.advance(299)
         with self.assertRaisesRegex(rt.FrameError, "replay"):
@@ -141,19 +142,19 @@ class TestFrameCodec(unittest.TestCase):
             with self.subTest(invalid=invalid):
                 with self.assertRaises(rt.FrameError):
                     self.decode(invalid)
-        for key, value in (("e", "abc"), ("s", -1), ("a", True), ("ts", "100000")):
+        for key, value in (("e", "abc"), ("r", None), ("s", -1), ("a", True), ("ts", "100000")):
             with self.subTest(key=key):
                 frame = dict(json.loads(data), **{key: value})
                 frame["h"] = self.sign(frame)
                 with self.assertRaises(rt.FrameError):
                     self.decode(json.dumps(frame).encode())
         with self.assertRaisesRegex(rt.FrameError, "ack payload"):
-            self.encode("ack", body={"s": ["1"]})
+            self.encode("ack", body={"e": RECIPIENT, "s": ["1"]})
         with self.assertRaisesRegex(rt.FrameError, "frame JSON"):
             self.encode(body={"value": float("nan")})
 
     def test_unknown_version_and_kind_have_valid_hmac(self):
-        for field, value, error in (("v", 2, "version"), ("k", "other", "kind")):
+        for field, value, error in (("v", 1, "version"), ("k", "other", "kind")):
             with self.subTest(field=field):
                 frame = dict(json.loads(self.encode()), **{field: value})
                 frame["h"] = self.sign(frame)

@@ -44,7 +44,6 @@ class TestRealtimeChecks(unittest.IsolatedAsyncioTestCase):
             dc_bot_instance=self.client, dc_outbox=self.outbox, _peer_caps={},
             _peer_caps_announcements={}, _peer_caps_requests=set(),
             _peer_rt_links={}, _peer_rt_carrier_ids=set(), _peer_rt_leaves=set(), _peer_rt_pending_adverts=set(),
-            _peer_rt_epoch="feed1234", _peer_rt_replay=peer_rt.ReplayWindow(clock=self.clock.monotonic),
             _peer_rt_limiter=peer_rt.TokenBucketLimiter(clock=self.clock.monotonic),
             _peer_rt_log=peer_rt.LogOnce(clock=self.clock.monotonic),
             _inbound_probes=bot.InboundProbeAdmission(), pending_peer_checks={}, pending_batch_checks={},
@@ -63,6 +62,7 @@ class TestRealtimeChecks(unittest.IsolatedAsyncioTestCase):
         self.link = bot._peer_rt_links[channel.MSG]
         self.peer = database.get_peer_by_fingerprint(channel.FP)
         bot._peer_caps.update({channel.EMAIL: {"rt1", "batch_check"}, LEGACY["email"]: {"batch_check"}})
+        self.link.remote_epoch = channel.REMOTE_EPOCH
         self.link.state.on_frame()
 
     async def run_sync(self, func, *args):
@@ -91,7 +91,8 @@ class TestRealtimeChecks(unittest.IsolatedAsyncioTestCase):
 
     def incoming(self, kind, body, *, ack=1, key=channel.IN_KEY):
         self.seq += 1
-        return list(peer_rt.encode(kind, "face1234", self.seq, body, key, ack=ack, clock=self.clock.time))
+        return list(peer_rt.encode(kind, channel.REMOTE_EPOCH, self.seq, body, key,
+                                   recipient=self.link.epoch, ack=ack, clock=self.clock.time))
 
     def receive_frame(self, kind, body, *, ack=1):
         self.receive_bytes(self.incoming(kind, body, ack=ack))
@@ -101,7 +102,7 @@ class TestRealtimeChecks(unittest.IsolatedAsyncioTestCase):
         bot.on_status_realtime(self.client, 1, event)
 
     def acknowledge(self, frame):
-        self.receive_frame("ack", {"s": [frame["s"]]}, ack=0)
+        self.receive_frame("ack", {"e": frame["e"], "s": [frame["s"]]}, ack=0)
 
     async def until(self, condition):
         async def wait():
@@ -147,7 +148,7 @@ class TestRealtimeChecks(unittest.IsolatedAsyncioTestCase):
         self.receive_mail("CHECK_BATCH_RESP", self.answer_body(req["b"], "down"))
         answers = await task
         await self.until(lambda: len(self.wire) == 2)
-        self.assertEqual(self.wire[1]["b"], {"s": [self.seq]})
+        self.assertEqual(self.wire[1]["b"], {"e": channel.REMOTE_EPOCH, "s": [self.seq]})
         self.assertEqual(self.wire[1]["k"], "ack")
         self.assertEqual([(a["node_name"], a["status"]) for a in answers], [("Peer", "up")])
         self.assertEqual(database.get_peer_by_fingerprint(channel.FP)["node_name"], "Peer")
@@ -287,7 +288,7 @@ class TestRealtimeChecks(unittest.IsolatedAsyncioTestCase):
             frames = {frame["k"]: frame for frame in self.wire}
             lost = frames["bresp"]
             self.assertEqual((lost["a"], lost["b"]["results"][0]["status"]), (1, "down"))
-            self.assertEqual(frames["ack"]["b"], {"s": [1]})
+            self.assertEqual(frames["ack"]["b"], {"e": channel.REMOTE_EPOCH, "s": [1]})
             self.receive_mail("CHECK_BATCH_REQ", req)
             self.assertEqual(self.mail_body(), lost["b"])
             self.receive_frame("breq", req)

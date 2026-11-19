@@ -139,7 +139,8 @@ class TestPeerRTCarrier(unittest.TestCase):
         self.audit()
         self.rpc.send_msg.assert_not_called()
         key_out = b"o" * 32
-        with patch.object(bot.secrets, "token_bytes", return_value=key_out) as generate:
+        with patch.object(bot.secrets, "token_bytes", return_value=key_out) as generate, \
+             patch.object(bot.secrets, "token_hex", return_value="a" * 32):
             self.receive("OFFER", msg_id=351)
         generate.assert_called_once_with(32)
         self.assertEqual(database.get_peer_rt(FP), dict(rt_cid=CID, rt_msg_id=351, rt_key_out=key_out,

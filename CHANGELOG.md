@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Keep realtime peer activity current when a paired bot switches relay addresses.
 - Limit caps-only mail to one startup attempt per peer with realtime off and back off when enabled peers never announce caps.
 - Cap future METRICS timestamps at five minutes ahead for telemetry ordering.
+- Recover realtime peer channels promptly after a cut, re-enable, or restart. Realtime frames now authenticate both link epochs, and ACKs include the acknowledged sender epoch. The unreleased frame format changes without adding a capability field.
 
 ## [3.0.0] - 2026-11-19
 

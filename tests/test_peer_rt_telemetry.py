@@ -15,7 +15,7 @@ import peer_rt
 from outbox import Outbox
 from test_peer_seam import inline_peer_metrics
 from test_peer_metrics import event, message
-from test_peer_rt_channel import CHAT, CID, EMAIL, FP, IN_KEY, MSG, OUT_KEY, Event
+from test_peer_rt_channel import CHAT, CID, EMAIL, FP, IN_KEY, MSG, OUT_KEY, REMOTE_EPOCH, Event
 
 
 class TestRealtimeTelemetry(unittest.IsolatedAsyncioTestCase):
@@ -53,7 +53,6 @@ class TestRealtimeTelemetry(unittest.IsolatedAsyncioTestCase):
             _local_degraded={}, _scheduler_cache={}, _get_self_addr=lambda *_: "local@example.org",
             _filter_peer_shareable_resources=lambda *args: args[-1],
             _peer_rt_links={}, _peer_rt_carrier_ids=set(), _peer_rt_leaves=set(), _peer_rt_pending_adverts=set(),
-            _peer_rt_replay=peer_rt.ReplayWindow(clock=self.clock.monotonic),
             _peer_rt_limiter=peer_rt.TokenBucketLimiter(clock=self.clock.monotonic),
             _peer_rt_log=peer_rt.LogOnce(clock=self.clock.monotonic),
             _get_verified_peer_for_msg=lambda _bot, _accid, msg, _private: (database.get_peer(EMAIL), EMAIL),
@@ -77,7 +76,9 @@ class TestRealtimeTelemetry(unittest.IsolatedAsyncioTestCase):
         database.set_peer_rt(fp, cid=CID, msg_id=msg_id, key_in=IN_KEY, key_out=OUT_KEY,
                              created_at=self.now)
         bot._refresh_peer_rt_channels()
-        return bot._peer_rt_links[msg_id]
+        link = bot._peer_rt_links[msg_id]
+        link.remote_epoch = REMOTE_EPOCH
+        return link
 
     def resource(self, number):
         return {"url": f"https://monitor{number}.example.org", "status": "up", "last_latency_ms": 100,
@@ -114,7 +115,8 @@ class TestRealtimeTelemetry(unittest.IsolatedAsyncioTestCase):
 
     def receive(self, kind, body, *, ack=0):
         self.seq += 1
-        wire = peer_rt.encode(kind, "face1234", self.seq, body, IN_KEY, ack=ack, clock=self.clock.time)
+        wire = peer_rt.encode(kind, REMOTE_EPOCH, self.seq, body, IN_KEY,
+                              recipient=self.link.epoch, ack=ack, clock=self.clock.time)
         bot.on_status_realtime(self.client, 1, Event(kind="WebxdcRealtimeData", msg_id=MSG, data=list(wire)))
 
     def metrics(self, timestamp, *entries, interval=120, **fields):
@@ -235,7 +237,7 @@ class TestRealtimeTelemetry(unittest.IsolatedAsyncioTestCase):
                 elif elapsed % 60:
                     self.receive("ping", {})
                 else:
-                    self.receive("pong", {"e": "face1234", "s": 1})
+                    self.receive("ping", {})
                 if elapsed == 3600:
                     keepalive = self.metrics(self.now, *self.resources)
                     bot.on_new_message(self.client, 1, event(message("METRICS", json.dumps(keepalive)), CHAT))

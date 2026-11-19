@@ -22,7 +22,7 @@ FP = {LEFT: "AA" * 20, RIGHT: "BB" * 20}
 KEY = {LEFT: b"a" * 32, RIGHT: b"b" * 32}
 
 
-class TestPeerRTRejoin(unittest.IsolatedAsyncioTestCase):
+class PeerRTRejoinFixture(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         directory = self.enterContext(tempfile.TemporaryDirectory())
         database.close_db()
@@ -119,6 +119,8 @@ class TestPeerRTRejoin(unittest.IsolatedAsyncioTestCase):
             self.client, 1, msg_id, self.link(msg_id), kind, body))
         return self.wire[-1][1]
 
+
+class TestPeerRTRejoin(PeerRTRejoinFixture):
     async def test_off_on_rejoins_on_the_first_exchange(self):
         old_epochs = {msg_id: self.link(msg_id).epoch for msg_id in OTHER_END}
         await self.reenable()
@@ -225,5 +227,4 @@ class TestPeerRTRejoin(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.link(RIGHT).remote_epoch, old_epoch)
 
         self.drop_pong_from = None
-        self.seconds += peer_rt.RT_CHANNEL_TIMEOUT
         await self.wait_for_link()

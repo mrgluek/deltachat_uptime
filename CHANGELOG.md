@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Limit caps-only mail to one startup attempt per peer with realtime off and back off when enabled peers never announce caps.
 - Cap future METRICS timestamps at five minutes ahead for telemetry ordering.
 - Recover realtime peer channels promptly after a cut, re-enable, or restart. Realtime frames now authenticate both link epochs, and ACKs include the acknowledged sender epoch. The unreleased frame format changes without adding a capability field.
+- Recover half-open realtime peer channels faster, bound discovery traffic, and reject reflected frames and recently retired sessions.
 
 ## [3.0.0] - 2026-11-19
 

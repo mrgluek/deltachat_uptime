@@ -176,6 +176,8 @@ Relay selection and failover are handled by the Delta Chat core (2.61+): it keep
 
 ### Peer channel (preview)
 
+**Privacy:** the channel is off by default. When enabled for a pair of bots, they connect over iroh (directly or through relays), so each bot can learn the other's IP address. Votes and telemetry stay end-to-end authenticated, and mail remains the fallback. Enable it only for peers you trust with that information.
+
 The iroh peer channel preview is off by default. Use `/peerrt` to see the current
 setting, `/peerrt off|canary|on` to change it, or
 `/peerrt <peer name|email> on|off|auto` to set a peer's preview mode. In canary

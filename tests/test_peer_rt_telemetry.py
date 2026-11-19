@@ -262,7 +262,7 @@ class TestRealtimeTelemetry(unittest.IsolatedAsyncioTestCase):
         expected = {
             "node_name": database.get_local_node_name(), "sender_email": "local@example.org",
             "timestamp": self.now, "msg_id": f"{self.now}_fixed", "caps": [*bot.OWN_PEER_CAPS, "rt1"],
-            "telemetry_interval": 300, "desired_interval": 120, "version": "2.44.2",
+            "telemetry_interval": 300, "desired_interval": 120, "version": bot.VERSION,
             "metrics": [{"url": r["url"], "type": "http", "expected_keyword": None, "status": "up",
                          "latency_ms": 100, "last_checked": self.now} for r in self.resources],
         }

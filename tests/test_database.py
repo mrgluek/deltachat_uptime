@@ -133,6 +133,48 @@ class TestReadConnections(unittest.TestCase):
             self.assertEqual(conn.execute("PRAGMA busy_timeout").fetchone(), (5000,))
             self.assertEqual(conn.execute("PRAGMA cache_size").fetchone(), (-2000,))
 
+    def test_nested_checkout_closes_during_replacement_from_another_thread(self):
+        replacement = self.path.with_name("replacement.db")
+        self.seed(replacement, "second")
+        checked_out, retired = threading.Event(), threading.Event()
+        released, finish = threading.Event(), threading.Event()
+        close_if_idle = database._ThreadReader.close_if_idle
+        owner = nested_reader = None
+
+        def pause_owner_close(reader):
+            if reader is nested_reader and threading.get_ident() == owner:
+                released.set()
+                self.assertTrue(finish.wait(5))
+            close_if_idle(reader)
+
+        def read():
+            nonlocal owner, nested_reader
+            owner = threading.get_ident()
+            with closing(database._connect()) as outer, closing(database._connect()) as nested:
+                nested_reader = nested._reader
+                raw = nested.cursor().connection
+                checked_out.set()
+                self.assertTrue(retired.wait(5))
+                self.assertEqual(nested.execute("SELECT value FROM config").fetchone(), ("first",))
+                outer.close()
+            with self.assertRaisesRegex(sqlite3.ProgrammingError, "closed database"):
+                raw.execute("SELECT 1")
+
+        with (patch.object(database._ThreadReader, "close_if_idle", pause_owner_close),
+              ThreadPoolExecutor(max_workers=1) as executor):
+            reading = executor.submit(read)
+            try:
+                self.assertTrue(checked_out.wait(5))
+                database.close_db()
+                retired.set()
+                self.assertTrue(released.wait(5))
+                replacement.replace(self.path)
+                self.assertEqual(database.get_config("key"), "second")
+            finally:
+                retired.set()
+                finish.set()
+            reading.result(5)
+
     def test_closing_releases_implicit_and_explicit_read_snapshots(self):
         with closing(sqlite3.connect(self.path)) as writer, writer:
             writer.execute("PRAGMA journal_mode = WAL").fetchall()

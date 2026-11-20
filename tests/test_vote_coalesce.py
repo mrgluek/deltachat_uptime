@@ -280,7 +280,7 @@ class VoteTests(unittest.IsolatedAsyncioTestCase):
         for _ in range(3):
             bot._note_vote_peer_result(self.peers[0], False)
         self.install(database, get_all_resources=lambda: [], get_active_probe_targets=lambda: [],
-                     get_all_peer_measurements=lambda: [], get_monitored_chats=lambda: {},
+                     get_remote_measurement_counts=lambda: {}, get_monitored_chats=lambda: {},
                      get_peer_metrics_24h=lambda now: ([("vote_skipped_paused", "out", 7)], []))
         expected = datetime.datetime.fromtimestamp(2300).strftime("%H:%M")
         stats = bot.build_stats_report(MagicMock(), 1)

@@ -5908,10 +5908,9 @@ def get_dashboard_html(chat_name, resources, overall_uptime, incidents=None, upt
                 badges_html += f' <span class="monitor-type" style="background: rgba(245, 158, 11, 0.15); color: #f59e0b; border-color: rgba(245, 158, 11, 0.3);">⏸️ Maintenance ({m_left_str} left)</span>'
 
             probe_badges_html = ""
-            peer_measurements = database.get_peer_measurements_for_url(r["url"])
-            local_node = database.get_local_node_name()
-            remote_measurements = [pm for pm in peer_measurements if pm.get("node_name") != local_node]
+            remote_measurements = database.get_peer_measurements_for_url(r["url"], remote_only=True)
             if remote_measurements:
+                local_node = database.get_local_node_name()
                 local_lat = f"{r['last_latency_ms']}ms" if r.get("last_latency_ms") is not None else ("UP" if r["status"] == "up" else "DOWN")
                 local_badge_color = "var(--color-up)" if r["status"] == "up" else ("var(--color-down)" if r["status"] == "down" else "var(--text-muted)")
                 probe_badges_html = f'<div style="display: flex; gap: 0.35rem; flex-wrap: wrap; margin-top: 0.35rem; font-size: 0.75rem;">'
@@ -10962,7 +10961,7 @@ def peers_command(bot, accid, event):
     all_resources = database.get_all_resources()
     unique_local_urls = len(set(r["url"] for r in all_resources if r.get("url")))
     probe_targets = database.get_active_probe_targets()
-    all_peer_measurements = database.get_all_peer_measurements()
+    remote_measurement_counts = database.get_remote_measurement_counts()
 
     reply = f"🛰️ **Distributed Monitoring Peers**\n"
     reply += f"📍 Local Node: `{local_node}`\n\n"
@@ -10972,7 +10971,7 @@ def peers_command(bot, accid, event):
     paused = [c for c, at in database.get_monitored_chats().items() if at is not None]
     if paused:
         reply += f"• Paused Chats (bot removed or chat gone): `{len(paused)}`\n"
-    reply += f"• Cached Remote Measurements: `{len(all_peer_measurements)}`\n\n"
+    reply += f"• Cached Remote Measurements: `{sum(remote_measurement_counts.values())}`\n\n"
 
     if not peers:
         reply += (
@@ -11004,7 +11003,7 @@ def peers_command(bot, accid, event):
                     seen_str = f"{diff // 3600}h ago"
             chat_lbl = f"Chat ID: `{p.get('chat_id')}`" if p.get('chat_id') else "Chat: `Pending`"
             p_node = p.get('node_name') or 'Remote'
-            node_meas_count = sum(1 for m in all_peer_measurements if m.get("node_name") == p_node)
+            node_meas_count = remote_measurement_counts.get(p_node, 0)
             fp = p.get("fingerprint")
             # First 16 hex digits identify the key; the address only shows the relay it last used
             key_lbl = f"Key: `{' '.join(fp[i:i + 4] for i in range(0, 16, 4))}…`" if fp else "Key: `not bound yet`"

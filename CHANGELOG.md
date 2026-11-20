@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Close nested SQLite readers safely during database replacement and shutdown.
+- Store in-flight check results under the current local node name after a rename.
+- Normalize legacy local measurement sources during database initialization.
+- Count remote measurements in SQLite for `/peers` and load only remote rows for status page badges.
+- Read an uncached local node name without waiting for ongoing database writes.
 - Reuse one read-only SQLite connection per thread, release read snapshots when a checkout is closed or collected, and let active reads finish during shutdown or database replacement. At 10,000 monitors, pooling alone reduced the status app workload from 19,996 reader opens and 11.32 s of CPU to 602 SQLite opens and 1.57 s.
 - Batch incident and partial-notice reads, use the partial index for unlinked open downtime, and skip expired resolved incidents before joining their downtime history. With pooled readers, report notices fell from 8.28 s to 2.98 s of CPU and startup from 5.66 s to 2.83 s.
 - Reuse monitor data and batch settings and incident history during status app updates. At 10,000 monitors, CPU fell from 1.63 s to 0.78 s and measured rows from 126,783 to 99,303 across two passes.

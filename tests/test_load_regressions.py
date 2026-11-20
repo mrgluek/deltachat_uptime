@@ -400,6 +400,79 @@ class DatabaseLoadTests(unittest.TestCase):
         self.assertEqual({row["node_name"] for row in rows}, {"New local"})
         self.assertEqual({row["source_peer"] for row in rows}, {None})
 
+    def test_rename_during_monitor_check_writes_under_the_current_local_name(self):
+        url = "http://monitor.example.org"
+        resource = database.add_resource(1, url, "Monitor", "http")
+        group = [database.get_resource_by_id(resource)]
+
+        async def run_db(fn, *args, **kwargs):
+            if fn is database.record_check_results:
+                database.rename_local_node("New local")
+            return fn(*args, **kwargs)
+
+        with (patch.object(bot, "run_db", run_db),
+              patch.object(bot, "run_single_check", AsyncMock(return_value=(True, "200 - OK", 22)))):
+            asyncio.run(bot.check_group_task(group, asyncio.Semaphore(1)))
+
+        rows = database.get_peer_measurements_for_url(url)
+        self.assertEqual([(row["node_name"], row["source_peer"]) for row in rows], [("New local", None)])
+
+    def test_init_migrates_legacy_local_measurement_sources_once(self):
+        database.set_local_node_name("Local")
+        rows = [("local", "Local", "Local"), ("new-local", "Local", None),
+                ("peer-key", "Local", "A" * 40), ("peer-email", "Local", "peer@example.org"),
+                ("other-node", "Old name", "Local")]
+        with database._writer_transaction() as conn:
+            conn.execute("DELETE FROM config WHERE key = 'local_measurement_source_migrated'")
+            conn.executemany("INSERT INTO peer_measurements(url, node_name, source_peer) VALUES (?, ?, ?)", rows)
+
+        database.init_db()
+        self.assertEqual({row["url"]: row["source_peer"] for row in database.get_all_peer_measurements()},
+                         {url: source if url != "local" else None for url, _, source in rows})
+
+        with database._writer_transaction() as conn:
+            conn.execute("INSERT INTO peer_measurements(url, node_name, source_peer) VALUES ('late', 'Local', 'Local')")
+        database.init_db()
+        self.assertEqual(database.get_peer_measurements_for_url("late")[0]["source_peer"], "Local")
+
+    def test_init_preserves_legacy_sources_matching_registered_peer_keys(self):
+        email, fingerprint = "peer@example.org", "A" * 40
+        database.add_or_update_peer(email, "Remote", 42, fingerprint=fingerprint)
+        for source in (email, fingerprint):
+            with self.subTest(source=source):
+                database.set_local_node_name(source)
+                with database._writer_transaction() as conn:
+                    conn.execute("DELETE FROM config WHERE key = 'local_measurement_source_migrated'")
+                    conn.execute("INSERT INTO peer_measurements(url, node_name, source_peer) VALUES (?, ?, ?)",
+                                 (source, source, source))
+                database.init_db()
+                self.assertEqual(database.get_peer_measurements_for_url(source)[0]["source_peer"], source)
+
+    def test_peers_reports_only_remote_measurement_counts(self):
+        database.add_or_update_peer("peer@example.org", "Remote", 42)
+        database.set_local_node_name("Remote")  # A name collision inherited from an older database.
+        database.save_peer_measurement("https://local.example.org", "Remote", "up", local=True)
+        database.save_peer_measurement("https://peer.example.org", "Remote", "up", source_peer="peer@example.org")
+        database.save_peer_measurement("https://other.example.org", "Other", "up", source_peer="other@example.org")
+        with (patch.object(bot, "_is_dc_admin", return_value=True), patch.object(bot, "_dc_send_msg_with_stats") as reply,
+              patch.object(database, "get_all_peer_measurements", wraps=database.get_all_peer_measurements) as load):
+            bot.peers_command(Mock(), 1, Mock())
+        message = reply.call_args.args[3].text
+        self.assertIn("Cached Remote Measurements: `2`", message)
+        self.assertIn("Active metrics: `1`", message)
+        load.assert_not_called()
+
+    def test_status_page_does_not_load_local_measurements_as_remote_badges(self):
+        url = "https://monitor.example.org"
+        resource = database.add_resource(1, url, "Monitor", "http")
+        database.set_local_node_name("Local")
+        with database._writer_transaction() as conn:
+            conn.execute("INSERT INTO peer_measurements(url, node_name, status, source_peer) VALUES (?, 'Old local', 'up', NULL)", (url,))
+        database.save_peer_measurement(url, "Local", "up", latency_ms=42, source_peer="peer@example.org")
+        dashboard = bot.get_dashboard_html("Test", [database.get_resource_by_id(resource)], 100.0)
+        self.assertNotIn("Old local", dashboard)
+        self.assertIn("42ms", dashboard)
+
     def test_nodename_refuses_a_case_insensitive_peer_name_collision(self):
         database.add_or_update_peer("remote@example.org", "Remote", 42)
         original = database.get_local_node_name()

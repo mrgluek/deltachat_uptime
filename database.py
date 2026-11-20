@@ -46,15 +46,17 @@ _thread_reader = threading.local()
 _pool_identity = None
 _pool_generation = 0
 _replaced_paths = set()
+_local_node_name_lock = threading.Lock()
 _local_node_name_cache: tuple[str, str | None] | None = None
 _local_node_name_generation = 0
 _peer_last_seen_updates: dict[tuple[str, str], int] = {}
 
 def _invalidate_local_node_name_cache():
-    """Invalidate the cached name and any reads in progress under _write_lock."""
+    """Invalidate the cached name and any reads in progress."""
     global _local_node_name_cache, _local_node_name_generation
-    _local_node_name_cache = None
-    _local_node_name_generation += 1
+    with _local_node_name_lock:
+        _local_node_name_cache = None
+        _local_node_name_generation += 1
 
 def close_db():
     """Close the persistent connections during tests and shutdown."""
@@ -97,7 +99,10 @@ def _get_writer_conn() -> sqlite3.Connection:
             conn.execute("PRAGMA journal_mode = WAL;")
             conn.execute("PRAGMA wal_autocheckpoint = 1000;")
             opened_identity = _db_identity(path)
-            if identity[1] is None or opened_identity == identity:
+            if identity[1] is None:
+                # Publish a newly created database before readers need to discover it.
+                identity = _prepare_db_identity(path)
+            if opened_identity == identity:
                 _writer_conn, _writer_identity = conn, opened_identity
                 return conn
         except BaseException:
@@ -124,7 +129,8 @@ def _open_reader(path, timeout, *, pooled=False, existing=False):
     if existing:
         # An open racing a removal must not recreate the old path.
         path = Path(path).absolute().as_uri() + "?mode=rw"
-    conn = sqlite3.connect(path, timeout=timeout, check_same_thread=not pooled, uri=existing)
+    # All registered readers can be closed by another thread after their lease is released.
+    conn = sqlite3.connect(path, timeout=timeout, check_same_thread=False, uri=existing)
     try:
         conn.execute("PRAGMA busy_timeout = 5000;")
         conn.execute("PRAGMA synchronous = NORMAL;")
@@ -752,6 +758,15 @@ def init_db():
                            "(SELECT COALESCE(fingerprint, email) FROM peers WHERE peers.node_name = peer_measurements.node_name), node_name)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_peer_meas_received ON peer_measurements(received_at)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_peer_meas_source ON peer_measurements(source_peer, received_at)")
+        if not cursor.execute("SELECT 1 FROM config WHERE key = 'local_measurement_source_migrated'").fetchone():
+            stored_name = cursor.execute("SELECT value FROM config WHERE key = 'node_name'").fetchone()
+            local_node = (stored_name and stored_name[0]) or os.getenv("NODE_NAME", "Node-1")
+            cursor.execute("""
+                UPDATE peer_measurements SET source_peer = NULL
+                WHERE source_peer = :node AND node_name = :node
+                  AND NOT EXISTS (SELECT 1 FROM peers WHERE email = :node OR fingerprint = :node)
+            """, {"node": local_node})
+            cursor.execute("INSERT INTO config (key, value) VALUES ('local_measurement_source_migrated', '1')")
 
         # Remote probe targets mirrored from peer bots
         cursor.execute('''
@@ -826,9 +841,9 @@ def init_db():
 
 # Config functions
 def set_config(key: str, value: str):
-    with _writer_transaction() as conn:
-        cursor = conn.cursor()
-        cursor.execute("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)", (key, value))
+    with _write_lock:
+        with _writer_transaction() as conn:
+            conn.execute("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)", (key, value))
         if key == "node_name":
             _invalidate_local_node_name_cache()
 
@@ -1139,14 +1154,16 @@ def batch_update_resource_status(updates: list[dict]):
 def record_check_results(updates: list[dict], measurement: tuple | None = None):
     """Everything one check writes, in one transaction: the status of each monitor of the target
     (as batch_update_resource_status) and, if given, the local peer measurement
-    (url, node_name, status, latency_ms, error_msg) - one commit per check instead of 2+."""
+    (url, previous_node_name, status, latency_ms, error_msg). Resolve the current name under the writer lock."""
     now = int(time.time())
     with _writer_transaction() as conn:
         cursor = conn.cursor()
         if updates:
             _apply_status_updates(cursor, updates, now)
         if measurement:
-            _upsert_peer_measurement(cursor, *measurement, now, source_peer=None)
+            url, _, status, latency_ms, error_msg = measurement
+            _upsert_peer_measurement(cursor, url, get_local_node_name(), status, latency_ms, error_msg, now,
+                                     source_peer=None)
 
 
 def _apply_status_updates(cursor, updates: list[dict], now: int):
@@ -2049,11 +2066,11 @@ def get_local_node_name() -> str:
         if cached is not None and cached[0] == DB_PATH:
             name = cached[1]
             break
-        with _write_lock:
+        with _local_node_name_lock:
             db_path = DB_PATH
             generation = _local_node_name_generation
         name = get_config("node_name")
-        with _write_lock:
+        with _local_node_name_lock:
             if generation == _local_node_name_generation and db_path == DB_PATH:
                 _local_node_name_cache = (db_path, name)
                 break
@@ -2679,12 +2696,13 @@ def set_ping_baseline(ip: str, rtt_ms: float):
             "INSERT OR REPLACE INTO ping_baselines (ip, rtt_ms, updated_at) VALUES (?, ?, ?)",
             (ip, rtt_ms, int(time.time())))
 
-def get_peer_measurements_for_url(url: str) -> list[dict]:
+def get_peer_measurements_for_url(url: str, *, remote_only: bool = False) -> list[dict]:
     conn = _connect()
     try:
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
-        cursor.execute("SELECT * FROM peer_measurements WHERE url = ? ORDER BY node_name ASC", (url,))
+        source_filter = " AND source_peer IS NOT NULL" if remote_only else ""
+        cursor.execute(f"SELECT * FROM peer_measurements WHERE url = ?{source_filter} ORDER BY node_name ASC", (url,))
         rows = cursor.fetchall()
         return [dict(r) for r in rows]
     finally:
@@ -2698,6 +2716,17 @@ def get_all_peer_measurements() -> list[dict]:
         cursor.execute("SELECT * FROM peer_measurements ORDER BY url, node_name ASC")
         rows = cursor.fetchall()
         return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+def get_remote_measurement_counts() -> dict[str, int]:
+    conn = _connect()
+    try:
+        rows = conn.execute("""
+            SELECT node_name, COUNT(*) FROM peer_measurements
+            WHERE source_peer IS NOT NULL GROUP BY node_name
+        """).fetchall()
+        return dict(rows)
     finally:
         conn.close()
 
@@ -3179,20 +3208,21 @@ def rename_local_node(name: str):
     """Change the local name and move its measurements in the same transaction."""
     validate_monitor_fields(name=name)
     new_name = name.strip()
-    with _writer_transaction() as conn:
-        if any(new_name.casefold() == (peer_name or "").casefold()
-               for peer_name, in conn.execute("SELECT node_name FROM peers")):
-            raise ValueError("This node name is already used by a peer.")
-        old_name = get_local_node_name()
-        if old_name != new_name:
-            # Older local measurements used the node name as the source.
-            local_rows = """node_name = ? AND (source_peer IS NULL OR source_peer NOT IN (
-                SELECT email FROM peers WHERE email IS NOT NULL
-                UNION SELECT fingerprint FROM peers WHERE fingerprint IS NOT NULL))"""
-            conn.execute(f"UPDATE OR IGNORE peer_measurements SET node_name = ?, source_peer = NULL WHERE {local_rows}",
-                         (new_name, old_name))
-            conn.execute(f"DELETE FROM peer_measurements WHERE {local_rows}", (old_name,))
-        conn.execute("INSERT OR REPLACE INTO config(key, value) VALUES ('node_name', ?)", (new_name,))
+    with _write_lock:
+        with _writer_transaction() as conn:
+            if any(new_name.casefold() == (peer_name or "").casefold()
+                   for peer_name, in conn.execute("SELECT node_name FROM peers")):
+                raise ValueError("This node name is already used by a peer.")
+            old_name = get_local_node_name()
+            if old_name != new_name:
+                # Older local measurements used the node name as the source.
+                local_rows = """node_name = ? AND (source_peer IS NULL OR source_peer NOT IN (
+                    SELECT email FROM peers WHERE email IS NOT NULL
+                    UNION SELECT fingerprint FROM peers WHERE fingerprint IS NOT NULL))"""
+                conn.execute(f"UPDATE OR IGNORE peer_measurements SET node_name = ?, source_peer = NULL WHERE {local_rows}",
+                             (new_name, old_name))
+                conn.execute(f"DELETE FROM peer_measurements WHERE {local_rows}", (old_name,))
+            conn.execute("INSERT OR REPLACE INTO config(key, value) VALUES ('node_name', ?)", (new_name,))
         _invalidate_local_node_name_cache()
 
 def _peer_name_taken(cursor, email, name):

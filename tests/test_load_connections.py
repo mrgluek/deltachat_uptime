@@ -115,6 +115,35 @@ class TestLocalNodeNameConnections(DatabaseFixture, unittest.TestCase):
             self.assertEqual(database.get_local_node_name(), "X")
             self.assertEqual(connections.calls, 1)
 
+    def test_cold_node_name_read_does_not_wait_for_writer_after_init(self):
+        with patch.dict(os.environ, {"NODE_NAME": "Fallback"}), ThreadPoolExecutor(1) as pool:
+            with database._write_lock:
+                self.assertEqual(pool.submit(database.get_local_node_name).result(timeout=1), "Fallback")
+
+    def test_a_read_during_rename_commit_does_not_cache_the_old_name_after_commit(self):
+        database.set_local_node_name("X")
+        committing, finish = threading.Event(), threading.Event()
+
+        def pause_commit(sql):
+            if sql == "COMMIT":
+                committing.set()
+                finish.wait(5)
+
+        writer = database._get_writer_conn()
+        writer.set_trace_callback(pause_commit)
+        try:
+            with ThreadPoolExecutor(2) as pool:
+                rename = pool.submit(database.rename_local_node, "Y")
+                try:
+                    self.assertTrue(committing.wait(5))
+                    self.assertEqual(pool.submit(database.get_local_node_name).result(timeout=1), "X")
+                finally:
+                    finish.set()
+                rename.result(5)
+            self.assertEqual(database.get_local_node_name(), "Y")
+        finally:
+            writer.set_trace_callback(None)
+
     def test_rename_during_node_name_read_discards_old_value(self):
         database.set_local_node_name("X")
         read_old_name, renamed = threading.Event(), threading.Event()

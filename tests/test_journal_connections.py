@@ -1,9 +1,11 @@
 """The 30 s journal pass must not open a database connection per outage row."""
 import os
+import sqlite3
 import sys
 import tempfile
 import time
 import unittest
+from contextlib import closing, contextmanager
 from unittest.mock import MagicMock, patch
 
 try:
@@ -151,6 +153,36 @@ class TestJournalConnections(unittest.TestCase):
         bot._journal_partial_events()
         self.assertEqual(len(self.events(1, "partial_end")), 2)
 
+    def test_pending_partial_pass_searches_the_ended_index(self):
+        statements = []
+        conn = sqlite3.connect(database.DB_PATH)
+        conn.set_trace_callback(statements.append)
+        with patch.object(database, "_connect", return_value=conn):
+            database.get_partial_journal_rows(pending_only=True)
+        with closing(sqlite3.connect(database.DB_PATH)) as conn:
+            plan = conn.execute("EXPLAIN QUERY PLAN " + statements[0]).fetchall()
+        self.assertTrue(any("SEARCH po USING INDEX idx_partial_outages_ended" in row[3] for row in plan), plan)
+
+    def test_pending_partial_pass_excludes_unjournaled_ends(self):
+        now = int(time.time())
+        with database._writer_transaction() as conn:
+            conn.execute("INSERT INTO resources(id, dc_chat_id, url) VALUES (1, 7, 'https://one.example.org'), "
+                         "(2, 8, 'https://two.example.org')")
+            conn.executemany("INSERT INTO partial_outages(id, resource_id, started_at, ended_at) VALUES (?, ?, ?, ?)",
+                             [(i, 1, now - 60, now) for i in range(1, 201)] +
+                             [(201, 1, now - 60, None), (202, 2, now - 60, None),
+                              (203, 1, now - 31 * 86400, now - 31 * 86400)])
+            conn.executemany("INSERT INTO config(key, value) VALUES (?, '1')", [
+                ("journal:partial_start:7:2",), ("journal:partial_end:7:2",),
+                ("journal:partial_start:7:3",), ("journal:partial_start:8:202",),
+                ("journal:partial_start:7:203",), ("journal:partial_start:7:04",),
+                ("journal:partial_start:8:5",),
+            ])
+        for chat in (None, 7, "7"):
+            self.assertEqual([r["partial_id"] for r in database.get_partial_journal_rows(chat, pending_only=True)],
+                             [3, 201])
+        self.assertEqual(len(database.get_partial_journal_rows()), 202)
+
     def test_incident_pass_uses_one_connection_for_all_ended_events(self):
         events = [{"id": i, "resource_id": 1, "went_down_at": 100, "went_up_at": 200} for i in range(1, 51)]
         events.append({"id": 99, "resource_id": 1, "went_down_at": 100, "went_up_at": None})
@@ -163,6 +195,64 @@ class TestJournalConnections(unittest.TestCase):
             bot._journal_incident_events(1, events, {1: {"name": "R"}}, 1000)
         self.assertLessEqual(counter.calls, 3)
         self.assertEqual(sorted(once for kind, once in added if kind == "incident_end"), list(range(1, 51, 2)))
+
+    def test_journal_writes_scale_with_new_events(self):
+        now = 1_800_000_000
+        events = [{"id": n, "resource_id": 1, "went_down_at": now - 3600, "went_up_at": now - 1800}
+                  for n in range(1, 2006)]
+        events[-1]["went_up_at"] = None
+        events[-2]["went_up_at"] = None
+        resource = {"name": "Settled", "url": "https://settled.example.org"}
+        database.add_resource(1, resource["url"], resource["name"], "http")
+        database.add_resource(1, "https://new.example.org", "New", "http")
+        database.add_resource(2, "https://off.example.org", "Off", "http")
+        database.set_chat_report_partial(2, "off")
+        database.update_resource_alert_state(2, "degraded", "[]")
+        database.update_resource_alert_state(3, "degraded", "[]")
+        with database._writer_transaction() as conn:
+            conn.executemany(
+                "INSERT INTO partial_outages(id, resource_id, started_at, ended_at, notice_state) "
+                "VALUES (?, 1, ?, ?, -1)",
+                ((i, now - 3600, now - 1800) for i in range(1, 2003)),
+            )
+            conn.executemany(
+                "INSERT INTO partial_outages(id, resource_id, started_at, ended_at, notice_state) "
+                "VALUES (?, ?, ?, NULL, 0)",
+                [(2003, 2, now - 1200), (2004, 2, now - 60), (2005, 2, now - 1200), (2006, 3, now - 1200)],
+            )
+            conn.executemany("INSERT INTO config VALUES (?, '1')", (
+                (f"journal:{kind}_{phase}:1:{i}",)
+                for i in range(1, 2001) for kind in ("partial", "incident") for phase in ("start", "end")
+            ))
+            conn.executemany("INSERT INTO config VALUES (?, ?)", [
+                ("journal:partial_start:1:2001", "1"),
+                ("journal:partial_start:1:2005", None),  # Existing key still blocks a repeat start.
+                ("journal:incident_start:1:2001", "1"),
+                ("journal:incident_start:1:2005", "1"),
+            ])
+        holds = []
+        transaction = database._writer_transaction
+
+        @contextmanager
+        def counting():
+            holds.append(1)
+            with transaction() as conn:
+                yield conn
+
+        with patch.object(database, "_writer_transaction", counting), patch.object(time, "time", return_value=now):
+            for _ in range(2):
+                bot._journal_partial_events()
+                bot._journal_incident_events(1, events, {1: resource}, now)
+        with database._writer_transaction() as conn:
+            result = conn.execute("SELECT ts, kind, text FROM chat_events WHERE kind LIKE 'partial_%' "
+                                  "OR kind LIKE 'incident_%' ORDER BY id").fetchall()
+        self.assertEqual(result, [
+            (now, "partial_end", "✅ Settled recovered after 30m"),
+            (now, "partial_start", "🟠 New is partially down"),
+            (now, "incident_end", "✅ Settled recovered after 30m"),
+            (now, "incident_start", "🔴 Settled is down"),
+        ])
+        self.assertEqual(len(holds), len(result))
 
 
 if __name__ == "__main__":

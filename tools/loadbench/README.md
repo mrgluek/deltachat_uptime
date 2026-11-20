@@ -32,6 +32,10 @@ Delta Chat RPC and outbox submission with in-memory counters.
 
 Use `--only report_notices` to select a single scenario. The check-write
 scenario includes separate steady-state variants for 3% DOWN and all UP.
+`cache_pressure` counts second-pass DNS and vote cache hits across the fixture.
+The JSON details also include the total DNS lock acquisition and hold times.
+`rt_ack_queue` simulates a 3.5 s RPC queue delay and reports how many links
+stay up when the stub core acknowledges frames on receipt.
 `--functions` includes individual function metrics in Markdown. JSON
 always includes them. `--profile` adds a cumulative cProfile top 15
 across the event loop and executor jobs. `--memory` enables scenario

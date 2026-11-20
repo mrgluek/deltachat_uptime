@@ -681,7 +681,8 @@ _vote_peers = {}          # peer identity -> _VotePeer
 _vote_check = contextvars.ContextVar("vote_check", default=None)  # None: one-off, False: regular, _GridVoteCheck: grid
 DEGRADED_CONFIRMATIONS = 2            # consecutive votes needed to enter or leave DEGRADED
 DEGRADED_NOTIFY_WINDOW = 10.0         # seconds to collect DEGRADED changes of a chat into one message
-_vote_cache = {}          # cross-check key -> _CachedVote
+VOTE_CACHE_MAX_ENTRIES = 20_000
+_vote_cache = collections.OrderedDict()  # cross-check key -> _CachedVote
 _alert_streaks = {}       # resource id -> (candidate alert state, consecutive votes for it)
 _degraded_notify_queue = {}  # chat id -> list of ("start" | "end", resource, votes, started_at)
 _degraded_flush_task = None
@@ -2636,8 +2637,10 @@ def _is_blocked_ip(ip) -> bool:
 DNS_CACHE_DEFAULT_TTL = 60   # used when the TTL is unknown (system resolver fallback)
 DNS_CACHE_MIN_TTL = 30       # TTL 0/1 tricks cannot force a fresh lookup between validation and connect
 DNS_CACHE_MAX_TTL = 300      # long TTLs must not keep probing an old address after a migration
-DNS_CACHE_MAX_ENTRIES = 5000
-_dns_cache = {}  # host -> (expires_at, tuple_of_ip_strings)
+DNS_CACHE_MAX_ENTRIES = 50_000
+DNS_CACHE_SWEEP_INTERVAL = 5
+_dns_cache_sweep_at = 0.0
+_dns_cache = collections.OrderedDict()  # host -> (expires_at, tuple_of_ip_strings)
 _dns_cache_lock = threading.Lock()
 
 
@@ -2649,12 +2652,16 @@ def _dns_cache_get(host: str):
     now = time.monotonic()
     with _dns_cache_lock:
         entry = _dns_cache.get(host)
-        if entry and entry[0] > now:
-            return entry[1]
+        if entry is not None:
+            if entry[0] > now:
+                _dns_cache.move_to_end(host)
+                return entry[1]
+            del _dns_cache[host]
     return None
 
 
 def _dns_cache_put(host: str, ips, ttl) -> tuple:
+    global _dns_cache_sweep_at
     try:
         ttl = int(ttl)
     except (TypeError, ValueError):
@@ -2663,12 +2670,14 @@ def _dns_cache_put(host: str, ips, ttl) -> tuple:
     ips = tuple(dict.fromkeys(ips))
     now = time.monotonic()
     with _dns_cache_lock:
-        if len(_dns_cache) >= DNS_CACHE_MAX_ENTRIES:
-            for key in [k for k, v in _dns_cache.items() if v[0] <= now]:
-                del _dns_cache[key]
-            if len(_dns_cache) >= DNS_CACHE_MAX_ENTRIES:
-                _dns_cache.clear()
         _dns_cache[host] = (now + ttl, ips)
+        _dns_cache.move_to_end(host)
+        if len(_dns_cache) > DNS_CACHE_MAX_ENTRIES and now >= _dns_cache_sweep_at:
+            for expired in [key for key, (expires, _) in _dns_cache.items() if expires <= now]:
+                del _dns_cache[expired]
+            _dns_cache_sweep_at = now + DNS_CACHE_SWEEP_INTERVAL
+        if len(_dns_cache) > DNS_CACHE_MAX_ENTRIES:
+            _dns_cache.popitem(last=False)
     return ips
 
 
@@ -4552,10 +4561,11 @@ async def collect_peer_votes(rep: dict, local_up: bool, fresh: bool = False, *,
         step = min(cached.step + 1, len(QUORUM_REVOTE_STEPS) - 1)
     else:
         step = 0
-    if len(_vote_cache) > 5000:
-        _vote_cache.clear()
     _vote_cache[key] = _CachedVote(now, grid.tick if non_urgent and grid else wall,
                                    local_up, results, step, cached.decision if cached else None)
+    _vote_cache.move_to_end(key)
+    if len(_vote_cache) > VOTE_CACHE_MAX_ENTRIES:
+        _vote_cache.popitem(last=False)
     return results
 
 
@@ -4621,12 +4631,14 @@ def _journal_outage_text(resource, prefix, ending=None):
 
 def _journal_partial_events(chat_id=None):
     now = int(time.time())
-    rows = [r for r in database.get_partial_journal_rows() if chat_id is None or r["dc_chat_id"] == chat_id]
-    # One connection for all settings: this runs every 30 s over every partial outage of the
-    # last 30 days, and a get_config() per row opened thousands of connections per pass.
+    rows = database.get_partial_journal_rows(chat_id, pending_only=True)
     chats = {r["dc_chat_id"] for r in rows}
     keys = [f"report_partial:{chat}" for chat in chats]
-    keys += [f"journal:partial_start:{r['dc_chat_id']}:{r['partial_id']}" for r in rows if r["partial_ended_at"] is not None]
+    for r in rows:
+        suffix = f"{r['dc_chat_id']}:{r['partial_id']}"
+        keys.append(f"journal:partial_start:{suffix}")
+        if r["partial_ended_at"] is not None:
+            keys.append(f"journal:partial_end:{suffix}")
     config = database.get_configs(keys)
     minutes_by_chat = {chat: database.parse_chat_report_partial(config.get(f"report_partial:{chat}")) for chat in chats}
     for r in rows:
@@ -4635,9 +4647,11 @@ def _journal_partial_events(chat_id=None):
         if minutes == "off":
             continue
         identity = r["partial_id"]
-        key = f"journal:partial_start:{chat}:{identity}"
+        start_key = f"journal:partial_start:{chat}:{identity}"
         ended = r["partial_ended_at"]
         if ended is None:
+            if start_key in config:
+                continue
             votes = _votes_from_json(r.get("last_votes"))
             nodes = [v["node"] for v in votes if v.get("status") in ("down", "degraded")]
             if (r.get("alert_state") == "degraded" and r.get("status") != "down"
@@ -4646,26 +4660,36 @@ def _journal_partial_events(chat_id=None):
                     and not (nodes and all(is_node_unstable(n) for n in nodes))):
                 database.add_chat_event(chat, "partial_start", _journal_outage_text(r, "🟠", None),
                                         once=identity)
-        elif (config.get(key) and r.get("notice_state") != 3
+        elif (f"journal:partial_end:{chat}:{identity}" not in config
+              and config.get(start_key) and r.get("notice_state") != 3
               and r.get("status") != "down" and r.get("alert_state") != "down"):
             database.add_chat_event(chat, "partial_end", _journal_outage_text(r, "", ended - r["partial_started_at"]),
                                     once=identity)
 
 
 def _journal_incident_events(chat_id, events, resources, now):
-    minutes = database.get_chat_report_full(chat_id)
-    notices_after = int(database.get_config(f"report_app_notices_after:{chat_id}") or 0)
-    started = database.get_configs(f"journal:incident_start:{chat_id}:{event['id']}"
-                                   for event in events if event.get("went_up_at") is not None)
+    minutes_key = f"report_full:{chat_id}"
+    notices_key = f"report_app_notices_after:{chat_id}"
+    keys = [minutes_key, notices_key]
+    for event in events:
+        suffix = f"{chat_id}:{event['id']}"
+        keys.append(f"journal:incident_start:{suffix}")
+        if event.get("went_up_at") is not None:
+            keys.append(f"journal:incident_end:{suffix}")
+    config = database.get_configs(keys)
+    minutes = database.parse_chat_report_full(config.get(minutes_key))
+    notices_after = int(config.get(notices_key) or 0)
     for event in events:
         identity = event["id"]
         resource = resources.get(event["resource_id"], event)
         ended = event.get("went_up_at")
+        start_key = f"journal:incident_start:{chat_id}:{identity}"
         if ended is None:
-            if event["went_down_at"] > notices_after and should_notify_start(event["went_down_at"], now, minutes):
+            if (start_key not in config and event["went_down_at"] > notices_after
+                    and should_notify_start(event["went_down_at"], now, minutes)):
                 database.add_chat_event(chat_id, "incident_start", _journal_outage_text(resource, "🔴"),
                                         once=identity)
-        elif started.get(f"journal:incident_start:{chat_id}:{identity}"):
+        elif f"journal:incident_end:{chat_id}:{identity}" not in config and config.get(start_key):
             database.add_chat_event(chat_id, "incident_end", _journal_outage_text(resource, "", ended - event["went_down_at"]),
                                     once=identity)
 
@@ -4813,7 +4837,7 @@ async def check_group_task(group, semaphore, session=None):
         await run_db(database.update_probe_target_result, rep["url"], status_str, latency_ms, error_msg)
         if status_str != rep.get("last_status"):
             _schedule_peer_metrics_delta()
-        await run_db(database.save_peer_measurement, rep["url"], local_node, status_str, latency_ms, error_msg)
+        await run_db(database.save_peer_measurement, rep["url"], local_node, status_str, latency_ms, error_msg, local=True)
         return
 
     res = await check_network_probe(rep, semaphore, session=session)
@@ -5558,7 +5582,9 @@ async def monitoring_scheduler_loop():
     semaphore = asyncio.Semaphore(CHECK_CONCURRENCY)
     _last_peer_audit = 0
     _last_incident_audit = 0
-    _last_cleanup = 0
+    _last_cleanup = None
+    cleanup_interval = None
+    cleanup_retry_at = None
     _last_chat_audit = 0
     _last_peer_chat_trim = 0
     _last_transport_flush = 0
@@ -5745,10 +5771,22 @@ async def monitoring_scheduler_loop():
                     asyncio.create_task(asyncio.to_thread(trim_peer_chats, dc_bot_instance, dc_accid))
                     asyncio.create_task(asyncio.to_thread(trim_user_chats, dc_bot_instance, dc_accid))
 
-                # Periodic database cleanup (every 24 hours)
-                if now - _last_cleanup >= 86400:
-                    _last_cleanup = now
-                    await run_db(database.cleanup_old_records, 90)
+                # Allow a restart to run cleanup a few hours before its daily schedule.
+                if cleanup_interval is None:
+                    _last_cleanup = await run_db(database.get_last_cleanup_at)
+                    cleanup_interval = 20 * 3600
+                cleanup_due = _last_cleanup is None or not 0 <= now - _last_cleanup < cleanup_interval
+                cleanup_interval = 86400
+                if cleanup_retry_at is not None:
+                    cleanup_due = time.monotonic() >= cleanup_retry_at
+                if cleanup_due:
+                    try:
+                        await run_db(database.cleanup_old_records, 90)
+                    except Exception:
+                        cleanup_retry_at = time.monotonic() + 600
+                        raise
+                    _last_cleanup = int(time.time())
+                    cleanup_retry_at = None
                     for k in [k for k, t in _check_finished_at.items() if now - t > 2 * 86400]:
                         del _check_finished_at[k]  # removed resources and peers' dropped targets
                     active_ids = {r["id"] for r in resources}
@@ -8208,6 +8246,7 @@ def _discard_peer_rt_send(link, seq):
 async def _send_peer_rt_check(destination, msg_id, link, kind, payload, send_mail, ttl, deadline,
                               before_send, after_send, should_send, still_waiting):
     loop = asyncio.get_running_loop()
+    send_until = deadline if deadline is not None else time.monotonic() + ttl
 
     def mail(*, fallback=False):
         remaining = ttl if deadline is None else deadline - time.monotonic()
@@ -8227,7 +8266,7 @@ async def _send_peer_rt_check(destination, msg_id, link, kind, payload, send_mai
         if not link.state.is_up:
             _fallback_peer_rt_sends(link)
 
-    if ((deadline is not None and deadline <= time.monotonic())
+    if (send_until <= time.monotonic()
             or (should_send is not None and not should_send()) or (still_waiting is not None and not still_waiting())):
         return
     blob = None
@@ -8243,10 +8282,7 @@ async def _send_peer_rt_check(destination, msg_id, link, kind, payload, send_mai
             if blob is not None:
                 link.seq += 1
                 link.fallbacks[seq] = (deadline is not None, fallback)
-                link.acks.track({"a": 1, "s": seq}, timed_out)
-                loop.call_later(peer_rt.RT_ACK_TIMEOUT, _expire_peer_rt_acks, link)
-                if deadline is not None:
-                    loop.call_later(max(0, deadline - time.monotonic()), _discard_peer_rt_send, link, seq)
+                link.acks.track({"a": 1, "s": seq}, timed_out, arm=False)
     if blob is None:
         await asyncio.to_thread(mail)
         return
@@ -8256,22 +8292,37 @@ async def _send_peer_rt_check(destination, msg_id, link, kind, payload, send_mai
             return False
         with _peer_rt_lock:
             if (_peer_rt_links.get(msg_id) is not link or link.remote_epoch != recipient
-                    or not link.state.is_up or seq not in link.fallbacks):
+                    or not link.state.is_up or seq not in link.fallbacks or send_until <= time.monotonic()):
                 return False
         if before_send:
             before_send()
         destination.bot.rpc.send_webxdc_realtime_data(destination.accid, msg_id, list(blob))
         return True
 
+    sent = False
+    send_timeout = asyncio.timeout(max(0, send_until - time.monotonic()))
     try:
-        sent = await run_rpc(send)
-    except Exception as exc:
-        if _peer_rt_log.should_log((msg_id, "send")):
-            logger.warning("Realtime %s on carrier %s failed (%s)", kind, msg_id, type(exc).__name__)
-        sent = False
-    if not sent:
-        fallback()
-        return
+        try:
+            async with send_timeout:
+                sent = await run_rpc(send)
+        except Exception as exc:
+            if send_timeout.expired():
+                return
+            if _peer_rt_log.should_log((msg_id, "send")):
+                logger.warning("Realtime %s on carrier %s failed (%s)", kind, msg_id, type(exc).__name__)
+        if not sent:
+            if time.monotonic() < send_until:
+                fallback()
+            return
+    finally:
+        if not sent or send_until <= time.monotonic():
+            _discard_peer_rt_send(link, seq)
+        else:
+            with _peer_rt_lock:
+                if link.acks.arm(seq):
+                    loop.call_later(peer_rt.RT_ACK_TIMEOUT, _expire_peer_rt_acks, link)
+                if deadline is not None and seq in link.fallbacks:
+                    loop.call_later(max(0, deadline - time.monotonic()), _discard_peer_rt_send, link, seq)
     database.record_peer_traffic(kind, "rt", "out", len(blob))
     _note_peer_rt_caps_sent(link, payload)
     if after_send:
@@ -10217,14 +10268,11 @@ def nodename_command(bot, accid, event):
     payload = (event.payload or "").strip()
     if payload:
         try:
-            database.validate_monitor_fields(name=payload)
+            database.rename_local_node(payload)
         except ValueError as exc:
             _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=f"❌ {exc}"))
             return
         global last_peer_telemetry_broadcast
-        old_name = database.get_local_node_name()
-        database.set_local_node_name(payload)
-        database.rename_measurement_node(old_name, payload.strip())
         # Peers learn the new name from the next telemetry message: send it on the next scheduler tick
         last_peer_telemetry_broadcast = 0.0
         name_note = ""

@@ -288,7 +288,7 @@ class TestPeerRTAuditFixes(_DbCase, unittest.IsolatedAsyncioTestCase):
             return Mock(result=result)
 
         metrics = [dict(TARGET, url=f"https://slow{i}.example.org") for i in range(1, 5)]
-        with patch.object(bot, "_submit_bounded", side_effect=submit), patch.object(bot, "_dns_cache", {}):
+        with patch.object(bot, "_submit_bounded", side_effect=submit), patch.object(bot, "_dns_cache", collections.OrderedDict()):
             bot._apply_peer_metrics(self.peer, {"msg_id": "deadline", "metrics": metrics}, "mail")
         self.assertEqual(queried, [("slow1.example.org", 5), ("slow2.example.org", 5), ("slow3.example.org", 1)])
         self.assertEqual([row["url"] for row in database.get_active_probe_targets()], [metrics[0]["url"]])

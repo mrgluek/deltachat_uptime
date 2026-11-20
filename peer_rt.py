@@ -211,21 +211,29 @@ class AckTracker:
 
     def __init__(self, *, clock: Callable[[], float] = time.monotonic):
         self._clock = clock
-        self._pending: dict[int, tuple[float, Callable[[int], None]]] = {}
+        self._pending: dict[int, tuple[float | None, Callable[[int], None]]] = {}
 
-    def track(self, frame: dict, on_timeout: Callable[[int], None]):
+    def track(self, frame: dict, on_timeout: Callable[[int], None], *, arm=True):
         if frame["a"] == 1:
             seq = frame["s"]
             if seq in self._pending:
                 raise ValueError("Sequence already awaiting acknowledgment")
-            self._pending[seq] = (self._clock() + RT_ACK_TIMEOUT, on_timeout)
+            self._pending[seq] = (self._clock() + RT_ACK_TIMEOUT if arm else None, on_timeout)
+
+    def arm(self, seq: int) -> bool:
+        """Start the timeout after sending, if an ACK has not already arrived."""
+        pending = self._pending.get(seq)
+        if pending is None or pending[0] is not None:
+            return False
+        self._pending[seq] = (self._clock() + RT_ACK_TIMEOUT, pending[1])
+        return True
 
     def ack(self, seq: int) -> bool:
         pending = self._pending.pop(seq, None)
         if pending is None:
             return False
         deadline, on_timeout = pending
-        if self._clock() >= deadline:
+        if deadline is not None and self._clock() >= deadline:
             on_timeout(seq)
             return False
         return True
@@ -235,10 +243,10 @@ class AckTracker:
 
     def expire(self):
         now = self._clock()
-        due = [seq for seq, (deadline, _) in self._pending.items() if deadline <= now]
+        due = [seq for seq, (deadline, _) in self._pending.items() if deadline is not None and deadline <= now]
         for seq in due:
             pending = self._pending.get(seq)
-            if pending is not None and pending[0] <= now:
+            if pending is not None and pending[0] is not None and pending[0] <= now:
                 del self._pending[seq]
                 _, on_timeout = pending
                 on_timeout(seq)

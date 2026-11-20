@@ -11,6 +11,7 @@ import threading
 import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock
+from urllib.parse import urlparse
 
 import database
 
@@ -21,6 +22,7 @@ from .measure import Proxy, patch
 SCENARIOS = (
     "scheduler_tick", "record_checks", "report_notices", "status_apps", "telemetry",
     "peer_metrics_in", "quorum_votes", "cleanup", "stale_downtime", "startup",
+    "cache_pressure", "rt_ack_queue",
 )
 VARIANT = "record_checks_all_up"
 BOT_FUNCTIONS = (
@@ -294,9 +296,11 @@ async def record_checks(bench):
             url, latency = probe["url"], probe["last_latency_ms"]
             node = database.get_local_node_name()
             await bench.bot.run_db(database.update_probe_target_result, url, "up", latency)
-            await bench.bot.run_db(database.save_peer_measurement, url, node, "up", latency)
+            await bench.bot.run_db(database.save_peer_measurement, url, node, "up", latency, local=True)
     bench.details.update(monitors=len(bench.resources), probes=len(bench.probes),
                          down=0 if all_up else sum(r["status"] == "down" for r in bench.resources))
+    bench.details["local_measurements"] = sum(
+        row["node_name"] == NODE for row in database.get_all_peer_measurements())
 
 
 async def report_notices(bench):
@@ -393,6 +397,115 @@ async def cleanup(bench):
     bench.details["deleted_rows"] = await bench.bot.run_db(database.cleanup_old_records, 90)
     bench.note("One daily maintenance invocation at 90-day retention. Lock hold is measured from acquisition "
                "to release of the writer lock, including commit.")
+
+
+async def cache_pressure(bench):
+    bot = bench.bot
+    urls = (row["url"] for row in (*bench.resources, *bench.probes))
+    hosts = list(dict.fromkeys(urlparse(url if "://" in url else f"//{url}").hostname
+                               for url in urls))[:12_000]
+    addresses = ("192.0.2.1",)
+    dns_lock = bot._dns_cache_lock
+
+    class TimedDnsLock:
+        acquires = acquire_ns = hold_ns = 0
+
+        def __enter__(self):
+            started = time.perf_counter_ns()
+            dns_lock.acquire()
+            self.acquired = time.perf_counter_ns()
+            self.acquire_ns += self.acquired - started
+            self.acquires += 1
+
+        def __exit__(self, *exc):
+            finished = time.perf_counter_ns()
+            dns_lock.release()
+            self.hold_ns += finished - self.acquired
+
+    timed_lock = TimedDnsLock()
+    with patch(bot, "_dns_cache_lock", timed_lock), bench.meter.span("dns_cache"):
+        dns_hits = 0
+        for _ in range(2):
+            dns_hits = 0
+            for host in hosts:
+                if bot._dns_cache_get(host) is None:
+                    bot._dns_cache_put(host, addresses, 60)
+                else:
+                    dns_hits += 1
+
+    requests = 0
+
+    async def request(*args, **kwargs):
+        nonlocal requests
+        requests += 1
+        return [{"node": "Peer", "status": "up"}]
+
+    with patch(bot, "request_peer_cross_checks_batched", request), bench.meter.span("vote_cache"):
+        for _ in range(2):
+            requests = 0
+            for resource in bench.resources:
+                await bot.collect_peer_votes(resource, True)
+    bench.details.update(dns_hosts=len(hosts), dns_second_pass_hits=dns_hits,
+                         dns_lock_acquires=timed_lock.acquires, dns_lock_acquire_ns=timed_lock.acquire_ns,
+                         dns_lock_hold_ns=timed_lock.hold_ns,
+                         vote_targets=len(bench.resources),
+                         vote_second_pass_hits=len(bench.resources) - requests)
+    bench.note("Two passes over the fixture's distinct hosts and monitor vote keys. DNS misses and "
+               "remote vote requests use in-memory stubs. Hit counts are for the second pass.")
+
+
+async def rt_ack_queue(bench):
+    bot = bench.bot
+    rt = bot.peer_rt
+    links = {}
+    for peer in bench.peers:
+        if peer["rt_msg_id"]:
+            link = bot._PeerRealtimeLink(peer, None, remote_epoch="a" * 32)
+            link.state.on_frame()
+            links[peer["rt_msg_id"]] = link
+    queued = asyncio.Event()
+    release = asyncio.Event()
+    queued_count = 0
+    execute = bot.run_rpc
+    original_send = bench.rpc.send_webxdc_realtime_data
+
+    async def queued_send(fn):
+        nonlocal queued_count
+        queued_count += 1
+        if queued_count == 2 * len(links):
+            queued.set()
+        await release.wait()
+        return await execute(fn)
+
+    def send_and_ack(accid, msg_id, data):
+        original_send(accid, msg_id, data)
+        link = links[msg_id]
+        frame = rt.authenticate(bytes(data), link.peer["rt_key_out"], clock=bot.time.time)
+        ack = rt.encode("ack", link.remote_epoch, frame["s"], {"e": link.epoch, "s": [frame["s"]]},
+                        link.peer["rt_key_in"], recipient=link.epoch, clock=bot.time.time)
+        with bot._peer_rt_lock:
+            bot._verify_peer_rt_frame(link, ack)
+
+    with (patch(bot, "_peer_rt_links", links), patch(bot, "run_rpc", queued_send),
+          patch(bench.rpc, "send_webxdc_realtime_data", send_and_ack)):
+        sends = [asyncio.create_task(bot._send_peer_rt_check(
+            SimpleNamespace(bot=bot.dc_bot_instance, accid=1), msg_id, link, "req",
+            {"req_id": str(seq)}, lambda ttl: bench.meter.add("mails_queued"),
+            30, None, None, None, None, None,
+        )) for msg_id, link in links.items() for seq in range(2)]
+        if sends:
+            await queued.wait()
+            bench.clock.offset += 3.5
+            for link in links.values():
+                bot._expire_peer_rt_acks(link)
+            release.set()
+            await asyncio.gather(*sends)
+            await asyncio.sleep(0)  # Let fallback callbacks schedule their mail jobs.
+            await asyncio.gather(*(task for task in asyncio.all_tasks() if task is not asyncio.current_task()))
+    bench.details.update(links=len(links), queued_sends=queued_count, simulated_queue_seconds=3.5,
+                         links_up=sum(link.state.is_up for link in links.values()))
+    bench.note("Two requests per realtime link wait 3.5 simulated seconds for an RPC executor slot. "
+               "The stub core acknowledges each frame as soon as it receives it.")
 
 
 def prepare_stale(bench):
@@ -526,4 +639,5 @@ WORKLOADS = {
     VARIANT: record_checks, "report_notices": report_notices, "status_apps": status_apps,
     "telemetry": telemetry, "peer_metrics_in": peer_metrics_in, "quorum_votes": quorum_votes,
     "cleanup": cleanup, "stale_downtime": stale_downtime,
+    "cache_pressure": cache_pressure, "rt_ack_queue": rt_ack_queue,
 }

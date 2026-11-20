@@ -7,6 +7,7 @@ import threading
 import time
 import secrets
 import string
+from itertools import product
 from urllib.parse import urlparse
 from monitor_names import short_journal_text
 
@@ -235,6 +236,9 @@ def init_db():
             # Existing outages have unknown delivery history: never repeat their start.
             cursor.execute("ALTER TABLE partial_outages ADD COLUMN notice_state INTEGER DEFAULT -1")
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_partial_outages_resource ON partial_outages(resource_id, ended_at)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_partial_outages_ended ON partial_outages(ended_at)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_partial_outages_notice_ended ON partial_outages(notice_state, ended_at)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_partial_outages_resource_started ON partial_outages(resource_id, started_at)')
         for field in ("start_attempts", "start_attempted_at", "end_attempts", "end_attempted_at"):
             if field not in [r[1] for r in cursor.execute("PRAGMA table_info(partial_outages)")]:
                 cursor.execute(f"ALTER TABLE partial_outages ADD COLUMN {field} INTEGER DEFAULT 0")
@@ -499,6 +503,8 @@ def init_db():
         if "down_since" not in pt_columns:
             # Start of the current local outage of a peer's target: drives the check slowdown
             cursor.execute("ALTER TABLE probe_targets ADD COLUMN down_since INTEGER")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_probe_targets_source_seen ON probe_targets(source_peer, last_seen)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_probe_targets_seen ON probe_targets(last_seen)")
         # Before 2.25.2 a peer's smtp:// target was stored as "http" and checked as a web page, so
         # it was always DOWN here: fix the type and forget that result
         cursor.execute("""UPDATE probe_targets SET type = 'smtp', last_status = NULL, last_error = NULL,
@@ -866,7 +872,7 @@ def record_check_results(updates: list[dict], measurement: tuple | None = None):
         if updates:
             _apply_status_updates(cursor, updates, now)
         if measurement:
-            _upsert_peer_measurement(cursor, *measurement, now)
+            _upsert_peer_measurement(cursor, *measurement, now, source_peer=None)
 
 
 def _apply_status_updates(cursor, updates: list[dict], now: int):
@@ -1619,52 +1625,99 @@ def get_peer_metrics_24h(now: float) -> tuple[list, list]:
     return traffic, rtt
 
 
+# Below SQLite's historical limit of 999 parameters, including the journal cutoff.
+_CLEANUP_BATCH_SIZE = 900
+
+
+def get_last_cleanup_at() -> int | None:
+    try:
+        return int(get_config("last_cleanup_at") or "")
+    except ValueError:
+        return None
+
+
+def _delete_old_rows(table, where, args, *, index=None, key="rowid"):
+    source = table if index is None else f"{table} INDEXED BY {index}"
+    total = 0
+    while True:
+        with _writer_transaction() as conn:
+            deleted = conn.execute(
+                f"DELETE FROM {table} WHERE ({key}) IN ("
+                f"SELECT {key} FROM {source} WHERE {where} LIMIT ?)",
+                (*args, _CLEANUP_BATCH_SIZE),
+            ).rowcount
+        total += deleted
+        if deleted < _CLEANUP_BATCH_SIZE:
+            return total
+        time.sleep(0.001)
+
+
+def _cleanup_journal_keys(cutoff):
+    with contextlib.closing(_connect()) as reader:
+        # The IDs of new outages are never reused, so new open outages cannot
+        # acquire an expired start key while this pass is running.
+        open_starts = {key for key, in reader.execute("""
+            SELECT 'journal:incident_start:' || r.dc_chat_id || ':' || de.id
+            FROM downtime_events de JOIN resources r ON r.id = de.resource_id
+            WHERE de.went_up_at IS NULL
+            UNION ALL
+            SELECT 'journal:partial_start:' || r.dc_chat_id || ':' || po.id
+            FROM partial_outages po JOIN resources r ON r.id = po.resource_id
+            WHERE po.ended_at IS NULL
+        """)}
+        # The old LIKE matched mixed-case prefixes too. Each spelling has its
+        # own narrow range in the existing binary config key index.
+        for chars in product(*zip("journal", "JOURNAL")):
+            prefix = "".join(chars)
+            after = prefix + ":"
+            while True:
+                rows = reader.execute(
+                    "SELECT key FROM config WHERE key >= ? AND key < ? "
+                    "AND CAST(value AS INTEGER) < ? ORDER BY key LIMIT ?",
+                    (after, prefix + ";", cutoff, _CLEANUP_BATCH_SIZE),
+                ).fetchall()
+                expired = [key for key, in rows if key not in open_starts]
+                if expired:
+                    marks = ",".join("?" * len(expired))
+                    with _writer_transaction() as conn:
+                        conn.execute(f"DELETE FROM config WHERE key IN ({marks}) AND CAST(value AS INTEGER) < ?",
+                                     (*expired, cutoff))
+                    time.sleep(0.001)
+                if len(rows) < _CLEANUP_BATCH_SIZE:
+                    break
+                # Appending NUL advances just past this key, preserving any longer keys.
+                after = rows[-1][0] + chr(0)
+
+
 def cleanup_old_records(retention_days: int = 90) -> dict[str, int]:
     """Prune old events, resolved incidents, and stale peer measurements and metrics."""
     now = int(time.time())
     cutoff = now - (retention_days * 86400)
-    cleaned = {}
+    meas_cutoff = now - (7 * 86400)
+    journal_cutoff = now - 30 * 86400
+    cleaned = {
+        "downtime_events": _delete_old_rows("downtime_events", "went_up_at < ?", (cutoff,)),
+        "incidents": _delete_old_rows("incidents", "status = 'resolved' AND resolved_at < ?", (cutoff,),
+                                     index="idx_incidents_resolved"),
+        "peer_measurements": _delete_old_rows("peer_measurements", "received_at < ?", (meas_cutoff,)),
+        "probe_targets": _delete_old_rows("probe_targets", "last_seen < ?", (meas_cutoff,)),
+        "peer_traffic": _delete_old_rows("peer_traffic", "day < date(?, 'unixepoch', '-29 days')", (now,)),
+        "peer_traffic_recent": _delete_old_rows("peer_traffic_recent", "ts <= ?", (now - 86400,),
+                                               key="ts, kind, transport, dir"),
+        "mail_kind": _delete_old_rows("mail_kind", "day < date(?, 'unixepoch', '-29 days')", (now,)),
+        "mail_kind_recent": _delete_old_rows("mail_kind_recent", "ts <= ?", (now - 86400,),
+                                            key="ts, kind"),
+        "peer_rtt": _delete_old_rows("peer_rtt", "ts < ?", (meas_cutoff,)),
+        "partial_outages": _delete_old_rows("partial_outages", "ended_at < ?", (cutoff,)),
+        "chat_events": _delete_old_rows("chat_events", "ts < ?", (journal_cutoff,)),
+    }
+    _cleanup_journal_keys(journal_cutoff)
     with _writer_transaction() as conn:
-        cursor = conn.cursor()
-        
-        # 1. Prune resolved downtime events older than retention_days
-        cursor.execute("DELETE FROM downtime_events WHERE went_up_at IS NOT NULL AND went_up_at < ?", (cutoff,))
-        cleaned["downtime_events"] = cursor.rowcount
-        
-        # 2. Prune resolved incidents older than retention_days
-        cursor.execute("DELETE FROM incidents WHERE status = 'resolved' AND resolved_at < ?", (cutoff,))
-        cleaned["incidents"] = cursor.rowcount
-        
-        # 3. Prune old peer measurements (older than 7 days)
-        meas_cutoff = now - (7 * 86400)
-        cursor.execute("DELETE FROM peer_measurements WHERE received_at < ?", (meas_cutoff,))
-        cleaned["peer_measurements"] = cursor.rowcount
-        cursor.execute("DELETE FROM probe_targets WHERE last_seen < ?", (meas_cutoff,))
-        cleaned["probe_targets"] = cursor.rowcount
-
-        cursor.execute("DELETE FROM peer_traffic WHERE day < date(?, 'unixepoch', '-29 days')", (now,))
-        cleaned["peer_traffic"] = cursor.rowcount
-        cursor.execute("DELETE FROM peer_traffic_recent WHERE ts <= ?", (now - 86400,))
-        cleaned["peer_traffic_recent"] = cursor.rowcount
-        cursor.execute("DELETE FROM mail_kind WHERE day < date(?, 'unixepoch', '-29 days')", (now,))
-        cleaned["mail_kind"] = cursor.rowcount
-        cursor.execute("DELETE FROM mail_kind_recent WHERE ts <= ?", (now - 86400,))
-        cleaned["mail_kind_recent"] = cursor.rowcount
-        cursor.execute("DELETE FROM peer_rtt WHERE ts < ?", (meas_cutoff,))
-        cleaned["peer_rtt"] = cursor.rowcount
-
-        cursor.execute("DELETE FROM partial_outages WHERE ended_at IS NOT NULL AND ended_at < ?", (cutoff,))
-        cleaned["partial_outages"] = cursor.rowcount
-        cursor.execute("DELETE FROM chat_events WHERE ts < ?", (now - 30 * 86400,))
-        cleaned["chat_events"] = cursor.rowcount
-        cursor.execute("DELETE FROM config WHERE key LIKE 'journal:%' AND CAST(value AS INTEGER) < ? "
-                       "AND NOT EXISTS (SELECT 1 FROM downtime_events de JOIN resources r ON r.id = de.resource_id "
-                       "WHERE de.went_up_at IS NULL AND config.key = 'journal:incident_start:' || r.dc_chat_id || ':' || de.id) "
-                       "AND NOT EXISTS (SELECT 1 FROM partial_outages po JOIN resources r ON r.id = po.resource_id "
-                       "WHERE po.ended_at IS NULL AND config.key = 'journal:partial_start:' || r.dc_chat_id || ':' || po.id)",
-                       (now - 30 * 86400,))
         _clear_disabled_peer_rt(conn)
+        conn.execute("INSERT OR REPLACE INTO config(key, value) VALUES ('last_cleanup_at', ?)",
+                     (str(int(time.time())),))
     return cleaned
+
 
 # Peer management functions
 def get_local_node_name() -> str:
@@ -2163,14 +2216,19 @@ def get_peer_rt_message_ids() -> set[int]:
 
 
 # Peer measurements (remote probe telemetry)
-def save_peer_measurement(url: str, node_name: str, status: str, latency_ms: int | None = None, error_msg: str = None, last_checked: int = None, source_peer: str = None):
+def save_peer_measurement(url: str, node_name: str, status: str, latency_ms: int | None = None, error_msg: str = None,
+                          last_checked: int = None, source_peer: str = None, *, local: bool = False):
     now = int(time.time())
     with _writer_transaction() as conn:
         cursor = conn.cursor()
-        source = _measurement_source(cursor, node_name, source_peer)
+        if local:
+            # A probe may have finished under the previous name while a rename was in progress.
+            node_name = get_local_node_name()
+        source = None if local else _measurement_source(cursor, node_name, source_peer)
         _upsert_peer_measurement(cursor, url, node_name, status, latency_ms, error_msg,
-                                 _clamp_measurement_time(last_checked, now), now, source)
-        _prune_peer_measurements(cursor, source)
+                                 _clamp_measurement_time(last_checked, now), now, source_peer=source)
+        if source is not None:
+            _prune_peer_measurements(cursor, source)
 
 
 def _clamp_measurement_time(claimed, now):
@@ -2184,18 +2242,23 @@ def _measurement_source(cursor, node_name, source_peer=None):
     if source_peer:
         return source_peer
     row = cursor.execute("SELECT COALESCE(fingerprint, email) FROM peers WHERE node_name = ?", (node_name,)).fetchone()
-    return row[0] if row else node_name
+    if row:
+        return row[0]
+    # Preserve callers that save a local result without supplying a source.
+    return None if node_name == get_local_node_name() else node_name
 
 
 def _prune_peer_measurements(cursor, source):
+    if cursor.execute("SELECT 1 FROM peer_measurements WHERE source_peer = ? LIMIT 1 OFFSET 1000",
+                      (source,)).fetchone() is None:
+        return
     cursor.execute("DELETE FROM peer_measurements WHERE rowid IN ("
                    "SELECT rowid FROM peer_measurements WHERE source_peer = ? "
                    "ORDER BY received_at DESC, rowid DESC LIMIT -1 OFFSET 1000)", (source,))
 
 
-def _upsert_peer_measurement(cursor, url, node_name, status, latency_ms, error_msg, now, received_at=None, source_peer=None):
+def _upsert_peer_measurement(cursor, url, node_name, status, latency_ms, error_msg, now, received_at=None, *, source_peer):
     received_at = int(time.time()) if received_at is None else received_at
-    source_peer = _measurement_source(cursor, node_name, source_peer)
     cursor.execute('''
         INSERT INTO peer_measurements (url, node_name, status, latency_ms, error_msg, last_checked, received_at, source_peer)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -2206,6 +2269,7 @@ def _upsert_peer_measurement(cursor, url, node_name, status, latency_ms, error_m
             last_checked = excluded.last_checked,
             received_at = excluded.received_at,
             source_peer = excluded.source_peer
+        WHERE peer_measurements.source_peer IS NOT NULL OR excluded.source_peer IS NULL
     ''', (url, node_name, status, latency_ms, error_msg, now, received_at, source_peer))
 
 def save_peer_measurements_batch(node_name: str, metrics_list: list[dict], source_peer: str = None):
@@ -2251,8 +2315,9 @@ def save_peer_measurements_batch(node_name: str, metrics_list: list[dict], sourc
         cursor = conn.cursor()
         source = _measurement_source(cursor, clean_node, source_peer)
         for row in rows:
-            _upsert_peer_measurement(cursor, *row, now, source)
-        _prune_peer_measurements(cursor, source)
+            _upsert_peer_measurement(cursor, *row, now, source_peer=source)
+        if source is not None:
+            _prune_peer_measurements(cursor, source)
 
 def get_held_reports(newer_than: float) -> list[tuple]:
     """(url, node, until_ts, streak) of the holds that ended after newer_than; older rows are dropped."""
@@ -2607,7 +2672,10 @@ def get_chat_report_partial(dc_chat_id: int) -> int | str:
 
 
 def get_chat_report_full(dc_chat_id: int) -> int:
-    value = get_config(f"report_full:{dc_chat_id}")
+    return parse_chat_report_full(get_config(f"report_full:{dc_chat_id}"))
+
+
+def parse_chat_report_full(value: str | None) -> int:
     return int(value) if value is not None else 2
 
 
@@ -2749,6 +2817,7 @@ def get_chat_partial_outages(dc_chat_id: int, limit: int = 10) -> list[dict]:
     try:
         rows = conn.execute('''
             SELECT po.*, r.name, r.url FROM partial_outages po
+            INDEXED BY idx_partial_outages_resource_started
             JOIN resources r ON r.id = po.resource_id
             WHERE r.dc_chat_id = ?
             ORDER BY po.started_at DESC LIMIT ?
@@ -2775,13 +2844,25 @@ def get_resources_by_urls(urls) -> list[dict]:
         conn.close()
 
 
-def rename_measurement_node(old_name: str, new_name: str):
-    """Moves cached per-node measurements to a node's new name (a newer row under the new name wins)."""
-    if not old_name or not new_name or old_name == new_name:
-        return
+def rename_local_node(name: str):
+    """Change the local name and move its measurements in the same transaction."""
+    validate_monitor_fields(name=name)
+    new_name = name.strip()
     with _writer_transaction() as conn:
-        conn.execute("UPDATE OR IGNORE peer_measurements SET node_name = ? WHERE node_name = ?", (new_name, old_name))
-        conn.execute("DELETE FROM peer_measurements WHERE node_name = ?", (old_name,))
+        if any(new_name.casefold() == (peer_name or "").casefold()
+               for peer_name, in conn.execute("SELECT node_name FROM peers")):
+            raise ValueError("This node name is already used by a peer.")
+        old_name = get_local_node_name()
+        if old_name != new_name:
+            # Older local measurements used the node name as the source.
+            local_rows = """node_name = ? AND (source_peer IS NULL OR source_peer NOT IN (
+                SELECT email FROM peers WHERE email IS NOT NULL
+                UNION SELECT fingerprint FROM peers WHERE fingerprint IS NOT NULL))"""
+            conn.execute(f"UPDATE OR IGNORE peer_measurements SET node_name = ?, source_peer = NULL WHERE {local_rows}",
+                         (new_name, old_name))
+            conn.execute(f"DELETE FROM peer_measurements WHERE {local_rows}", (old_name,))
+        conn.execute("INSERT OR REPLACE INTO config(key, value) VALUES ('node_name', ?)", (new_name,))
+        _invalidate_local_node_name_cache()
 
 def _peer_name_taken(cursor, email, name):
     own = cursor.execute("SELECT value FROM config WHERE key = 'node_name'").fetchone()
@@ -2922,10 +3003,44 @@ def get_retained_message_ids():
         conn.close()
 
 
-def get_partial_journal_rows():
+def get_partial_journal_rows(chat_id=None, *, pending_only=False):
     conn = _connect()
     conn.row_factory = sqlite3.Row
     try:
-        return [dict(r) for r in conn.execute("SELECT r.*, po.id AS partial_id, po.started_at AS partial_started_at, po.ended_at AS partial_ended_at, po.nodes_down, po.notice_state FROM partial_outages po JOIN resources r ON r.id = po.resource_id WHERE po.ended_at IS NULL OR po.ended_at >= ?", (int(time.time()) - 30 * 86400,))]
+        columns = """
+            SELECT r.*, po.id AS partial_id, po.started_at AS partial_started_at,
+                   po.ended_at AS partial_ended_at, po.nodes_down, po.notice_state
+        """
+        outages = "FROM partial_outages po JOIN resources r ON r.id = po.resource_id"
+        scope = " AND r.dc_chat_id = ?" if chat_id is not None else ""
+        scope_args = (chat_id,) if chat_id is not None else ()
+        cutoff = int(time.time()) - 30 * 86400
+        if pending_only:
+            start_prefix = "journal:partial_start:"
+            start_key = f"'{start_prefix}' || r.dc_chat_id || ':' || po.id"
+            prefix = f"{start_prefix}{int(chat_id)}:" if isinstance(chat_id, int) else start_prefix
+            suffix_offset = len(start_prefix) + 1
+            suffix = f"substr(start.key, {suffix_offset})"
+            # Find unpaired starts by indexed key range, then resolve their outage IDs.
+            # Match the whole key after the join to exclude malformed IDs and mismatched chats.
+            query = f"""
+                {columns} {outages}
+                WHERE po.ended_at IS NULL{scope}
+                  AND NOT EXISTS (SELECT 1 FROM config WHERE key = {start_key})
+                UNION ALL
+                {columns} FROM config start
+                CROSS JOIN partial_outages po
+                  ON po.id = CAST(substr(start.key, {suffix_offset} + instr({suffix}, ':')) AS INTEGER)
+                JOIN resources r ON r.id = po.resource_id
+                WHERE start.key >= ? AND start.key < ?
+                  AND NOT EXISTS (SELECT 1 FROM config WHERE key = 'journal:partial_end:' || {suffix})
+                  AND po.ended_at >= ? AND start.key = {start_key}{scope}
+            """
+            args = (*scope_args, prefix, prefix[:-1] + ";", cutoff, *scope_args)
+        else:
+            query = f"{columns} {outages} WHERE (po.ended_at IS NULL OR po.ended_at >= ?){scope}"
+            args = (cutoff, *scope_args)
+        rows = sorted(conn.execute(query, args), key=lambda row: row["partial_id"])
+        return [dict(row) for row in rows]
     finally:
         conn.close()

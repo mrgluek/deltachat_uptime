@@ -40,7 +40,7 @@ class VoteTests(unittest.IsolatedAsyncioTestCase):
         self.sent = []
         self.local = {}
         self.peer_status = "down"
-        self.install(bot, time=self.clock, _vote_cache={}, _peer_suspects={}, _vote_peers={},
+        self.install(bot, time=self.clock, _vote_cache=collections.OrderedDict(), _peer_suspects={}, _vote_peers={},
                      _alert_streaks={}, _check_finished_at={}, running_resource_ids=set(),
                      _cross_check_queue=[], _cross_check_flush_task=None,
                      CROSS_CHECK_BATCH_WINDOW=0.001, _stat_events=collections.defaultdict(collections.deque),

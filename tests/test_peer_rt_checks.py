@@ -185,6 +185,92 @@ class TestRealtimeChecks(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bot._vote_peers[channel.FP].streak, 0)
         self.assertEqual(database._peer_traffic_buffer[int(self.now) - 1, "rt_fallback", "fallback", "out"][0], 1)
 
+    async def delayed_send(self, *, early_ack=False):
+        destination = bot._PeerDestination(self.client, 1, channel.CHAT, fingerprint=channel.FP)
+        mail = Mock()
+
+        async def queued_rpc(send):
+            self.advance(3.5)
+            bot._expire_peer_rt_acks(self.link)
+            result = send()
+            if early_ack and result:
+                self.acknowledge(self.wire[-1])
+                self.assertFalse(self.link.fallbacks)
+            return result
+
+        with patch.object(bot, "run_rpc", queued_rpc):
+            await bot._send_peer_rt_check(destination, channel.MSG, self.link, "req", {"req_id": "queued"},
+                                          mail, 30, None, None, None, None, None)
+        return mail
+
+    async def test_prompt_ack_survives_three_and_a_half_seconds_waiting_for_rpc(self):
+        mail = await self.delayed_send()
+        self.assertEqual(len(self.wire), 1)
+        self.acknowledge(self.wire[0])
+        self.advance(3)
+        bot._expire_peer_rt_acks(self.link)
+        self.assertIsNone(self.link.state.ack_failed_at)
+        self.assertFalse(self.link.fallbacks)
+        mail.assert_not_called()
+
+    async def test_ack_before_rpc_returns_is_accepted(self):
+        mail = await self.delayed_send(early_ack=True)
+        self.assertEqual(len(self.wire), 1)
+        self.advance(3)
+        bot._expire_peer_rt_acks(self.link)
+        self.assertIsNone(self.link.state.ack_failed_at)
+        mail.assert_not_called()
+
+    async def test_missing_ack_waits_three_seconds_after_rpc_returns(self):
+        with patch.object(self.link.state, "on_ack_timeout", wraps=self.link.state.on_ack_timeout) as timeout:
+            mail = await self.delayed_send()
+            self.assertEqual(len(self.wire), 1)
+            self.advance(2.999)
+            bot._expire_peer_rt_acks(self.link)
+            timeout.assert_not_called()
+            self.advance(0.001)
+            bot._expire_peer_rt_acks(self.link)
+            timeout.assert_called_once()
+        await self.until(lambda: mail.called)
+        mail.assert_called_once()
+
+    async def test_cancelled_send_discards_ack_and_fallback(self):
+        entered = asyncio.Event()
+
+        async def stalled_rpc(_send):
+            entered.set()
+            await asyncio.Future()
+
+        destination = bot._PeerDestination(self.client, 1, channel.CHAT, fingerprint=channel.FP)
+        mail = Mock()
+        with patch.object(bot, "run_rpc", stalled_rpc):
+            task = asyncio.create_task(bot._send_peer_rt_check(
+                destination, channel.MSG, self.link, "req", {"req_id": "cancelled"},
+                mail, 30, self.mono + 30, None, None, None, None))
+            await asyncio.wait_for(entered.wait(), 1)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        self.assertFalse(self.link.acks._pending)
+        self.assertFalse(self.link.fallbacks)
+        mail.assert_not_called()
+
+    async def test_stalled_request_and_answer_sends_expire_at_their_bounds(self):
+        async def stalled_rpc(_send):
+            await asyncio.Future()
+
+        destination = bot._PeerDestination(self.client, 1, channel.CHAT, fingerprint=channel.FP)
+        for kind, ttl, deadline in (("req", 30, self.mono + 0.01), ("resp", 0.01, None)):
+            with self.subTest(kind=kind), patch.object(bot, "run_rpc", stalled_rpc):
+                mail = Mock()
+                await asyncio.wait_for(bot._send_peer_rt_check(
+                    destination, channel.MSG, self.link, kind, {"req_id": "stalled"},
+                    mail, ttl, deadline, None, None, None, None), 0.25)
+                self.assertFalse(self.link.acks._pending)
+                self.assertFalse(self.link.fallbacks)
+                self.assertIsNone(self.link.state.ack_failed_at)
+                mail.assert_not_called()
+
     async def test_channel_down_after_request_ack_uses_mail(self):
         task = self.vote(peers=[self.peer])
         req = await self.first_request()

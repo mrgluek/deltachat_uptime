@@ -2814,14 +2814,11 @@ class TestUptimeBot(unittest.TestCase):
         recent_ts = now - (10 * 86400)
 
         # 1. Old and recent downtime events & incidents
-        conn = database._connect()
-        c = conn.cursor()
-        c.execute("INSERT INTO downtime_events (resource_id, went_down_at, went_up_at) VALUES (1, ?, ?)", (old_ts, old_ts + 300))
-        c.execute("INSERT INTO downtime_events (resource_id, went_down_at, went_up_at) VALUES (1, ?, ?)", (recent_ts, recent_ts + 300))
-        c.execute("INSERT INTO incidents (dc_chat_id, status, started_at, resolved_at) VALUES (1, 'resolved', ?, ?)", (old_ts, old_ts + 500))
-        c.execute("INSERT INTO incidents (dc_chat_id, status, started_at) VALUES (2, 'ongoing', ?)", (old_ts,))
-        conn.commit()
-        conn.close()
+        with database._writer_transaction() as conn:
+            conn.execute("INSERT INTO downtime_events (resource_id, went_down_at, went_up_at) VALUES (1, ?, ?)", (old_ts, old_ts + 300))
+            conn.execute("INSERT INTO downtime_events (resource_id, went_down_at, went_up_at) VALUES (1, ?, ?)", (recent_ts, recent_ts + 300))
+            conn.execute("INSERT INTO incidents (dc_chat_id, status, started_at, resolved_at) VALUES (1, 'resolved', ?, ?)", (old_ts, old_ts + 500))
+            conn.execute("INSERT INTO incidents (dc_chat_id, status, started_at) VALUES (2, 'ongoing', ?)", (old_ts,))
 
         # 2. Old and recent peer measurements
         # Retention follows our receive time, not a peer's claimed check time.

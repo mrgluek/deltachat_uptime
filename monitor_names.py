@@ -20,14 +20,23 @@ def short_monitor_name(resource):
     return name if len(name) <= 30 else name[:29] + "…"
 
 
-def short_journal_text(text, resources=()):
-    """Also compact stored entries written by previous versions."""
-    # Old journal entries saved node names but no historical voter denominator.
-    text = re.sub(r" \(nodes: .*?(?:\)|$)", "", text)
+def journal_monitor_labels(resources):
+    labels = []
     for resource in sorted(resources, key=lambda r: len(r.get("name") or r.get("url") or ""), reverse=True):
         old = resource.get("name") or resource.get("url")
         if old:
-            text = text.replace(old, short_monitor_name(resource))
+            labels.append((old, short_monitor_name(resource)))
+    return labels
+
+
+def short_journal_text(text, resources=(), *, labels=None):
+    """Also compact stored entries written by previous versions."""
+    # Old journal entries saved node names but no historical voter denominator.
+    text = re.sub(r" \(nodes: .*?(?:\)|$)", "", text)
+    if labels is None:
+        labels = journal_monitor_labels(resources)
+    for old, short in labels:
+        text = text.replace(old, short)
     text = re.sub(r'https?://[^\s,]+', lambda m: short_monitor_name({"url": m[0]}), text)
     # Historical monitor labels can outlive their resource (removal or rename).
     for prefix in ("➕ Added monitor ", "➖ Removed monitor ", "✏️ Changed monitor ",

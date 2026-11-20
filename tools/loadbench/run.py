@@ -100,9 +100,9 @@ def run_worker(args):
         database.DB_PATH = str(scratch)
         if args.copy:
             shutil.copyfile(path, scratch)
-        else:
-            database.init_db()
-            database.close_db()
+        database.init_db()
+        database.close_db()
+        if not args.copy:
             with closing(sqlite3.connect(scratch)) as conn:
                 populate(conn, argparse.Namespace(**settings))
         meter.install_database(stack, clock)
@@ -132,13 +132,13 @@ def format_row(label, values):
     memory = values.get("peak_memory_growth_bytes", values.get("peak_memory_growth_lower_bound_bytes"))
     memory = f"{memory / 2**20:.2f}" if memory is not None else "—"
     return (f"| {label} | {values['calls']:,} | {values['wall_s'] * 1_000:.3f} | "
-            f"{values['cpu_s'] * 1_000:.3f} | {values['connects']:,} | "
+            f"{values['cpu_s'] * 1_000:.3f} | {values['connects']:,} | {values['sqlite_opens']:,} | "
             f"{values['writer_transactions']:,} | {values['rows']:,} | {values['rpc_calls']:,} | "
             f"{values['rpc_bytes']:,} | {values['mails_queued']:,} | {lock} | {memory} |")
 
 
 TABLE = [
-    "| Scenario or function | Calls | Wall ms | CPU ms | _connect | Writes | SQL rows | RPC calls | RPC bytes | Mails queued | Longest lock ms | Peak MiB |",
+    "| Scenario or function | Calls | Wall ms | CPU ms | _connect | SQLite opens | Writes | SQL rows | RPC calls | RPC bytes | Mails queued | Longest lock ms | Peak MiB |",
     "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
 ]
 
@@ -155,7 +155,7 @@ def markdown(report, include_functions=False):
         if result["status"] == "ok":
             lines.append(format_row(name, result["total"]))
         else:
-            lines.append(f"| {name} ({result['status']}) | — | — | — | — | — | — | — | — | — | — | — |")
+            lines.append(f"| {name} ({result['status']}) | — | — | — | — | — | — | — | — | — | — | — | — |")
     if report["settings"]["memory"] and include_functions:
         lines.extend(("", "Per-function peaks are observed lower bounds for process-wide traced Python allocations."))
     for result in report["scenarios"]:

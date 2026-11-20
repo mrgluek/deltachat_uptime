@@ -1,6 +1,8 @@
 import asyncio
 from collections import OrderedDict
+from contextlib import closing
 from pathlib import Path
+import sqlite3
 from tempfile import TemporaryDirectory
 import time
 import unittest
@@ -8,6 +10,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import bot
 import database
+import monitor_names
 
 
 NOW = 1_800_000_000
@@ -59,8 +62,221 @@ class DatabaseLoadTests(unittest.TestCase):
         database.close_db()
         self.enterContext(patch.object(database, "DB_PATH", str(Path(directory) / "uptime.db")))
         self.addCleanup(database.close_db)
+        database.invalidate_uptime_cache()
+        self.addCleanup(database.invalidate_uptime_cache)
         self.clock = self.enterContext(patch.object(database.time, "time", return_value=NOW))
         database.init_db()
+
+    def test_incident_sync_checks_idle_chats_in_one_read(self):
+        with patch.object(database, "_connect", wraps=database._connect) as read:
+            asyncio.run(bot.sync_chat_incident_state(1))
+        read.assert_called_once()
+
+    def test_incident_sync_batches_active_events(self):
+        resource = database.add_resource(1, "https://uptime.example", "Uptime", "http")
+        incidents = [database.create_incident(1, NOW - offset) for offset in (600, 300, 100)]
+        with database._writer_transaction() as conn:
+            conn.executemany("INSERT INTO downtime_events(resource_id, went_down_at, incident_id) VALUES (?, ?, ?)",
+                             [(resource, NOW - 600, incident) for incident in incidents])
+        statements = []
+        connect = sqlite3.connect
+
+        def traced_connect(*args, **kwargs):
+            conn = connect(*args, **kwargs)
+            conn.set_trace_callback(statements.append)
+            return conn
+
+        database.close_db()
+        with (patch.object(sqlite3, "connect", traced_connect),
+              patch.object(database, "get_resources", wraps=database.get_resources) as resources,
+              patch.object(bot, "_queue_incident_message") as queue,
+              patch.object(bot, "_incident_last_edit_state", {})):
+            asyncio.run(bot.sync_chat_incident_state(1))
+        resources.assert_called_once_with(1, for_incident=True)
+        self.assertEqual([call.args[0] for call in queue.call_args_list], incidents)
+        event_queries = [sql for sql in statements if "WHERE de.incident_id" in sql]
+        self.assertEqual(len(event_queries), 1)
+        with closing(sqlite3.connect(database.DB_PATH)) as reader:
+            plan = [row[-1] for row in reader.execute("EXPLAIN QUERY PLAN " + event_queries[0])]
+        self.assertTrue(any("idx_downtime_incident_started" in node for node in plan), plan)
+        self.assertFalse(any("TEMP B-TREE" in node for node in plan), plan)
+
+    def test_legacy_unlinked_outage_still_creates_an_incident(self):
+        resource = database.add_resource(1, "https://legacy.example", "Legacy", "http")
+        with database._writer_transaction() as conn:
+            conn.execute("INSERT INTO downtime_events(resource_id, went_down_at) VALUES (?, ?)", (resource, NOW - 300))
+        with patch.object(bot, "_queue_incident_message") as queue:
+            asyncio.run(bot.sync_chat_incident_state(1))
+        incident = database.get_active_incident(1)
+        self.assertIsNotNone(incident)
+        self.assertEqual(incident["started_at"], NOW - 300)
+        self.assertEqual(database.get_incident_downtime_events(incident["id"])[0]["resource_id"], resource)
+        queue.assert_called_once()
+
+    def test_unlinked_incident_queries_use_sparse_index_on_skewed_history(self):
+        monitor = database.add_resource(1, "https://legacy.example", "Legacy", "http")
+        with database._writer_transaction() as conn:
+            conn.executemany("INSERT INTO downtime_events(resource_id, went_down_at, went_up_at) VALUES (?, ?, ?)",
+                             [(monitor, NOW - 60, NOW - 1)] * 20_000)
+            conn.execute("ANALYZE")
+        incident = database.create_incident(1, NOW)
+
+        statements = []
+        for read, expected in ((database.get_unlinked_open_downtime_events, []),
+                               (database.get_incident_sync_candidates, ([incident], False))):
+            with self.subTest(read=read.__name__):
+                conn = sqlite3.connect(database.DB_PATH)
+                conn.set_trace_callback(statements.append)
+                with patch.object(database, "_connect", return_value=conn):
+                    result = read(1)
+                if read is database.get_incident_sync_candidates:
+                    active, pending = result
+                    result = ([row["id"] for row in active], pending)
+                self.assertEqual(result, expected)
+                with closing(database._connect()) as conn:
+                    plan = [row[-1] for row in conn.execute("EXPLAIN QUERY PLAN " + statements[-1])]
+                self.assertTrue(any("idx_downtime_unlinked_open" in node for node in plan), plan)
+
+        with database._writer_transaction() as conn:
+            conn.executemany("INSERT INTO resources(dc_chat_id, url) VALUES (1, ?)",
+                             [(f"https://monitor-{i}.example",) for i in range(1_000)])
+        steps = []
+        conn = sqlite3.connect(database.DB_PATH)
+        conn.execute("SELECT name FROM sqlite_master LIMIT 1").fetchall()
+        conn.set_progress_handler(lambda: steps.append(1) or 0, 100)
+        with patch.object(database, "_connect", return_value=conn):
+            self.assertFalse(database.get_incident_sync_candidates(1)[1])
+        self.assertLess(len(steps), 2)
+
+        with database._writer_transaction() as conn:
+            conn.execute("INSERT INTO downtime_events(resource_id, went_down_at) VALUES (?, ?)", (monitor, NOW))
+        self.assertEqual([row["resource_id"] for row in database.get_unlinked_open_downtime_events(1)], [monitor])
+        self.assertTrue(database.get_incident_sync_candidates(1)[1])
+        self.assertEqual(database.get_incident_sync_candidates(2), ([], False))
+
+    def test_partial_notice_pass_reads_settings_together(self):
+        database.set_chat_report_partial(1, 0)
+        database.set_chat_report_app(2, "only")
+        rows = [dict(dc_chat_id=chat, partial_ended_at=NOW - 1) for chat in (1, 1, 2)]
+        with (patch.object(bot, "_journal_partial_events"),
+              patch.object(bot, "dc_outbox") as outbox,
+              patch.object(database, "get_pending_partial_notices", return_value=rows),
+              patch.object(database, "get_configs", wraps=database.get_configs) as read):
+            asyncio.run(bot._check_report_notices())
+        read.assert_called_once()
+        self.assertEqual([call.kwargs["key"] for call in outbox.submit.call_args_list], [("partial", 1)])
+
+    def test_candidate_search_skips_events_of_expired_resolved_incidents(self):
+        monitor = database.add_resource(1, "https://uptime.example", "Uptime", "http")
+        with database._writer_transaction() as conn:
+            conn.executemany("INSERT INTO incidents(id, dc_chat_id, status, started_at, resolved_at) "
+                             "VALUES (?, 1, 'resolved', ?, ?)",
+                             [(i, NOW - 10 * DAY, NOW - 9 * DAY) for i in range(1, 51)])
+            conn.executemany("INSERT INTO downtime_events(resource_id, went_down_at, went_up_at, incident_id) "
+                             "VALUES (?, ?, ?, ?)",
+                             [(monitor, NOW - 10 * DAY, NOW - 9 * DAY, i) for i in range(1, 51)] * 100)
+        recent = database.create_incident(1, NOW - 20 * DAY)
+        with database._writer_transaction() as conn:
+            conn.execute("INSERT INTO downtime_events(resource_id, went_down_at, went_up_at, incident_id) "
+                         "VALUES (?, ?, ?, ?)", (monitor, NOW - 60, NOW - 1, recent))
+
+        steps = []
+        with closing(sqlite3.connect(database.DB_PATH)) as reader:
+            reader.set_progress_handler(lambda: steps.append(1) or 0, 100)
+            with patch.object(database, "_connect", return_value=reader):
+                self.assertEqual(database.get_active_incident_for_outage(1, NOW)["id"], recent)
+        self.assertLess(len(steps), 100)
+
+        steps.clear()
+        writer = database._get_writer_conn()
+        writer.set_progress_handler(lambda: steps.append(1) or 0, 100)
+        try:
+            database.update_resource_status(monitor, "down", 1)
+        finally:
+            writer.set_progress_handler(None, 0)
+        self.assertLess(len(steps), 100)
+        self.assertEqual(len(database.get_incident_downtime_events(recent)), 2)
+
+    def test_status_reads_resources_once_and_batches_incident_events(self):
+        resource = database.add_resource(1, "https://uptime.example", "Uptime", "http")
+        incidents = [database.create_incident(1, NOW - offset) for offset in range(21)]
+        with database._writer_transaction() as conn:
+            conn.executemany("INSERT INTO downtime_events(resource_id, went_down_at, incident_id) VALUES (?, ?, ?)",
+                             [(resource, NOW - 600, incident) for incident in incidents])
+        with (patch.object(database, "_connect", wraps=database._connect) as read,
+              patch.object(database, "get_resources", wraps=database.get_resources) as resources):
+            state = bot.build_status_state(1)
+        self.assertEqual([i["id"] for i in state["incidents"]], incidents[:0:-1])
+        self.assertTrue(all(i["names"] == ["Uptime"] for i in state["incidents"]))
+        resources.assert_called_once_with(1)
+        self.assertLessEqual(read.call_count, 7)
+
+    def test_journal_compacts_each_monitor_label_once(self):
+        name = "A long monitor label that should shrink"
+        database.add_resource(1, "https://uptime.example", name, "http")
+        for _ in range(5):
+            database.add_chat_event(1, "test", f"{name} changed")
+        short = monitor_names.short_monitor_name({"name": name})
+        with patch.object(monitor_names, "short_monitor_name", wraps=monitor_names.short_monitor_name) as shorten:
+            entries = database.get_recent_chat_events(1, limit=5)
+        self.assertEqual([e["text"] for e in entries], [f"{short} changed"] * 5)
+        shorten.assert_called_once()
+
+    def test_status_push_batches_settings_and_uses_the_chat_name_it_just_read(self):
+        database.add_resource(1, "https://uptime.example", "Uptime", "http")
+        database.set_chat_report_app(1, "on")
+        database.set_chat_webxdc(1, 100, "old-state", NOW - 600)
+        database.set_chat_status_line(1, 101, "old-line")
+        database.set_config("webxdc_app_version:1", str(bot.WEBXDC_APP_VERSION))
+        database.set_config("webxdc_posted_at:1", str(NOW - 3600))
+        rpc = Mock()
+        rpc.get_existing_msg_ids.return_value = [100]
+        rpc.get_basic_chat_info.return_value = {"name": "Renamed chat"}
+        rpc.get_chat_contacts.return_value = [1, 2]
+        client = Mock(rpc=rpc)
+        with (patch.multiple(bot, dc_accid=1, dc_bot_instance=client, STATUS_REALTIME_CHATS=set()),
+              patch.object(bot, "queue_status_app") as queue,
+              patch.object(database, "get_config", wraps=database.get_config) as read):
+            asyncio.run(bot.push_status_apps())
+        queue.assert_called_once_with(1, client, 1)
+        self.assertEqual(sum(call.args == ("webxdc_chat_name:1",) for call in read.call_args_list), 1)
+        self.assertLessEqual(read.call_count, 2)
+
+    def test_uptime_uses_end_range_and_includes_old_open_outages(self):
+        monitor = database.add_resource(1, "https://uptime.example", "Uptime", "http")
+        with database._writer_transaction() as conn:
+            conn.execute("UPDATE resources SET created_at = ? WHERE id = ?", (NOW - 90 * DAY, monitor))
+            conn.executemany("INSERT INTO downtime_events(resource_id, went_down_at, went_up_at) VALUES (?, ?, ?)",
+                             [(monitor, NOW - 40 * DAY, NOW - 31 * DAY)] * 5000)
+            conn.executemany("INSERT INTO downtime_events(resource_id, went_down_at, went_up_at) VALUES (?, ?, ?)", [
+                (monitor, NOW - 32 * DAY, NOW - 30 * DAY),
+                (monitor, NOW - 31 * DAY, NOW - 29 * DAY),
+                (monitor, NOW - DAY, None),
+                (monitor, NOW, None),
+            ])
+        steps = []
+        with closing(sqlite3.connect(database.DB_PATH)) as reader:
+            reader.set_progress_handler(lambda: steps.append(1) or 0, 100)
+            with patch.object(database, "_connect", return_value=reader):
+                self.assertEqual(database.get_resources_uptime_30d([monitor])[monitor], 28 / 30 * 100)
+        self.assertLess(len(steps), 25)
+
+    def test_partial_outage_limit_sorts_index_entries_and_preserves_ties(self):
+        earlier = database.add_resource(1, "https://first.example", "First", "http")
+        later = database.add_resource(1, "https://second.example", "Second", "http")
+        with database._writer_transaction() as conn:
+            conn.execute("UPDATE resources SET status = 'up' WHERE id = ?", (earlier,))
+            conn.execute("UPDATE resources SET status = 'down' WHERE id = ?", (later,))
+            conn.executemany("INSERT INTO partial_outages(resource_id, started_at) VALUES (?, ?)",
+                             [(earlier, NOW), (later, NOW), (later, NOW)])
+        statements = []
+        with closing(sqlite3.connect(database.DB_PATH)) as reader:
+            reader.set_trace_callback(statements.append)
+            with patch.object(database, "_connect", return_value=reader):
+                self.assertEqual([p["id"] for p in database.get_chat_partial_outages(1, 2)], [3, 2])
+        with closing(sqlite3.connect(database.DB_PATH)) as reader:
+            plan = [row[-1] for row in reader.execute("EXPLAIN QUERY PLAN " + statements[-1])]
+        self.assertTrue(any("COVERING INDEX idx_partial_outages_resource_started" in node for node in plan), plan)
 
     def test_cleanup_preserves_retention_boundaries_and_open_journals(self):
         with database._writer_transaction() as conn:

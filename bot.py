@@ -4743,15 +4743,18 @@ def _deliver_degraded_notices(chat_id: int):
 async def _check_report_notices():
     await run_db(_journal_partial_events)
     pending = await run_db(database.get_pending_partial_notices)
+    now = int(time.time())
+    chats = {r["dc_chat_id"] for r in pending}
+    config = await run_db(database.get_configs, (f"{key}:{chat}" for chat in chats
+                                                  for key in ("report_partial", "report_app")))
     settings = {}
     due_chats = set()
-    now = int(time.time())
     for r in pending:
         chat_id = r["dc_chat_id"]
         if chat_id not in settings:
-            settings[chat_id] = await run_db(database.get_chat_report_partial, chat_id)
+            settings[chat_id] = database.parse_chat_report_partial(config.get(f"report_partial:{chat_id}"))
         minutes = settings[chat_id]
-        if minutes == "off" or await run_db(database.get_chat_report_app, chat_id) == "only":
+        if minutes == "off" or config.get(f"report_app:{chat_id}") == "only":
             continue
         if r["partial_ended_at"] is not None or (
                 r.get("alert_state") == "degraded" and r.get("status") != "down"
@@ -5198,38 +5201,46 @@ def _queue_incident_message(inc_id: int, dc_chat_id: int, msg_text: str, priorit
 async def sync_chat_incident_state(dc_chat_id: int, force_update: bool = False):
     chat_lock = get_chat_incident_lock(dc_chat_id)
     async with chat_lock:
-        resources = await asyncio.to_thread(database.get_resources, dc_chat_id)
-        total_chat_monitors = len(resources) if resources else 0
-        now = int(time.time())
-        active_res_map = {r["id"]: r for r in (resources or [])}
-        
-        # Link any unlinked open downtime events to matching incident or create a new incident
-        unlinked_events = await asyncio.to_thread(database.get_unlinked_open_downtime_events, dc_chat_id)
-        for ev in unlinked_events:
-            matching_inc = await asyncio.to_thread(database.get_active_incident_for_outage, dc_chat_id, ev["went_down_at"], 3600, True)
-            if matching_inc:
-                if matching_inc.get("status") == "resolved":
-                    await asyncio.to_thread(database.reopen_incident, matching_inc["id"])
-                await asyncio.to_thread(database.link_downtime_event_to_incident, ev["id"], matching_inc["id"])
-                force_update = True
-            else:
-                new_inc_id = await asyncio.to_thread(database.create_incident, dc_chat_id, ev["went_down_at"])
-                await asyncio.to_thread(database.link_downtime_event_to_incident, ev["id"], new_inc_id)
-                force_update = True
-
-        active_incidents = await asyncio.to_thread(database.get_active_incidents_for_chat, dc_chat_id)
-        if not active_incidents:
+        active_incidents, has_unlinked = await run_db(database.get_incident_sync_candidates, dc_chat_id)
+        if not active_incidents and not has_unlinked:
             return
 
+        resources = await run_db(database.get_resources, dc_chat_id, for_incident=True)
+        total_chat_monitors = len(resources)
+        now = int(time.time())
+        active_res_map = {r["id"]: r for r in resources}
+        
+        # Link any unlinked open downtime events to matching incident or create a new incident
+        if has_unlinked:
+            unlinked_events = await run_db(database.get_unlinked_open_downtime_events, dc_chat_id)
+            for ev in unlinked_events:
+                matching_inc = await run_db(database.get_active_incident_for_outage, dc_chat_id, ev["went_down_at"], 3600, True)
+                if matching_inc:
+                    inc_id = matching_inc["id"]
+                    if matching_inc.get("status") == "resolved":
+                        await run_db(database.reopen_incident, inc_id)
+                else:
+                    inc_id = await run_db(database.create_incident, dc_chat_id, ev["went_down_at"])
+                await run_db(database.link_downtime_event_to_incident, ev["id"], inc_id)
+            active_incidents = await run_db(database.get_active_incidents_for_chat, dc_chat_id)
+
+        events_by_incident = await run_db(database.get_incident_downtime_events_batch,
+                                          [inc["id"] for inc in active_incidents])
+        closed_resources = set()
         reloaded = set()
         for inc in active_incidents:
             inc_id = inc["id"]
-            events = await asyncio.to_thread(database.get_incident_downtime_events, inc_id)
+            events = events_by_incident.pop(inc_id, None)
+            if events is None or any(ev["resource_id"] in closed_resources and ev.get("went_up_at") is None
+                                     for ev in events):
+                # A retry or one of our earlier closes can invalidate the batch snapshot.
+                events = await run_db(database.get_incident_downtime_events, inc_id)
             
             # If any open downtime event belongs to a deleted resource, close it
             for ev in events:
                 if ev["resource_id"] not in active_res_map and ev.get("went_up_at") is None:
-                    await asyncio.to_thread(database.close_resource_downtime_events, ev["resource_id"], now)
+                    await run_db(database.close_resource_downtime_events, ev["resource_id"], now)
+                    closed_resources.add(ev["resource_id"])
                     ev["went_up_at"] = now
 
             await run_db(_journal_incident_events, dc_chat_id, events, active_res_map, now)
@@ -5237,13 +5248,16 @@ async def sync_chat_incident_state(dc_chat_id: int, force_update: bool = False):
             
             if open_events:
                 # Grouped/reopened incidents may be older than the continuous DOWN interval.
-                minutes = await run_db(database.get_chat_report_full, dc_chat_id)
-                notices_after = int(await run_db(database.get_config, f"report_app_notices_after:{dc_chat_id}") or 0)
-                if not inc.get("msg_id") and (await run_db(database.get_chat_report_app, dc_chat_id) == "only"
-                        or inc.get("message_claimed") or not any(
-                        ev["went_down_at"] > notices_after and should_notify_start(ev["went_down_at"], now, minutes)
-                        for ev in open_events)):
-                    continue
+                if not inc.get("msg_id"):
+                    minutes_key, after_key, app_key = (f"{key}:{dc_chat_id}" for key in
+                                                        ("report_full", "report_app_notices_after", "report_app"))
+                    settings = await run_db(database.get_configs, (minutes_key, after_key, app_key))
+                    minutes = database.parse_chat_report_full(settings.get(minutes_key))
+                    notices_after = int(settings.get(after_key) or 0)
+                    if settings.get(app_key) == "only" or inc.get("message_claimed") or not any(
+                            ev["went_down_at"] > notices_after and should_notify_start(ev["went_down_at"], now, minutes)
+                            for ev in open_events):
+                        continue
                 # Incident is ongoing
                 started_at = inc["started_at"]
                 duration = max(0, now - started_at)
@@ -5258,18 +5272,18 @@ async def sync_chat_incident_state(dc_chat_id: int, force_update: bool = False):
 
                 inc_resources = []
                 seen_res = set()
+                down_resources = {ev["resource_id"] for ev in open_events}
                 for ev in events:
                     rid = ev["resource_id"]
                     if rid in active_res_map and rid not in seen_res:
                         seen_res.add(rid)
                         r = active_res_map[rid]
-                        is_currently_down = any(e["resource_id"] == rid and e.get("went_up_at") is None for e in events)
                         inc_resources.append({
                             "id": r["id"],
                             "name": r.get("name"),
                             "url": r.get("url"),
                             "type": r.get("type"),
-                            "status": "down" if is_currently_down else "up",
+                            "status": "down" if rid in down_resources else "up",
                             "last_changed": r.get("last_changed") or ev.get("went_up_at") or ev.get("went_down_at"),
                             "went_down_at": ev.get("went_down_at"),
                             "went_up_at": ev.get("went_up_at"),
@@ -5307,12 +5321,12 @@ async def sync_chat_incident_state(dc_chat_id: int, force_update: bool = False):
                 else:
                     summary_str = f"All {total_chat_monitors} monitors operational" if total_chat_monitors > 0 else "All monitored resources removed or operational"
                 
-                if not await asyncio.to_thread(database.resolve_incident, inc_id, now, summary_str):
+                if not await run_db(database.resolve_incident, inc_id, now, summary_str):
                     # A new failure may have linked after the recovery snapshot. Reload once,
                     # then let the next audit retry if failures keep changing underneath us.
                     current = await run_db(database.get_incident_by_id, dc_chat_id, inc_id)
                     if current and current["status"] == "ongoing" and inc_id not in reloaded:
-                        resources = await run_db(database.get_resources, dc_chat_id)
+                        resources = await run_db(database.get_resources, dc_chat_id, for_incident=True)
                         active_res_map = {r["id"]: r for r in resources}
                         total_chat_monitors = len(resources)
                         reloaded.add(inc_id)
@@ -7091,11 +7105,12 @@ def _build_xdc(source_dir, name, lock, *, deterministic=False) -> str:
         return str(target)
 
 
-def build_status_state(chat_id: int) -> dict:
+def build_status_state(chat_id: int, *, chat_name: str | None = None) -> dict:
     """Read a full snapshot without RPC calls or writes (chat name is cached at delivery)."""
     now = int(time.time())
     resources = database.get_resources(chat_id)
-    uptimes = database.get_resources_uptime_30d([r["id"] for r in resources]) if resources else {}
+    created_at = {r["id"]: r["created_at"] for r in resources}
+    uptimes = database.get_resources_uptime_30d(list(created_at), created_at=created_at)
     counts = {"up": 0, "partial": 0, "down": 0}
     monitors = []
     for r in resources:
@@ -7113,18 +7128,21 @@ def build_status_state(chat_id: int) -> dict:
                       for v in _votes_from_json(r.get("last_votes")) if isinstance(v, dict)],
         })
     monitors.sort(key=lambda m: ({"down": 0, "partial": 1, "up": 2, "paused": 3}[m["status"]], m["id"]))
-    journal = database.get_recent_chat_events(chat_id, 20)
+    journal = database.get_recent_chat_events(chat_id, 20, resources=resources)
+    recent = [i for i in database.get_recent_incidents(chat_id, 20)
+              if (i.get("resolved_at") or now) >= now - 30 * 86400]
+    incident_events = database.get_incident_downtime_events_batch([i["id"] for i in recent])
     incidents = []
-    for incident in database.get_recent_incidents(chat_id, 20):
-        if (incident.get("resolved_at") or now) < now - 30 * 86400:
-            continue
+    for incident in recent:
         affected = {e["resource_id"]: short_monitor_name(e)
-                    for e in database.get_incident_downtime_events(incident["id"])}
+                    for e in incident_events[incident["id"]]}
         incidents.append({**{k: incident[k] for k in ("id", "status", "started_at", "resolved_at")},
                           "names": list(affected.values())[:5], "count": len(affected)})
     partials = [{"monitor": short_monitor_name(p), "started_at": p["started_at"], "ended_at": p["ended_at"]}
                 for p in database.get_chat_partial_outages(chat_id, 10)]
-    return {"v": WEBXDC_APP_VERSION, "chat": database.get_config(f"webxdc_chat_name:{chat_id}") or "Chat Monitor",
+    if chat_name is None:
+        chat_name = database.get_config(f"webxdc_chat_name:{chat_id}")
+    return {"v": WEBXDC_APP_VERSION, "chat": chat_name or "Chat Monitor",
             "generated_at": now, "counts": counts, "monitors": monitors, "events": status_app_events(chat_id, journal),
             "event_serial": journal[0]["id"] if journal else 0, "incidents": incidents, "partial_outages": partials}
 
@@ -7154,15 +7172,17 @@ def status_full_state_hash(state: dict) -> str:
     return _status_content_hash({key: value for key, value in state.items() if key != "generated_at"})
 
 
-def status_app_refresh_due(chat_id, saved, state, now):
+def status_app_refresh_due(chat_id, saved, state, now, *, settings=None):
+    get_config = database.get_config if settings is None else settings.get
     return (saved["webxdc_last_sent_at"] is not None
             and now - saved["webxdc_last_sent_at"] >= STATUS_REFRESH_SECONDS
-            and database.get_config(f"webxdc_full_state_hash:{chat_id}") != status_full_state_hash(state))
+            and get_config(f"webxdc_full_state_hash:{chat_id}") != status_full_state_hash(state))
 
 
-def status_app_first_state(chat_id, saved):
+def status_app_first_state(chat_id, saved, *, settings=None):
+    get_config = database.get_config if settings is None else settings.get
     return (not saved["webxdc_state_hash"]
-            or database.get_config(f"webxdc_update_count:{chat_id}") == "0")
+            or get_config(f"webxdc_update_count:{chat_id}") == "0")
 
 
 def _status_app_capped(chat_id, attempts, now):
@@ -7225,13 +7245,14 @@ def status_app_info(events):
     return " | ".join(lines)
 
 
-def status_app_rotation_due(chat_id, now):
+def status_app_rotation_due(chat_id, now, *, settings=None):
     # Config keys are additive migration: legacy instances acquire an age on first audit.
-    posted = database.get_config(f"webxdc_posted_at:{chat_id}")
+    get_config = database.get_config if settings is None else settings.get
+    posted = get_config(f"webxdc_posted_at:{chat_id}")
     if posted is None:
-        posted = database.get_config(f"webxdc_reposted_at:{chat_id}") or str(now)
+        posted = get_config(f"webxdc_reposted_at:{chat_id}") or str(now)
         database.set_config(f"webxdc_posted_at:{chat_id}", posted)
-    count = int(database.get_config(f"webxdc_update_count:{chat_id}") or 0)
+    count = int(get_config(f"webxdc_update_count:{chat_id}") or 0)
     return now - int(posted) > 7 * 86400 or count > 500
 
 
@@ -7240,8 +7261,10 @@ def status_app_dirty(chat_id):
 
 
 def status_app_urgent(chat_id):
-    revision = database.get_config(f"webxdc_dirty:{chat_id}")
-    return status_app_dirty(chat_id) and revision != database.get_config(f"webxdc_attempt_revision:{chat_id}")
+    dirty, clean, attempted = (f"webxdc_{key}:{chat_id}" for key in ("dirty", "clean", "attempt_revision"))
+    settings = database.get_configs((dirty, clean, attempted))
+    revision = settings.get(dirty)
+    return revision != settings.get(clean) and revision != settings.get(attempted)
 
 
 def _status_update_json(state: dict, limit: int, info_line=None) -> str:
@@ -7514,12 +7537,15 @@ async def push_status_apps():
             msg_id = saved["webxdc_msg_id"]
             # Reads use the existing RPC executor; only actual mails need outbox tokens.
             exists = msg_id and msg_id in await run_rpc(dc_bot_instance.rpc.get_existing_msg_ids, dc_accid, [msg_id])
-            version = await run_db(database.get_config, f"webxdc_app_version:{chat_id}")
-            if not exists or version != str(WEBXDC_APP_VERSION) or await run_db(status_app_rotation_due, chat_id, now):
-                last_post = await run_db(database.get_config, f"webxdc_reposted_at:{chat_id}")
+            keys = ("app_version", "posted_at", "reposted_at", "update_count", "pin_pending")
+            settings = await run_db(database.get_configs, (f"webxdc_{key}:{chat_id}" for key in keys))
+            version = settings.get(f"webxdc_app_version:{chat_id}")
+            if (not exists or version != str(WEBXDC_APP_VERSION)
+                    or await run_db(status_app_rotation_due, chat_id, now, settings=settings)):
+                last_post = settings.get(f"webxdc_reposted_at:{chat_id}")
                 if last_post is not None and now - int(last_post) < 3600:
                     continue
-            elif not await run_db(database.get_config, f"webxdc_pin_pending:{chat_id}"):
+            elif not settings.get(f"webxdc_pin_pending:{chat_id}"):
                 chat = await run_rpc(dc_bot_instance.rpc.get_basic_chat_info, dc_accid, chat_id)
                 name = str(chat.get("name") if isinstance(chat, dict) else chat.name)
                 if name != await run_db(database.get_config, f"webxdc_chat_name:{chat_id}"):
@@ -7530,16 +7556,19 @@ async def push_status_apps():
                         and now - saved["webxdc_last_sent_at"] < await run_db(status_mail_interval, chat_id, members)
                         and not urgent):
                     continue
-                state = await run_db(build_status_state, chat_id)
+                state = await run_db(build_status_state, chat_id, chat_name=name)
+                keys = ("update_count", "full_state_hash", "updates")
+                settings = await run_db(database.get_configs, (f"webxdc_{key}:{chat_id}" for key in keys))
+                first_state = status_app_first_state(chat_id, saved, settings=settings)
                 if (status_state_hash(state) == saved["webxdc_state_hash"]
-                        and not await run_db(status_app_first_state, chat_id, saved)
-                        and not await run_db(status_app_refresh_due, chat_id, saved, state, now)
+                        and not first_state
+                        and not status_app_refresh_due(chat_id, saved, state, now, settings=settings)
                         and saved["status_line_msg_id"] and saved["status_line_hash"] == _status_line_hash(status_line_text(state))):
                     continue
-                updates = json.loads(await run_db(database.get_config, f"webxdc_updates:{chat_id}") or "[]")
+                updates = json.loads(settings.get(f"webxdc_updates:{chat_id}") or "[]")
                 attempts = sum(now - ts < 3600 for ts in updates)
                 cap = await run_db(status_mail_cap, chat_id, members, urgent)
-                if attempts >= cap and not await run_db(status_app_first_state, chat_id, saved):
+                if attempts >= cap and not first_state:
                     await run_db(_status_app_capped, chat_id, attempts, now)
                     continue
             queue_status_app(chat_id, dc_bot_instance, dc_accid)

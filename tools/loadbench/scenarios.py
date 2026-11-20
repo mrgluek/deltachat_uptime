@@ -266,9 +266,12 @@ async def status_apps(bench):
         if offset:
             # This fixture mutation lives outside the two per-pass spans.
             with database._writer_transaction() as conn:
+                last_event = conn.execute("SELECT COALESCE(MAX(id), 0) FROM chat_events").fetchone()[0]
                 conn.executemany(
                     "UPDATE resources SET name = name || ' renamed' WHERE id = "
                     "(SELECT MIN(id) FROM resources WHERE dc_chat_id = ?)", ((chat,) for chat in enabled))
+                # SQLite's journal triggers use the real clock, independent of Clock.
+                conn.execute("UPDATE chat_events SET ts = ? WHERE id > ?", (int(bench.clock.time()), last_event))
         with bench.meter.span(name):
             await bench.bot.push_status_apps()
             for chat in bench.chats:

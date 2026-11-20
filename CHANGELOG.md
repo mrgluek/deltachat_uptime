@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Reuse one read-only SQLite connection per thread, release read snapshots when a checkout is closed or collected, and let active reads finish during shutdown or database replacement. At 10,000 monitors, pooling alone reduced the status app workload from 19,996 reader opens and 11.32 s of CPU to 602 SQLite opens and 1.57 s.
+- Batch incident and partial-notice reads, use the partial index for unlinked open downtime, and skip expired resolved incidents before joining their downtime history. With pooled readers, report notices fell from 8.28 s to 2.98 s of CPU and startup from 5.66 s to 2.83 s.
+- Reuse monitor data and batch settings and incident history during status app updates. At 10,000 monitors, CPU fell from 1.63 s to 0.78 s and measured rows from 126,783 to 99,303 across two passes.
 - Use the partial outage end-time index for open journal entries. Skip outage events already recorded and ended partial outages without a journaled start. At 10,000 monitors, report notices used 3,421 write transactions per simulated minute, down from 45,304.
 - Skip startup cleanup after a recent run, prune old records in batches, and retry failed runs after ten minutes. A saved cleanup time in the future makes cleanup due immediately. On the 90-day fixture, cleanup finished in 8.29 s with a 31 ms longest write lock hold. The previous run exceeded 60 s.
 - Keep local measurements when saving probe-only results, including during a local rename. At 10,000 monitors and 4,000 mirrored targets, local measurements retained rose from 1,000 to 14,000 while the 1,000-row quota per remote peer stayed in place.

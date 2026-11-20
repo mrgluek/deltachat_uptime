@@ -45,14 +45,15 @@ LARGE_READS = (
     "get_all_resources", "get_active_probe_targets", "get_partial_journal_rows",
     "get_pending_partial_notices", "get_configs", "get_resources",
     "get_resources_uptime_30d", "get_resource_uptime_window", "get_recent_chat_events",
-    "get_recent_incidents", "get_incident_downtime_events", "get_chat_partial_outages",
+    "get_recent_incidents", "get_incident_downtime_events", "get_incident_downtime_events_batch",
+    "get_chat_partial_outages", "get_incident_sync_candidates",
     "get_all_peers", "get_all_active_incidents", "get_active_incidents_for_chat",
     "get_unlinked_open_downtime_events", "get_monitored_chats", "get_retained_message_ids",
 )
 
 
 def metrics():
-    return dict(calls=0, wall_s=0.0, cpu_s=0.0, connects=0, writer_transactions=0,
+    return dict(calls=0, wall_s=0.0, cpu_s=0.0, connects=0, sqlite_opens=0, writer_transactions=0,
                 rows=0, rpc_calls=0, rpc_bytes=0, mails_queued=0, max_write_lock_s=0.0)
 
 
@@ -173,6 +174,7 @@ class Meter:
                 return super().execute(sql, parameters)
 
         def connect(*args, **kwargs):
+            meter.add("sqlite_opens")
             return sqlite3.connect(*args, **kwargs, factory=Connection)
 
         db_connect = database._connect

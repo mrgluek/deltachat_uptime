@@ -38,10 +38,8 @@ class TestSmtpProbeTargets(_DbCase):
 
     def test_mistyped_rows_are_fixed_at_start(self):
         database.save_probe_targets_batch([{"url": "smtp://chatmail.uk", "type": "smtp"}], "peer@example.org")
-        conn = database._connect()
-        conn.execute("UPDATE probe_targets SET type = 'http', last_status = 'down' WHERE url = 'smtp://chatmail.uk'")
-        conn.commit()
-        conn.close()
+        with database._writer_transaction() as conn:
+            conn.execute("UPDATE probe_targets SET type = 'http', last_status = 'down' WHERE url = 'smtp://chatmail.uk'")
         database.init_db()
         t = next(t for t in database.get_active_probe_targets() if t["url"] == "smtp://chatmail.uk")
         self.assertEqual((t["type"], t["last_status"]), ("smtp", None))

@@ -7,9 +7,12 @@ import threading
 import time
 import secrets
 import string
+import weakref
+from collections import Counter
 from itertools import product
+from pathlib import Path
 from urllib.parse import urlparse
-from monitor_names import short_journal_text
+from monitor_names import journal_monitor_labels, short_journal_text
 
 MAX_MONITORS_PER_CHAT = max(1, int(os.getenv("MAX_MONITORS_PER_CHAT", "300")))
 MAX_MONITORS_TOTAL = max(1, int(os.getenv("MAX_MONITORS_TOTAL", "3000")))
@@ -34,7 +37,15 @@ _write_lock = threading.RLock()
 _lock = _write_lock  # Backwards compatibility
 
 _writer_conn = None
-_writer_conn_db_path = None
+_writer_identity = None
+_readers = weakref.WeakSet()
+_retiring_readers = weakref.WeakSet()
+_opening_readers = Counter()
+_reader_lock = threading.Lock()
+_thread_reader = threading.local()
+_pool_identity = None
+_pool_generation = 0
+_replaced_paths = set()
 _local_node_name_cache: tuple[str, str | None] | None = None
 _local_node_name_generation = 0
 _peer_last_seen_updates: dict[tuple[str, str], int] = {}
@@ -46,38 +57,53 @@ def _invalidate_local_node_name_cache():
     _local_node_name_generation += 1
 
 def close_db():
-    """Explicitly closes the persistent writer connection (useful for tests and shutdown)."""
-    global _writer_conn, _writer_conn_db_path, _node_ignored_cache
-    with _write_lock:
-        if _writer_conn is not None:
-            try:
-                _writer_conn.close()
-            except Exception:
-                pass
-            _writer_conn = None
-            _writer_conn_db_path = None
+    """Close the persistent connections during tests and shutdown."""
+    global _node_ignored_cache
+    with _write_lock, _reader_lock:
+        _retire_readers()
+        _close_writer()
         _invalidate_local_node_name_cache()
         _peer_last_seen_updates.clear()
     _node_ignored_cache = None
 
-def _get_writer_conn() -> sqlite3.Connection:
-    """Returns a shared, persistent connection for write operations guarded by _write_lock."""
-    global _writer_conn, _writer_conn_db_path
-    if _writer_conn is not None and _writer_conn_db_path != DB_PATH:
+
+def _close_writer():
+    global _writer_conn, _writer_identity
+    if _writer_conn is not None:
         try:
             _writer_conn.close()
         except Exception:
             pass
         _writer_conn = None
+        _writer_identity = None
 
-    if _writer_conn is None:
-        _writer_conn = sqlite3.connect(DB_PATH, timeout=15.0, check_same_thread=False)
-        _writer_conn.execute("PRAGMA busy_timeout = 5000;")
-        _writer_conn.execute("PRAGMA synchronous = NORMAL;")
-        _writer_conn.execute("PRAGMA journal_mode = WAL;")
-        _writer_conn.execute("PRAGMA wal_autocheckpoint = 1000;")
-        _writer_conn_db_path = DB_PATH
-    return _writer_conn
+
+def _get_writer_conn() -> sqlite3.Connection:
+    """Returns a shared, persistent connection for write operations guarded by _write_lock."""
+    global _writer_conn, _writer_identity
+    path = os.fspath(DB_PATH)
+    while True:
+        identity = _db_identity(path)
+        if identity != _pool_identity:
+            identity = _prepare_db_identity(path)
+        if _writer_identity == identity:
+            return _writer_conn
+        _close_writer()
+
+        conn = sqlite3.connect(path, timeout=15.0, check_same_thread=False)
+        try:
+            conn.execute("PRAGMA busy_timeout = 5000;")
+            conn.execute("PRAGMA synchronous = NORMAL;")
+            conn.execute("PRAGMA journal_mode = WAL;")
+            conn.execute("PRAGMA wal_autocheckpoint = 1000;")
+            opened_identity = _db_identity(path)
+            if identity[1] is None or opened_identity == identity:
+                _writer_conn, _writer_identity = conn, opened_identity
+                return conn
+        except BaseException:
+            conn.close()
+            raise
+        conn.close()
 
 @contextlib.contextmanager
 def _writer_transaction():
@@ -94,11 +120,252 @@ def _writer_transaction():
                 pass
             raise
 
-def _connect(timeout: float = 10.0) -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, timeout=timeout)
-    conn.execute("PRAGMA busy_timeout = 5000;")
-    conn.execute("PRAGMA synchronous = NORMAL;")
+def _open_reader(path, timeout, *, pooled=False, existing=False):
+    if existing:
+        # An open racing a removal must not recreate the old path.
+        path = Path(path).absolute().as_uri() + "?mode=rw"
+    conn = sqlite3.connect(path, timeout=timeout, check_same_thread=not pooled, uri=existing)
+    try:
+        conn.execute("PRAGMA busy_timeout = 5000;")
+        conn.execute("PRAGMA synchronous = NORMAL;")
+        if pooled:
+            conn.execute("PRAGMA query_only = ON;")
+            conn.execute("PRAGMA cache_size = -2000;")
+    except BaseException:
+        conn.close()
+        raise
     return conn
+
+
+class _ThreadReader:
+    def __init__(self, identity, connection):
+        self.identity = identity
+        self.connection = connection
+        self.retired = False
+        self.lease = threading.Lock()
+
+    def checkout(self):
+        if not self.retired and self.lease.acquire(blocking=False):
+            if not self.retired:
+                return _ReaderCheckout(self)
+            self.release()
+
+    def release(self):
+        self.lease.release()
+        # Retirement and release can race. Both sides check after publishing
+        # their state, so whichever goes last will close the retired reader.
+        if self.retired:
+            self.close_if_idle()
+
+    def close_if_idle(self):
+        if self.lease.acquire(blocking=False):
+            try:
+                self.close()
+            except Exception:
+                pass
+            finally:
+                self.lease.release()
+
+    def close(self):
+        if self.connection is not None:
+            self.connection.close()
+            self.connection = None
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+class _ReaderCheckout:
+    __slots__ = ("_reader", "_cursors")
+
+    def __init__(self, reader):
+        self._reader = reader
+        self._cursors = []
+
+    @property
+    def _connection(self):
+        reader = self._reader
+        if reader is None or reader.connection is None:
+            raise sqlite3.ProgrammingError("Cannot operate on a closed database.")
+        return reader.connection
+
+    def __getattr__(self, name):
+        return getattr(self._connection, name)
+
+    def __setattr__(self, name, value):
+        if name in self.__slots__:
+            object.__setattr__(self, name, value)
+        else:
+            setattr(self._connection, name, value)
+
+    def _track(self, cursor):
+        self._cursors.append(weakref.ref(cursor))
+        return cursor
+
+    def cursor(self, *args, **kwargs):
+        return self._track(self._connection.cursor(*args, **kwargs))
+
+    def execute(self, *args, **kwargs):
+        return self._track(self._connection.execute(*args, **kwargs))
+
+    def executemany(self, *args, **kwargs):
+        return self._track(self._connection.executemany(*args, **kwargs))
+
+    def executescript(self, *args, **kwargs):
+        return self._track(self._connection.executescript(*args, **kwargs))
+
+    def __enter__(self):
+        self._connection.__enter__()
+        return self
+
+    def __exit__(self, *exc):
+        return self._connection.__exit__(*exc)
+
+    def close(self):
+        reader = self._reader
+        if reader is None:
+            return
+        self._reader = None
+        conn = reader.connection
+        try:
+            # An unfinished SELECT can hold a WAL snapshot even in autocommit mode.
+            for ref in self._cursors:
+                cursor = ref()
+                if cursor is not None:
+                    try:
+                        cursor.close()
+                    except sqlite3.Error:
+                        reader.retired = True
+        except BaseException:
+            reader.retired = True
+            raise
+        finally:
+            self._cursors.clear()
+            try:
+                try:
+                    conn.rollback()
+                except sqlite3.Error:
+                    reader.retired = True
+                finally:
+                    conn.row_factory = None
+            except BaseException:
+                reader.retired = True
+                raise
+            finally:
+                reader.release()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+def _db_identity(path):
+    try:
+        stat = os.stat(path)
+    except FileNotFoundError:
+        return path, None, None
+    return path, stat.st_dev, stat.st_ino
+
+
+def _retire_readers():
+    """Retire the pool under _reader_lock and let checked-out readers finish."""
+    global _pool_generation
+    _pool_generation += 1
+    for reader in list(_readers):
+        reader.retired = True
+        reader.close_if_idle()
+        if reader.connection is not None:
+            _retiring_readers.add(reader)
+    _readers.clear()
+
+
+def _prepare_db_identity(path):
+    global _pool_identity
+    with _write_lock, _reader_lock:
+        identity = _db_identity(path)
+        if identity == _pool_identity:
+            return identity
+
+        def replaced(previous):
+            return previous is not None and previous[0] == path and previous[1] is not None and previous != identity
+
+        _retire_readers()
+        old_openers = any(replaced(opening) for opening in _opening_readers)
+        old_readers = [reader for reader in _retiring_readers
+                       if reader.connection is not None and replaced(reader.identity)]
+        if replaced(_writer_identity):
+            _close_writer()
+            _replaced_paths.add(path)
+        if replaced(_pool_identity) or old_openers or old_readers:
+            _replaced_paths.add(path)
+        if path in _replaced_paths:
+            for reader in old_readers:
+                reader.close_if_idle()
+                if reader.connection is not None:
+                    raise sqlite3.OperationalError("Replaced database still has active readers")
+            if old_openers and identity[1] is not None:
+                raise sqlite3.OperationalError("Replaced database still has readers opening")
+            # SQLite may leave a WAL behind when the old inode was unlinked.
+            # Attaching it to the replacement can replay the old database's pages.
+            try:
+                wal_size = os.stat(f"{path}-wal").st_size
+            except FileNotFoundError:
+                wal_size = 0
+            if wal_size:
+                raise sqlite3.OperationalError("Replaced database has a nonempty WAL at the same path")
+            _replaced_paths.discard(path)
+        _pool_identity = identity
+        return identity
+
+
+def _connect(timeout: float = 10.0):
+    while True:
+        path = os.fspath(DB_PATH)
+        identity = _db_identity(path)
+        reader = getattr(_thread_reader, "reader", None)
+        if reader is not None and reader.identity == identity:
+            checkout = reader.checkout()
+            if checkout is not None:
+                return checkout
+
+        if identity != _pool_identity:
+            identity = _prepare_db_identity(path)
+        pooled = identity[1] is not None and (reader is None or not reader.lease.locked())
+        with _reader_lock:
+            if identity != _pool_identity:
+                continue
+            generation = _pool_generation
+            _opening_readers[identity] += 1
+        try:
+            existing = identity[1] is not None
+            try:
+                conn = _open_reader(path, timeout, pooled=pooled, existing=existing)
+            except sqlite3.OperationalError:
+                if _db_identity(path) != identity:
+                    continue
+                raise
+            with _reader_lock:
+                if generation == _pool_generation and _db_identity(path) == identity:
+                    reader = _ThreadReader(identity, conn)
+                    checkout = reader.checkout()
+                    _readers.add(reader)
+                    if pooled:
+                        _thread_reader.reader = reader
+                    else:
+                        reader.retired = True
+                    return checkout
+            conn.close()
+        finally:
+            with _reader_lock:
+                _opening_readers[identity] -= 1
+                if not _opening_readers[identity]:
+                    del _opening_readers[identity]
+
 
 def init_db():
     with _writer_transaction() as conn:
@@ -270,7 +537,14 @@ def init_db():
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_downtime_went_down ON downtime_events(went_down_at)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_downtime_went_up ON downtime_events(went_up_at)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_downtime_resource_range ON downtime_events(resource_id, went_down_at, went_up_at)')
+        cursor.execute('''CREATE INDEX IF NOT EXISTS idx_downtime_resource_end
+                          ON downtime_events(resource_id, COALESCE(went_up_at, 9223372036854775807),
+                                             went_down_at, went_up_at)''')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_downtime_incident ON downtime_events(incident_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_downtime_incident_started ON downtime_events(incident_id, went_down_at)')
+        cursor.execute('''CREATE INDEX IF NOT EXISTS idx_downtime_unlinked_open
+                          ON downtime_events(resource_id, went_down_at)
+                          WHERE went_up_at IS NULL AND incident_id IS NULL''')
 
         # Incidents table for tracking grouped chat outages
         cursor.execute('''
@@ -570,8 +844,7 @@ def get_config(key: str) -> str:
 
 
 def get_configs(keys) -> dict:
-    """Reads many config keys over one connection. Missing keys are absent from the result.
-    Use this instead of get_config() in loops: every get_config() opens a new connection."""
+    """Read many config keys in batches. Missing keys are absent from the result."""
     keys = list(dict.fromkeys(keys))
     found = {}
     if not keys:
@@ -813,12 +1086,13 @@ def delete_resource(dc_chat_id: int, resource_id: int) -> bool:
             cursor.execute("DELETE FROM partial_outages WHERE resource_id = ?", (resource_id,))
         return deleted
 
-def get_resources(dc_chat_id: int) -> list[dict]:
+def get_resources(dc_chat_id: int, *, for_incident: bool = False) -> list[dict]:
     conn = _connect()
-    conn.row_factory = sqlite3.Row
     try:
+        conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
-        cursor.execute("SELECT * FROM resources WHERE dc_chat_id = ? ORDER BY id ASC", (dc_chat_id,))
+        columns = "id, name, url, type, last_changed, last_votes, alert_state" if for_incident else "*"
+        cursor.execute(f"SELECT {columns} FROM resources WHERE dc_chat_id = ? ORDER BY id ASC", (dc_chat_id,))
         rows = cursor.fetchall()
         return [dict(r) for r in rows]
     finally:
@@ -826,8 +1100,8 @@ def get_resources(dc_chat_id: int) -> list[dict]:
 
 def get_resource_by_id(resource_id: int) -> dict | None:
     conn = _connect()
-    conn.row_factory = sqlite3.Row
     try:
+        conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM resources WHERE id = ?", (resource_id,))
         row = cursor.fetchone()
@@ -838,8 +1112,8 @@ def get_resource_by_id(resource_id: int) -> dict | None:
 def get_all_resources() -> list[dict]:
     """Monitors of all chats the bot can still write to (abandoned chats are paused)."""
     conn = _connect()
-    conn.row_factory = sqlite3.Row
     try:
+        conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         cursor.execute('''
             SELECT r.* FROM resources r LEFT JOIN chats c ON c.dc_chat_id = r.dc_chat_id
@@ -914,9 +1188,10 @@ def _apply_status_updates(cursor, updates: list[dict], now: int):
                                COALESCE(i.resolved_at, MAX(COALESCE(de.went_up_at, de.went_down_at, i.started_at))) as last_event_at
                         FROM incidents i
                         LEFT JOIN downtime_events de ON de.incident_id = i.id
-                        WHERE i.dc_chat_id = ?
+                        WHERE i.dc_chat_id = ?1
+                          AND (i.resolved_at IS NULL OR (?2 - i.resolved_at <= 3600 AND ?3 >= i.resolved_at))
                         GROUP BY i.id
-                        HAVING (? - last_event_at) <= 3600 AND (? >= last_event_at)
+                        HAVING (?2 - last_event_at) <= 3600 AND (?3 >= last_event_at)
                         ORDER BY (CASE WHEN i.status = 'ongoing' THEN 0 ELSE 1 END), i.id DESC LIMIT 1
                     ''', (chat_id, now, now))
                     inc_row = cursor.fetchone()
@@ -1016,8 +1291,8 @@ def create_incident(dc_chat_id: int, started_at: int = None) -> int:
 
 def get_active_incident(dc_chat_id: int) -> dict | None:
     conn = _connect()
-    conn.row_factory = sqlite3.Row
     try:
+        conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         cursor.execute('''
             SELECT * FROM incidents 
@@ -1032,8 +1307,8 @@ def get_active_incident(dc_chat_id: int) -> dict | None:
 def get_active_incidents_for_chat(dc_chat_id: int) -> list[dict]:
     """Returns all currently ongoing incidents for a specific chat."""
     conn = _connect()
-    conn.row_factory = sqlite3.Row
     try:
+        conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         cursor.execute('''
             SELECT * FROM incidents 
@@ -1045,11 +1320,38 @@ def get_active_incidents_for_chat(dc_chat_id: int) -> list[dict]:
     finally:
         conn.close()
 
+
+def get_incident_sync_candidates(dc_chat_id: int) -> tuple[list[dict], bool]:
+    """Read ongoing incidents and check for legacy unlinked events in one query."""
+    with contextlib.closing(_connect()) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute('''
+            SELECT i.*, pending.has_unlinked
+            FROM (SELECT CASE WHEN EXISTS(
+                SELECT 1 FROM downtime_events INDEXED BY idx_downtime_unlinked_open
+                WHERE went_up_at IS NULL AND incident_id IS NULL
+            ) THEN EXISTS(
+                SELECT 1 FROM resources r
+                CROSS JOIN downtime_events de INDEXED BY idx_downtime_unlinked_open ON de.resource_id = r.id
+                WHERE r.dc_chat_id = ?1 AND de.went_up_at IS NULL AND de.incident_id IS NULL
+            ) ELSE 0 END AS has_unlinked) pending
+            LEFT JOIN incidents i ON i.dc_chat_id = ?1 AND i.status = 'ongoing'
+            ORDER BY i.id
+        ''', (dc_chat_id,)).fetchall()
+        active = []
+        for row in rows:
+            if row["id"] is not None:
+                incident = dict(row)
+                del incident["has_unlinked"]
+                active.append(incident)
+        return active, bool(rows[0]["has_unlinked"])
+
+
 def get_active_incident_for_outage(dc_chat_id: int, outage_time: int, max_gap_seconds: int = 3600, allow_reopen: bool = True) -> dict | None:
     """Finds an ongoing or recently resolved incident in dc_chat_id within max_gap_seconds of outage_time."""
     conn = _connect()
-    conn.row_factory = sqlite3.Row
     try:
+        conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         if allow_reopen:
             cursor.execute('''
@@ -1058,9 +1360,10 @@ def get_active_incident_for_outage(dc_chat_id: int, outage_time: int, max_gap_se
                        COALESCE(i.resolved_at, MAX(COALESCE(de.went_up_at, de.went_down_at, i.started_at))) as last_event_at
                 FROM incidents i
                 LEFT JOIN downtime_events de ON de.incident_id = i.id
-                WHERE i.dc_chat_id = ?
+                WHERE i.dc_chat_id = ?1
+                  AND (i.resolved_at IS NULL OR (?2 - i.resolved_at <= ?3 AND ?4 >= i.resolved_at))
                 GROUP BY i.id
-                HAVING (? - last_event_at) <= ? AND (? >= last_event_at)
+                HAVING (?2 - last_event_at) <= ?3 AND (?4 >= last_event_at)
                 ORDER BY (CASE WHEN i.status = 'ongoing' THEN 0 ELSE 1 END), i.id DESC LIMIT 1
             ''', (dc_chat_id, outage_time, max_gap_seconds, outage_time))
         else:
@@ -1091,8 +1394,8 @@ def reopen_incident(incident_id: int):
 def get_all_active_incidents() -> list[dict]:
     """Ongoing incidents, except in abandoned chats (nobody can be told about them there)."""
     conn = _connect()
-    conn.row_factory = sqlite3.Row
     try:
+        conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         cursor.execute('''
             SELECT i.* FROM incidents i LEFT JOIN chats c ON c.dc_chat_id = i.dc_chat_id
@@ -1106,8 +1409,8 @@ def get_all_active_incidents() -> list[dict]:
 def get_incident_by_msg_id(dc_chat_id: int, msg_id: int) -> dict | None:
     """Finds incident record matching chat and message ID."""
     conn = _connect()
-    conn.row_factory = sqlite3.Row
     try:
+        conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         cursor.execute('''
             SELECT * FROM incidents 
@@ -1192,8 +1495,8 @@ def resolve_incident(incident_id: int, resolved_at: int = None, summary: str = "
 
 def get_recent_incidents(dc_chat_id: int, limit: int = 10) -> list[dict]:
     conn = _connect()
-    conn.row_factory = sqlite3.Row
     try:
+        conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         cursor.execute('''
             SELECT * FROM incidents 
@@ -1207,8 +1510,8 @@ def get_recent_incidents(dc_chat_id: int, limit: int = 10) -> list[dict]:
 
 def get_incident_by_id(dc_chat_id: int, incident_id: int) -> dict | None:
     conn = _connect()
-    conn.row_factory = sqlite3.Row
     try:
+        conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         cursor.execute('''
             SELECT * FROM incidents 
@@ -1222,15 +1525,15 @@ def get_incident_by_id(dc_chat_id: int, incident_id: int) -> dict | None:
 def get_unlinked_open_downtime_events(dc_chat_id: int) -> list[dict]:
     """Returns open downtime events in this chat that are not yet linked to any incident."""
     conn = _connect()
-    conn.row_factory = sqlite3.Row
     try:
+        conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         cursor.execute('''
             SELECT de.*, r.name, r.url, r.type, r.status as resource_status
-            FROM downtime_events de
-            JOIN resources r ON r.id = de.resource_id
+            FROM resources r
+            CROSS JOIN downtime_events de INDEXED BY idx_downtime_unlinked_open ON de.resource_id = r.id
             WHERE r.dc_chat_id = ? AND de.went_up_at IS NULL AND de.incident_id IS NULL
-            ORDER BY de.went_down_at ASC
+            ORDER BY de.went_down_at, de.id
         ''', (dc_chat_id,))
         rows = cursor.fetchall()
         return [dict(r) for r in rows]
@@ -1244,21 +1547,35 @@ def link_downtime_event_to_incident(downtime_event_id: int, incident_id: int):
 
 def get_incident_downtime_events(incident_id: int) -> list[dict]:
     """Returns all downtime events associated with an incident."""
-    conn = _connect()
-    conn.row_factory = sqlite3.Row
-    try:
-        cursor = conn.cursor()
-        cursor.execute('''
-            SELECT de.*, r.name, r.url, r.type, r.status as resource_status, r.last_changed, r.consecutive_failures, r.interval
-            FROM downtime_events de
-            LEFT JOIN resources r ON r.id = de.resource_id
-            WHERE de.incident_id = ?
-            ORDER BY de.went_down_at ASC
-        ''', (incident_id,))
-        rows = cursor.fetchall()
-        return [dict(r) for r in rows]
-    finally:
-        conn.close()
+    with contextlib.closing(_connect()) as conn:
+        conn.row_factory = sqlite3.Row
+        return _read_incident_downtime_events(conn, (incident_id,))
+
+
+def _read_incident_downtime_events(conn, incident_ids):
+    marks = ",".join("?" for _ in incident_ids)
+    rows = conn.execute(f'''
+        SELECT de.*, r.name, r.url, r.type, r.status as resource_status, r.last_changed, r.consecutive_failures, r.interval
+        FROM downtime_events de
+        LEFT JOIN resources r ON r.id = de.resource_id
+        WHERE de.incident_id IN ({marks})
+        ORDER BY de.incident_id, de.went_down_at, de.id
+    ''', incident_ids).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_incident_downtime_events_batch(incident_ids) -> dict[int, list[dict]]:
+    """Read linked events in chronological order within each requested incident."""
+    events = {incident_id: [] for incident_id in incident_ids}
+    if not events:
+        return events
+    ids = list(events)
+    with contextlib.closing(_connect()) as conn:
+        conn.row_factory = sqlite3.Row
+        for offset in range(0, len(ids), 500):
+            for event in _read_incident_downtime_events(conn, ids[offset:offset + 500]):
+                events[event["incident_id"]].append(event)
+    return events
 
 def close_resource_downtime_events(resource_id: int, now: int = None):
     if now is None:
@@ -1269,8 +1586,8 @@ def close_resource_downtime_events(resource_id: int, now: int = None):
 
 def get_resource_downtime_events(resource_id: int, limit: int = 10) -> list[dict]:
     conn = _connect()
-    conn.row_factory = sqlite3.Row
     try:
+        conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         cursor.execute('''
             SELECT * FROM downtime_events 
@@ -1325,7 +1642,7 @@ def invalidate_uptime_cache(resource_id: int = None):
             _uptime_cache.pop(resource_id, None)
 
 
-def get_resources_uptime_30d(resource_ids: list[int]) -> dict[int, float]:
+def get_resources_uptime_30d(resource_ids: list[int], *, created_at: dict[int, int] | None = None) -> dict[int, float]:
     """Batch calculates the 30-day uptime percentages for multiple resources in a single query with TTL caching."""
     if not resource_ids:
         return {}
@@ -1352,12 +1669,17 @@ def get_resources_uptime_30d(resource_ids: list[int]) -> dict[int, float]:
     try:
         cursor = conn.cursor()
         placeholders = ",".join("?" for _ in missing_ids)
-        cursor.execute(f"SELECT id, created_at FROM resources WHERE id IN ({placeholders})", missing_ids)
-        created_map = {row[0]: row[1] for row in cursor.fetchall()}
+        if created_at is None:
+            cursor.execute(f"SELECT id, created_at FROM resources WHERE id IN ({placeholders})", missing_ids)
+            created_at = dict(cursor.fetchall())
 
+        # Treat open outages as ending at the largest timestamp to seek straight
+        # to the overlapping outages, even when the history is older than 30 days.
         cursor.execute(f'''
-            SELECT resource_id, went_down_at, went_up_at FROM downtime_events 
-            WHERE resource_id IN ({placeholders}) AND went_down_at < ? AND (went_up_at IS NULL OR went_up_at > ?)
+            SELECT resource_id, went_down_at, went_up_at
+            FROM downtime_events INDEXED BY idx_downtime_resource_end
+            WHERE resource_id IN ({placeholders}) AND went_down_at < ?
+              AND COALESCE(went_up_at, 9223372036854775807) > ?
         ''', (*missing_ids, now, start_time))
         events = cursor.fetchall()
     finally:
@@ -1369,11 +1691,11 @@ def get_resources_uptime_30d(resource_ids: list[int]) -> dict[int, float]:
 
     new_cache = {}
     for rid in missing_ids:
-        created_at = created_map.get(rid)
-        if created_at is None:
+        created = created_at.get(rid)
+        if created is None:
             pct = 100.0
         else:
-            tracking_start = max(created_at, start_time)
+            tracking_start = max(created, start_time)
             total_time = now - tracking_start
             if total_time <= 0:
                 pct = 100.0
@@ -1516,8 +1838,8 @@ def flush_transport_stats():
 def get_all_transport_stats() -> list[dict]:
     flush_transport_stats()
     conn = _connect()
-    conn.row_factory = sqlite3.Row
     try:
+        conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM transport_stats ORDER BY msgs_sent + msgs_received DESC")
         rows = cursor.fetchall()
@@ -1800,8 +2122,8 @@ def find_peer(identifier: str) -> dict | None:
     if len(fp) < 8 or not re.fullmatch(r'[0-9A-F]+', fp):
         return None
     conn = _connect()
-    conn.row_factory = sqlite3.Row
     try:
+        conn.row_factory = sqlite3.Row
         rows = conn.execute("SELECT * FROM peers WHERE fingerprint LIKE ?", (fp + "%",)).fetchall()
         # An ambiguous prefix matches nothing rather than an arbitrary peer
         return dict(rows[0]) if len(rows) == 1 else None
@@ -1825,8 +2147,8 @@ def remove_peer(identifier: str) -> bool:
 def get_peer(email: str) -> dict | None:
     email = email.lower().strip()
     conn = _connect()
-    conn.row_factory = sqlite3.Row
     try:
+        conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM peers WHERE email = ?", (email,))
         row = cursor.fetchone()
@@ -1839,8 +2161,8 @@ def get_peer_by_fingerprint(fingerprint: str) -> dict | None:
     if not fingerprint:
         return None
     conn = _connect()
-    conn.row_factory = sqlite3.Row
     try:
+        conn.row_factory = sqlite3.Row
         row = conn.execute("SELECT * FROM peers WHERE fingerprint = ?", (fingerprint,)).fetchone()
         return dict(row) if row else None
     finally:
@@ -1891,8 +2213,8 @@ def bind_peer_identity(email: str, fingerprint: str = None, new_email: str = Non
 
 def get_peer_by_chat_id(chat_id: int) -> dict | None:
     conn = _connect()
-    conn.row_factory = sqlite3.Row
     try:
+        conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM peers WHERE chat_id = ?", (chat_id,))
         row = cursor.fetchone()
@@ -1902,8 +2224,8 @@ def get_peer_by_chat_id(chat_id: int) -> dict | None:
 
 def get_all_peers() -> list[dict]:
     conn = _connect()
-    conn.row_factory = sqlite3.Row
     try:
+        conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM peers ORDER BY node_name ASC")
         rows = cursor.fetchall()
@@ -2359,8 +2681,8 @@ def set_ping_baseline(ip: str, rtt_ms: float):
 
 def get_peer_measurements_for_url(url: str) -> list[dict]:
     conn = _connect()
-    conn.row_factory = sqlite3.Row
     try:
+        conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM peer_measurements WHERE url = ? ORDER BY node_name ASC", (url,))
         rows = cursor.fetchall()
@@ -2370,8 +2692,8 @@ def get_peer_measurements_for_url(url: str) -> list[dict]:
 
 def get_all_peer_measurements() -> list[dict]:
     conn = _connect()
-    conn.row_factory = sqlite3.Row
     try:
+        conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM peer_measurements ORDER BY url, node_name ASC")
         rows = cursor.fetchall()
@@ -2442,8 +2764,8 @@ def save_probe_targets_batch(targets: list[dict], source_peer: str = None, max_p
 
 def get_active_probe_targets(max_age_seconds: int = 86400) -> list[dict]:
     conn = _connect()
-    conn.row_factory = sqlite3.Row
     try:
+        conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         min_seen = int(time.time()) - max_age_seconds
         cursor.execute("SELECT * FROM probe_targets WHERE last_seen >= ? ORDER BY url ASC", (min_seen,))
@@ -2545,8 +2867,8 @@ def is_probe_target_ignored(url: str) -> bool:
 
 def get_all_ignored_probe_targets() -> list[dict]:
     conn = _connect()
-    conn.row_factory = sqlite3.Row
     try:
+        conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM ignored_probe_targets ORDER BY url ASC")
         rows = cursor.fetchall()
@@ -2574,8 +2896,8 @@ def get_all_node_ignored_targets() -> list[dict]:
     if _node_ignored_cache is not None:
         return _node_ignored_cache
     conn = _connect()
-    conn.row_factory = sqlite3.Row
     try:
+        conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         cursor.execute("SELECT node_pattern, target_pattern, created_at FROM node_ignored_targets ORDER BY node_pattern ASC, target_pattern ASC")
         rows = [dict(r) for r in cursor.fetchall()]
@@ -2715,8 +3037,8 @@ def release_rejected_incident_message(incident_id: int):
 
 def get_pending_partial_notices() -> list[dict]:
     conn = _connect()
-    conn.row_factory = sqlite3.Row
     try:
+        conn.row_factory = sqlite3.Row
         return [dict(row) for row in conn.execute("""
             SELECT r.*, po.id AS partial_id, po.started_at AS partial_started_at,
                    po.ended_at AS partial_ended_at, po.notice_state
@@ -2800,8 +3122,8 @@ def end_partial_outage(resource_id: int, ended_at: int, notify_end: bool = True)
 
 def get_partial_outages(resource_id: int, limit: int = 20) -> list[dict]:
     conn = _connect()
-    conn.row_factory = sqlite3.Row
     try:
+        conn.row_factory = sqlite3.Row
         rows = conn.execute(
             "SELECT * FROM partial_outages WHERE resource_id = ? ORDER BY started_at DESC LIMIT ?",
             (resource_id, limit)
@@ -2813,14 +3135,23 @@ def get_partial_outages(resource_id: int, limit: int = 20) -> list[dict]:
 def get_chat_partial_outages(dc_chat_id: int, limit: int = 10) -> list[dict]:
     """Recent partial outages of a chat's monitors, newest first, with the monitor's name and URL."""
     conn = _connect()
-    conn.row_factory = sqlite3.Row
     try:
+        conn.row_factory = sqlite3.Row
+        # Sort the index entries before fetching the rows that make the limit.
+        # The old plan scanned the chat/status index forward and outage index backward.
         rows = conn.execute('''
-            SELECT po.*, r.name, r.url FROM partial_outages po
-            INDEXED BY idx_partial_outages_resource_started
-            JOIN resources r ON r.id = po.resource_id
-            WHERE r.dc_chat_id = ?
-            ORDER BY po.started_at DESC LIMIT ?
+            SELECT po.*, r.name, r.url
+            FROM (
+                SELECT po.id, po.started_at, po.resource_id, r.status
+                FROM resources r INDEXED BY idx_resources_chat_status
+                CROSS JOIN partial_outages po INDEXED BY idx_partial_outages_resource_started
+                    ON po.resource_id = r.id
+                WHERE r.dc_chat_id = ?
+                ORDER BY po.started_at DESC LIMIT ?
+            ) latest
+            CROSS JOIN partial_outages po ON po.id = latest.id
+            CROSS JOIN resources r ON r.id = latest.resource_id
+            ORDER BY latest.started_at DESC, latest.status, latest.resource_id, latest.id DESC
         ''', (dc_chat_id, limit)).fetchall()
         return [dict(r) for r in rows]
     finally:
@@ -2831,8 +3162,8 @@ def get_resources_by_urls(urls) -> list[dict]:
     if not urls:
         return []
     conn = _connect()
-    conn.row_factory = sqlite3.Row
     try:
+        conn.row_factory = sqlite3.Row
         rows = []
         for i in range(0, len(urls), 500):  # stay below SQLite's variable limit
             chunk = urls[i:i + 500]
@@ -2920,8 +3251,8 @@ def set_chat_report_app(dc_chat_id: int, mode: str):
 
 def get_chat_webxdc(dc_chat_id: int) -> dict:
     conn = _connect()
-    conn.row_factory = sqlite3.Row
     try:
+        conn.row_factory = sqlite3.Row
         row = conn.execute("SELECT webxdc_msg_id, webxdc_state_hash, webxdc_last_sent_at, status_line_msg_id, status_line_hash FROM chats WHERE dc_chat_id = ?",
                            (dc_chat_id,)).fetchone()
         return dict(row) if row else {"webxdc_msg_id": None, "webxdc_state_hash": None, "webxdc_last_sent_at": None, "status_line_msg_id": None, "status_line_hash": None}
@@ -2980,19 +3311,21 @@ def add_chat_event(dc_chat_id: int, kind: str, text: str, ts=None, once=None):
                             (dc_chat_id, now, kind, ' '.join(text.split())[:140])).lastrowid
 
 
-def get_recent_chat_events(dc_chat_id: int, limit: int = 20, after_id=None):
+def get_recent_chat_events(dc_chat_id: int, limit: int = 20, after_id=None, *, resources=None):
     conn = _connect()
-    conn.row_factory = sqlite3.Row
     try:
+        conn.row_factory = sqlite3.Row
         if after_id is not None:
             # Info needs every unacknowledged outage, even when monitor edits fill the journal view.
             rows = conn.execute("SELECT * FROM chat_events WHERE dc_chat_id = ? AND id > ? AND kind IN ('incident_start','incident_end','partial_start','partial_end') ORDER BY id", (dc_chat_id, after_id)).fetchall()
         else:
             rows = conn.execute("SELECT * FROM chat_events WHERE dc_chat_id = ? ORDER BY id DESC LIMIT ?", (dc_chat_id, limit)).fetchall()
-        resources = get_resources(dc_chat_id)
-        return [{**dict(r), "text": short_journal_text(r["text"], resources)} for r in rows]
     finally:
         conn.close()
+    if resources is None:
+        resources = get_resources(dc_chat_id)
+    labels = journal_monitor_labels(resources) if rows else []
+    return [{**dict(r), "text": short_journal_text(r["text"], labels=labels)} for r in rows]
 
 
 def get_retained_message_ids():
@@ -3005,8 +3338,8 @@ def get_retained_message_ids():
 
 def get_partial_journal_rows(chat_id=None, *, pending_only=False):
     conn = _connect()
-    conn.row_factory = sqlite3.Row
     try:
+        conn.row_factory = sqlite3.Row
         columns = """
             SELECT r.*, po.id AS partial_id, po.started_at AS partial_started_at,
                    po.ended_at AS partial_ended_at, po.nodes_down, po.notice_state

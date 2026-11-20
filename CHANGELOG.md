@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Limit recovery checks for down realtime peer links to every five seconds while no fresh activity arrives. Seven offline peers used 84 connections and dispatches per minute, down from 840 connections and 420 dispatches, with CPU time down from 328 ms to 45 ms per simulated minute.
+- Cache the local node name between checks and invalidate it on rename. In 1,000 lookups, connections dropped from 1,000 to 1 and CPU time from 342 ms to 0.94 ms.
 - Stop opening a database connection per outage row in the 30 s journal pass. It read a setting for every partial outage and incident of the last 30 days through its own connection, which made it the biggest CPU consumer of the bot. Settings are now read in one query per pass.
 - Require fresh peer announcements and matching check responses before clearing realtime capability or carrier state.
 - Advertise realtime only to enabled peers and wait for capability exchange before sending carrier offers.

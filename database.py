@@ -34,6 +34,15 @@ _lock = _write_lock  # Backwards compatibility
 
 _writer_conn = None
 _writer_conn_db_path = None
+_local_node_name_cache: tuple[str, str | None] | None = None
+_local_node_name_generation = 0
+_peer_last_seen_updates: dict[tuple[str, str], int] = {}
+
+def _invalidate_local_node_name_cache():
+    """Invalidate the cached name and any reads in progress under _write_lock."""
+    global _local_node_name_cache, _local_node_name_generation
+    _local_node_name_cache = None
+    _local_node_name_generation += 1
 
 def close_db():
     """Explicitly closes the persistent writer connection (useful for tests and shutdown)."""
@@ -46,6 +55,8 @@ def close_db():
                 pass
             _writer_conn = None
             _writer_conn_db_path = None
+        _invalidate_local_node_name_cache()
+        _peer_last_seen_updates.clear()
     _node_ignored_cache = None
 
 def _get_writer_conn() -> sqlite3.Connection:
@@ -90,6 +101,8 @@ def _connect(timeout: float = 10.0) -> sqlite3.Connection:
 
 def init_db():
     with _writer_transaction() as conn:
+        _invalidate_local_node_name_cache()
+        _peer_last_seen_updates.clear()
         # Enable WAL mode and concurrency PRAGMAs
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")
@@ -536,6 +549,8 @@ def set_config(key: str, value: str):
     with _writer_transaction() as conn:
         cursor = conn.cursor()
         cursor.execute("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)", (key, value))
+        if key == "node_name":
+            _invalidate_local_node_name_cache()
 
 def get_config(key: str) -> str:
     conn = _connect()
@@ -1653,10 +1668,21 @@ def cleanup_old_records(retention_days: int = 90) -> dict[str, int]:
 
 # Peer management functions
 def get_local_node_name() -> str:
-    name = get_config("node_name")
-    if name:
-        return name
-    return os.getenv("NODE_NAME", "Node-1")
+    global _local_node_name_cache
+    while True:
+        cached = _local_node_name_cache
+        if cached is not None and cached[0] == DB_PATH:
+            name = cached[1]
+            break
+        with _write_lock:
+            db_path = DB_PATH
+            generation = _local_node_name_generation
+        name = get_config("node_name")
+        with _write_lock:
+            if generation == _local_node_name_generation and db_path == DB_PATH:
+                _local_node_name_cache = (db_path, name)
+                break
+    return name or os.getenv("NODE_NAME", "Node-1")
 
 def set_local_node_name(name: str):
     validate_monitor_fields(name=name)
@@ -1740,6 +1766,7 @@ def remove_peer(identifier: str) -> bool:
         removed = cursor.rowcount > 0
         # Stop scanning targets that were mirrored from this peer
         cursor.execute("DELETE FROM probe_targets WHERE source_peer = ?", (email,))
+        _peer_last_seen_updates.pop((DB_PATH, peer["fingerprint"]), None)
         return removed
 
 def get_peer(email: str) -> dict | None:
@@ -1831,6 +1858,10 @@ def get_all_peers() -> list[dict]:
     finally:
         conn.close()
 
+def peer_last_seen_update(fingerprint: str) -> int | None:
+    """In-memory activity hint for realtime rejoin checks."""
+    return _peer_last_seen_updates.get((DB_PATH, fingerprint))
+
 def update_peer_last_seen(email: str | None, timestamp: int = None, *, min_interval: int = 0,
                           fingerprint: str | None = None, chat_id: int | None = None) -> tuple[bool, int, dict | None]:
     """
@@ -1839,31 +1870,37 @@ def update_peer_last_seen(email: str | None, timestamp: int = None, *, min_inter
     (was_recovered, downtime_seconds, peer_dict).
     """
     now = timestamp if timestamp is not None else int(time.time())
-    with _writer_transaction() as conn:
-        cursor = conn.cursor()
-        where = "fingerprint = ? AND chat_id = ?" if fingerprint else "email = ?"
-        key = (fingerprint, chat_id) if fingerprint else (email.lower().strip(),)
-        cursor.execute(f"SELECT email, node_name, chat_id, last_seen, is_offline, went_offline_at FROM peers WHERE {where}", key)
-        row = cursor.fetchone()
-        if not row:
-            return False, 0, None
-        if min_interval and not row[4] and now - (row[3] or 0) < min_interval:
-            return False, 0, None
-            
-        peer = {
-            "email": row[0],
-            "node_name": row[1],
-            "chat_id": row[2],
-            "last_seen": row[3],
-            "is_offline": row[4],
-            "went_offline_at": row[5],
-        }
-        was_offline = (peer.get("is_offline") == 1)
-        went_offline_at = peer.get("went_offline_at") or 0
-        downtime = max(1, now - went_offline_at) if was_offline and went_offline_at > 0 else 0
+    with _write_lock:
+        with _writer_transaction() as conn:
+            cursor = conn.cursor()
+            where = "fingerprint = ? AND chat_id = ?" if fingerprint else "email = ?"
+            key = (fingerprint, chat_id) if fingerprint else (email.lower().strip(),)
+            cursor.execute(f"SELECT email, node_name, chat_id, last_seen, is_offline, went_offline_at, fingerprint "
+                           f"FROM peers WHERE {where}", key)
+            row = cursor.fetchone()
+            if not row:
+                return False, 0, None
+            if min_interval and not row[4] and now - (row[3] or 0) < min_interval:
+                return False, 0, None
 
-        cursor.execute("UPDATE peers SET last_seen = ?, is_offline = 0, went_offline_at = 0 WHERE email = ?", (now, row[0]))
-        return was_offline, downtime, peer
+            peer = {
+                "email": row[0],
+                "node_name": row[1],
+                "chat_id": row[2],
+                "last_seen": row[3],
+                "is_offline": row[4],
+                "went_offline_at": row[5],
+            }
+            was_offline = (peer.get("is_offline") == 1)
+            went_offline_at = peer.get("went_offline_at") or 0
+            downtime = max(1, now - went_offline_at) if was_offline and went_offline_at > 0 else 0
+
+            cursor.execute("UPDATE peers SET last_seen = ?, is_offline = 0, went_offline_at = 0 WHERE email = ?",
+                           (now, row[0]))
+        if row[6]:
+            hint_key = (DB_PATH, row[6])
+            _peer_last_seen_updates[hint_key] = max(now, _peer_last_seen_updates.get(hint_key, now))
+    return was_offline, downtime, peer
 
 def audit_peers_offline(threshold_seconds: int = 360, now: int = None, thresholds: dict = None) -> list[dict]:
     """

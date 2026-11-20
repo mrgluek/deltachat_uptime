@@ -310,6 +310,67 @@ class TestPeerRTChannel(unittest.IsolatedAsyncioTestCase):
             await self.tick()
             self.assertIsNone(database.get_peer(EMAIL)["rt_rejoin_at"])
 
+    async def test_fresh_activity_triggers_recovery_on_the_next_tick(self):
+        self.carrier()
+        await self.tick()
+        self.advertise.reset_mock()
+        link = bot._peer_rt_links[MSG]
+        self.advance(bot.PEER_RT_REJOIN_DELAYS[0])
+
+        with patch.object(bot, "PEER_RT_REJOIN_CHECK_INTERVAL", 3600), \
+             patch.object(bot, "_advertise_peer_rt", wraps=bot._advertise_peer_rt) as recover:
+            await self.tick()  # Establish the initial check for this down period.
+            recover.assert_awaited_once_with(self.client, 1, MSG, link, recover=True)
+            self.advertise.assert_not_called()
+            recover.reset_mock()
+
+            self.advance(1)
+            await self.tick()
+            recover.assert_not_awaited()
+
+            self.advance(1)
+            database.update_peer_last_seen(EMAIL)
+            await self.tick()
+            recover.assert_awaited_once_with(self.client, 1, MSG, link, recover=True)
+            self.advertise.assert_called_once_with(1, MSG)
+
+    async def test_recovery_reserves_and_advertises_only_for_eligible_peers(self):
+        self.carrier()
+        await self.tick()
+        self.advertise.reset_mock()
+        self.advance(bot.PEER_RT_REJOIN_DELAYS[0] + 1)
+        database.update_peer_last_seen(EMAIL)
+        link = bot._peer_rt_links[MSG]
+        fields = ("rt_advert_at", "rt_rejoin_at", "rt_rejoin_step")
+        before = tuple(link.peer[field] for field in fields)
+
+        for flag, capable in (("off", True), ("canary", True), ("on", False), ("on", True)):
+            with self.subTest(flag=flag, capable=capable):
+                # Keep the carrier intact so recovery reaches the eligibility check.
+                database.set_config("peer_rt", flag)
+                with database._writer_transaction() as conn:
+                    conn.execute("UPDATE peers SET rt_capable = ? WHERE fingerprint = ?", (capable, FP))
+                with patch.object(database, "get_peer_rt_flag", wraps=database.get_peer_rt_flag) as read_flag, \
+                     patch.object(database, "reserve_peer_rt_advert", wraps=database.reserve_peer_rt_advert) as reserve:
+                    await bot._advertise_peer_rt(self.client, 1, MSG, link, recover=True)
+                read_flag.assert_called_once_with()
+
+                peer = database.get_peer_by_fingerprint(FP)
+                self.assertEqual(peer["rt_mode"], "auto")
+                expected = before
+                if flag == "on" and capable:
+                    expected = (self.now, self.now + bot.PEER_RT_REJOIN_DELAYS[1], 1)
+                    reserve.assert_called_once_with(FP, MSG, CID, self.now, bot.PEER_RT_ADVERT_COOLDOWN,
+                                                    expected[1], expected[2])
+                    self.leave.assert_called_once_with(1, MSG)
+                    self.advertise.assert_called_once_with(1, MSG)
+                else:
+                    reserve.assert_not_called()
+                    self.leave.assert_not_called()
+                    self.advertise.assert_not_called()
+                self.assertEqual(tuple(peer[field] for field in fields), expected)
+                self.assertEqual(tuple(link.peer[field] for field in fields), expected)
+
     async def test_leaves_removed_disabled_and_downgraded_carriers(self):
         for index, action in enumerate(("global", "mode", "downgrade", "remove"), 1):
             with self.subTest(action=action):

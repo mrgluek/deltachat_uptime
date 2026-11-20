@@ -377,6 +377,7 @@ PEER_RT_HELLOS_PER_TICK = 4
 PEER_RT_CHALLENGES_PER_TICK = 2
 PEER_RT_DISCOVERY_PROBES = 4
 PEER_RT_REJOIN_DELAYS = (300, 900, 3600)
+PEER_RT_REJOIN_CHECK_INTERVAL = 5
 _peer_rt_lock = threading.RLock()
 _peer_rt_audit_requested = threading.Event()
 _peer_rt_retry_now = set()
@@ -7940,6 +7941,8 @@ class _PeerRealtimeLink:
     fallbacks: dict[int, tuple[bool, Callable]] = field(default_factory=dict)
     activity_at: float = -math.inf
     incoming_metrics_interval: int | None = None
+    rejoin_checked_at: float = -math.inf
+    rejoin_checked_for: tuple[float, int | None] | None = None
 
     @property
     def down_since(self):
@@ -8339,8 +8342,7 @@ def _reserve_peer_rt_advert(msg_id, link, recover):
             return False
         fp, cid = link.peer["fingerprint"], link.peer["rt_cid"]
         peer = database.get_peer_by_fingerprint(fp)
-        if (not _peer_rt_eligible(peer, database.get_peer_rt_flag()) or peer["rt_msg_id"] != msg_id
-                or peer["rt_cid"] != cid or peer["rt_lost"]):
+        if not peer or peer["rt_msg_id"] != msg_id or peer["rt_cid"] != cid or peer["rt_lost"]:
             return False
         now = time.time()
         rejoin_at, step = peer["rt_rejoin_at"], peer["rt_rejoin_step"]
@@ -8356,6 +8358,8 @@ def _reserve_peer_rt_advert(msg_id, link, recover):
                 return False
             step = min(len(PEER_RT_REJOIN_DELAYS) - 1, (step or 0) + 1)
             rejoin_at = now + PEER_RT_REJOIN_DELAYS[step]
+        if not _peer_rt_eligible(peer, database.get_peer_rt_flag()):
+            return False
         if not database.reserve_peer_rt_advert(fp, msg_id, cid, now, PEER_RT_ADVERT_COOLDOWN, rejoin_at, step):
             return False
         link.peer.update(rt_advert_at=now, rt_rejoin_at=rejoin_at, rt_rejoin_step=step)
@@ -8477,7 +8481,13 @@ async def _tick_peer_rt_link(bot, accid, msg_id, link):
     down_since = link.down_since
     if (not link.state.is_up and down_since is not None and now - down_since >= PEER_RT_REJOIN_DELAYS[0]
             and (link.peer["rt_rejoin_at"] is None or time.time() >= link.peer["rt_rejoin_at"])):
-        await _advertise_peer_rt(bot, accid, msg_id, link, recover=True)
+        now = time.monotonic()
+        rejoin_check = (down_since, database.peer_last_seen_update(link.peer["fingerprint"]))
+        if (rejoin_check != link.rejoin_checked_for
+                or now - link.rejoin_checked_at >= PEER_RT_REJOIN_CHECK_INTERVAL):
+            link.rejoin_checked_for = rejoin_check
+            link.rejoin_checked_at = now
+            await _advertise_peer_rt(bot, accid, msg_id, link, recover=True)
 
 
 async def _tick_peer_rt(bot, accid):

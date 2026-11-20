@@ -330,6 +330,15 @@ Reload Caddy to apply changes:
 sudo systemctl reload caddy
 ```
 
+## Development
+
+`python3 -m unittest discover -s tests` runs the test suite. `tools/loadbench` builds a synthetic database of production size (10,000 monitors, 300 chats, 20 peers, 90 days of history) and measures what the periodic and per-check work costs per simulated minute (CPU time, database connections, write transactions, rows read). Use it before and after a change that touches a timer path:
+
+```bash
+python -m tools.loadbench.gen_db --db /tmp/lb.db
+python -m tools.loadbench.run --db /tmp/lb.db --functions --markdown /tmp/lb.md
+```
+
 ## License
 
 MIT, see [LICENSE](LICENSE).

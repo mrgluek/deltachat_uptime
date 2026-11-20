@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.0.1] - 2026-11-20
+
 ### Fixed
 - Close nested SQLite readers safely during database replacement and shutdown.
 - Store in-flight check results under the current local node name after a rename.
@@ -24,15 +26,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Limit recovery checks for down realtime peer links to every five seconds while no fresh activity arrives. Seven offline peers used 84 connections and dispatches per minute, down from 840 connections and 420 dispatches, with CPU time down from 328 ms to 45 ms per simulated minute.
 - Cache the local node name between checks and invalidate it on rename. In 1,000 lookups, connections dropped from 1,000 to 1 and CPU time from 342 ms to 0.94 ms.
 - Stop opening a database connection per outage row in the 30 s journal pass. It read a setting for every partial outage and incident of the last 30 days through its own connection, which made it the biggest CPU consumer of the bot. Settings are now read in one query per pass.
-- Require fresh peer announcements and matching check responses before clearing realtime capability or carrier state.
-- Advertise realtime only to enabled peers and wait for capability exchange before sending carrier offers.
-- Retry unaccepted carrier offers after ten minutes and resume negotiation promptly when realtime is re-enabled.
-- Reply by mail when a fallback arrives while a realtime check is still running.
-- Keep realtime peer activity current when a paired bot switches relay addresses.
-- Limit caps-only mail to one startup attempt per peer with realtime off and back off when enabled peers never announce caps.
-- Cap future METRICS timestamps at five minutes ahead for telemetry ordering.
-- Recover realtime peer channels promptly after a cut, re-enable, or restart. Realtime frames now authenticate both link epochs, and ACKs include the acknowledged sender epoch. The unreleased frame format changes without adding a capability field.
-- Recover half-open realtime peer channels faster, bound discovery traffic, and reject reflected frames and recently retired sessions.
 
 ## [3.0.0] - 2026-11-19
 
@@ -53,6 +46,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Satisfy capability requests over realtime so healthy channels can rotate after 14 days.
 - Send hourly mail heartbeats when an established peer channel is down and there are no targets to share.
 - Validate incoming telemetry in bounded worker queues so DNS cannot stall peer event delivery.
+- Require fresh peer announcements and matching check responses before clearing realtime capability or carrier state.
+- Advertise realtime only to enabled peers and wait for capability exchange before sending carrier offers.
+- Retry unaccepted carrier offers after ten minutes and resume negotiation promptly when realtime is re-enabled.
+- Reply by mail when a fallback arrives while a realtime check is still running.
+- Keep realtime peer activity current when a paired bot switches relay addresses.
+- Limit caps-only mail to one startup attempt per peer with realtime off and back off when enabled peers never announce caps.
+- Cap future METRICS timestamps at five minutes ahead for telemetry ordering.
+- Recover realtime peer channels promptly after a cut, re-enable, or restart. Realtime frames now authenticate both link epochs, and ACKs include the acknowledged sender epoch. The unreleased frame format changes without adding a capability field.
+- Recover half-open realtime peer channels faster, bound discovery traffic, and reject reflected frames and recently retired sessions.
 
 ## [2.44.2] - 2026-11-19
 

@@ -359,6 +359,35 @@ with ThreadPoolExecutor(max_workers=2) as executor:
             with self.assertRaises(sqlite3.ProgrammingError):
                 slow_connections[0].execute("SELECT 1")
 
+    def test_replacement_waits_for_readers_still_opening_the_old_file(self):
+        entered = threading.Event()
+        resume = threading.Event()
+        original_open = database._open_reader
+
+        def slow_open(path, *args, **kwargs):
+            if threading.current_thread().name.startswith("slow_reader"):
+                entered.set()
+                self.assertTrue(resume.wait(5))
+            return original_open(path, *args, **kwargs)
+
+        with (ThreadPoolExecutor(max_workers=1, thread_name_prefix="slow_reader") as slow,
+              patch.object(database, "_open_reader", slow_open)):
+            old = slow.submit(database.get_config, "key")
+            self.assertTrue(entered.wait(3))
+            self.path.unlink()
+            for suffix in ("-wal", "-shm"):
+                self.path.with_name(self.path.name + suffix).unlink(missing_ok=True)
+            self.seed(self.path, "second")
+            timer = threading.Timer(0.3, resume.set)
+            timer.start()
+            try:
+                # The old opener is still running; replacing the file must wait for it, not fail.
+                self.assertEqual(database.get_config("key"), "second")
+            finally:
+                resume.set()
+                timer.cancel()
+            old.result(3)
+
     def test_inflight_open_does_not_recreate_a_removed_database(self):
         other = self.path.with_name("other.db")
         self.seed(other, "second")

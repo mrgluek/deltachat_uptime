@@ -290,7 +290,24 @@ def _retire_readers():
     _readers.clear()
 
 
+class _ReadersOpening(sqlite3.OperationalError):
+    """Readers of the replaced database are still opening; they discard themselves when done."""
+
+
 def _prepare_db_identity(path):
+    """Switch the pool to the database file now at `path`, waiting briefly for readers still opening
+    on the old file (they drop their connection once they notice the file changed)."""
+    deadline = time.monotonic() + 5.0
+    while True:
+        try:
+            return _prepare_db_identity_once(path)
+        except _ReadersOpening:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.01)
+
+
+def _prepare_db_identity_once(path):
     global _pool_identity
     with _write_lock, _reader_lock:
         identity = _db_identity(path)
@@ -315,7 +332,7 @@ def _prepare_db_identity(path):
                 if reader.connection is not None:
                     raise sqlite3.OperationalError("Replaced database still has active readers")
             if old_openers and identity[1] is not None:
-                raise sqlite3.OperationalError("Replaced database still has readers opening")
+                raise _ReadersOpening("Replaced database still has readers opening")
             # SQLite may leave a WAL behind when the old inode was unlinked.
             # Attaching it to the replacement can replay the old database's pages.
             try:

@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Wait up to five seconds for readers that are still opening the old database file when the file is replaced, instead of failing. This only affects tests that recreate the database; production never replaces the file.
+
 ## [3.0.1] - 2026-11-20
 
 ### Fixed

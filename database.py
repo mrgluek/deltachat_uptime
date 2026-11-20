@@ -547,6 +547,24 @@ def get_config(key: str) -> str:
     finally:
         conn.close()
 
+
+def get_configs(keys) -> dict:
+    """Reads many config keys over one connection. Missing keys are absent from the result.
+    Use this instead of get_config() in loops: every get_config() opens a new connection."""
+    keys = list(dict.fromkeys(keys))
+    found = {}
+    if not keys:
+        return found
+    conn = _connect()
+    try:
+        for i in range(0, len(keys), 500):  # stay below SQLite's bound-parameter limit
+            chunk = keys[i:i + 500]
+            marks = ",".join("?" * len(chunk))
+            found.update(conn.execute(f"SELECT key, value FROM config WHERE key IN ({marks})", chunk))
+    finally:
+        conn.close()
+    return found
+
 def _clean_admin_fingerprint(fp):
     if fp:
         cleaned = fp.strip().replace(" ", "").replace(":", "").upper()
@@ -2542,9 +2560,13 @@ def set_chat_alert_mode(dc_chat_id: int, mode: str):
         raise ValueError(f"alert mode must be one of {ALERT_MODES}")
     set_config(f"alert_mode:{dc_chat_id}", mode)
 
-def get_chat_report_partial(dc_chat_id: int) -> int | str:
-    value = get_config(f"report_partial:{dc_chat_id}")
+def parse_chat_report_partial(value) -> int | str:
+    """The stored report_partial:<chat> value as minutes, "off" or the default of 10."""
     return "off" if value == "off" else int(value) if value is not None else 10
+
+
+def get_chat_report_partial(dc_chat_id: int) -> int | str:
+    return parse_chat_report_partial(get_config(f"report_partial:{dc_chat_id}"))
 
 
 def get_chat_report_full(dc_chat_id: int) -> int:

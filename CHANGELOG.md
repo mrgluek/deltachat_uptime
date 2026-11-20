@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Stop opening a database connection per outage row in the 30 s journal pass. It read a setting for every partial outage and incident of the last 30 days through its own connection, which made it the biggest CPU consumer of the bot. Settings are now read in one query per pass.
 - Require fresh peer announcements and matching check responses before clearing realtime capability or carrier state.
 - Advertise realtime only to enabled peers and wait for capability exchange before sending carrier offers.
 - Retry unaccepted carrier offers after ten minutes and resume negotiation promptly when realtime is re-enabled.

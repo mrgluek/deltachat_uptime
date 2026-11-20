@@ -4620,11 +4620,17 @@ def _journal_outage_text(resource, prefix, ending=None):
 
 def _journal_partial_events(chat_id=None):
     now = int(time.time())
-    for r in database.get_partial_journal_rows():
+    rows = [r for r in database.get_partial_journal_rows() if chat_id is None or r["dc_chat_id"] == chat_id]
+    # One connection for all settings: this runs every 30 s over every partial outage of the
+    # last 30 days, and a get_config() per row opened thousands of connections per pass.
+    chats = {r["dc_chat_id"] for r in rows}
+    keys = [f"report_partial:{chat}" for chat in chats]
+    keys += [f"journal:partial_start:{r['dc_chat_id']}:{r['partial_id']}" for r in rows if r["partial_ended_at"] is not None]
+    config = database.get_configs(keys)
+    minutes_by_chat = {chat: database.parse_chat_report_partial(config.get(f"report_partial:{chat}")) for chat in chats}
+    for r in rows:
         chat = r["dc_chat_id"]
-        if chat_id is not None and chat != chat_id:
-            continue
-        minutes = database.get_chat_report_partial(chat)
+        minutes = minutes_by_chat[chat]
         if minutes == "off":
             continue
         identity = r["partial_id"]
@@ -4639,7 +4645,7 @@ def _journal_partial_events(chat_id=None):
                     and not (nodes and all(is_node_unstable(n) for n in nodes))):
                 database.add_chat_event(chat, "partial_start", _journal_outage_text(r, "🟠", None),
                                         once=identity)
-        elif (database.get_config(key) and r.get("notice_state") != 3
+        elif (config.get(key) and r.get("notice_state") != 3
               and r.get("status") != "down" and r.get("alert_state") != "down"):
             database.add_chat_event(chat, "partial_end", _journal_outage_text(r, "", ended - r["partial_started_at"]),
                                     once=identity)
@@ -4648,6 +4654,8 @@ def _journal_partial_events(chat_id=None):
 def _journal_incident_events(chat_id, events, resources, now):
     minutes = database.get_chat_report_full(chat_id)
     notices_after = int(database.get_config(f"report_app_notices_after:{chat_id}") or 0)
+    started = database.get_configs(f"journal:incident_start:{chat_id}:{event['id']}"
+                                   for event in events if event.get("went_up_at") is not None)
     for event in events:
         identity = event["id"]
         resource = resources.get(event["resource_id"], event)
@@ -4656,7 +4664,7 @@ def _journal_incident_events(chat_id, events, resources, now):
             if event["went_down_at"] > notices_after and should_notify_start(event["went_down_at"], now, minutes):
                 database.add_chat_event(chat_id, "incident_start", _journal_outage_text(resource, "🔴"),
                                         once=identity)
-        elif database.get_config(f"journal:incident_start:{chat_id}:{identity}"):
+        elif started.get(f"journal:incident_start:{chat_id}:{identity}"):
             database.add_chat_event(chat_id, "incident_end", _journal_outage_text(resource, "", ended - event["went_down_at"]),
                                     once=identity)
 

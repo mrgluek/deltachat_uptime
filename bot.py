@@ -84,7 +84,7 @@ from outbox import SKIP_SEND, record_sent_mail
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "3.0.1"
+VERSION = "3.0.2"
 SYNC_MAX_BYTES = 64 * 1024
 # 200 metrics / 100 cross-checks, including JSON's twelve-byte astral Unicode escaping at field limits.
 PEER_MAX_BYTES = 8 * 1024 * 1024
@@ -430,6 +430,9 @@ PEER_ANSWER_CACHE_MAX = 2000
 PEER_ANSWER_REPLAY_GAP = 5
 PEER_ANSWER_REPLAYS_PER_MINUTE = 6
 PEER_BATCH_CHECK_CONCURRENCY = 20
+INBOUND_PROBE_REQUESTER_SLOTS = 10   # most worker slots one requester can hold at once
+PEER_BATCH_WORKERS_MAX = 5           # one batch reserves at most this many, so a second request fits
+PEER_BUSY_REPLIES_PER_MINUTE = 20    # "busy" answers per requester; more are dropped silently
 
 
 def _peer_identity(peer):
@@ -467,6 +470,32 @@ class InboundProbeAdmission:
         self.answers = collections.OrderedDict()
         self.replay_rates = collections.OrderedDict()
         self.warned = {}
+        self.busy_times = {}  # identity -> times of recent busy answers
+        self.rejected = 0     # requests turned away since start
+        self.reduced = 0      # requests that got fewer slots than they asked for
+
+    def allow_busy_reply(self, peer, req_id):
+        """Whether a rejected request may be answered with "busy": only well-formed requests of a
+        requester that is not over its rate or the cache bound, and a few per minute, so a
+        rejection cannot be turned into a flood of mail."""
+        if not isinstance(req_id, str) or not 0 < len(req_id) <= 64:
+            return False
+        identity = _peer_identity(peer)
+        with self.lock:
+            now = time.monotonic()
+            if len(self.seen) + len(self.answers) >= 10000 or len(self.rates.get(identity, ())) >= 120:
+                return False
+            times = self.busy_times.setdefault(identity, collections.deque())
+            while times and times[0] <= now - 60:
+                times.popleft()
+            if len(self.busy_times) > 1000:
+                for other in [i for i, t in self.busy_times.items() if not t or t[-1] <= now - 60]:
+                    del self.busy_times[other]
+                times = self.busy_times.setdefault(identity, times)
+            if len(times) >= PEER_BUSY_REPLIES_PER_MINUTE:
+                return False
+            times.append(now)
+            return True
 
     def _expire_answers(self, now):
         while self.answers and next(iter(self.answers.values())).sent_at <= now - PEER_ANSWER_CACHE_TTL:
@@ -551,27 +580,29 @@ class InboundProbeAdmission:
                     del self.rates[rate_identity]
             self.warned = {key: ts for key, ts in self.warned.items() if ts > now - 600}
             times = self.rates.get(identity, ())
-            rejected = (len(self.seen) + len(self.answers) >= 10000
-                        or self.outstanding[identity] + slots > 10 or len(times) >= 120)
+            rejected = len(self.seen) + len(self.answers) >= 10000 or len(times) >= 120
+            # A request that does not fit gets the free slots instead of nothing
+            want = min(slots, INBOUND_PROBE_REQUESTER_SLOTS - self.outstanding[identity])
             reserved = 0
             if not rejected:
-                for _ in range(slots):
+                for _ in range(max(0, want)):
                     if not self.slots.acquire(blocking=False):
-                        rejected = True
                         break
                     reserved += 1
+                rejected = reserved < 1
             if rejected:
-                for _ in range(reserved):
-                    self.slots.release()
+                self.rejected += 1
                 if identity not in self.warned:
                     self.warned[identity] = now
                     logger.warning("Dropping excess probe requests from peer %s", identity)
                 return _ProbeAdmission.REJECTED, None
-            self.outstanding[identity] += slots
+            if reserved < slots:
+                self.reduced += 1
+            self.outstanding[identity] += reserved
             self.rates.setdefault(identity, collections.deque()).append(now)
             self.seen[key] = now
             self.running[key] = via
-            return _ProbeAdmission.ACCEPTED, (key, slots)
+            return _ProbeAdmission.ACCEPTED, (key, reserved)
 
     def reply_via(self, key):
         with self.lock:
@@ -592,12 +623,16 @@ class InboundProbeAdmission:
 _inbound_probes = InboundProbeAdmission()
 # Carry the verified request context through the async probe to its outbox callback.
 _inbound_probe_answer = contextvars.ContextVar("inbound_probe_answer", default=None)
+# How many worker slots admission really granted to the running request (may be fewer than asked).
+_inbound_probe_slots = contextvars.ContextVar("inbound_probe_slots", default=None)
 
 
 def _submit_inbound_probe(peer, req_id, make_coro, slots=1, *, via):
     admission = _inbound_probes
     outcome, reservation = admission.acquire(peer, req_id, slots, via=via)
     if reservation is None:
+        if outcome is _ProbeAdmission.REJECTED:
+            stat_event("probe_rejected")
         return outcome
     started = False
 
@@ -606,9 +641,11 @@ def _submit_inbound_probe(peer, req_id, make_coro, slots=1, *, via):
         started = True
         key, _ = reservation
         token = _inbound_probe_answer.set((key, admission))
+        slots_token = _inbound_probe_slots.set(reservation[1])
         try:
             await make_coro()
         finally:
+            _inbound_probe_slots.reset(slots_token)
             _inbound_probe_answer.reset(token)
             admission.release(reservation)
 
@@ -1000,7 +1037,7 @@ CHAT_AUDIT_INTERVAL = 3600
 # messages and a 175 MB database, and the core spent ~0.5 s CPU per message instead of ~0.1 s.
 PEER_CHAT_TRIM_INTERVAL = 600
 PEER_CHAT_KEEP = 20       # newest messages left in each peer chat (a reply may still be on its way)
-PEER_CHAT_TRIM_CHUNK = 500
+PEER_CHAT_TRIM_CHUNK = 50
 
 
 def _field(obj, name, default=None):
@@ -1061,25 +1098,28 @@ def trim_peer_chats(bot, accid) -> int:
 
 
 def _delete_trimmed_messages(bot, accid, old) -> int:
+    """Delete old messages from this device in chunks of PEER_CHAT_TRIM_CHUNK. The delete RPC runs
+    without _peer_rt_lock (it takes about 4 ms per message and the lock is taken by the event thread
+    and the event loop); the lock only covers the check of which ids are still protected."""
     deleted = 0
     for i in range(0, len(old), PEER_CHAT_TRIM_CHUNK):
         # Recheck at deletion time so a just-accepted OFFER is protected too.
         with _peer_rt_lock:
             protected = database.get_peer_rt_message_ids()
             chunk = [msg_id for msg_id in old[i:i + PEER_CHAT_TRIM_CHUNK] if msg_id not in protected]
-            if not chunk:
-                continue
-            try:
-                bot.rpc.delete_messages(accid, chunk)
-                deleted += len(chunk)
-            except Exception:
-                # The core stops at the first message already gone.
-                for msg_id in chunk:
-                    try:
-                        bot.rpc.delete_messages(accid, [msg_id])
-                        deleted += 1
-                    except Exception:
-                        pass
+        if not chunk:
+            continue
+        try:
+            bot.rpc.delete_messages(accid, chunk)
+            deleted += len(chunk)
+        except Exception:
+            # The core stops at the first message already gone.
+            for msg_id in chunk:
+                try:
+                    bot.rpc.delete_messages(accid, [msg_id])
+                    deleted += 1
+                except Exception:
+                    pass
     return deleted
 
 
@@ -8245,9 +8285,9 @@ def _deliver_peer_rt_message(bot, accid, msg_id, link, frame, received_at, size)
         _record_invalid_peer_rt(fp, size, type(exc).__name__)
         return
     database.record_peer_traffic(kind, "rt", "in", size)
-    if (frame["a"] and (kind not in _PEER_RT_REQUESTS or outcome in (
-            _ProbeAdmission.ACCEPTED, _ProbeAdmission.RUNNING, _ProbeAdmission.COMPLETED))
-            and (loop := _peer_rt_event_loop()) is not None):
+    # A rejected request is still acknowledged: the frame arrived, and an unacked frame counts as a
+    # link failure on the sender. The refusal is told in a "busy" answer instead.
+    if frame["a"] and (loop := _peer_rt_event_loop()) is not None:
         loop.call_soon_threadsafe(lambda: loop.create_task(
             _send_peer_rt_unacked(bot, accid, msg_id, link, "ack", {"e": frame["e"], "s": [frame["s"]]})))
 
@@ -10887,6 +10927,8 @@ def build_stats_report(bot, accid) -> str:
         + f"; votes ask up to {VOTE_SAMPLE_SIZE} peers",
         f"• Last hour: {stat_last_hour('vote', now)} votes sent to peers, {stat_last_hour('held', now)} reports held back",
         *_peer_metrics_report(now),
+        f"• Probe requests from peers turned away: {stat_last_hour('probe_rejected', now)} in the last hour, "
+        f"{_inbound_probes.rejected} since start ({_inbound_probes.reduced} got fewer workers)",
         f"• Old protocol messages deleted since start: {_bot_stats['trimmed']}",
         f"• Old user chat messages deleted since start: {_bot_stats['user_trimmed']}",
         "",
@@ -11711,6 +11753,9 @@ def handle_peer_check_req(bot, accid, peer, chat_id, data, via="mail", *, stamp=
         outcome = _submit_inbound_probe(peer, req_id, _do_cross_check_reply, via=via)
         if outcome is _ProbeAdmission.COMPLETED:
             _resend_cached_probe_answer(bot, accid, chat_id, peer, req_id, via)
+        elif outcome is _ProbeAdmission.REJECTED:
+            _send_busy_answer(bot, accid, chat_id, peer, req_id, via, "CHECK_RESP",
+                              {"url": target_url, "status": "skip", "latency_ms": None, "error_msg": _BUSY_TEXT})
         return outcome
     return _ProbeAdmission.REJECTED
 
@@ -11721,17 +11766,42 @@ def handle_peer_check_batch_req(bot, accid, peer, chat_id, data, via="mail", *, 
     if _resend_cached_probe_answer(bot, accid, chat_id, peer, req_id, via):
         return _ProbeAdmission.COMPLETED
     raw_targets = req_data.get("targets")
-    workers = min(10, max(1, len(raw_targets))) if isinstance(raw_targets, list) else 1
+    workers = min(PEER_BATCH_WORKERS_MAX, max(1, len(raw_targets))) if isinstance(raw_targets, list) else 1
     async def answer():
         _note_peer_check_activity(peer, req_data, via, stamp)
         targets = await run_db(_parse_batch_targets, req_data.get("targets"))
         if targets:
-            await _answer_batch_cross_check(bot, accid, chat_id, req_id, targets, workers,
+            # Admission may have granted fewer slots than asked for
+            await _answer_batch_cross_check(bot, accid, chat_id, req_id, targets,
+                                            _inbound_probe_slots.get() or workers,
                                             fingerprint=peer.get("fingerprint"), via=via)
     outcome = _submit_inbound_probe(peer, req_id, answer, workers, via=via)
     if outcome is _ProbeAdmission.COMPLETED:
         _resend_cached_probe_answer(bot, accid, chat_id, peer, req_id, via)
+    elif outcome is _ProbeAdmission.REJECTED and isinstance(raw_targets, list):
+        count = min(len(raw_targets), CROSS_CHECK_BATCH_MAX)
+        busy = {"status": "skip", "latency_ms": None, "error_msg": _BUSY_TEXT}
+        _send_busy_answer(bot, accid, chat_id, peer, req_id, via, "CHECK_BATCH_RESP",
+                          {"results": [busy] * count} if count else None)
     return outcome
+
+
+_BUSY_TEXT = "Busy: too many requests from this node"
+
+
+def _send_busy_answer(bot, accid, chat_id, peer, req_id, via, kind, fields):
+    """Tell the requester at once that its request was turned away, instead of letting it wait for
+    its deadline. The answer is a plain "skip" ("unknown" vote), which every version reads, and it
+    is not cached, so the same request id can still be accepted if the requester retries."""
+    if fields is None or not _inbound_probes.allow_busy_reply(peer, req_id):
+        return
+    try:
+        payload = {"req_id": req_id, "node_name": database.get_local_node_name(),
+                   "caps": _own_peer_caps(peer), **fields}
+        destination = _PeerDestination(bot, accid, chat_id, fingerprint=peer.get("fingerprint"), via=via)
+        _send_peer_check_answer(destination, kind, payload, key=("peer_busy", _peer_identity(peer), req_id))
+    except Exception:
+        logger.debug("Could not send busy answer", exc_info=True)
 
 
 def handle_peer_check_batch_resp(bot, accid, peer, chat_id, data, via="mail", *,

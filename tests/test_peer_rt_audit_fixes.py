@@ -82,7 +82,7 @@ class TestPeerRTAuditFixes(_DbCase, unittest.IsolatedAsyncioTestCase):
                 await asyncio.sleep(0.001)
         await asyncio.wait_for(wait(), 5)
 
-    async def test_capacity_rejection_leaves_rt_requests_unacked_until_mail_retry(self):
+    async def test_capacity_rejection_is_acked_and_answered_busy_then_mail_retry_runs(self):
         self.link.state.on_frame()
         admission = bot._inbound_probes
         reservations = [admission.acquire({"email": f"busy{i}@example.org"}, "busy", 10)[1] for i in range(2)]
@@ -96,8 +96,13 @@ class TestPeerRTAuditFixes(_DbCase, unittest.IsolatedAsyncioTestCase):
             self.receive_rt("breq", batch)
             await asyncio.sleep(0)
             await asyncio.sleep(0)
-            send_rt.assert_not_awaited()
+            # Rejected requests are still ACKed (an unacked frame would count against the link)
+            self.assertEqual([call.args[4:] for call in send_rt.await_args_list],
+                             [("ack", {"e": REMOTE_EPOCH, "s": [1]}), ("ack", {"e": REMOTE_EPOCH, "s": [2]})])
+            self.assertTrue(self.link.state.is_up)
             check.assert_not_awaited()
+            send_rt.reset_mock()
+            self.client.rpc.send_msg.reset_mock()
 
             for reservation in reservations:
                 admission.release(reservation)

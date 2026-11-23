@@ -111,7 +111,8 @@ class TestProbeAdmission(AuditCase):
                 self.assertEqual(peak['https://honest.example'], 0 if repeated else 10)
                 self.assertEqual(sum(bot._inbound_probes.outstanding.values()), expected)
                 self.assertEqual(safe.call_count, expected)  # drops never validate targets
-                send.assert_not_called()
+                # Rejected requests get at most a few "busy" answers per minute, never a flood
+                self.assertEqual(send.call_count, 0 if repeated else bot.PEER_BUSY_REPLIES_PER_MINUTE)
                 tasks = asyncio.all_tasks() - {asyncio.current_task()}
                 gate.set()
                 await asyncio.wait_for(asyncio.gather(*tasks), self.timeout)
@@ -152,11 +153,12 @@ class TestProbeAdmission(AuditCase):
                 self.assertEqual(calls.count('https://honest.example'), 10)
                 self.assertEqual(sum(bot._inbound_probes.outstanding.values()), 20)
                 tasks = asyncio.all_tasks() - {asyncio.current_task()}
-                self.assertLessEqual(len(tasks), 21)  # 20 workers and one batch coordinator
+                self.assertLessEqual(len(tasks), 22)  # 20 workers and two batch coordinators
                 gate.set()
                 await asyncio.wait_for(asyncio.gather(*tasks), self.timeout)
-                self.assertEqual(len(calls), 110)
-                self.assertEqual(send.call_count, 11)
+                # Evil's second batch also runs now (5 workers each), within the same 10 slots
+                self.assertEqual(len(calls), 210)
+                self.assertEqual(send.call_count, 12)
                 self.assertFalse(bot._inbound_probes.outstanding)
         asyncio.run(scenario())
 
@@ -165,9 +167,11 @@ class TestProbeAdmission(AuditCase):
         peers = [dict(email=f'{i}@example.org') for i in range(3)]
         _, first = admission.acquire(peers[0], 'one', 10)
         _, second = admission.acquire(peers[1], 'two', 9)
-        self.assertEqual(admission.acquire(peers[2], 'too-large', 2), (bot._ProbeAdmission.REJECTED, None))
-        outcome, third = admission.acquire(peers[2], 'one-left')
+        # Two asked for, one left: the request gets the one that is free
+        outcome, third = admission.acquire(peers[2], 'too-large', 2)
         self.assertIs(outcome, bot._ProbeAdmission.ACCEPTED)
+        self.assertEqual(third[1], 1)
+        self.assertEqual(admission.acquire(peers[2], 'none-left'), (bot._ProbeAdmission.REJECTED, None))
         for reservation in (first, second, third):
             admission.release(reservation)
         self.assertFalse(admission.outstanding)

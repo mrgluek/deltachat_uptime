@@ -11,6 +11,7 @@ import zipfile
 
 import bot
 import database
+import dc_fingerprint
 from outbox import Outbox
 from test_peer_seam import inline_peer_metrics
 
@@ -34,6 +35,16 @@ def envelope(kind, cid=CID, key=KEY, **fields):
 
 
 class TestPeerRTCarrier(unittest.TestCase):
+    @property
+    def self_fp(self):
+        return self._self_fp
+
+    @self_fp.setter
+    def self_fp(self, value):
+        # The bot caches its own fingerprint for the process; these tests change "our key" on purpose
+        self._self_fp = value
+        dc_fingerprint.forget_self_fingerprint()
+
     def setUp(self):
         inline_peer_metrics(self)
         directory = self.enterContext(tempfile.TemporaryDirectory())
@@ -418,9 +429,9 @@ class TestPeerRTCarrier(unittest.TestCase):
         self.assertEqual(self.rpc.method_calls, [])
         self.tick(1)
         self.rpc.get_message_ids.assert_called_once_with(1, CHAT, False, False)
-        self.assertEqual(len(self.rpc.method_calls), 2)  # Own fingerprint and one carrier scan.
+        self.assertEqual(len(self.rpc.method_calls), 1)  # One carrier scan; the own fingerprint is cached
         self.tick()
-        self.assertEqual(len(self.rpc.method_calls), 2)
+        self.assertEqual(len(self.rpc.method_calls), 1)
 
     def test_remote_reset_must_match_owner_carrier_or_pending_offer(self):
         self.audit()

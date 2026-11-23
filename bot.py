@@ -433,6 +433,8 @@ PEER_BATCH_CHECK_CONCURRENCY = 20
 INBOUND_PROBE_REQUESTER_SLOTS = 10   # most worker slots one requester can hold at once
 PEER_BATCH_WORKERS_MAX = 5           # one batch reserves at most this many, so a second request fits
 PEER_BUSY_REPLIES_PER_MINUTE = 20    # "busy" answers per requester; more are dropped silently
+PEER_BUSY_REPLIES_GLOBAL_PER_MINUTE = 30  # and across all requesters together
+PEER_BATCH_MIN_SLOTS = 3             # a batch of this many targets or more never runs on fewer slots
 
 
 def _peer_identity(peer):
@@ -471,6 +473,7 @@ class InboundProbeAdmission:
         self.replay_rates = collections.OrderedDict()
         self.warned = {}
         self.busy_times = {}  # identity -> times of recent busy answers
+        self.busy_global = collections.deque()  # times of all recent busy answers
         self.rejected = 0     # requests turned away since start
         self.reduced = 0      # requests that got fewer slots than they asked for
 
@@ -485,6 +488,10 @@ class InboundProbeAdmission:
             now = time.monotonic()
             if len(self.seen) + len(self.answers) >= 10000 or len(self.rates.get(identity, ())) >= 120:
                 return False
+            while self.busy_global and self.busy_global[0] <= now - 60:
+                self.busy_global.popleft()
+            if len(self.busy_global) >= PEER_BUSY_REPLIES_GLOBAL_PER_MINUTE:
+                return False
             times = self.busy_times.setdefault(identity, collections.deque())
             while times and times[0] <= now - 60:
                 times.popleft()
@@ -495,6 +502,7 @@ class InboundProbeAdmission:
             if len(times) >= PEER_BUSY_REPLIES_PER_MINUTE:
                 return False
             times.append(now)
+            self.busy_global.append(now)
             return True
 
     def _expire_answers(self, now):
@@ -589,9 +597,17 @@ class InboundProbeAdmission:
                     if not self.slots.acquire(blocking=False):
                         break
                     reserved += 1
+                # A multi-target batch on one or two workers would outlive its requester's deadline
+                if slots >= PEER_BATCH_MIN_SLOTS and reserved < PEER_BATCH_MIN_SLOTS:
+                    for _ in range(reserved):
+                        self.slots.release()
+                    reserved = 0
                 rejected = reserved < 1
             if rejected:
                 self.rejected += 1
+                # Rejected requests count towards the rate bound too (bounded: 120 entries are enough to trip it)
+                if len(times) < 120:
+                    self.rates.setdefault(identity, collections.deque()).append(now)
                 if identity not in self.warned:
                     self.warned[identity] = now
                     logger.warning("Dropping excess probe requests from peer %s", identity)
@@ -1098,29 +1114,35 @@ def trim_peer_chats(bot, accid) -> int:
 
 
 def _delete_trimmed_messages(bot, accid, old) -> int:
-    """Delete old messages from this device in chunks of PEER_CHAT_TRIM_CHUNK. The delete RPC runs
-    without _peer_rt_lock (it takes about 4 ms per message and the lock is taken by the event thread
-    and the event loop); the lock only covers the check of which ids are still protected."""
+    """Delete old messages from this device in chunks of PEER_CHAT_TRIM_CHUNK. _peer_rt_lock is held
+    across the protected-id check and the delete RPC of ONE chunk (about 4 ms per message, so at most
+    about 200 ms) and released between chunks: a just-accepted OFFER cannot be deleted, and the
+    event thread and the event loop wait for one chunk, not for the whole trim."""
     deleted = 0
     for i in range(0, len(old), PEER_CHAT_TRIM_CHUNK):
-        # Recheck at deletion time so a just-accepted OFFER is protected too.
         with _peer_rt_lock:
             protected = database.get_peer_rt_message_ids()
             chunk = [msg_id for msg_id in old[i:i + PEER_CHAT_TRIM_CHUNK] if msg_id not in protected]
-        if not chunk:
-            continue
-        try:
-            bot.rpc.delete_messages(accid, chunk)
-            deleted += len(chunk)
-        except Exception:
-            # The core stops at the first message already gone.
-            for msg_id in chunk:
-                try:
-                    bot.rpc.delete_messages(accid, [msg_id])
-                    deleted += 1
-                except Exception:
-                    pass
+            if not chunk:
+                continue
+            try:
+                bot.rpc.delete_messages(accid, chunk)
+                deleted += len(chunk)
+            except Exception:
+                # The core stops at the first message already gone.
+                for msg_id in chunk:
+                    try:
+                        bot.rpc.delete_messages(accid, [msg_id])
+                        deleted += 1
+                    except Exception:
+                        pass
+        # Give a thread waiting for the lock a chance to take it: a lock released and taken again at
+        # once usually goes to the same thread, which would starve the event thread for the whole trim.
+        _trim_yield.wait(0.002)
     return deleted
+
+
+_trim_yield = threading.Event()  # never set; only used to sleep
 
 
 def trim_user_chats(bot, accid) -> int:
@@ -1345,6 +1367,7 @@ class _PeerRtt:
         self.sent_at = None
         self.rt_sent_at = None
         self.answer = None
+        self.busy = False  # the peer turned the request away ("Busy:"): no real answer
 
     def start(self):
         self.sent_at = time.monotonic()
@@ -1352,7 +1375,11 @@ class _PeerRtt:
     def start_rt(self):
         self.rt_sent_at = time.monotonic()
 
-    def note_answer(self, arrived_at, node_name, via):
+    def note_answer(self, arrived_at, node_name, via, busy=False):
+        if busy:
+            # Not an answer: it must not reset the vote-peer backoff or count as an ok sample
+            self.busy = True
+            return
         self.answer = (arrived_at, node_name, via)
         if self.vote_round is not None or self.kind == "vote":
             _note_vote_peer_result(self.peer, True)
@@ -1472,6 +1499,8 @@ async def request_peer_cross_checks(target_dict: dict, timeout: float = 8.0, pee
     for timing in timings.values():
         if timing.answer is not None:
             timing.finish(True)
+        elif timing.busy:
+            timing.finish(False)
         elif timed_out_at is not None:
             timing.finish(False, timed_out_at)
 
@@ -1856,15 +1885,24 @@ async def _batch_cross_check_peer(peer: dict, items: list, results: dict) -> Non
     finally:
         pending_batch_checks.pop(req_id, None)
         _pending_peer_rtt.pop(req_id, None)
-    timing.finish(True, peer=answers[0]["node_name"] if answers else None)
+    if timing.busy:
+        timing.finish(False)
+    else:
+        timing.finish(True, peer=answers[0]["node_name"] if answers else None)
     answered = []
     for (key, target), answer in zip(items, answers):
         answer["url"] = target.get("url")  # positions are what the peer answers; URLs are ours
         results[key].append(answer)
-        answered.append(answer)
+        if not _is_busy_result(answer):  # a refusal says nothing about the target
+            answered.append(answer)
     if answered:
         await run_db(database.save_peer_measurements_batch, answered[0]["node_name"], answered,
                      peer.get("fingerprint") or peer["email"])
+
+
+def _is_busy_result(item) -> bool:
+    error = item.get("error_msg") if isinstance(item, dict) else None
+    return isinstance(error, str) and error.startswith(_BUSY_PREFIX)
 
 
 def _clean_peer_result(item, node_name: str, url: str) -> dict:
@@ -11786,7 +11824,8 @@ def handle_peer_check_batch_req(bot, accid, peer, chat_id, data, via="mail", *, 
     return outcome
 
 
-_BUSY_TEXT = "Busy: too many requests from this node"
+_BUSY_PREFIX = "Busy:"
+_BUSY_TEXT = _BUSY_PREFIX + " too many requests from this node"
 
 
 def _send_busy_answer(bot, accid, chat_id, peer, req_id, via, kind, fields):
@@ -11835,7 +11874,8 @@ def handle_peer_check_batch_resp(bot, accid, peer, chat_id, data, via="mail", *,
         if not fut.done():
             timing = _pending_peer_rtt.get(req_id, {}).get(chat_id)
             if timing is not None:
-                timing.note_answer(arrived_at, node_name, via)
+                timing.note_answer(arrived_at, node_name, via,
+                                   busy=bool(answers) and all(_is_busy_result(a) for a in answers))
             fut.set_result(answers)
 
     if async_event_loop and async_event_loop.is_running():
@@ -11878,7 +11918,9 @@ def handle_peer_check_resp(bot, accid, peer, chat_id, data, via="mail", *,
         latency_ms = None
     error_msg = str(error_msg)[:500] if error_msg else None
 
-    if target_url and _valid_peer_fields(resp_data) and is_safe_target_url(target_url, target_type(target_url)):
+    busy = _is_busy_result({"error_msg": error_msg})
+    if (not busy and target_url and _valid_peer_fields(resp_data)
+            and is_safe_target_url(target_url, target_type(target_url))):
         database.save_peer_measurement(target_url, node_name, status, latency_ms, error_msg, int(time.time()),
                                        peer.get("fingerprint") or peer["email"])
 
@@ -11895,7 +11937,7 @@ def handle_peer_check_resp(bot, accid, peer, chat_id, data, via="mail", *,
         })
         timing = _pending_peer_rtt.get(req_id, {}).get(chat_id)
         if timing is not None:
-            timing.note_answer(arrived_at, node_name, via)
+            timing.note_answer(arrived_at, node_name, via, busy=busy)
         complete = len(resp_list) >= expected_count
     if complete:
         if async_event_loop and async_event_loop.is_running():

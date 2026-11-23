@@ -45,7 +45,7 @@ _QR_FP_RE = re.compile(r"(?:i\.delta\.chat/#|OPENPGP4FPR:)([0-9A-Fa-f]{64}|[0-9A
 # different connection (or a test double) never sees another one's answer.
 _self_fp_lock = threading.Lock()
 _self_fp_cache = weakref.WeakKeyDictionary()  # rpc -> {accid: fingerprint}
-_self_fp_cache_unweakable = {}  # accid -> fingerprint, for rpc objects that cannot be weakly referenced
+_self_fp_cache_unweakable = {}  # id(rpc) -> {accid: fingerprint}, for rpc objects that cannot be weakly referenced
 
 
 def forget_self_fingerprint(rpc=None, accid=None):
@@ -58,7 +58,7 @@ def forget_self_fingerprint(rpc=None, accid=None):
         try:
             per_rpc = _self_fp_cache.get(rpc)
         except TypeError:
-            per_rpc = _self_fp_cache_unweakable
+            per_rpc = _self_fp_cache_unweakable.get(id(rpc))
         if per_rpc is not None:
             if accid is None:
                 per_rpc.clear()
@@ -92,7 +92,7 @@ def get_self_fingerprint(rpc, accid: int) -> str | None:
         try:
             per_rpc = _self_fp_cache.setdefault(rpc, {})
         except TypeError:
-            per_rpc = _self_fp_cache_unweakable
+            per_rpc = _self_fp_cache_unweakable.setdefault(id(rpc), {})
         cached = per_rpc.get(accid)
     if cached:
         return cached

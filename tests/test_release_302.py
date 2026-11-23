@@ -3,6 +3,7 @@ import asyncio
 import json
 import threading
 import unittest
+from concurrent.futures import Future
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import bot
@@ -42,10 +43,10 @@ class TestProbeAdmissionUnderGrid(AuditCase):
     def test_request_that_does_not_fit_gets_the_free_slots(self):
         peer = self.peer()
         admission = bot.InboundProbeAdmission()
-        _, first = admission.acquire(peer, "a", 8)
+        _, first = admission.acquire(peer, "a", 6)
         outcome, second = admission.acquire(peer, "b", 5)
         self.assertIs(outcome, bot._ProbeAdmission.ACCEPTED)
-        self.assertEqual(second[1], 2)  # only 2 left under the per-requester cap
+        self.assertEqual(second[1], 4)  # only 4 left under the per-requester cap
         self.assertEqual(admission.reduced, 1)
         outcome, none = admission.acquire(peer, "c", 1)
         self.assertEqual((outcome, none), (bot._ProbeAdmission.REJECTED, None))
@@ -61,9 +62,9 @@ class TestProbeAdmissionUnderGrid(AuditCase):
         self.assertEqual((outcome, small), (bot._ProbeAdmission.REJECTED, None))
         admission2 = bot.InboundProbeAdmission()
         a = admission2.acquire(dict(email="1@example.org"), "x", 10)[1]
-        b = admission2.acquire(dict(email="2@example.org"), "x", 8)[1]
+        b = admission2.acquire(dict(email="2@example.org"), "x", 7)[1]
         outcome, c = admission2.acquire(dict(email="3@example.org"), "y", 5)
-        self.assertEqual(c[1], 2)
+        self.assertEqual(c[1], 3)
 
     def test_urgent_batch_during_a_grid_batch_is_answered_not_dropped(self):
         async def scenario():
@@ -130,14 +131,14 @@ class TestProbeAdmissionUnderGrid(AuditCase):
         async def scenario():
             peer = self.peer()
             admission = bot._inbound_probes
-            _, held = admission.acquire(peer, "held", 8)
+            _, held = admission.acquire(peer, "held", 6)
             targets = [dict(url=f"https://t.example/{i}", type="http") for i in range(5)]
             with patch.object(bot, "run_single_check", AsyncMock(return_value=(True, None, 1))), \
                  patch.object(bot, "_answer_batch_cross_check", AsyncMock()) as answer:
                 self.receive(peer, "UPTIME_PEER_CHECK_BATCH_REQ", dict(req_id="b", targets=targets))
                 tasks = asyncio.all_tasks() - {asyncio.current_task()}
                 await asyncio.wait_for(asyncio.gather(*tasks), self.timeout)
-            self.assertEqual(answer.call_args.args[5], 2)
+            self.assertEqual(answer.call_args.args[5], 4)
             admission.release(held)
         asyncio.run(scenario())
 
@@ -166,6 +167,135 @@ class TestProbeAdmissionUnderGrid(AuditCase):
             self.receive(peer, "UPTIME_PEER_CHECK_REQ", dict(req_id=f"n{i}", url="https://x.example", type="http"))
         self.assertEqual(bot.stat_last_hour("probe_rejected") - before, 3)
         bot._inbound_probes.release(held)
+
+
+class TestBusyAnswersOnTheRequesterSide(AuditCase):
+    URL = "https://busy-target.example"
+
+    def setUp(self):
+        super().setUp()
+        self.peer_row = self.peer()
+        self.stack.enter_context(patch.object(bot, "_vote_peers", {}))
+        self.rtt = self.stack.enter_context(patch.object(bot, "_record_peer_rtt"))
+        self.stack.enter_context(patch.object(bot, "is_safe_target_url", return_value=True))
+        database.save_peer_measurement(self.URL, "Evil", "up", 12, None, 1000000, self.peer_row["fingerprint"])
+        key = bot._vote_peer_key(self.peer_row)
+        bot._vote_peers[key] = bot._VotePeer(streak=2)
+        self.state = bot._vote_peers[key]
+        self.busy = {"status": "skip", "latency_ms": None, "error_msg": bot._BUSY_TEXT}
+
+    def measurement(self):
+        return [(m["status"], m["latency_ms"]) for m in database.get_peer_measurements_for_url(self.URL)]
+
+    def test_busy_single_answer_is_not_a_measurement_or_an_ok_sample_and_keeps_the_streak(self):
+        future, responses = Future(), []
+        timing = bot._PeerRtt("vote", self.peer_row)
+        timing.start()
+        data = dict(self.busy, req_id="abc", url=self.URL)
+        with patch.object(bot, "pending_peer_checks", {"abc": (future, 1, responses, {701})}), \
+             patch.object(bot, "_pending_peer_rtt", {"abc": {701: timing}}):
+            bot.handle_peer_check_resp(None, 1, self.peer_row, 701, data)
+        self.assertEqual(self.measurement(), [("up", 12)])  # not overwritten with "unknown"
+        self.assertEqual(responses[0]["status"], "unknown")  # still an abstaining vote
+        self.assertIsNone(timing.answer)
+        self.assertTrue(timing.busy)
+        self.assertEqual(self.state.streak, 2)  # no reset by the answer
+        timing.finish(False)  # what the collector does for a busy peer
+        self.assertEqual(self.state.streak, 3)
+        self.assertFalse(self.rtt.call_args.args[4])  # ok=False
+        self.assertEqual(self.rtt.call_count, 1)
+
+    def test_real_single_answer_still_resets_the_streak(self):
+        timing = bot._PeerRtt("vote", self.peer_row)
+        timing.start()
+        data = {"req_id": "abc", "url": self.URL, "status": "down", "latency_ms": 5}
+        with patch.object(bot, "pending_peer_checks", {"abc": (Future(), 1, [], {701})}), \
+             patch.object(bot, "_pending_peer_rtt", {"abc": {701: timing}}):
+            bot.handle_peer_check_resp(None, 1, self.peer_row, 701, data)
+        self.assertEqual(self.state.streak, 0)
+        self.assertEqual(self.measurement(), [("down", 5)])
+
+    def run_batch(self, results):
+        sent = []
+
+        def fake_send(destination, kind, payload, **kw):
+            kw["before_send"]()
+            sent.append(payload)
+            bot.handle_peer_check_batch_resp(
+                None, 1, self.peer_row, 701,
+                {"req_id": payload["req_id"], "results": results}, via="mail")
+
+        async def scenario():
+            loop = asyncio.get_running_loop()
+            results_map = {"t": []}
+            with patch.object(bot, "async_event_loop", loop), \
+                 patch.object(bot, "peer_send", side_effect=fake_send), \
+                 patch.object(bot, "_resolve_peer_chat_id", AsyncMock(return_value=701)):
+                await bot._batch_cross_check_peer(self.peer_row, [("t", {"url": self.URL, "type": "http"})], results_map)
+            return results_map
+
+        return asyncio.run(scenario())
+
+    def test_busy_batch_answer_is_not_a_measurement_or_an_ok_sample_and_keeps_the_streak(self):
+        results = self.run_batch([self.busy])
+        self.assertEqual(self.measurement(), [("up", 12)])
+        self.assertEqual(results["t"][0]["status"], "unknown")
+        self.assertEqual(self.state.streak, 3)  # counted like a failure, not reset
+        self.assertEqual(self.rtt.call_count, 1)
+        self.assertFalse(self.rtt.call_args.args[4])
+
+    def test_real_batch_answer_still_counts(self):
+        self.run_batch([{"status": "down", "latency_ms": 7, "error_msg": "x"}])
+        self.assertEqual(self.measurement(), [("down", 7)])
+        self.assertEqual(self.state.streak, 0)
+        self.assertTrue(self.rtt.call_args.args[4])
+
+
+class TestBusyFloodAndZombies(unittest.TestCase):
+    def test_global_busy_cap_across_requesters(self):
+        adm = bot.InboundProbeAdmission()
+        sent = 0
+        for r in range(4):
+            peer = dict(email=f"r{r}@example.org")
+            for i in range(25):
+                sent += adm.allow_busy_reply(peer, f"id{r}-{i}")
+        self.assertEqual(sent, bot.PEER_BUSY_REPLIES_GLOBAL_PER_MINUTE)
+
+    def test_rejected_requests_count_towards_the_rate_bound(self):
+        adm = bot.InboundProbeAdmission()
+        peer = dict(email="flood@example.org")
+        _, held = adm.acquire(peer, "held", 10)
+        for i in range(150):
+            adm.acquire(peer, f"r{i}", 1)
+        self.assertEqual(len(adm.rates[bot._peer_identity(peer)]), 120)
+        adm.release(held)
+        self.assertEqual(adm.acquire(peer, "after", 1), (bot._ProbeAdmission.REJECTED, None))  # rate bound tripped
+        self.assertFalse(adm.allow_busy_reply(peer, "x"))  # and no busy answer for it
+
+    def test_multi_target_batch_is_not_granted_fewer_than_three_slots(self):
+        adm = bot.InboundProbeAdmission()
+        peer = dict(email="a@example.org")
+        _, held = adm.acquire(peer, "held", 8)  # two slots left for this requester
+        self.assertEqual(adm.acquire(peer, "batch", 5), (bot._ProbeAdmission.REJECTED, None))
+        self.assertEqual(adm.acquire(peer, "batch3", 3), (bot._ProbeAdmission.REJECTED, None))
+        # nothing leaked: the global pool is intact
+        self.assertEqual(adm.outstanding[bot._peer_identity(peer)], 8)
+        outcome, two = adm.acquire(peer, "batch2", 2)  # a 2-target batch may take what is free
+        self.assertIs(outcome, bot._ProbeAdmission.ACCEPTED)
+        self.assertEqual(two[1], 2)
+        adm.release(held)
+        adm.release(two)
+        outcome, single = adm.acquire(peer, "single", 1)
+        self.assertEqual(single[1], 1)
+        released = [adm.slots.acquire(blocking=False) for _ in range(bot.PEER_BATCH_CHECK_CONCURRENCY - 1)]
+        self.assertTrue(all(released))
+
+    def test_batch_gets_three_or_four_free_slots_when_that_is_all_there_is(self):
+        adm = bot.InboundProbeAdmission()
+        peer = dict(email="a@example.org")
+        _, held = adm.acquire(peer, "held", 6)
+        outcome, got = adm.acquire(peer, "batch", 5)
+        self.assertEqual(got[1], 4)
 
 
 class TestOwnFingerprintCache(unittest.TestCase):
@@ -203,50 +333,90 @@ class TestOwnFingerprintCache(unittest.TestCase):
         self.assertEqual(dc_fingerprint.get_self_fingerprint(rpc, 1), PEER_FP)
 
 
-class TestTrimWithoutLock(unittest.TestCase):
-    def test_delete_rpc_runs_without_the_lock_in_chunks_of_50(self):
-        calls, held = [], []
+class _LoggedLock:
+    """An RLock that records enter and exit, to check what runs while it is held."""
+    def __init__(self, log):
+        self._lock = threading.RLock()
+        self.log = log
+
+    def __enter__(self):
+        self._lock.acquire()
+        self.log.append("enter")
+
+    def __exit__(self, *exc):
+        self.log.append("exit")
+        self._lock.release()
+
+
+class TestTrimLockPerChunk(unittest.TestCase):
+    def run_trim(self, old, protected_for_call=lambda n: set()):
+        log, deleted_ids = [], []
+        calls = {"n": 0}
 
         class Rpc:
             def delete_messages(self, accid, ids):
-                held.append(bot._peer_rt_lock._is_owned())
-                calls.append(list(ids))
+                log.append(("delete", len(ids)))
+                deleted_ids.append(list(ids))
+
+        def protected():
+            calls["n"] += 1
+            log.append("check")
+            return protected_for_call(calls["n"])
 
         fake = MagicMock()
         fake.rpc = Rpc()
-        old = list(range(1000, 1430))
-        with patch.object(database, "get_peer_rt_message_ids", return_value={1010, 1011}):
+        with patch.object(bot, "_peer_rt_lock", _LoggedLock(log)), \
+             patch.object(database, "get_peer_rt_message_ids", side_effect=protected):
             deleted = bot._delete_trimmed_messages(fake, 1, old)
-        self.assertEqual(deleted, 428)
-        self.assertEqual(len(calls), 9)
-        self.assertTrue(all(len(c) <= 50 for c in calls))
-        self.assertFalse(any(held))
-        self.assertFalse({1010, 1011} & {i for c in calls for i in c})
+        return deleted, log, deleted_ids
 
-    def test_other_thread_can_take_the_lock_while_a_delete_runs(self):
+    def test_each_chunk_checks_and_deletes_under_the_lock_and_releases_between_chunks(self):
+        deleted, log, ids = self.run_trim(list(range(1000, 1430)))
+        self.assertEqual(deleted, 430)
+        self.assertEqual(len(ids), 9)
+        self.assertTrue(all(len(c) <= 50 for c in ids))
+        self.assertEqual(log, ["enter", "check", ("delete", 50), "exit"] * 8 + ["enter", "check", ("delete", 30), "exit"])
+
+    def test_offer_accepted_between_chunks_is_protected_in_the_second_chunk(self):
+        old = list(range(1000, 1100))
+        # The OFFER arrives (set_peer_rt) after the first chunk and takes message 1075
+        deleted, log, ids = self.run_trim(old, lambda n: {1075} if n >= 2 else set())
+        self.assertEqual(deleted, 99)
+        self.assertNotIn(1075, {i for c in ids for i in c})
+        for i, entry in enumerate(log):  # no delete outside enter/exit
+            if isinstance(entry, tuple):
+                self.assertEqual(log[:i].count("enter") - log[:i].count("exit"), 1)
+
+    def test_other_thread_waits_for_one_chunk_not_the_whole_trim(self):
         in_rpc, release, got_lock = threading.Event(), threading.Event(), threading.Event()
+        starts = []
 
         class Rpc:
             def delete_messages(self, accid, ids):
-                in_rpc.set()
-                release.wait(5)
+                starts.append(list(ids))
+                if len(starts) == 1:
+                    in_rpc.set()
+                    release.wait(5)
 
         fake = MagicMock()
         fake.rpc = Rpc()
         with patch.object(database, "get_peer_rt_message_ids", return_value=set()):
-            worker = threading.Thread(target=bot._delete_trimmed_messages, args=(fake, 1, [1, 2, 3]))
+            worker = threading.Thread(target=bot._delete_trimmed_messages, args=(fake, 1, list(range(200))))
             worker.start()
             self.assertTrue(in_rpc.wait(5))
 
             def take():
                 with bot._peer_rt_lock:
                     got_lock.set()
+                    contender_saw.append(len(starts))
+            contender_saw = []
             t = threading.Thread(target=take)
             t.start()
-            self.assertTrue(got_lock.wait(2), "lock held across delete_messages")
+            self.assertFalse(got_lock.wait(0.2), "lock must be held during a delete")
             release.set()
             worker.join(5)
             t.join(5)
+        self.assertTrue(got_lock.is_set())
 
     def test_failed_chunk_is_retried_one_by_one(self):
         class Rpc:

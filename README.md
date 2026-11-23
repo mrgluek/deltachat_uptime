@@ -164,6 +164,7 @@ These commands are only executable by the configured administrator.
 - `/addpeer <email|link> [token=<token>] [node_name]` — Link another Delta Chat Uptime bot as a remote probe using the command printed by its `/invitepeer` (e.g. `/addpeer https://i.delta.chat/#... token=... RU`). Without a token (e.g. `/addpeer ruptimebot@chat.gluek.info RU`) the other bot's admin must add this bot too.
 - `/rmpeer <email|key>` — Remove a remote peer probe by its current address or key fingerprint (the first 8+ hex digits shown by `/peers` are enough). Also stops probing targets it mirrored to this node.
 - `/peershare [admin|all|none]` — Choose which local monitors are disclosed to peers (default `admin`: only chats the administrator is a member of).
+- `/hiddentrim [off|dry|on]` — Show or set the cleanup of hidden status update messages. The core keeps every status app update the bot sends as a hidden message of 10-80 KB and never deletes it. Every ten minutes the bot reads the ids of the oldest such messages (older than 24 hours, at most 500 per pass) from the core database, read-only, and deletes them in chunks of 50. `dry` (default) only logs how many it would delete; `on` deletes; `off` does nothing. The current status app and the peer channel app are never touched. `/stats` shows the mode and the counters.
 - `/accounts` — List active bot accounts.
 - `/rmaccount <id>` — Delete a bot account.
 - `/transports` — Show mail relays: relay used for sending, send queue, incoming status and storage.

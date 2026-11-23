@@ -84,7 +84,7 @@ from outbox import SKIP_SEND, record_sent_mail
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "3.0.2"
+VERSION = "3.0.3"
 SYNC_MAX_BYTES = 64 * 1024
 # 200 metrics / 100 cross-checks, including JSON's twelve-byte astral Unicode escaping at field limits.
 PEER_MAX_BYTES = 8 * 1024 * 1024
@@ -698,7 +698,8 @@ VOTE_HISTORY_WINDOW = 86400   # how far back a node's lone failures count agains
 _node_vote_history = {}       # node -> deque of (time.time(), alone_failing: bool) of its counted votes
 
 # /stats: counters since start and events of the last hour (in memory, reset on restart)
-_bot_stats = {"started": time.time(), "trimmed": 0, "user_trimmed": 0}
+_bot_stats = {"started": time.time(), "trimmed": 0, "user_trimmed": 0, "hidden_trimmed": 0,
+              "hidden_candidates": None, "hidden_bytes": 0, "hidden_pass_at": None}
 _stat_events = collections.defaultdict(collections.deque)  # name -> times of the last hour
 _cpu_samples = collections.deque(maxlen=4)  # (time.monotonic(), {name: cpu seconds}) once a minute
 _last_check_summary = {}
@@ -1189,6 +1190,111 @@ def trim_user_chats(bot, accid) -> int:
     _bot_stats["user_trimmed"] += deleted
     logger.info("Deleted %s old messages from user chats (%s examined)", deleted, examined)
     return deleted
+
+
+# Hidden status-update carriers. Each status app update is sent through the core as a hidden message
+# of the bot itself whose param column holds the whole update (10-80 KB). The core never deletes them
+# and the chat trims only see visible messages, so they took 73% of the core database on de2. The ids
+# are read from the core database (read-only, one connection per pass, at most HIDDEN_TRIM_MAX rows)
+# and deleted through the core RPC in chunks of PEER_CHAT_TRIM_CHUNK.
+HIDDEN_TRIM_MODES = ("off", "dry", "on")
+HIDDEN_TRIM_MAX = 500            # ids per pass (one pass per PEER_CHAT_TRIM_INTERVAL)
+HIDDEN_TRIM_MIN_AGE = 86400      # never touch a message younger than this
+HIDDEN_TRIM_MIN_PARAM = 1000     # ordinary small messages are left alone
+_HIDDEN_TRIM_SQL = (
+    "SELECT id, length(param) FROM msgs WHERE hidden = 1 AND type = 10 AND from_id = 1 "
+    "AND timestamp < ? AND length(param) > ? AND param LIKE '%E={%' ORDER BY id LIMIT ?")
+_hidden_trim_lock = threading.Lock()
+_hidden_trim_warned = set()
+
+
+def get_hidden_trim_mode() -> str:
+    value = (database.get_config("hidden_trim") or "dry").strip().lower()
+    return value if value in HIDDEN_TRIM_MODES else "dry"
+
+
+def _hidden_trim_mode_or_unknown() -> str:
+    try:
+        return get_hidden_trim_mode()
+    except Exception:
+        return "unknown"
+
+
+def _core_db_path(bot, accid):
+    """Path of the core database file of this account, or None. Uses the core's own report of its
+    database location; falls back to the only accounts/*/dc.db below the config directory."""
+    candidates = []
+    try:
+        info = bot.rpc.get_info(accid)
+        for key in ("database_dir", "dbfile"):
+            value = _field(info, key)
+            if isinstance(value, str) and value:
+                path = Path(value)
+                candidates.append(path / "dc.db" if path.is_dir() else path)
+        blobdir = _field(info, "blobdir")
+        if isinstance(blobdir, str) and blobdir:
+            candidates.append(Path(blobdir).parent / "dc.db")
+    except Exception as exc:
+        logger.debug("Cannot ask the core for its database path: %s", exc)
+    for path in candidates:
+        if path.is_file() and os.access(path, os.R_OK):
+            return path
+    if _storage_config_dir:
+        found = [p for p in Path(_storage_config_dir, "accounts").glob("*/dc.db") if os.access(p, os.R_OK)]
+        if len(found) == 1:
+            return found[0]
+    return None
+
+
+def _read_hidden_carriers(path, now):
+    """One read-only connection, one query: (ids, total bytes) of the oldest candidate carriers."""
+    conn = sqlite3.connect(f"{Path(path).resolve().as_uri()}?mode=ro", uri=True, timeout=5)
+    try:
+        conn.execute("PRAGMA query_only = ON")
+        rows = conn.execute(_HIDDEN_TRIM_SQL, (now - HIDDEN_TRIM_MIN_AGE, HIDDEN_TRIM_MIN_PARAM,
+                                               HIDDEN_TRIM_MAX)).fetchall()
+    finally:
+        conn.close()
+    return [r[0] for r in rows], sum(r[1] or 0 for r in rows)
+
+
+def trim_hidden_status_updates(bot, accid, now=None) -> int:
+    """One pass of the hidden carrier trim. Mode off: nothing. Mode dry: logs what it would delete.
+    Mode on: deletes. Returns how many messages were deleted."""
+    if not _hidden_trim_lock.acquire(blocking=False):
+        return 0
+    try:
+        mode = get_hidden_trim_mode()
+        if mode == "off":
+            return 0
+        path = _core_db_path(bot, accid)
+        if path is None:
+            if "path" not in _hidden_trim_warned:
+                _hidden_trim_warned.add("path")
+                logger.warning("Hidden message trim: the core database file was not found or is not readable; skipped")
+            return 0
+        try:
+            ids, size = _read_hidden_carriers(path, int(now if now is not None else time.time()))
+        except Exception as exc:
+            if "read" not in _hidden_trim_warned:
+                _hidden_trim_warned.add("read")
+                logger.warning("Hidden message trim: cannot read %s: %s", path, exc)
+            return 0
+        _bot_stats["hidden_pass_at"] = time.time()
+        protected = database.get_retained_message_ids() | database.get_peer_rt_message_ids()
+        ids = [i for i in ids if i not in protected]
+        _bot_stats["hidden_candidates"] = len(ids)
+        _bot_stats["hidden_bytes"] = size
+        if mode != "on":
+            logger.info("Hidden message trim (dry): would delete %s hidden status update messages (%s bytes in this batch)",
+                        len(ids), size)
+            return 0
+        deleted = _delete_trimmed_messages(bot, accid, ids)
+        _bot_stats["hidden_trimmed"] += deleted
+        logger.info("Hidden message trim: deleted %s of %s candidates (%s bytes in this batch)", deleted, len(ids), size)
+        return deleted
+    finally:
+        _hidden_trim_lock.release()
 
 
 def _delete_abandoned_chat(chat_id):
@@ -5862,6 +5968,7 @@ async def monitoring_scheduler_loop():
                     _last_peer_chat_trim = now
                     asyncio.create_task(asyncio.to_thread(trim_peer_chats, dc_bot_instance, dc_accid))
                     asyncio.create_task(asyncio.to_thread(trim_user_chats, dc_bot_instance, dc_accid))
+                    asyncio.create_task(asyncio.to_thread(trim_hidden_status_updates, dc_bot_instance, dc_accid))
 
                 # Allow a restart to run cleanup a few hours before its daily schedule.
                 if cleanup_interval is None:
@@ -8973,6 +9080,7 @@ def help_command(bot, accid, event):
             f"/peershare [admin|all|none] — Choose which local monitors are disclosed to peers\n"
             f"/peerrt [off|canary|on] — Show or set the peer channel preview flag\n"
             f"/peerrt <peer name|email> on|off|auto — Set a peer's preview mode\n"
+            f"/hiddentrim [off|dry|on] — Show or set the cleanup of hidden status update messages\n"
             f"/nodeignore [node_pat] [target_pat] — Ignore targets on peer node(s) (e.g. `RU* facebook.*`)\n"
             f"/nodeunignore <node_pat> [target_pat] — Resume checks for node(s)\n"
             f"/accounts — List configured bot accounts\n"
@@ -10969,6 +11077,8 @@ def build_stats_report(bot, accid) -> str:
         f"{_inbound_probes.rejected} since start ({_inbound_probes.reduced} got fewer workers)",
         f"• Old protocol messages deleted since start: {_bot_stats['trimmed']}",
         f"• Old user chat messages deleted since start: {_bot_stats['user_trimmed']}",
+        f"• Hidden updates ({_hidden_trim_mode_or_unknown()}): {_bot_stats['hidden_trimmed']} deleted, "
+        + ("no pass yet" if _bot_stats["hidden_candidates"] is None else f"last pass {_bot_stats['hidden_candidates']}"),
         "",
         "**Relays**",
         (f"• {len(relays)}: " + ", ".join(f"`{r}`" for r in relays)) if relays else "• n/a",
@@ -11155,6 +11265,25 @@ def peerrt_command(bot, accid, event):
     else:
         reply = "❌ Usage: `/peerrt [off|canary|on]` or `/peerrt <peer name|email> on|off|auto`"
     _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=reply))
+
+@dc_cli.on(events.NewMessage(command="/hiddentrim"))
+@command_budget
+def hiddentrim_command(bot, accid, event):
+    msg = event.msg
+    if not _is_dc_admin(bot, accid, msg.from_id):
+        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text="❌ This command is only for the administrator."))
+        return
+    value = (event.payload or "").strip().lower()
+    if not value:
+        reply = (f"Hidden status update cleanup: `{get_hidden_trim_mode()}` "
+                 f"({_bot_stats['hidden_trimmed']} deleted since start).")
+    elif value in HIDDEN_TRIM_MODES:
+        database.set_config("hidden_trim", value)
+        reply = f"✅ Hidden status update cleanup set to `{value}`."
+    else:
+        reply = "❌ Usage: `/hiddentrim [off|dry|on]`"
+    _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=reply))
+
 
 @dc_cli.on(events.NewMessage(command="/invitepeer"))
 @dc_cli.on(events.NewMessage(command="/peerinvite"))

@@ -19,6 +19,7 @@ const clearInterval = () => { interval = null; };
 const document = {getElementById: () => ({addEventListener() {}})};
 const localStorage = {setItem() {}, removeItem() {}, getItem() {return null;}};
 const newer = () => false;
+const acceptPayload = () => {};
 const render = () => {};
 const webxdc = {joinRealtimeChannel() {
   const ch = {sent: [], left: false, setListener(fn) {this.listener = fn;},

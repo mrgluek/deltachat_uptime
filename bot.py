@@ -84,7 +84,7 @@ from outbox import SKIP_SEND, record_sent_mail
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "3.0.4"
+VERSION = "3.0.5"
 SYNC_MAX_BYTES = 64 * 1024
 # 200 metrics / 100 cross-checks, including JSON's twelve-byte astral Unicode escaping at field limits.
 PEER_MAX_BYTES = 8 * 1024 * 1024
@@ -164,7 +164,11 @@ def _missing_keyword_error(keyword: str, body: bytes | None, max_length: int) ->
 
 
 STATUS_REFRESH_SECONDS = 1800
-WEBXDC_APP_VERSION = 5  # Bump only for layout changes requiring a new app instance.
+WEBXDC_APP_VERSION = 5  # Bump only for layout changes requiring a new app instance (minimum accepted version).
+WEBXDC_DELTA_APP_VERSION = 6  # App that understands delta updates; instances at 5 keep full snapshots.
+STATUS_DELTA_EVERY = 20       # every 20th update of an instance is a full snapshot
+STATUS_DELTA_MAX_RATIO = 0.6  # a delta larger than this share of the snapshot is not worth sending
+STATUS_APP_DELTA_MODES = ("on", "off")
 # Safety net; explicit trimming preserves app instances and ongoing incident messages.
 DELETE_DEVICE_AFTER = 30 * 86400
 USER_CHAT_KEEP_SECONDS = 86400
@@ -7450,6 +7454,79 @@ def _build_xdc(source_dir, name, lock, *, deterministic=False) -> str:
         return str(target)
 
 
+def _status_app_version_ok(version) -> bool:
+    """Instance versions the bot keeps using: the minimum (5) up to the delta app (6)."""
+    try:
+        number = int(version)
+    except (TypeError, ValueError):
+        return False
+    return WEBXDC_APP_VERSION <= number <= max(WEBXDC_APP_VERSION, WEBXDC_DELTA_APP_VERSION)
+
+
+def _status_app_has_delta(version) -> bool:
+    try:
+        return int(version) >= WEBXDC_DELTA_APP_VERSION
+    except (TypeError, ValueError):
+        return False
+
+
+def get_status_app_delta_mode() -> str:
+    value = (database.get_config("status_app_delta") or "on").strip().lower()
+    return value if value in STATUS_APP_DELTA_MODES else "on"
+
+
+def _status_app_delta_mode_or_unknown() -> str:
+    try:
+        return get_status_app_delta_mode()
+    except Exception:
+        return "unknown"
+
+
+def _monitor_sig(monitor: dict) -> str:
+    """8 hex characters over exactly the fields status_state_hash treats as significant."""
+    content = [monitor.get(key) for key in ("id", "name", "url", "type", "status", "since")]
+    content.append([[node.get("node"), node.get("status")] for node in monitor.get("nodes", [])])
+    return hashlib.sha1(json.dumps(content, ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()[:8]
+
+
+def _status_sent_record(state: dict) -> dict:
+    """What a delta needs to know about the last update sent to an instance (about 4 KB for 84 monitors)."""
+    return {"g": state["generated_at"], "m": {str(m["id"]): _monitor_sig(m) for m in state["monitors"]}}
+
+
+def _load_status_sent(raw):
+    try:
+        record = json.loads(raw) if raw else None
+    except (TypeError, ValueError):
+        return None
+    if (isinstance(record, dict) and isinstance(record.get("g"), int) and not isinstance(record.get("g"), bool)
+            and isinstance(record.get("m"), dict)):
+        return record
+    return None
+
+
+def _status_delta_json(state: dict, prev: dict, record: dict, limit: int, info_line, snapshot_size: int):
+    """Encoded delta update against the record of the last sent update, or None when a snapshot is better."""
+    if state["generated_at"] <= prev["g"]:
+        return None
+    old, new = prev["m"], record["m"]
+    chg = [m for m in state["monitors"] if old.get(str(m["id"])) != new[str(m["id"])]]
+    rm = [int(i) for i in old if i not in new]
+    payload = {"v": WEBXDC_DELTA_APP_VERSION, "delta": 1, "base": prev["g"], "generated_at": state["generated_at"],
+               "chg": chg, "rm": rm}
+    for key, value in state.items():
+        if key in ("chat", "counts", "events", "event_serial", "incidents", "partial_outages") or key.endswith("_omitted"):
+            payload[key] = value
+    update = {"payload": payload, "summary": status_app_summary(state)}
+    if info_line:
+        update["info"] = info_line
+    encoded = json.dumps(update, ensure_ascii=False, separators=(",", ":"))
+    size = len(encoded.encode())
+    if size > limit or size > STATUS_DELTA_MAX_RATIO * snapshot_size:
+        return None
+    return encoded
+
+
 def build_status_state(chat_id: int, *, chat_name: str | None = None) -> dict:
     """Read a full snapshot without RPC calls or writes (chat name is cached at delivery)."""
     now = int(time.time())
@@ -7766,7 +7843,7 @@ def _deliver_status_app(chat_id, bot, accid, known_msg_id=None):
         # A just-posted and successfully pinned id is already known to exist; send its
         # first state next without another existence probe. Audits always probe again.
         exists = msg_id and (msg_id == known_msg_id or msg_id in bot.rpc.get_existing_msg_ids(accid, [msg_id]))
-        if not exists or version != str(WEBXDC_APP_VERSION) or status_app_rotation_due(chat_id, now):
+        if not exists or not _status_app_version_ok(version) or status_app_rotation_due(chat_id, now):
             last_post = database.get_config(f"webxdc_reposted_at:{chat_id}")
             if last_post is not None and now - int(last_post) < 3600:
                 return
@@ -7781,7 +7858,7 @@ def _deliver_status_app(chat_id, bot, accid, known_msg_id=None):
             database.set_chat_webxdc(chat_id, msg_id)
             database.set_config(f"webxdc_posted_at:{chat_id}", str(now))
             database.set_config(f"webxdc_update_count:{chat_id}", "0")
-            database.set_config(f"webxdc_app_version:{chat_id}", str(WEBXDC_APP_VERSION))
+            database.set_config(f"webxdc_app_version:{chat_id}", str(max(WEBXDC_APP_VERSION, WEBXDC_DELTA_APP_VERSION)))
             database.set_chat_status_line(chat_id, None, None)
             if exists and msg_id != old_instance and get_app_retire_mode() != "off":
                 # Record the replaced instance; the 10-minute pass deletes it for all members later.
@@ -7823,7 +7900,11 @@ def _deliver_status_app(chat_id, bot, accid, known_msg_id=None):
         first_state = status_app_first_state(chat_id, saved)
         last_info = int(database.get_config(f"webxdc_last_info_event_id:{chat_id}") or 0)
         info_events = database.get_recent_chat_events(chat_id, after_id=last_info)
-        update = _status_update_json(state, limit, status_app_info(info_events))
+        delta_app = _status_app_has_delta(version)
+        info_line = status_app_info(info_events)
+        if delta_app:
+            state["snap"] = 1  # marks a full snapshot for the delta-aware app; hashes were taken before
+        update = _status_update_json(state, limit, info_line)
         line_changed = saved["status_line_hash"] != _status_line_hash(status_line_text(state))
         if (saved["webxdc_state_hash"] == digest and not first_state and not refresh_due and not line_changed) or (saved["webxdc_last_sent_at"] is not None
                 and now - saved["webxdc_last_sent_at"] < interval):
@@ -7849,12 +7930,25 @@ def _deliver_status_app(chat_id, bot, accid, known_msg_id=None):
         # Count attempts durably too: retrying an uncertain RPC must not exceed the cap.
         database.set_config(f"webxdc_updates:{chat_id}", json.dumps(updates + [now]))
         database.set_config(f"webxdc_attempt_revision:{chat_id}", revision)
+        count = int(database.get_config(f"webxdc_update_count:{chat_id}") or 0)
+        sent_record = _status_sent_record(state) if delta_app else None
+        if (delta_app and not first_state and not refresh_due and count % STATUS_DELTA_EVERY != 0
+                and not state.get("details_omitted")):
+            # One batched read for the previous-state record and the switch; no per-monitor work.
+            sent_key, mode_key = f"webxdc_sent:{chat_id}", "status_app_delta"
+            cfg = database.get_configs((sent_key, mode_key))
+            prev = _load_status_sent(cfg.get(sent_key))
+            if prev is not None and (cfg.get(mode_key) or "on").strip().lower() != "off":
+                delta = _status_delta_json(state, prev, sent_record, limit, info_line, len(update.encode()))
+                if delta is not None:
+                    update = delta
         bot.rpc.send_webxdc_status_update(accid, msg_id, update, status_app_summary(state))
         record_sent_mail("status_app")
         stat_event("mail_out")
         database.set_chat_webxdc(chat_id, msg_id, digest, now)
         database.set_config(f"webxdc_full_state_hash:{chat_id}", full_digest)
-        count = int(database.get_config(f"webxdc_update_count:{chat_id}") or 0)
+        if sent_record is not None:
+            database.set_config(f"webxdc_sent:{chat_id}", json.dumps(sent_record, separators=(",", ":")))
         database.set_config(f"webxdc_update_count:{chat_id}", str(count + 1))
         database.set_config(f"webxdc_clean:{chat_id}", revision)
         if line_changed:
@@ -7889,7 +7983,7 @@ async def push_status_apps():
             keys = ("app_version", "posted_at", "reposted_at", "update_count", "pin_pending")
             settings = await run_db(database.get_configs, (f"webxdc_{key}:{chat_id}" for key in keys))
             version = settings.get(f"webxdc_app_version:{chat_id}")
-            if (not exists or version != str(WEBXDC_APP_VERSION)
+            if (not exists or not _status_app_version_ok(version)
                     or await run_db(status_app_rotation_due, chat_id, now, settings=settings)):
                 last_post = settings.get(f"webxdc_reposted_at:{chat_id}")
                 if last_post is not None and now - int(last_post) < 3600:
@@ -9247,6 +9341,7 @@ def help_command(bot, accid, event):
             f"/peerrt <peer name|email> on|off|auto — Set a peer's preview mode\n"
             f"/hiddentrim [off|dry|on] — Show or set the cleanup of hidden status update messages\n"
             f"/appretire [off|dry|on|sweep] — Show or set the deletion of old status apps for all members; sweep finds old ones in this chat\n"
+            f"/appdelta [on|off] — Show or set small delta updates in the status app (off: always full snapshots)\n"
             f"/nodeignore [node_pat] [target_pat] — Ignore targets on peer node(s) (e.g. `RU* facebook.*`)\n"
             f"/nodeunignore <node_pat> [target_pat] — Resume checks for node(s)\n"
             f"/accounts — List configured bot accounts\n"
@@ -11247,6 +11342,7 @@ def build_stats_report(bot, accid) -> str:
         + ("no pass yet" if _bot_stats["hidden_candidates"] is None else f"last pass {_bot_stats['hidden_candidates']}"),
         f"• Old status apps ({_app_retire_mode_or_unknown()}): {_bot_stats['app_retired']} deleted for all, "
         + ("no pass yet" if _bot_stats["app_retire_candidates"] is None else f"last pass {_bot_stats['app_retire_candidates']} due"),
+        f"• Status app delta updates: `{_status_app_delta_mode_or_unknown()}`",
         "",
         "**Relays**",
         (f"• {len(relays)}: " + ", ".join(f"`{r}`" for r in relays)) if relays else "• n/a",
@@ -11450,6 +11546,24 @@ def hiddentrim_command(bot, accid, event):
         reply = f"✅ Hidden status update cleanup set to `{value}`."
     else:
         reply = "❌ Usage: `/hiddentrim [off|dry|on]`"
+    _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=reply))
+
+
+@dc_cli.on(events.NewMessage(command="/appdelta"))
+@command_budget
+def appdelta_command(bot, accid, event):
+    msg = event.msg
+    if not _is_dc_admin(bot, accid, msg.from_id):
+        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text="❌ This command is only for the administrator."))
+        return
+    value = (event.payload or "").strip().lower()
+    if not value:
+        reply = f"Status app delta updates: `{get_status_app_delta_mode()}`."
+    elif value in STATUS_APP_DELTA_MODES:
+        database.set_config("status_app_delta", value)
+        reply = f"✅ Status app delta updates set to `{value}`."
+    else:
+        reply = "❌ Usage: `/appdelta [on|off]`"
     _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=reply))
 
 

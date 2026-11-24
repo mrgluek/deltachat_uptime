@@ -113,10 +113,36 @@ function render(state) {
   document.getElementById("journal").hidden = !(state.events || []).length;
   if (!visible.length) list.append(element("p", query ? "No matching monitors." : "No monitors in this chat yet."));
 }
-// Mail updates and live updates both carry complete snapshots; never let an older one replace a newer one.
+// A payload is a complete snapshot (never let an older one replace a newer one) or, from app version 6,
+// a delta against the previous stored update.
 const newer = state => !currentState || (state && (state.generated_at || 0) >= (currentState.generated_at || 0));
-// Core replays history in serial order. Each payload is a complete replacement snapshot.
-if (window.webxdc) webxdc.setUpdateListener(update => { if (newer(update.payload)) render(update.payload); }, 0);
+// DELTA-BEGIN
+const DELTA_DROP = ["delta", "base", "chg", "rm"];
+function mergeDelta(current, delta) {
+  const byId = new Map(current.monitors.map(m => [m.id, m]));
+  for (const id of delta.rm || []) byId.delete(id);
+  for (const monitor of delta.chg || []) byId.set(monitor.id, monitor);
+  const monitors = [...byId.values()].sort((a, b) => (order[a.status] ?? 4) - (order[b.status] ?? 4) || a.id - b.id);
+  const next = {};
+  for (const key of Object.keys(delta)) if (!DELTA_DROP.includes(key)) next[key] = delta[key];
+  next.monitors = monitors;
+  return next;
+}
+// Apply a delta only when we hold a state at least as new as its base and it is newer than ours;
+// if its base is newer than what we hold we missed an update: wait for the next snapshot.
+function acceptPayload(payload) {
+  if (!payload) return;
+  if (payload.delta) {
+    if (!currentState) return;
+    const held = currentState.generated_at || 0;
+    if (payload.generated_at > held && payload.base <= held) render(mergeDelta(currentState, payload));
+    return;
+  }
+  if (newer(payload)) render(payload);
+}
+// DELTA-END
+// Core replays history in serial order.
+if (window.webxdc) webxdc.setUpdateListener(update => acceptPayload(update.payload), 0);
 
 // Live updates over the webxdc realtime channel (opt-in, remembered on this device).
 // Protocol: app sends {"t":"hello"} until the first state arrives (the bot joins only after it
@@ -155,7 +181,7 @@ function startLive() {
     lastLive = Date.now();
     liveStatus(`Live · checked ${new Date().toLocaleTimeString()}`);
     if (first) { clearInterval(timer); timer = setInterval(liveTick, 60 * 1000); }
-    if (newer(msg.u.payload)) render(msg.u.payload);
+    acceptPayload(msg.u.payload);
   });
   lastLive = 0;
   joinedLive = Date.now();

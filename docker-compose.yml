@@ -27,8 +27,11 @@ services:
       - DISPLAY_NAME
       - STATUS_TEXT
       - AVATAR_PATH
+    # CPU cap: 1 core by default, because Docker refuses a cap above the number of cores of the
+    # host. On a host with 2 or more cores set UPTIME_CPUS=2 in .env (de2 runs with 2: at 1 core
+    # the container was throttled about 23 periods a minute and votes timed out)
     deploy:
       resources:
         limits:
-          cpus: '1'
+          cpus: '${UPTIME_CPUS:-1}'
           memory: 1G

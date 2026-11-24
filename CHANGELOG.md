@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- `docker-compose.yml`: the CPU cap is read from `UPTIME_CPUS` (default `1`, as before). On a host with 2 or more cores, `UPTIME_CPUS=2` is recommended. Measured on de2 (5 cores, 3.0.3): at a cap of 1 core the container was throttled 1,464 periods (76 s) in 62 minutes and 20-27 votes per 30 minutes failed; after raising the cap to 2, 51 throttled periods (1.5 s) in 5 hours 13 minutes and 7 failed votes per 30 minutes. A default of 2 was not used because Docker refuses a cap above the host's core count and the host `ru` has one core.
+
 ## [3.0.3] - 2026-11-23
 
 ### Added

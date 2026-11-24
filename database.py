@@ -3375,6 +3375,69 @@ def get_recent_chat_events(dc_chat_id: int, limit: int = 20, after_id=None, *, r
     return [{**dict(r), "text": short_journal_text(r["text"], labels=labels)} for r in rows]
 
 
+RETIRE_PREFIX = "webxdc_retire:"
+
+
+def get_retire_lists() -> dict:
+    """Old status app instances waiting to be deleted for all: {chat_id: [[msg_id, replaced_at, attempts], ...]}.
+    One query for all chats."""
+    out = {}
+    with contextlib.closing(_connect()) as conn:
+        rows = conn.execute("SELECT key, value FROM config WHERE key LIKE ?", (RETIRE_PREFIX + "%",)).fetchall()
+    for key, value in rows:
+        try:
+            chat_id = int(key[len(RETIRE_PREFIX):])
+            entries = [[int(e[0]), int(e[1]), int(e[2]) if len(e) > 2 else 0] for e in json.loads(value)]
+        except (ValueError, TypeError, IndexError):
+            continue
+        if entries:
+            out[chat_id] = entries
+    return out
+
+
+def add_retire_entries(dc_chat_id: int, entries) -> int:
+    """Record (msg_id, replaced_at) pairs for a chat; ids already listed are kept as they are. Returns how many were new."""
+    key = f"{RETIRE_PREFIX}{dc_chat_id}"
+    with _write_lock:
+        with _writer_transaction() as conn:
+            row = conn.execute("SELECT value FROM config WHERE key = ?", (key,)).fetchone()
+            try:
+                current = [list(e) for e in json.loads(row[0])] if row else []
+            except (ValueError, TypeError):
+                current = []
+            known = {e[0] for e in current}
+            added = 0
+            for msg_id, replaced_at in entries:
+                if msg_id not in known:
+                    known.add(msg_id)
+                    current.append([int(msg_id), int(replaced_at), 0])
+                    added += 1
+            if added:
+                conn.execute("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)", (key, json.dumps(current)))
+            return added
+
+
+def save_retire_lists(lists: dict):
+    """Replace the retire list of every given chat in ONE transaction (an empty list removes the key)."""
+    if not lists:
+        return
+    with _write_lock:
+        with _writer_transaction() as conn:
+            for chat_id, entries in lists.items():
+                key = f"{RETIRE_PREFIX}{chat_id}"
+                if entries:
+                    conn.execute("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)", (key, json.dumps(entries)))
+                else:
+                    conn.execute("DELETE FROM config WHERE key = ?", (key,))
+
+
+def get_chat_webxdc_ids() -> dict:
+    """{chat_id: current status app message id} for every chat that has one."""
+    with contextlib.closing(_connect()) as conn:
+        return {r[0]: r[1] for r in conn.execute(
+            "SELECT dc_chat_id, webxdc_msg_id FROM chats WHERE webxdc_msg_id IS NOT NULL")}
+
+
 def get_retained_message_ids():
     conn = _connect()
     try:

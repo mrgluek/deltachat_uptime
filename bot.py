@@ -84,7 +84,7 @@ from outbox import SKIP_SEND, record_sent_mail
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "3.0.3"
+VERSION = "3.0.4"
 SYNC_MAX_BYTES = 64 * 1024
 # 200 metrics / 100 cross-checks, including JSON's twelve-byte astral Unicode escaping at field limits.
 PEER_MAX_BYTES = 8 * 1024 * 1024
@@ -699,7 +699,8 @@ _node_vote_history = {}       # node -> deque of (time.time(), alone_failing: bo
 
 # /stats: counters since start and events of the last hour (in memory, reset on restart)
 _bot_stats = {"started": time.time(), "trimmed": 0, "user_trimmed": 0, "hidden_trimmed": 0,
-              "hidden_candidates": None, "hidden_bytes": 0, "hidden_pass_at": None}
+              "hidden_candidates": None, "hidden_bytes": 0, "hidden_pass_at": None,
+              "app_retired": 0, "app_retire_candidates": None}
 _stat_events = collections.defaultdict(collections.deque)  # name -> times of the last hour
 _cpu_samples = collections.deque(maxlen=4)  # (time.monotonic(), {name: cpu seconds}) once a minute
 _last_check_summary = {}
@@ -1295,6 +1296,165 @@ def trim_hidden_status_updates(bot, accid, now=None) -> int:
         return deleted
     finally:
         _hidden_trim_lock.release()
+
+
+# Old status app instances. Every instance the bot replaced stays on every member's device for ever
+# (up to 501 updates of 34-53 KB, about 26 MB each). The rotation records the replaced id here and a pass
+# of the 10-minute trim timer deletes it for all members after a grace period. delete_messages_for_all is
+# irreversible and visible to every member, so every deletion is gated by mode "on".
+APP_RETIRE_MODES = ("off", "dry", "on")
+APP_RETIRE_MAX = 100             # ids per pass (at most 2 delete_messages_for_all calls of 50)
+APP_RETIRE_MIN_AGE = 86400       # an instance is deleted at the earliest 24 h after it was replaced
+APP_RETIRE_MAX_ATTEMPTS = 5
+APP_RETIRE_SWEEP_EXAMINE = 1000  # most media messages one /appretire sweep looks at
+STATUS_XDC_NAME = "Uptime Status"   # name in webxdc/manifest.toml; the peer app is "Uptime peer link"
+SELF_CONTACT_ID = 1
+_app_retire_lock = threading.Lock()
+
+
+def get_app_retire_mode() -> str:
+    value = (database.get_config("app_retire") or "dry").strip().lower()
+    return value if value in APP_RETIRE_MODES else "dry"
+
+
+def _app_retire_mode_or_unknown() -> str:
+    try:
+        return get_app_retire_mode()
+    except Exception:
+        return "unknown"
+
+
+def retire_old_status_apps(bot, accid, now=None) -> int:
+    """One pass: deletes for all the recorded old status app instances that were replaced at least 24 h
+    ago. Mode off: nothing (no RPC). Mode dry: logs how many it would delete, changes nothing. Returns
+    how many ids were deleted."""
+    if not _app_retire_lock.acquire(blocking=False):
+        return 0
+    try:
+        mode = get_app_retire_mode()
+        if mode == "off":
+            return 0
+        lists = database.get_retire_lists()
+        if not lists:
+            _bot_stats["app_retire_candidates"] = 0
+            return 0
+        now = int(now if now is not None else time.time())
+        cutoff = now - APP_RETIRE_MIN_AGE
+        current = database.get_chat_webxdc_ids()
+        protected = database.get_retained_message_ids() | database.get_peer_rt_message_ids()
+        picked = []          # (chat_id, msg_id) due in this pass, at most APP_RETIRE_MAX
+        for chat_id in sorted(lists):
+            for msg_id, replaced_at, _tries in lists[chat_id]:
+                if len(picked) >= APP_RETIRE_MAX:
+                    break
+                if replaced_at <= cutoff and msg_id not in protected:
+                    picked.append((chat_id, msg_id))
+            if len(picked) >= APP_RETIRE_MAX:
+                break
+        _bot_stats["app_retire_candidates"] = len(picked)
+        if mode != "on":
+            logger.info("Old status app cleanup (dry): would delete %s old status app instances for all members "
+                        "(%s chats have a list)", len(picked), len(lists))
+            return 0
+        changed = {}
+        # An id that became the current instance, the status line, an open incident or a peer channel
+        # carrier is never deleted and is dropped from the list.
+        for chat_id, entries in lists.items():
+            keep = [e for e in entries if e[0] not in protected and e[0] != current.get(chat_id)]
+            if len(keep) != len(entries):
+                changed[chat_id] = keep
+        if not picked:
+            database.save_retire_lists(changed)
+            return 0
+        chats = {c for c, _ in picked}
+        probe = [m for _, m in picked] + [current[c] for c in chats if c in current]
+        try:
+            existing = set(bot.rpc.get_existing_msg_ids(accid, probe))
+        except Exception as exc:
+            logger.warning("Old status app cleanup: cannot check which messages exist: %s", exc)
+            database.save_retire_lists(changed)
+            return 0
+        due = {}   # msg_id -> chat_id, the ones to delete
+        gone = set()
+        for chat_id, msg_id in picked:
+            if msg_id in protected or msg_id == current.get(chat_id):
+                continue
+            if current.get(chat_id) not in existing:
+                continue          # the chat's current instance is not there: do not touch anything
+            if msg_id in existing:
+                due[msg_id] = chat_id
+            else:
+                gone.add(msg_id)
+        done, failed = set(gone), set()
+        ids = list(due)
+        for i in range(0, len(ids), PEER_CHAT_TRIM_CHUNK):
+            chunk = ids[i:i + PEER_CHAT_TRIM_CHUNK]
+            try:
+                bot.rpc.delete_messages_for_all(accid, chunk)
+                done.update(chunk)
+            except Exception as exc:
+                logger.warning("Old status app cleanup: deleting %s instances failed, will retry: %s", len(chunk), exc)
+                failed.update(chunk)
+            _trim_yield.wait(0.002)
+        deleted = len(done & set(due))
+        for chat_id in {c for c, _ in picked}:
+            new = []
+            for e in changed.get(chat_id, lists[chat_id]):
+                if e[0] in done:
+                    continue
+                if e[0] in failed:
+                    e = [e[0], e[1], e[2] + 1]
+                    if e[2] >= APP_RETIRE_MAX_ATTEMPTS:
+                        logger.warning("Old status app cleanup: giving up on message %s after %s attempts", e[0], e[2])
+                        continue
+                new.append(e)
+            changed[chat_id] = new
+        database.save_retire_lists(changed)
+        _bot_stats["app_retired"] += deleted
+        logger.info("Old status app cleanup: deleted %s old status app instances for all members (%s already gone)",
+                    deleted, len(gone))
+        return deleted
+    finally:
+        _app_retire_lock.release()
+
+
+def sweep_old_status_apps(bot, accid, chat_id, now=None):
+    """Finds the bot's own old status app instances in one chat. Returns (candidates, reason): candidates
+    is a list of (msg_id, replaced_at); reason is set when nothing can be said. Only a message that the bot
+    sent itself, that is a webxdc app named STATUS_XDC_NAME and that is not the chat's current instance,
+    status line or peer channel carrier qualifies. replaced_at is the time of the next status app of the bot."""
+    now = int(now if now is not None else time.time())
+    current = database.get_chat_webxdc(chat_id)["webxdc_msg_id"]
+    if not current:
+        return [], "this chat has no current status app"
+    media = list(bot.rpc.get_chat_media(accid, chat_id, "Webxdc", None, None))
+    if current not in media:
+        return [], "the current status app was not found in this chat"
+    protected = database.get_retained_message_ids() | database.get_peer_rt_message_ids()
+    apps = []
+    for msg_id in media[-APP_RETIRE_SWEEP_EXAMINE:]:
+        if msg_id in protected and msg_id != current:
+            continue
+        try:
+            message = bot.rpc.get_message(accid, msg_id)
+            if _field(message, "from_id") != SELF_CONTACT_ID or _field(message, "view_type") != "Webxdc":
+                continue
+            timestamp = _field(message, "timestamp")
+            if not isinstance(timestamp, int):
+                continue
+            if msg_id != current:
+                info = bot.rpc.get_webxdc_info(accid, msg_id)
+                if _field(info, "name") != STATUS_XDC_NAME:
+                    continue
+            apps.append((timestamp, msg_id))
+        except Exception:
+            continue
+    apps.sort()
+    found = []
+    for (timestamp, msg_id), (next_ts, _next) in zip(apps, apps[1:]):
+        if msg_id != current and msg_id not in protected and timestamp < now - APP_RETIRE_MIN_AGE:
+            found.append((msg_id, next_ts))
+    return found, None
 
 
 def _delete_abandoned_chat(chat_id):
@@ -5969,6 +6129,7 @@ async def monitoring_scheduler_loop():
                     asyncio.create_task(asyncio.to_thread(trim_peer_chats, dc_bot_instance, dc_accid))
                     asyncio.create_task(asyncio.to_thread(trim_user_chats, dc_bot_instance, dc_accid))
                     asyncio.create_task(asyncio.to_thread(trim_hidden_status_updates, dc_bot_instance, dc_accid))
+                    asyncio.create_task(asyncio.to_thread(retire_old_status_apps, dc_bot_instance, dc_accid))
 
                 # Allow a restart to run cleanup a few hours before its daily schedule.
                 if cleanup_interval is None:
@@ -7611,6 +7772,7 @@ def _deliver_status_app(chat_id, bot, accid, known_msg_id=None):
                 return
             # Persist before RPC: an ambiguous failure must not cause a re-post loop.
             database.set_config(f"webxdc_reposted_at:{chat_id}", str(now))
+            old_instance = msg_id
             old_ids = [i for i in (msg_id, saved["status_line_msg_id"]) if i]
             database.set_config(f"webxdc_unpin:{chat_id}", json.dumps(old_ids))
             msg_id = bot.rpc.send_msg(accid, chat_id, MsgData(file=build_status_xdc()))
@@ -7621,6 +7783,9 @@ def _deliver_status_app(chat_id, bot, accid, known_msg_id=None):
             database.set_config(f"webxdc_update_count:{chat_id}", "0")
             database.set_config(f"webxdc_app_version:{chat_id}", str(WEBXDC_APP_VERSION))
             database.set_chat_status_line(chat_id, None, None)
+            if exists and msg_id != old_instance and get_app_retire_mode() != "off":
+                # Record the replaced instance; the 10-minute pass deletes it for all members later.
+                database.add_retire_entries(chat_id, [(old_instance, now)])
             saved = database.get_chat_webxdc(chat_id)
         if not saved["status_line_msg_id"]:
             text = status_line_text(build_status_state(chat_id))
@@ -9081,6 +9246,7 @@ def help_command(bot, accid, event):
             f"/peerrt [off|canary|on] — Show or set the peer channel preview flag\n"
             f"/peerrt <peer name|email> on|off|auto — Set a peer's preview mode\n"
             f"/hiddentrim [off|dry|on] — Show or set the cleanup of hidden status update messages\n"
+            f"/appretire [off|dry|on|sweep] — Show or set the deletion of old status apps for all members; sweep finds old ones in this chat\n"
             f"/nodeignore [node_pat] [target_pat] — Ignore targets on peer node(s) (e.g. `RU* facebook.*`)\n"
             f"/nodeunignore <node_pat> [target_pat] — Resume checks for node(s)\n"
             f"/accounts — List configured bot accounts\n"
@@ -11079,6 +11245,8 @@ def build_stats_report(bot, accid) -> str:
         f"• Old user chat messages deleted since start: {_bot_stats['user_trimmed']}",
         f"• Hidden updates ({_hidden_trim_mode_or_unknown()}): {_bot_stats['hidden_trimmed']} deleted, "
         + ("no pass yet" if _bot_stats["hidden_candidates"] is None else f"last pass {_bot_stats['hidden_candidates']}"),
+        f"• Old status apps ({_app_retire_mode_or_unknown()}): {_bot_stats['app_retired']} deleted for all, "
+        + ("no pass yet" if _bot_stats["app_retire_candidates"] is None else f"last pass {_bot_stats['app_retire_candidates']} due"),
         "",
         "**Relays**",
         (f"• {len(relays)}: " + ", ".join(f"`{r}`" for r in relays)) if relays else "• n/a",
@@ -11282,6 +11450,44 @@ def hiddentrim_command(bot, accid, event):
         reply = f"✅ Hidden status update cleanup set to `{value}`."
     else:
         reply = "❌ Usage: `/hiddentrim [off|dry|on]`"
+    _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=reply))
+
+
+@dc_cli.on(events.NewMessage(command="/appretire"))
+@command_budget
+def appretire_command(bot, accid, event):
+    msg = event.msg
+    if not _is_dc_admin(bot, accid, msg.from_id):
+        _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text="❌ This command is only for the administrator."))
+        return
+    value = (event.payload or "").strip().lower()
+    mode = get_app_retire_mode()
+    if not value:
+        reply = (f"Old status app cleanup: `{mode}` ({_bot_stats['app_retired']} deleted for all since start, "
+                 f"{sum(len(v) for v in database.get_retire_lists().values())} waiting).")
+    elif value in APP_RETIRE_MODES:
+        database.set_config("app_retire", value)
+        reply = f"✅ Old status app cleanup set to `{value}`."
+    elif value == "sweep":
+        if mode == "off":
+            reply = "Old status app cleanup is `off`: nothing was looked up or recorded."
+        else:
+            try:
+                found, reason = sweep_old_status_apps(bot, accid, msg.chat_id)
+            except Exception as exc:
+                logger.warning("Old status app sweep failed: %s", exc)
+                found, reason = [], "the core could not be asked"
+            if reason:
+                reply = f"Nothing found: {reason}."
+            elif mode == "dry":
+                reply = (f"Found {len(found)} old status app instances of the bot in this chat (older than 24 hours, "
+                         f"up to 501 updates each). Mode is `dry`: nothing was recorded or deleted.")
+            else:
+                added = database.add_retire_entries(msg.chat_id, found)
+                reply = (f"Found {len(found)} old status app instances of the bot in this chat; {added} newly recorded. "
+                         f"They are deleted for all members, at most {APP_RETIRE_MAX} per 10 minutes.")
+    else:
+        reply = "❌ Usage: `/appretire [off|dry|on|sweep]`"
     _dc_send_msg_with_stats(bot, accid, msg.chat_id, MsgData(text=reply))
 
 

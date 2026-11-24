@@ -10,6 +10,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - `docker-compose.yml`: the CPU cap is read from `UPTIME_CPUS` (default `1`, as before). On a host with 2 or more cores, `UPTIME_CPUS=2` is recommended. Measured on de2 (5 cores, 3.0.3): at a cap of 1 core the container was throttled 1,464 periods (76 s) in 62 minutes and 20-27 votes per 30 minutes failed; after raising the cap to 2, 51 throttled periods (1.5 s) in 5 hours 13 minutes and 7 failed votes per 30 minutes. A default of 2 was not used because Docker refuses a cap above the host's core count and the host `ru` has one core.
 
+## [3.0.6] - 2026-11-24
+
+### Fixed
+- `/appretire` (3.0.4) could not delete anything for members. The local trim of user chats (`trim_user_chats`, messages older than 24 hours) removed a replaced status app instance from the bot's own database as soon as it stopped being the current one, long before the 24-hour grace of the retire pass was over; the pass then found the message gone and dropped it, and `delete_messages_for_all` needs the message to exist. Found on 2026-11-24: in a chat with 14 old instances on the owner's device, `/appretire sweep` found 0 because the bot's database held only the current one. Now, in mode `on`, the ids on the retire lists are kept out of the local trim until the pass has deleted them. In modes `dry` and `off` nothing changes (the local trim still removes them, so the bot's database does not grow).
+- Instances replaced before this release (and before mode `on`) are already gone from the bot's database; the bot cannot delete them on members' devices. `/appretire sweep` only finds instances that are still in the bot's database.
+- Cost: one extra query for the retire lists per trim pass (every 10 minutes), only in mode `on`.
+
 ## [3.0.5] - 2026-11-24
 
 ### Changed

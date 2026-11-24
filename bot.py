@@ -84,7 +84,7 @@ from outbox import SKIP_SEND, record_sent_mail
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "3.0.5"
+VERSION = "3.0.6"
 SYNC_MAX_BYTES = 64 * 1024
 # 200 metrics / 100 cross-checks, including JSON's twelve-byte astral Unicode escaping at field limits.
 PEER_MAX_BYTES = 8 * 1024 * 1024
@@ -1158,6 +1158,11 @@ def trim_user_chats(bot, accid) -> int:
     try:
         peers = {p.get("chat_id") for p in database.get_all_peers()}
         protected = database.get_retained_message_ids()
+        if get_app_retire_mode() == "on":
+            # A replaced status app instance must stay in the bot's own database until the retire pass has
+            # deleted it for all members: delete_messages_for_all needs the message, and a local trim
+            # would remove it first (it is older than a day as soon as it is replaced).
+            protected = protected | database.get_retire_message_ids()
         cutoff = int(time.time()) - USER_CHAT_KEEP_SECONDS
         # Include archived chats (flag 1) as well as the ordinary chat list.
         chats = dict.fromkeys(bot.rpc.get_chatlist_entries(accid, 0, None, None)

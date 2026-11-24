@@ -3431,6 +3431,11 @@ def save_retire_lists(lists: dict):
                     conn.execute("DELETE FROM config WHERE key = ?", (key,))
 
 
+def get_retire_message_ids() -> set:
+    """Ids of old status app instances waiting to be deleted for all members (one query)."""
+    return {entry[0] for entries in get_retire_lists().values() for entry in entries}
+
+
 def get_chat_webxdc_ids() -> dict:
     """{chat_id: current status app message id} for every chat that has one."""
     with contextlib.closing(_connect()) as conn:

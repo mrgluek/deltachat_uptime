@@ -84,7 +84,7 @@ from outbox import SKIP_SEND, record_sent_mail
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("uptime_bot")
-VERSION = "3.0.6"
+VERSION = "3.0.7"
 SYNC_MAX_BYTES = 64 * 1024
 # 200 metrics / 100 cross-checks, including JSON's twelve-byte astral Unicode escaping at field limits.
 PEER_MAX_BYTES = 8 * 1024 * 1024
@@ -7937,8 +7937,7 @@ def _deliver_status_app(chat_id, bot, accid, known_msg_id=None):
         database.set_config(f"webxdc_attempt_revision:{chat_id}", revision)
         count = int(database.get_config(f"webxdc_update_count:{chat_id}") or 0)
         sent_record = _status_sent_record(state) if delta_app else None
-        if (delta_app and not first_state and not refresh_due and count % STATUS_DELTA_EVERY != 0
-                and not state.get("details_omitted")):
+        if delta_app and not first_state and not refresh_due and count % STATUS_DELTA_EVERY != 0:
             # One batched read for the previous-state record and the switch; no per-monitor work.
             sent_key, mode_key = f"webxdc_sent:{chat_id}", "status_app_delta"
             cfg = database.get_configs((sent_key, mode_key))
